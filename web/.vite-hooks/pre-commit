@@ -1,1 +1,5 @@
-vp staged
+#!/bin/sh
+
+repo_root=$(git rev-parse --show-toplevel) || exit 1
+cd "$repo_root/web" || exit 1
+exec vp staged
