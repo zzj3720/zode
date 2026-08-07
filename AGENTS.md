@@ -515,6 +515,24 @@ fabricate or relabel a later capture as the historical first occurrence.
 - The main agent owns the authoritative design, the major E2E behavior matrix,
   cross-module decisions, and final repository review. It should not become the
   default production implementer after those boundaries are fixed.
+- Bind each long-lived delivery task to one fixed worktree and one stable local
+  branch for the lifetime of that task outcome. A pull request is a delivery
+  checkpoint, not a reason to create a replacement task, worktree, or branch
+  lineage. Reuse the same worktree and stable branch for every later PR owned by
+  that task.
+- After one of those PRs is squash-merged, synchronize that same stable branch
+  exactly to the new `origin/main` before starting later work. This reset is
+  allowed only after the PR is merged, no PR from the branch remains open, and
+  the tracked worktree is clean. Fetch/prune first; do not rebase already-squashed
+  commits back onto main or carry them through cherry-picks. Ignored first-
+  occurrence captures and local build-cache configuration are not tracked dirt
+  and must remain intact.
+- If a task still has uncommitted tracked work, an open PR, unreplayed evidence,
+  or an unresolved handoff, keep its existing worktree and branch in place until
+  that state is resolved. Never create another worktree merely to escape branch
+  divergence, a blocked review, build output, or a dirty tree. A new worktree is
+  justified only by a genuinely new concurrent task outcome approved by the main
+  task, not by the number of PRs.
 - Give each implementation thread or agent one coherent task outcome, normally
   bound to one GitHub issue. Task ownership is behavioral, not directory-based:
   the owner may change any module needed to deliver the complete vertical path
