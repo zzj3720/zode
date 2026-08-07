@@ -519,10 +519,16 @@ function commandOutput(command, args) {
 }
 
 async function processIdentity(pid) {
-  const output = await commandOutput("ps", ["-p", String(pid), "-o", "pgid=,sid="]);
-  const parts = output.trim().split(/\s+/);
-  if (parts.length < 2 || !/^\d+$/.test(parts[0]) || !/^\d+$/.test(parts[1])) return null;
-  return { process_group_id: Number(parts[0]), session_id: parts[1] };
+  // macOS exposes the session id as `sess` (not the Linux-only `sid`); keep a
+  // fallback for platforms whose procps still uses the latter spelling.
+  for (const field of ["sess=", "sid="]) {
+    const output = await commandOutput("ps", ["-p", String(pid), "-o", `pgid=,${field}`]);
+    const parts = output.trim().split(/\s+/);
+    if (parts.length >= 2 && /^\d+$/.test(parts[0]) && /^\d+$/.test(parts[1])) {
+      return { process_group_id: Number(parts[0]), session_id: parts[1] };
+    }
+  }
+  return null;
 }
 
 function isAlive(pid) {
