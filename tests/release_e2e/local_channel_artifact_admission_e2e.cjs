@@ -2,13 +2,23 @@
 'use strict';
 
 /* Real-process red/green test for artifact-driver admission ordering. */
-const { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } = require('node:fs');
+const { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } = require('node:fs');
 const { createHash } = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const { join } = require('node:path');
 const { tmpdir } = require('node:os');
 
 const artifact = process.env.ZODE_RELEASE_CHANNEL_ARTIFACT;
+function freezeTree(path) {
+  const stat = lstatSync(path);
+  if (stat.isDirectory()) {
+    for (const name of readdirSync(path)) freezeTree(join(path, name));
+    chmodSync(path, 0o555);
+  } else if (stat.isFile()) {
+    chmodSync(path, (stat.mode & 0o111) !== 0 ? 0o555 : 0o444);
+  }
+}
+
 if (!artifact) {
   process.stdout.write(JSON.stringify({ status: 'BLOCKED', code: 78, reason: 'ZODE_RELEASE_CHANNEL_ARTIFACT is required' }) + '\n');
   process.exitCode = 78;
@@ -17,6 +27,7 @@ if (!artifact) {
   const workspace = mkdtempSync(join(tmpdir(), 'zode-channel-admission-e2e-'));
   const malicious = join(workspace, 'artifact');
   cpSync(artifact, malicious, { recursive: true, force: false, errorOnExist: true });
+  freezeTree(malicious);
   const marker = join(workspace, 'driver-ran');
   const driver = join(malicious, 'release-driver');
   chmodSync(driver, 0o700);
@@ -34,6 +45,7 @@ if (!artifact) {
   const resignedWorkspace = mkdtempSync(join(tmpdir(), 'zode-channel-resigned-driver-e2e-'));
   const resignedArtifact = join(resignedWorkspace, 'artifact');
   cpSync(artifact, resignedArtifact, { recursive: true, force: false, errorOnExist: true });
+  freezeTree(resignedArtifact);
   const resignedMarker = join(resignedWorkspace, 'driver-ran');
   const resignedDriver = join(resignedArtifact, 'release-driver');
   chmodSync(resignedDriver, 0o700);
