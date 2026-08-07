@@ -16,6 +16,39 @@ ZODE_RELEASE_UI_URL=http://127.0.0.1:<management-port>/ \
 ./tests/release_e2e/run_release_e2e.sh --promote-incident
 ```
 
+## 首次本机测试安装
+
+完整三 revision 发布 E2E 需要 baseline/candidate/failed 三个冻结提交；在
+Management all-in-one 纵切尚未 ready 时，不应把 `78/BLOCKED` 当成行为红。
+要先交付一个可消费的单 revision 安装，可使用固定 channel 入口：
+
+```sh
+node release/channel.cjs build --revision <commit> --output-root <artifact-root>
+node release/channel.cjs install --artifact <artifact> --release-root <channel-root>
+node release/channel.cjs start --artifact <artifact> --release-root <channel-root>
+node release/channel.cjs stop --release-root <channel-root>
+node release/channel.cjs update --artifact <candidate> --release-root <channel-root>
+```
+
+构建只读取 `git archive`，并在同一 revision 内锁定 Endpoint、Server、Vite+
+UI、协议输入和 release driver 的 manifest/digest。`install` 不切换运行中
+版本；`update` 的 candidate readiness 失败会保留 `current`/`previous` 并返回
+非零。启动/停止使用真实产品进程和既有认证边界；它们不新增 release API，
+也不接受 cassette、replay 或测试 locator 参数。Management all-in-one ready
+后，使用同一个 `channel-root` 启动安装版，再通过真实浏览器执行 UI → Server
+→ built-in Endpoint smoke；无需等待完整三 revision rollback 矩阵。
+
+安装入口的真实进程 smoke 可在已有 artifact 上运行：
+
+```sh
+ZODE_RELEASE_CHANNEL_ARTIFACT=<artifact> \
+  node tests/release_e2e/local_channel_install_e2e.cjs
+```
+
+该 smoke 只证明 immutable install 的副作用边界（`releases/` 新增一个版本，
+`current`/`previous` 仍不存在），不把尚未具备 all-in-one 的启动失败伪装成
+浏览器行为红。
+
 The test channel supplies the existing authentication inputs through
 `ZODE_RELEASE_ACCESS_ASSERTION` (or `_ACCESS_JWT_ASSERTION`) and
 `ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER` (or `_CONTROLLER_BEARER`). Optional

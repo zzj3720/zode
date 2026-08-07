@@ -120,8 +120,12 @@ function canonicalDirectory(path, label) {
   try { real = realpathSync(value); } catch (error) {
     fail("release_root_invalid", `${label} cannot be resolved`, { path: value, error: String(error) });
   }
-  if (real !== value) fail("release_root_invalid", `${label} must not resolve through a symlink`, { path: value });
-  return value;
+  // lstat above rejects a symlink at the releaseRoot itself.  System temp
+  // directories on macOS commonly have a symlinked ancestor (`/tmp`), which
+  // is an alias rather than an escape from the caller's directory.  Use the
+  // canonical target after that boundary check so all child paths and pointer
+  // containment checks share one root identity.
+  return real;
 }
 
 function regularFile(path, label, immutable = false) {
@@ -220,14 +224,14 @@ function validateManifest(artifactPath) {
       || typeof binding.driver_binary_sha256 !== "string") {
     fail("release_manifest_mismatch", "manifest has no complete revision binding");
   }
-  for (const [name, expectedKind, digestKey] of [
-    ["ui", "tree", "ui_tree_sha256"],
-    ["server", "binary", "server_binary_sha256"],
-    ["endpoint", "binary", "endpoint_binary_sha256"],
+  for (const [name, expectedKind, digestKey, componentDigestKey] of [
+    ["ui", "tree", "ui_tree_sha256", "tree_sha256"],
+    ["server", "binary", "server_binary_sha256", "binary_sha256"],
+    ["endpoint", "binary", "endpoint_binary_sha256", "binary_sha256"],
   ]) {
     const component = components[name];
     if (!component || component.kind !== expectedKind || component.revision !== manifest.revision
-        || component[digestKey] !== binding[digestKey]) {
+        || component[componentDigestKey] !== binding[digestKey]) {
       fail("release_manifest_mismatch", `${name} component is not bound to the manifest revision`);
     }
   }
@@ -1495,7 +1499,7 @@ async function teardown(root) {
 function parseCli(argv) {
   if (FORBIDDEN_ENV.some((key) => process.env[key])) fail("production_driver_replay_forbidden", "release driver does not accept cassette, replay, recorder, or test mode");
   const operation = argv.shift();
-  if (!["bootstrap", "stage", "promote", "health", "rollback", "teardown"].includes(operation)) fail("driver_usage", "unknown release operation", { operation }, 2);
+  if (!["install", "bootstrap", "stage", "promote", "health", "rollback", "teardown"].includes(operation)) fail("driver_usage", "unknown release operation", { operation }, 2);
   let root = null; let artifact = null; let json = false;
   while (argv.length) {
     const arg = argv.shift();
@@ -1505,8 +1509,8 @@ function parseCli(argv) {
     else fail("driver_usage", "unknown release driver argument", { argument: arg }, 2);
   }
   if (!root || !json) fail("driver_usage", "--release-root and --json are required", {}, 2);
-  if (["bootstrap", "stage"].includes(operation) && !artifact) fail("driver_usage", `${operation} requires --artifact`, {}, 2);
-  if (!["bootstrap", "stage"].includes(operation) && artifact) fail("driver_usage", `${operation} does not accept --artifact`, {}, 2);
+  if (["install", "bootstrap", "stage"].includes(operation) && !artifact) fail("driver_usage", `${operation} requires --artifact`, {}, 2);
+  if (!["install", "bootstrap", "stage"].includes(operation) && artifact) fail("driver_usage", `${operation} does not accept --artifact`, {}, 2);
   return { operation, root: resolve(root), artifact: artifact ? resolve(artifact) : null };
 }
 
@@ -1542,7 +1546,16 @@ async function main() {
   if (cli.artifact) record = validateManifest(cli.artifact);
   let payload;
   let status = 0;
-  if (cli.operation === "bootstrap") {
+  if (cli.operation === "install") {
+    const installed = installArtifact(root, record);
+    payload = {
+      ok: true,
+      operation: "install",
+      revision: record.manifest.revision,
+      artifact: installed.installPath,
+      manifest_sha256: installed.digest,
+    };
+  } else if (cli.operation === "bootstrap") {
     const result = await bootstrap(root, record);
     payload = { ok: result.readiness.ready, operation: "bootstrap", revision: record.manifest.revision, health: result.health };
     status = result.readiness.ready ? 0 : 1;
