@@ -12,7 +12,6 @@ pub const ENDPOINT_PROTOCOL_V1: &str = "zode.endpoint.v1";
 pub const IDENTITY_SCHEMA_V1: &str = "zode.identity.v1";
 pub const HEALTH_SCHEMA_V1: &str = "zode.endpoint-health.v1";
 pub const CAPABILITIES_SCHEMA_V1: &str = "zode.endpoint-capabilities.v1";
-pub const ERROR_SCHEMA_V1: &str = "zode.error.v1";
 
 pub const MAX_ENDPOINT_ID_BYTES: usize = 256;
 pub const MAX_AUTHORITY_ID_BYTES: usize = 256;
@@ -54,7 +53,11 @@ pub struct EndpointIdentity {
 }
 
 impl EndpointIdentity {
-    pub fn v1(endpoint_id: impl Into<String>, authority_id: impl Into<String>, revision: u64) -> Self {
+    pub fn v1(
+        endpoint_id: impl Into<String>,
+        authority_id: impl Into<String>,
+        revision: u64,
+    ) -> Self {
         Self {
             schema: IDENTITY_SCHEMA_V1.to_owned(),
             protocol_version: ENDPOINT_PROTOCOL_V1.to_owned(),
@@ -68,14 +71,23 @@ impl EndpointIdentity {
         if self.schema != IDENTITY_SCHEMA_V1 {
             return Err(CompatibilityError::UnsupportedSchema {
                 field: "identity.schema",
-                value: self.schema.clone(),
             });
         }
         validate_protocol_version(&self.protocol_version)?;
-        validate_text(&self.endpoint_id, MAX_ENDPOINT_ID_BYTES, "identity.endpoint_id")?;
-        validate_text(&self.authority_id, MAX_AUTHORITY_ID_BYTES, "identity.authority_id")?;
+        validate_text(
+            &self.endpoint_id,
+            MAX_ENDPOINT_ID_BYTES,
+            "identity.endpoint_id",
+        )?;
+        validate_text(
+            &self.authority_id,
+            MAX_AUTHORITY_ID_BYTES,
+            "identity.authority_id",
+        )?;
         if self.revision == 0 {
-            return Err(CompatibilityError::Invalid("identity.revision must be positive"));
+            return Err(CompatibilityError::Invalid(
+                "identity.revision must be positive",
+            ));
         }
         Ok(())
     }
@@ -104,11 +116,14 @@ impl EndpointHealth {
         if self.schema != HEALTH_SCHEMA_V1 {
             return Err(CompatibilityError::UnsupportedSchema {
                 field: "health.schema",
-                value: self.schema.clone(),
             });
         }
         validate_protocol_version(&self.protocol_version)?;
-        validate_text(&self.endpoint_id, MAX_ENDPOINT_ID_BYTES, "health.endpoint_id")?;
+        validate_text(
+            &self.endpoint_id,
+            MAX_ENDPOINT_ID_BYTES,
+            "health.endpoint_id",
+        )?;
         if self.status != "ready" {
             return Err(CompatibilityError::Invalid("health.status is not ready"));
         }
@@ -147,9 +162,9 @@ impl Default for CapabilityLimits {
 
 impl CapabilityLimits {
     fn validate(&self) -> Result<(), CompatibilityError> {
-        if self.max_session_request_bytes < MAX_SESSION_REQUEST_BYTES
-            || self.max_auth_replica_request_bytes < MAX_AUTH_REPLICA_REQUEST_BYTES
-            || self.max_inline_tool_output_bytes < MAX_INLINE_TOOL_OUTPUT_BYTES
+        if self.max_session_request_bytes != MAX_SESSION_REQUEST_BYTES
+            || self.max_auth_replica_request_bytes != MAX_AUTH_REPLICA_REQUEST_BYTES
+            || self.max_inline_tool_output_bytes != MAX_INLINE_TOOL_OUTPUT_BYTES
             || self.wait_for_min_seconds != WAIT_FOR_MIN_SECONDS
             || self.wait_for_default_seconds != WAIT_FOR_DEFAULT_SECONDS
             || self.wait_for_max_seconds != WAIT_FOR_MAX_SECONDS
@@ -211,7 +226,6 @@ impl EndpointCapabilities {
         if self.schema != CAPABILITIES_SCHEMA_V1 {
             return Err(CompatibilityError::UnsupportedSchema {
                 field: "capabilities.schema",
-                value: self.schema.clone(),
             });
         }
         validate_protocol_version(&self.protocol_version)?;
@@ -240,24 +254,38 @@ impl EndpointCapabilities {
         }
         let mut previous = None;
         for tool in &self.tools {
-            validate_text(&tool.name, MAX_CAPABILITY_NAME_BYTES, "capabilities.tool.name")?;
+            validate_text(
+                &tool.name,
+                MAX_CAPABILITY_NAME_BYTES,
+                "capabilities.tool.name",
+            )?;
             if previous.is_some_and(|name| name >= tool.name.as_str()) {
                 return Err(CompatibilityError::Invalid(
                     "capabilities.tools must be sorted and unique",
                 ));
             }
-            if tool.completion_mode != "response"
-                && tool.completion_mode != "external_callback"
-            {
+            if tool.completion_mode != "response" && tool.completion_mode != "external_callback" {
                 return Err(CompatibilityError::Invalid(
                     "capabilities.tool.completion_mode is unsupported",
                 ));
             }
             previous = Some(tool.name.as_str());
         }
+        if self
+            .tools
+            .iter()
+            .any(|tool| tool.completion_mode == "external_callback")
+            != self
+                .outbound_capabilities
+                .iter()
+                .any(|capability| capability == EXTERNAL_CALLBACK_CAPABILITY)
+        {
+            return Err(CompatibilityError::Invalid(
+                "capabilities external callback projection is inconsistent",
+            ));
+        }
         self.limits.validate()
     }
-
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -287,9 +315,7 @@ pub fn negotiate_endpoint_protocol(
 
 fn validate_protocol_version(value: &str) -> Result<(), CompatibilityError> {
     if value != ENDPOINT_PROTOCOL_V1 {
-        return Err(CompatibilityError::UnsupportedProtocol {
-            value: value.to_owned(),
-        });
+        return Err(CompatibilityError::UnsupportedProtocol);
     }
     validate_text(value, MAX_PROTOCOL_VERSION_BYTES, "protocol_version")
 }
@@ -331,8 +357,8 @@ fn validate_text(
 pub enum CompatibilityError {
     Invalid(&'static str),
     BoundsExceeded(&'static str),
-    UnsupportedSchema { field: &'static str, value: String },
-    UnsupportedProtocol { value: String },
+    UnsupportedSchema { field: &'static str },
+    UnsupportedProtocol,
     ProtocolMismatch,
     EndpointIdMismatch,
     IncompatibleLimits,
@@ -342,13 +368,19 @@ impl fmt::Display for CompatibilityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(message) | Self::BoundsExceeded(message) => formatter.write_str(message),
-            Self::UnsupportedSchema { field, .. } => {
+            Self::UnsupportedSchema { field } => {
                 write!(formatter, "unsupported schema in {field}")
             }
-            Self::UnsupportedProtocol { .. } => formatter.write_str("unsupported protocol version"),
-            Self::ProtocolMismatch => formatter.write_str("identity and capabilities protocol mismatch"),
-            Self::EndpointIdMismatch => formatter.write_str("identity and capabilities Endpoint ID mismatch"),
-            Self::IncompatibleLimits => formatter.write_str("Endpoint capability limits are incompatible"),
+            Self::UnsupportedProtocol => formatter.write_str("unsupported protocol version"),
+            Self::ProtocolMismatch => {
+                formatter.write_str("identity and capabilities protocol mismatch")
+            }
+            Self::EndpointIdMismatch => {
+                formatter.write_str("identity and capabilities Endpoint ID mismatch")
+            }
+            Self::IncompatibleLimits => {
+                formatter.write_str("Endpoint capability limits are incompatible")
+            }
         }
     }
 }
@@ -380,7 +412,11 @@ impl ErrorDocument {
 
     pub fn validate(&self) -> Result<(), CompatibilityError> {
         validate_text(&self.error.code, MAX_ERROR_CODE_BYTES, "error.code")?;
-        validate_text(&self.error.message, MAX_ERROR_MESSAGE_BYTES, "error.message")
+        validate_text(
+            &self.error.message,
+            MAX_ERROR_MESSAGE_BYTES,
+            "error.message",
+        )
     }
 }
 

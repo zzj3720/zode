@@ -30,7 +30,8 @@ function createObservationQuarantine(label) {
 function readFirstOccurrenceSummary({ rawPath, cassettePath }) {
   const raw = JSON.parse(fs.readFileSync(rawPath, 'utf8'));
   const cassette = JSON.parse(fs.readFileSync(cassettePath, 'utf8'));
-  const exchange = cassette.exchanges?.[0];
+  const exchange = cassette.exchanges?.find((candidate) => candidate.recording_id === cassette.first_failure_recording_id)
+    || cassette.exchanges?.[0];
   return {
     recording_id: raw.recording_id,
     raw: {

@@ -4,7 +4,11 @@ const { defineConfig } = require('@playwright/test');
 
 module.exports = defineConfig({
   testDir: '.',
-  testMatch: ['support/smoke.spec.cjs', 'specs/**/*.spec.{cjs,ts}'],
+  testMatch: [
+    'support/smoke.spec.cjs',
+    'support/harness_regressions.spec.cjs',
+    'specs/**/*.spec.{cjs,ts}',
+  ],
   timeout: 60_000,
   expect: { timeout: 8_000 },
   fullyParallel: false,

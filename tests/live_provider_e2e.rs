@@ -151,7 +151,7 @@ async fn run_live_provider(api_key: String) -> TestResult<()> {
             } else {
                 match new_llm_live_recording_run_dir(&recording_id) {
                     Ok(live_directory) => {
-                        if let Err(error) = recording.write_atomic(
+                        if let Err(error) = recording.promote_immutable(
                             &live_directory.join("recording.json"),
                             &[&api_key, TEST_CONTROLLER_SECRET],
                         ) {
@@ -170,7 +170,7 @@ async fn run_live_provider(api_key: String) -> TestResult<()> {
         {
             let tracked = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(RECORDING_PATH);
             if let Err(error) =
-                recording.write_atomic(&tracked, &[&api_key, TEST_CONTROLLER_SECRET])
+                recording.promote_immutable(&tracked, &[&api_key, TEST_CONTROLLER_SECRET])
             {
                 cleanup_errors.push(format!("explicit cassette promotion failed: {error}"));
             }
@@ -201,7 +201,12 @@ fn assert_retained_live_recording_exactly_two_exchanges() -> TestResult<()> {
 }
 
 async fn replay_retained_live_recording(recording: LlmHttpRecording) -> TestResult<()> {
-    let mut replay = LlmHttpProxy::replay(recording, false).await?;
+    let mut replay = LlmHttpProxy::replay_with_authorization(
+        recording,
+        false,
+        Some(OFFLINE_REPLAY_SECRET.to_owned()),
+    )
+    .await?;
     let database = TempDatabase::new("live-recording-exact-count")?;
     let config = live_config(database.path())?;
     let primary = run_provider_roundtrip_and_restart(ProviderRoundtripSpec {

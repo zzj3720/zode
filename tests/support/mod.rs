@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
+#[path = "process_capture.rs"]
+pub mod process_capture;
+
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fs,
     future::Future,
@@ -33,7 +36,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     net::TcpListener,
     process::Child,
-    runtime::{Builder, Handle, RuntimeFlavor},
+    runtime::Builder,
     sync::{oneshot, watch, Notify},
     task::JoinHandle,
     time::{sleep, timeout},
@@ -1269,7 +1272,7 @@ async fn wait_for_path(path: PathBuf) -> TestResult<()> {
 pub struct HttpFixture {
     base_url: String,
     shutdown: Option<oneshot::Sender<()>>,
-    task: Option<JoinHandle<()>>,
+    task: Option<JoinHandle<std::io::Result<()>>>,
 }
 
 impl HttpFixture {
@@ -1282,11 +1285,11 @@ impl HttpFixture {
         let address = listener.local_addr()?;
         let (shutdown, shutdown_signal) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let _ = axum::serve(listener, router)
+            axum::serve(listener, router)
                 .with_graceful_shutdown(async {
                     let _ = shutdown_signal.await;
                 })
-                .await;
+                .await
         });
         Ok(Self {
             base_url: format!("http://{address}"),
@@ -1310,9 +1313,10 @@ impl HttpFixture {
     }
 }
 
-async fn await_fixture_task(mut task: JoinHandle<()>) -> TestResult<()> {
+async fn await_fixture_task(mut task: JoinHandle<std::io::Result<()>>) -> TestResult<()> {
     match timeout(FIXTURE_SHUTDOWN_TIMEOUT, &mut task).await {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(IoError::other(format!("fixture worker failed: {error}")).into()),
         Ok(Err(error)) if error.is_cancelled() => {
             Err(IoError::other("fixture task cancelled").into())
         }
@@ -1336,6 +1340,9 @@ impl Drop for HttpFixture {
 pub const LLM_HTTP_RECORDING_SCHEMA: &str = "zode.llm-http-recording.v1";
 pub const HTTP_INCIDENT_RECORDING_SCHEMA: &str = "zode.http-incident-recording.v1";
 const MAX_LLM_RECORDING_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_LLM_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LLM_RESPONSE_CHUNKS: usize = 4_096;
+pub const MAX_LLM_CHUNK_DELAY_US: u64 = 60_000_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1388,6 +1395,7 @@ pub enum LlmHttpResponseOutcome {
     ClientDisconnect,
     TransportError,
     StreamError,
+    CaptureBoundExceeded,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1434,6 +1442,15 @@ pub struct LlmHttpRecordingMetadata {
     pub secret_slots: Vec<String>,
 }
 
+/// The capture owner may provide the attempt identity explicitly when request
+/// bodies are not sufficient to distinguish logical rounds (for example,
+/// repeated prompts after a restart).  Entries are indexed by wire sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LlmHttpAttemptPlan {
+    pub logical_round: u64,
+    pub wire_attempt: u64,
+}
+
 impl LlmHttpRecording {
     pub fn load(path: &Path) -> TestResult<Self> {
         let mut bytes = Vec::new();
@@ -1456,7 +1473,28 @@ impl LlmHttpRecording {
         Ok(self)
     }
 
+    /// Write a quarantined recording with exclusive creation and restrictive
+    /// permissions.  Promotion uses [`Self::promote_immutable`] so a raw
+    /// capture can never accidentally become a tracked fixture.
     pub fn write_atomic(&self, path: &Path, forbidden: &[&str]) -> TestResult<u64> {
+        self.write_atomic_with_mode(path, forbidden, 0o600)
+    }
+
+    /// Promote a secret-scanned recording into an immutable tracked fixture.
+    /// The temporary file is flushed while private, then changed to `0444`
+    /// before it is linked into place.  The destination is created with
+    /// `hard_link`, so an existing path (including a concurrent creator) is
+    /// never overwritten.
+    pub fn promote_immutable(&self, path: &Path, forbidden: &[&str]) -> TestResult<u64> {
+        self.write_atomic_with_mode(path, forbidden, 0o444)
+    }
+
+    fn write_atomic_with_mode(
+        &self,
+        path: &Path,
+        forbidden: &[&str],
+        final_mode: u32,
+    ) -> TestResult<u64> {
         let recording = self.clone().with_digest()?;
         let bytes = serde_json::to_vec_pretty(&recording)?;
         for marker in forbidden.iter().filter(|marker| !marker.is_empty()) {
@@ -1470,13 +1508,6 @@ impl LlmHttpRecording {
         let parent = path
             .parent()
             .ok_or_else(|| IoError::other("LLM recording path has no parent"))?;
-        if path.exists() {
-            return Err(IoError::new(
-                ErrorKind::AlreadyExists,
-                "tracked LLM recording is immutable",
-            )
-            .into());
-        }
         fs::create_dir_all(parent)?;
         let file_name = path
             .file_name()
@@ -1495,12 +1526,37 @@ impl LlmHttpRecording {
             options.mode(0o600);
         }
         let mut file = options.open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        if let Err(error) = fs::hard_link(&temporary, path) {
+        if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+            drop(file);
             let _ = fs::remove_file(&temporary);
             return Err(error.into());
+        }
+        drop(file);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) =
+                fs::set_permissions(&temporary, fs::Permissions::from_mode(final_mode))
+                    .and_then(|_| fs::File::open(&temporary)?.sync_all())
+            {
+                let _ = fs::remove_file(&temporary);
+                return Err(error.into());
+            }
+            // Persist the permission transition before exposing the file via
+            // the destination hard link.
+        }
+        if let Err(error) = fs::hard_link(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(if error.kind() == ErrorKind::AlreadyExists {
+                IoError::new(
+                    ErrorKind::AlreadyExists,
+                    "tracked LLM recording is immutable",
+                )
+            } else {
+                error
+            }
+            .into());
         }
         fs::remove_file(&temporary)?;
         fs::File::open(parent)?.sync_all()?;
@@ -1542,7 +1598,7 @@ impl LlmHttpRecording {
         for exchange in &self.requests {
             if exchange.sequence != next_sequence
                 || exchange.request.method != "POST"
-                || !exchange.request.path.starts_with('/')
+                || !path_is_secret_safe(&exchange.request.path)
             {
                 return Err(IoError::other("LLM recording request is not canonical").into());
             }
@@ -1651,16 +1707,26 @@ fn validate_response(response: &LlmHttpRecordingResponse) -> TestResult<()> {
                     IoError::other("LLM pre-response disconnect has response metadata").into(),
                 );
             }
-            if chunks_contain_done(&response.chunks) {
-                return Err(IoError::other(
-                    "LLM response marked disconnect after a complete DONE marker",
-                )
-                .into());
-            }
         }
-        LlmHttpResponseOutcome::StreamError => validate_http_response(response)?,
+        LlmHttpResponseOutcome::StreamError | LlmHttpResponseOutcome::CaptureBoundExceeded => {
+            validate_http_response(response)?
+        }
     }
+    if response.chunks.len() > MAX_LLM_RESPONSE_CHUNKS {
+        return Err(IoError::other("LLM response capture chunk bound exceeded").into());
+    }
+    let mut response_bytes = 0usize;
     for (index, chunk) in response.chunks.iter().enumerate() {
+        if chunk.at_us > MAX_LLM_CHUNK_DELAY_US {
+            return Err(IoError::other("LLM response captured timing bound exceeded").into());
+        }
+        let bytes = hex_decode(&chunk.bytes_hex)?;
+        response_bytes = response_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| IoError::other("LLM response capture byte bound exceeded"))?;
+        if response_bytes > MAX_LLM_RESPONSE_BYTES {
+            return Err(IoError::other("LLM response capture byte bound exceeded").into());
+        }
         if chunk.sequence != index as u64
             || (index > 0 && chunk.at_us < response.chunks[index - 1].at_us)
             || (is_event_stream_content_type(response.content_type.as_deref())
@@ -1670,9 +1736,19 @@ fn validate_response(response: &LlmHttpRecordingResponse) -> TestResult<()> {
         {
             return Err(IoError::other("LLM response chunks are not ordered").into());
         }
-        let _ = hex_decode(&chunk.bytes_hex)?;
     }
     Ok(())
+}
+
+fn is_pre_stream_retryable_response(response: &LlmHttpRecordingResponse) -> bool {
+    response
+        .status
+        .is_some_and(|status| status == 408 || status == 429 || (500..=599).contains(&status))
+        && response.content_type.is_none()
+        && matches!(
+            response.outcome,
+            LlmHttpResponseOutcome::Complete { done_seen: false }
+        )
 }
 
 fn validate_http_response(response: &LlmHttpRecordingResponse) -> TestResult<()> {
@@ -1695,6 +1771,36 @@ fn is_event_stream_content_type(value: Option<&str>) -> bool {
     value
         .and_then(|value| value.split(';').next())
         .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+fn path_is_secret_safe(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    let Some((_, query)) = path.split_once('?') else {
+        return true;
+    };
+    const FORBIDDEN_QUERY_KEYS: [&str; 9] = [
+        "authorization",
+        "assertion",
+        "bearer",
+        "code",
+        "credential",
+        "key",
+        "password",
+        "secret",
+        "token",
+    ];
+    query.split('&').all(|pair| {
+        let key = pair
+            .split('=')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        !FORBIDDEN_QUERY_KEYS
+            .iter()
+            .any(|marker| key.contains(marker))
+    })
 }
 
 fn chunks_contain_done(chunks: &[LlmHttpRecordingChunk]) -> bool {
@@ -1764,16 +1870,29 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn hex_decode(value: &str) -> TestResult<Vec<u8>> {
-    if !value.len().is_multiple_of(2) {
+    if !value.is_ascii() || !value.len().is_multiple_of(2) {
         return Err(IoError::other("LLM recording chunk encoding is invalid").into());
     }
-    (0..value.len())
-        .step_by(2)
-        .map(|offset| {
-            u8::from_str_radix(&value[offset..offset + 2], 16)
-                .map_err(|_| IoError::other("LLM recording chunk encoding is invalid").into())
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_nibble(pair[0])
+                .ok_or_else(|| IoError::other("LLM recording chunk encoding is invalid"))?;
+            let low = hex_nibble(pair[1])
+                .ok_or_else(|| IoError::other("LLM recording chunk encoding is invalid"))?;
+            Ok((high << 4) | low)
         })
         .collect()
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[derive(Clone)]
@@ -1788,14 +1907,20 @@ enum LlmHttpProxyMode {
     Replay {
         recording: LlmHttpRecording,
         captured_timing: bool,
+        expected_authorization: Option<String>,
+        terminal_hold: Option<std::sync::Arc<Notify>>,
     },
 }
 
 struct RecordingSink {
     directory: PathBuf,
+    requires_authorization: bool,
+    attempt_plan: Option<Vec<LlmHttpAttemptPlan>>,
     next_sequence: AtomicU64,
     chunk_count: AtomicU64,
+    submitted_count: AtomicU64,
     chunk_seen: Notify,
+    submitted_seen: Notify,
     exchange_seen: Notify,
     state: std::sync::Mutex<RecordingSinkState>,
     flush_error: std::sync::Mutex<Option<String>>,
@@ -1805,7 +1930,12 @@ struct RecordingSinkState {
     next_finalize: u64,
     pending: BTreeMap<u64, LlmHttpRecordingExchange>,
     finalized: Vec<LlmHttpRecordingExchange>,
-    logical: Option<(String, u64, u64)>,
+    logical: Option<(String, u64, u64, bool)>,
+    // A no-plan capture must observe exchanges in wire-arrival order.  A
+    // completion with a lower sequence means two logical attempts were
+    // interleaved and body-based inference can no longer be trusted.
+    last_submitted_sequence: Option<u64>,
+    active_sequences: BTreeSet<u64>,
 }
 
 #[derive(Serialize)]
@@ -1820,7 +1950,11 @@ struct LlmHttpIngress {
 }
 
 impl RecordingSink {
-    fn new(directory: PathBuf) -> TestResult<Self> {
+    fn new(
+        directory: PathBuf,
+        attempt_plan: Option<Vec<LlmHttpAttemptPlan>>,
+        requires_authorization: bool,
+    ) -> TestResult<Self> {
         fs::create_dir_all(&directory)?;
         #[cfg(unix)]
         {
@@ -1829,15 +1963,21 @@ impl RecordingSink {
         }
         Ok(Self {
             directory,
+            requires_authorization,
+            attempt_plan,
             next_sequence: AtomicU64::new(0),
             chunk_count: AtomicU64::new(0),
+            submitted_count: AtomicU64::new(0),
             chunk_seen: Notify::new(),
+            submitted_seen: Notify::new(),
             exchange_seen: Notify::new(),
             state: std::sync::Mutex::new(RecordingSinkState {
                 next_finalize: 0,
                 pending: BTreeMap::new(),
                 finalized: Vec::new(),
                 logical: None,
+                last_submitted_sequence: None,
+                active_sequences: BTreeSet::new(),
             }),
             flush_error: std::sync::Mutex::new(None),
         })
@@ -1845,6 +1985,16 @@ impl RecordingSink {
 
     fn allocate_sequence(&self) -> u64 {
         self.next_sequence.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn begin_sequence(&self, sequence: u64) {
+        if self.attempt_plan.is_none() {
+            self.state
+                .lock()
+                .expect("LLM recording sink mutex poisoned")
+                .active_sequences
+                .insert(sequence);
+        }
     }
 
     fn note_chunk(&self) {
@@ -1889,6 +2039,21 @@ impl RecordingSink {
         Ok(())
     }
 
+    async fn wait_for_submitted(&self, expected: usize) -> TestResult<()> {
+        timeout(HTTP_RESPONSE_HEADERS_TIMEOUT, async {
+            loop {
+                let notified = self.submitted_seen.notified();
+                if self.submitted_count.load(Ordering::SeqCst) >= expected as u64 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| IoError::new(ErrorKind::TimedOut, "recording submit barrier timed out"))?;
+        Ok(())
+    }
+
     fn record_ingress(&self, sequence: u64, method: &str, path: &str, raw_body: &[u8]) {
         let file_path = self
             .directory
@@ -1902,13 +2067,7 @@ impl RecordingSink {
             raw_body_sha256: sha256_hex(raw_body),
         };
         if let Err(error) = write_restricted_json_new(&file_path, &ingress) {
-            let mut flush_error = self
-                .flush_error
-                .lock()
-                .expect("LLM recording flush mutex poisoned");
-            if flush_error.is_none() {
-                *flush_error = Some(error.to_string());
-            }
+            self.fail_flush(&format!("recording ingress flush failed: {error}"));
         }
     }
 
@@ -1922,58 +2081,122 @@ impl RecordingSink {
         }
     }
 
-    fn submit(&self, exchange: LlmHttpRecordingExchange) {
+    fn submit(&self, exchange: LlmHttpRecordingExchange) -> TestResult<()> {
         let mut state = self
             .state
             .lock()
             .expect("LLM recording sink mutex poisoned");
+        let mut exchange = exchange;
+        let mut ambiguous_completion = false;
+        let mut attempt_plan_error = false;
+        if self.attempt_plan.is_none() {
+            ambiguous_completion = state.active_sequences.len() > 1
+                || state
+                    .last_submitted_sequence
+                    .is_some_and(|previous| exchange.sequence < previous);
+            state.active_sequences.remove(&exchange.sequence);
+            if ambiguous_completion {
+                self.fail_flush("ambiguous attempt identity; provide an explicit attempt plan");
+            }
+        }
+        let (logical_round, wire_attempt) = if let Some(plan) = &self.attempt_plan {
+            match plan.get(exchange.sequence as usize).copied() {
+                Some(attempt) => (attempt.logical_round, attempt.wire_attempt),
+                None => {
+                    attempt_plan_error = true;
+                    self.fail_flush(&format!(
+                        "recording attempt plan omitted sequence {}",
+                        exchange.sequence
+                    ));
+                    (exchange.logical_round, exchange.wire_attempt)
+                }
+            }
+        } else {
+            if ambiguous_completion {
+                // Preserve the caller-supplied envelope facts, but do not
+                // infer a logical round once completion order is ambiguous.
+                (exchange.logical_round, exchange.wire_attempt)
+            } else {
+                let logical_key = exchange
+                    .request
+                    .canonical_json
+                    .clone()
+                    .unwrap_or_else(|| exchange.request.raw_body_sha256.clone());
+                match state.logical.as_mut() {
+                    Some((previous, round, attempt, previous_retryable))
+                        if previous == &logical_key =>
+                    {
+                        if !*previous_retryable {
+                            ambiguous_completion = true;
+                            self.fail_flush(
+                                "ambiguous attempt identity; provide an explicit attempt plan",
+                            );
+                        }
+                        if *previous_retryable {
+                            *attempt = attempt.saturating_add(1);
+                        } else {
+                            *attempt = 0;
+                        }
+                        *previous_retryable = is_pre_stream_retryable_response(&exchange.response);
+                        (*round, *attempt)
+                    }
+                    Some((previous, round, attempt, previous_retryable)) => {
+                        *round = round.saturating_add(1);
+                        *attempt = 0;
+                        *previous = logical_key;
+                        *previous_retryable = is_pre_stream_retryable_response(&exchange.response);
+                        (*round, 0)
+                    }
+                    None => {
+                        let retryable = is_pre_stream_retryable_response(&exchange.response);
+                        state.logical = Some((logical_key, 0, 0, retryable));
+                        (0, 0)
+                    }
+                }
+            }
+        };
+        if self.attempt_plan.is_none() {
+            state.last_submitted_sequence = Some(exchange.sequence);
+        }
+        exchange.logical_round = logical_round;
+        exchange.wire_attempt = wire_attempt;
+        // Seal every completed exchange immediately. Ordered projection below
+        // is only for the in-memory envelope; a later sequence must survive a
+        // recorder crash while an earlier stream is still held.
+        let path = self
+            .directory
+            .join(format!("exchange-{:020}.json", exchange.sequence));
+        if let Err(error) = write_restricted_json_new(&path, &exchange) {
+            let message = format!("recording exchange flush failed: {error}");
+            self.fail_flush(&message);
+            return Err(IoError::other(message).into());
+        }
+        // Expose the completion barrier only after the per-exchange durable
+        // fact has been written (or its fatal flush error has been latched).
+        self.submitted_count.fetch_add(1, Ordering::SeqCst);
+        self.submitted_seen.notify_waiters();
         state.pending.insert(exchange.sequence, exchange);
         let previous_len = state.finalized.len();
         loop {
             let next_finalize = state.next_finalize;
-            let Some(mut exchange) = state.pending.remove(&next_finalize) else {
+            let Some(exchange) = state.pending.remove(&next_finalize) else {
                 break;
             };
-            let logical_key = exchange
-                .request
-                .canonical_json
-                .clone()
-                .unwrap_or_else(|| exchange.request.raw_body_sha256.clone());
-            let (logical_round, wire_attempt) = match state.logical.as_mut() {
-                Some((previous, round, attempt)) if previous == &logical_key => {
-                    *attempt = attempt.saturating_add(1);
-                    (*round, *attempt)
-                }
-                Some((previous, round, attempt)) => {
-                    *round = round.saturating_add(1);
-                    *attempt = 0;
-                    *previous = logical_key;
-                    (*round, 0)
-                }
-                None => {
-                    state.logical = Some((logical_key, 0, 0));
-                    (0, 0)
-                }
-            };
-            exchange.logical_round = logical_round;
-            exchange.wire_attempt = wire_attempt;
-            let path = self
-                .directory
-                .join(format!("exchange-{:020}.json", exchange.sequence));
-            if let Err(error) = write_restricted_json_new(&path, &exchange) {
-                let mut flush_error = self
-                    .flush_error
-                    .lock()
-                    .expect("LLM recording flush mutex poisoned");
-                if flush_error.is_none() {
-                    *flush_error = Some(error.to_string());
-                }
-            }
             state.finalized.push(exchange);
             state.next_finalize = state.next_finalize.saturating_add(1);
         }
         if state.finalized.len() != previous_len {
             self.exchange_seen.notify_waiters();
+        }
+        if attempt_plan_error {
+            Err(IoError::other("recording attempt plan omitted an exchange sequence").into())
+        } else if ambiguous_completion {
+            Err(
+                IoError::other("ambiguous attempt identity; provide an explicit attempt plan")
+                    .into(),
+            )
+        } else {
+            Ok(())
         }
     }
 
@@ -2029,6 +2252,11 @@ fn write_restricted_json_new<T: Serialize>(path: &Path, value: &T) -> TestResult
     Ok(())
 }
 
+fn sync_directory(path: &Path) -> TestResult<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
 pub fn new_llm_recording_run_dir() -> TestResult<PathBuf> {
     new_llm_recording_directory("quarantine", None)
 }
@@ -2054,6 +2282,7 @@ fn new_llm_recording_directory(class: &str, run_id: Option<&str>) -> TestResult<
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
     }
+    sync_directory(&root)?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -2078,6 +2307,8 @@ fn new_llm_recording_directory(class: &str, run_id: Option<&str>) -> TestResult<
                     use std::os::unix::fs::PermissionsExt;
                     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
                 }
+                sync_directory(&directory)?;
+                sync_directory(&root)?;
                 return Ok(directory);
             }
             Err(error) if error.kind() == ErrorKind::AlreadyExists && run_id.is_none() => continue,
@@ -2088,14 +2319,55 @@ fn new_llm_recording_directory(class: &str, run_id: Option<&str>) -> TestResult<
 }
 
 pub fn scan_llm_recording_tree(directory: &Path, forbidden: &[&str]) -> TestResult<()> {
+    let root_metadata = fs::symlink_metadata(directory)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(IoError::other("recording quarantine root was not a directory").into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = root_metadata.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            return Err(IoError::other(format!(
+                "recording quarantine directory had mode {mode:04o}, expected 0700"
+            ))
+            .into());
+        }
+    }
     let mut stack = vec![directory.to_owned()];
     while let Some(path) = stack.pop() {
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(IoError::other("recording tree contained a symlink").into());
+            }
+            if metadata.is_dir() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = metadata.permissions().mode() & 0o777;
+                    if mode != 0o700 {
+                        return Err(IoError::other(format!(
+                            "recording quarantine directory had mode {mode:04o}, expected 0700"
+                        ))
+                        .into());
+                    }
+                }
                 stack.push(path);
                 continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = metadata.permissions().mode() & 0o777;
+                if mode != 0o600 {
+                    return Err(IoError::other(format!(
+                        "recording quarantine file had mode {mode:04o}, expected 0600"
+                    ))
+                    .into());
+                }
             }
             let bytes = fs::read(path)?;
             for marker in forbidden.iter().filter(|marker| !marker.is_empty()) {
@@ -2115,6 +2387,11 @@ struct LlmHttpProxyState {
     client: Client,
     mode: LlmHttpProxyMode,
     observed: std::sync::Mutex<Vec<LlmHttpObservedRequest>>,
+    observed_seen: Notify,
+    replay_chunk_count: AtomicU64,
+    replay_chunk_seen: Notify,
+    replay_terminal_waiting: AtomicU64,
+    replay_terminal_seen: Notify,
     next_replay: std::sync::Mutex<usize>,
     replay_completed: std::sync::Mutex<usize>,
     replay_error: std::sync::Mutex<Option<String>>,
@@ -2134,7 +2411,62 @@ impl LlmHttpProxy {
         quarantine_directory: impl Into<PathBuf>,
         metadata: LlmHttpRecordingMetadata,
     ) -> TestResult<Self> {
-        let sink = std::sync::Arc::new(RecordingSink::new(quarantine_directory.into())?);
+        Self::record_with_attempt_plan(
+            upstream_base_url,
+            provider,
+            model,
+            quarantine_directory,
+            metadata,
+            None,
+        )
+        .await
+    }
+
+    /// Start a recorder with a caller-owned, sequence-indexed attempt plan.
+    /// This avoids guessing logical rounds from request-body equality.
+    pub async fn record_with_attempt_plan(
+        upstream_base_url: impl Into<String>,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        quarantine_directory: impl Into<PathBuf>,
+        metadata: LlmHttpRecordingMetadata,
+        attempt_plan: Option<Vec<LlmHttpAttemptPlan>>,
+    ) -> TestResult<Self> {
+        let requires_authorization = metadata.boundary.to_ascii_lowercase().contains("provider")
+            || metadata
+                .secret_slots
+                .iter()
+                .any(|slot| slot.to_ascii_uppercase().contains("AUTHORIZATION"));
+        Self::record_with_attempt_plan_and_authorization(
+            upstream_base_url,
+            provider,
+            model,
+            quarantine_directory,
+            metadata,
+            attempt_plan,
+            requires_authorization,
+        )
+        .await
+    }
+
+    /// Start a recorder with an explicit authentication requirement.  The
+    /// flag is deliberately independent of the synthetic slot spelling so a
+    /// provider-specific slot such as `SLOT_PROVIDER_AUTH` cannot silently
+    /// disable Authorization capture/replay checks.
+    pub async fn record_with_attempt_plan_and_authorization(
+        upstream_base_url: impl Into<String>,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        quarantine_directory: impl Into<PathBuf>,
+        metadata: LlmHttpRecordingMetadata,
+        attempt_plan: Option<Vec<LlmHttpAttemptPlan>>,
+        requires_authorization: bool,
+    ) -> TestResult<Self> {
+        let sink = std::sync::Arc::new(RecordingSink::new(
+            quarantine_directory.into(),
+            attempt_plan,
+            requires_authorization,
+        )?);
         Self::start(LlmHttpProxyMode::Record {
             upstream_base_url: upstream_base_url.into(),
             provider: provider.into(),
@@ -2145,11 +2477,47 @@ impl LlmHttpProxy {
         .await
     }
 
+    /// Compatibility replay has no out-of-band credential binding.  A
+    /// recording that declares secret slots therefore fails closed on its
+    /// first request; callers replaying a provider cassette must use
+    /// `replay_with_authorization(Some(...))` so the live Authorization value
+    /// is explicitly bound without being serialized into the cassette.
     pub async fn replay(recording: LlmHttpRecording, captured_timing: bool) -> TestResult<Self> {
+        Self::replay_with_authorization(recording, captured_timing, None).await
+    }
+
+    /// Replay with an out-of-band authorization binding. The expected value
+    /// remains in the test process and is never serialized into a cassette.
+    pub async fn replay_with_authorization(
+        recording: LlmHttpRecording,
+        captured_timing: bool,
+        expected_authorization: Option<String>,
+    ) -> TestResult<Self> {
         recording.validate()?;
         Self::start(LlmHttpProxyMode::Replay {
             recording,
             captured_timing,
+            expected_authorization,
+            terminal_hold: None,
+        })
+        .await
+    }
+
+    /// Test-only barrier that pauses replay after all recorded chunks have
+    /// been emitted and before the response terminal outcome is delivered.
+    /// It makes a client abort at that exact boundary deterministic.
+    pub async fn replay_with_terminal_hold(
+        recording: LlmHttpRecording,
+        captured_timing: bool,
+        expected_authorization: Option<String>,
+        terminal_hold: std::sync::Arc<Notify>,
+    ) -> TestResult<Self> {
+        recording.validate()?;
+        Self::start(LlmHttpProxyMode::Replay {
+            recording,
+            captured_timing,
+            expected_authorization,
+            terminal_hold: Some(terminal_hold),
         })
         .await
     }
@@ -2163,6 +2531,11 @@ impl LlmHttpProxy {
             client,
             mode,
             observed: std::sync::Mutex::new(Vec::new()),
+            observed_seen: Notify::new(),
+            replay_chunk_count: AtomicU64::new(0),
+            replay_chunk_seen: Notify::new(),
+            replay_terminal_waiting: AtomicU64::new(0),
+            replay_terminal_seen: Notify::new(),
             next_replay: std::sync::Mutex::new(0),
             replay_completed: std::sync::Mutex::new(0),
             replay_error: std::sync::Mutex::new(None),
@@ -2229,6 +2602,74 @@ impl LlmHttpProxy {
             LlmHttpProxyMode::Record { sink, .. } => sink.wait_for_chunks(expected).await,
             LlmHttpProxyMode::Replay { .. } => {
                 Err(IoError::other("replay proxy has no recording chunk barrier").into())
+            }
+        }
+    }
+
+    pub async fn wait_for_replayed_chunks(&self, expected: u64) -> TestResult<()> {
+        match &self.state.mode {
+            LlmHttpProxyMode::Replay { .. } => {
+                timeout(HTTP_RESPONSE_HEADERS_TIMEOUT, async {
+                    loop {
+                        let notified = self.state.replay_chunk_seen.notified();
+                        if self.state.replay_chunk_count.load(Ordering::SeqCst) >= expected {
+                            return;
+                        }
+                        notified.await;
+                    }
+                })
+                .await
+                .map_err(|_| IoError::new(ErrorKind::TimedOut, "replay chunk barrier timed out"))?;
+                Ok(())
+            }
+            LlmHttpProxyMode::Record { .. } => {
+                Err(IoError::other("recording proxy has no replay chunk barrier").into())
+            }
+        }
+    }
+
+    pub async fn wait_for_replay_terminal_hold(&self) -> TestResult<()> {
+        timeout(HTTP_RESPONSE_HEADERS_TIMEOUT, async {
+            loop {
+                let notified = self.state.replay_terminal_seen.notified();
+                if self.state.replay_terminal_waiting.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| IoError::new(ErrorKind::TimedOut, "replay terminal barrier timed out"))?;
+        Ok(())
+    }
+
+    pub async fn wait_for_observed_requests(&self, expected: usize) -> TestResult<()> {
+        timeout(HTTP_RESPONSE_HEADERS_TIMEOUT, async {
+            loop {
+                let notified = self.state.observed_seen.notified();
+                if self
+                    .state
+                    .observed
+                    .lock()
+                    .expect("LLM proxy observed mutex poisoned")
+                    .len()
+                    >= expected
+                {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| IoError::new(ErrorKind::TimedOut, "recording request barrier timed out"))?;
+        Ok(())
+    }
+
+    pub async fn wait_for_submitted_exchanges(&self, expected: usize) -> TestResult<()> {
+        match &self.state.mode {
+            LlmHttpProxyMode::Record { sink, .. } => sink.wait_for_submitted(expected).await,
+            LlmHttpProxyMode::Replay { .. } => {
+                Err(IoError::other("replay proxy has no recording submit barrier").into())
             }
         }
     }
@@ -2310,7 +2751,19 @@ async fn llm_http_proxy_request(
         LlmHttpProxyMode::Replay {
             recording,
             captured_timing,
-        } => replay_llm_http_request(state, request, recording, captured_timing).await,
+            expected_authorization,
+            terminal_hold,
+        } => {
+            replay_llm_http_request(
+                state,
+                request,
+                recording,
+                captured_timing,
+                expected_authorization,
+                terminal_hold,
+            )
+            .await
+        }
     }
 }
 
@@ -2324,12 +2777,14 @@ struct LlmHttpStreamCapture {
     content_type: Option<String>,
     response_headers: Vec<LlmHttpHeader>,
     chunks: Vec<LlmHttpRecordingChunk>,
+    response_bytes: usize,
     stream_error: bool,
+    bound_exceeded: bool,
     finished: bool,
 }
 
 impl LlmHttpStreamCapture {
-    fn persist(&mut self, outcome: LlmHttpResponseOutcome) {
+    fn persist(&mut self, outcome: LlmHttpResponseOutcome) -> TestResult<()> {
         self.finished = true;
         self.sink.submit(LlmHttpRecordingExchange {
             sequence: self.sequence,
@@ -2343,23 +2798,19 @@ impl LlmHttpStreamCapture {
                 chunks: self.chunks.clone(),
                 outcome,
             },
-        });
+        })
     }
 
-    fn finish(mut self, outcome: LlmHttpResponseOutcome) {
-        self.persist(outcome);
+    fn finish(mut self, outcome: LlmHttpResponseOutcome) -> TestResult<()> {
+        self.persist(outcome)
     }
 }
 
 impl Drop for LlmHttpStreamCapture {
     fn drop(&mut self) {
         if !self.finished {
-            let outcome = if self.status.is_some() && chunks_contain_done(&self.chunks) {
-                LlmHttpResponseOutcome::Complete { done_seen: true }
-            } else {
-                LlmHttpResponseOutcome::ClientDisconnect
-            };
-            self.persist(outcome);
+            let outcome = LlmHttpResponseOutcome::ClientDisconnect;
+            let _ = self.persist(outcome);
         }
     }
 }
@@ -2450,6 +2901,14 @@ async fn record_llm_http_request(
         .unwrap_or_else(|| request.uri().path())
         .to_owned();
     let headers = request.headers().clone();
+    if !path_is_secret_safe(&path) {
+        sink.fail_flush("provider request path contained a credential-bearing query");
+        return llm_proxy_error(AxumStatusCode::SERVICE_UNAVAILABLE);
+    }
+    if sink.requires_authorization && headers.get(header::AUTHORIZATION).is_none() {
+        sink.fail_flush("provider request omitted the required authorization slot");
+        return llm_proxy_error(AxumStatusCode::SERVICE_UNAVAILABLE);
+    }
     let body = match to_bytes(request.into_body(), 4 * 1024 * 1024).await {
         Ok(body) => body,
         Err(_) => {
@@ -2458,7 +2917,6 @@ async fn record_llm_http_request(
             return llm_proxy_error(AxumStatusCode::PAYLOAD_TOO_LARGE);
         }
     };
-    sink.record_ingress(sequence, &method_name, &path, &body);
     let canonical_body = canonical_json(&body).ok();
     let request_record = make_request(&method_name, &path, &headers, &body, canonical_body.clone());
     state
@@ -2472,9 +2930,22 @@ async fn record_llm_http_request(
             raw_body_hex: request_record.raw_body_hex.clone(),
             canonical_json: canonical_body.clone(),
         });
+    state.observed_seen.notify_waiters();
+
+    sink.record_ingress(sequence, &method_name, &path, &body);
+
+    // The ingress fact is the durable proof that this exchange can be
+    // replayed.  Never send a provider request after that write failed.  The
+    // observation above is retained solely as a barrier proving the request
+    // reached the recorder, even when the durable write deliberately fails.
+    if sink.flush_error().is_some() {
+        return llm_proxy_error(AxumStatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    sink.begin_sequence(sequence);
 
     if canonical_body.is_none() {
-        sink.submit(LlmHttpRecordingExchange {
+        let submit_result = sink.submit(LlmHttpRecordingExchange {
             sequence,
             logical_round: 0,
             wire_attempt: 0,
@@ -2487,6 +2958,9 @@ async fn record_llm_http_request(
                 outcome: LlmHttpResponseOutcome::Complete { done_seen: false },
             },
         });
+        if submit_result.is_err() {
+            return llm_proxy_error(AxumStatusCode::SERVICE_UNAVAILABLE);
+        }
         return llm_proxy_error(AxumStatusCode::BAD_REQUEST);
     }
 
@@ -2500,7 +2974,9 @@ async fn record_llm_http_request(
         content_type: None,
         response_headers: Vec::new(),
         chunks: Vec::new(),
+        response_bytes: 0,
         stream_error: false,
+        bound_exceeded: false,
         finished: false,
     };
 
@@ -2508,7 +2984,12 @@ async fn record_llm_http_request(
     let method = match reqwest::Method::from_bytes(method_name.as_bytes()) {
         Ok(method) => method,
         Err(_) => {
-            capture.finish(LlmHttpResponseOutcome::TransportError);
+            if capture
+                .finish(LlmHttpResponseOutcome::TransportError)
+                .is_err()
+            {
+                return llm_proxy_error(AxumStatusCode::SERVICE_UNAVAILABLE);
+            }
             return llm_proxy_error(AxumStatusCode::BAD_REQUEST);
         }
     };
@@ -2525,7 +3006,12 @@ async fn record_llm_http_request(
     let response = match timeout(LLM_UPSTREAM_HEADERS_TIMEOUT, outbound.send()).await {
         Ok(Ok(response)) => response,
         Ok(Err(_)) | Err(_) => {
-            capture.finish(LlmHttpResponseOutcome::TransportError);
+            if capture
+                .finish(LlmHttpResponseOutcome::TransportError)
+                .is_err()
+            {
+                return llm_proxy_error(AxumStatusCode::SERVICE_UNAVAILABLE);
+            }
             return llm_proxy_error(AxumStatusCode::BAD_GATEWAY);
         }
     };
@@ -2541,6 +3027,20 @@ async fn record_llm_http_request(
         while let Some(chunk) = upstream_stream.next().await {
             match chunk {
                 Ok(bytes) => {
+                    if capture.chunks.len() >= MAX_LLM_RESPONSE_CHUNKS
+                        || capture
+                            .response_bytes
+                            .saturating_add(bytes.len())
+                            > MAX_LLM_RESPONSE_BYTES
+                    {
+                        capture.bound_exceeded = true;
+                        capture.sink.fail_flush(&format!(
+                            "recording response capture bound exceeded ({} chunks/{} bytes)",
+                            MAX_LLM_RESPONSE_CHUNKS, MAX_LLM_RESPONSE_BYTES
+                        ));
+                        break;
+                    }
+                    capture.response_bytes = capture.response_bytes.saturating_add(bytes.len());
                     let kind = if is_event_stream_content_type(capture.content_type.as_deref()) {
                         LlmHttpChunkKind::Sse
                     } else {
@@ -2566,15 +3066,23 @@ async fn record_llm_http_request(
             }
         }
         let stream_failed = capture.stream_error;
+        let bound_exceeded = capture.bound_exceeded;
         let done_seen = chunks_contain_done(&capture.chunks);
-        capture.finish(if done_seen {
-            LlmHttpResponseOutcome::Complete { done_seen: true }
+        if let Err(error) = capture.finish(if bound_exceeded {
+            LlmHttpResponseOutcome::CaptureBoundExceeded
         } else if stream_failed {
             LlmHttpResponseOutcome::StreamError
+        } else if done_seen {
+            LlmHttpResponseOutcome::Complete { done_seen: true }
         } else {
             LlmHttpResponseOutcome::Complete { done_seen: false }
-        });
-        if stream_failed && !done_seen {
+        }) {
+            yield Err(std::io::Error::other(error.to_string()));
+            return;
+        }
+        if bound_exceeded {
+            yield Err(std::io::Error::other("recording response capture bound exceeded"));
+        } else if stream_failed {
             yield Err(std::io::Error::other("upstream stream failed"));
         }
     };
@@ -2596,6 +3104,8 @@ async fn replay_llm_http_request(
     request: Request,
     recording: LlmHttpRecording,
     captured_timing: bool,
+    expected_authorization: Option<String>,
+    terminal_hold: Option<std::sync::Arc<Notify>>,
 ) -> AxumResponse {
     let method = request.method().as_str().to_owned();
     let path = request
@@ -2604,6 +3114,13 @@ async fn replay_llm_http_request(
         .map(|value| value.as_str())
         .unwrap_or_else(|| request.uri().path())
         .to_owned();
+    if !path_is_secret_safe(&path) {
+        record_replay_error(
+            &state,
+            "provider request path contained a credential-bearing query",
+        );
+        return llm_proxy_error(AxumStatusCode::CONFLICT);
+    }
     let headers = request.headers().clone();
     let body = match to_bytes(request.into_body(), 4 * 1024 * 1024).await {
         Ok(body) => body,
@@ -2612,6 +3129,30 @@ async fn replay_llm_http_request(
     let canonical_body = canonical_json(&body).ok();
     let semantic_headers = semantic_headers(&headers, true);
     let raw_body_hex = hex_encode(&body);
+    if expected_authorization.is_some() || !recording.secret_slots.is_empty() {
+        if expected_authorization.is_none() {
+            record_replay_error(&state, "replay requires an explicit authorization binding");
+            return llm_proxy_error(AxumStatusCode::CONFLICT);
+        }
+        let authorization = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        // Authorization values are intentionally not part of the cassette.
+        // Replay still proves the provider boundary was authenticated, while
+        // rejecting a synthetic slot accidentally sent as a literal value.
+        let bound_value_matches = expected_authorization.as_deref().is_none_or(|expected| {
+            authorization.is_some_and(|actual| actual == format!("Bearer {expected}"))
+        });
+        if authorization.is_none()
+            || authorization.is_some_and(|value| value.contains("SLOT_"))
+            || !bound_value_matches
+        {
+            record_replay_error(&state, "provider request did not supply authorization slot");
+            return llm_proxy_error(AxumStatusCode::CONFLICT);
+        }
+    }
     state
         .observed
         .lock()
@@ -2623,6 +3164,7 @@ async fn replay_llm_http_request(
             raw_body_hex: raw_body_hex.clone(),
             canonical_json: canonical_body.clone(),
         });
+    state.observed_seen.notify_waiters();
     let expected = {
         let mut next = state
             .next_replay
@@ -2646,12 +3188,34 @@ async fn replay_llm_http_request(
     };
     let response = expected.response;
     if matches!(response.outcome, LlmHttpResponseOutcome::TransportError) {
-        *state
-            .replay_completed
-            .lock()
-            .expect("LLM replay completion mutex poisoned") += 1;
-        state.replay_completion_seen.notify_waiters();
-        return llm_proxy_error(AxumStatusCode::BAD_GATEWAY);
+        let state_for_stream = state.clone();
+        if terminal_hold.is_some() {
+            state_for_stream
+                .replay_terminal_waiting
+                .fetch_add(1, Ordering::SeqCst);
+            state_for_stream.replay_terminal_seen.notify_waiters();
+        }
+        let stream = stream! {
+            if let Some(hold) = terminal_hold {
+                hold.notified().await;
+            }
+            // Headers alone do not consume a transport failure.  Count the
+            // exchange only when the terminal body error is ready to be
+            // delivered; a client abort while the hold is active leaves it
+            // unconsumed.
+            *state_for_stream
+                .replay_completed
+                .lock()
+                .expect("LLM replay completion mutex poisoned") += 1;
+            state_for_stream.replay_completion_seen.notify_waiters();
+            yield Err::<Bytes, std::io::Error>(std::io::Error::other(
+                "LLM recording transport error",
+            ));
+        };
+        return AxumResponse::builder()
+            .status(AxumStatusCode::BAD_GATEWAY)
+            .body(Body::from_stream(stream))
+            .expect("LLM transport-error replay response builds");
     }
     let status = response
         .status
@@ -2667,7 +3231,17 @@ async fn replay_llm_http_request(
     let stream = stream! {
         let started = Instant::now();
         let total_chunks = response.chunks.len();
-        let mut completion = ReplayCompletion::new(state_for_stream);
+        let terminal_required = matches!(
+            outcome,
+            LlmHttpResponseOutcome::StreamError
+                | LlmHttpResponseOutcome::ClientDisconnect
+                | LlmHttpResponseOutcome::CaptureBoundExceeded
+        ) && !matches!(
+            outcome,
+            LlmHttpResponseOutcome::ClientDisconnect
+                if chunks_contain_done(&response.chunks)
+        );
+        let mut completion = ReplayCompletion::new(state_for_stream.clone());
         if total_chunks == 0 {
             completion.all_chunks_emitted = true;
         }
@@ -2681,8 +3255,12 @@ async fn replay_llm_http_request(
             }
             match hex_decode(&chunk.bytes_hex) {
                 Ok(bytes) => {
-                    completion.all_chunks_emitted = index + 1 == total_chunks;
+                    state_for_stream
+                        .replay_chunk_count
+                        .fetch_add(1, Ordering::SeqCst);
+                    state_for_stream.replay_chunk_seen.notify_waiters();
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(bytes));
+                    completion.all_chunks_emitted = index + 1 == total_chunks;
                 }
                 Err(_) => {
                     yield Err(std::io::Error::other("LLM recording chunk is invalid"));
@@ -2690,12 +3268,30 @@ async fn replay_llm_http_request(
                 }
             }
         }
-        completion.complete();
-        if matches!(
-            outcome,
-            LlmHttpResponseOutcome::StreamError | LlmHttpResponseOutcome::ClientDisconnect
-        ) {
-            yield Err(std::io::Error::other("LLM recording response disconnected"));
+        if let Some(hold) = terminal_hold {
+            state_for_stream
+                .replay_terminal_waiting
+                .fetch_add(1, Ordering::SeqCst);
+            state_for_stream.replay_terminal_seen.notify_waiters();
+            hold.notified().await;
+        }
+        if terminal_required {
+            // Mark the terminal error before yielding it. If the client aborts
+            // at the final chunk, the stream is dropped before this point and
+            // ReplayCompletion must remain uncompleted.
+            completion.terminal_error_emitted = true;
+            let message = if matches!(outcome, LlmHttpResponseOutcome::CaptureBoundExceeded) {
+                "LLM recording response capture bound exceeded"
+            } else {
+                "LLM recording response disconnected"
+            };
+            yield Err(std::io::Error::other(message));
+            completion.complete();
+        } else {
+            // A legacy/recorded disconnect after DONE maps to the model's
+            // complete-after-DONE projection while retaining raw termination
+            // in the cassette.
+            completion.complete();
         }
     };
     let mut builder = AxumResponse::builder()
@@ -2724,6 +3320,7 @@ fn record_replay_error(state: &LlmHttpProxyState, message: &str) {
 struct ReplayCompletion {
     state: std::sync::Arc<LlmHttpProxyState>,
     all_chunks_emitted: bool,
+    terminal_error_emitted: bool,
     completed: bool,
 }
 
@@ -2732,6 +3329,7 @@ impl ReplayCompletion {
         Self {
             state,
             all_chunks_emitted: false,
+            terminal_error_emitted: false,
             completed: false,
         }
     }
@@ -2751,7 +3349,13 @@ impl ReplayCompletion {
 
 impl Drop for ReplayCompletion {
     fn drop(&mut self) {
-        if self.all_chunks_emitted {
+        // A normal Complete response is counted only after the generator
+        // reaches its terminal branch.  Dropping after the last yielded
+        // chunk but before that branch is an aborted transport, not an
+        // exhausted replay.  A terminal error has already been emitted when
+        // `terminal_error_emitted` is set, so it remains safe to account for
+        // that case if the client drops immediately after receiving it.
+        if self.all_chunks_emitted && self.terminal_error_emitted {
             self.complete();
         }
     }
@@ -2777,8 +3381,14 @@ pub enum ModelScript {
     StreamHold {
         hold: ModelHold,
     },
+    StreamDoneHold {
+        hold: ModelHold,
+    },
     StreamFailureHold {
         hold: ModelHold,
+    },
+    LargeStream {
+        bytes: usize,
     },
     Final {
         text: String,
@@ -2877,8 +3487,16 @@ impl ModelScript {
         Self::StreamHold { hold }
     }
 
+    pub fn stream_done_hold(hold: ModelHold) -> Self {
+        Self::StreamDoneHold { hold }
+    }
+
     pub fn stream_failure_hold(hold: ModelHold) -> Self {
         Self::StreamFailureHold { hold }
+    }
+
+    pub fn large_stream(bytes: usize) -> Self {
+        Self::LargeStream { bytes }
     }
 
     pub fn final_text(text: impl Into<String>) -> Self {
@@ -3130,7 +3748,9 @@ async fn execute_model_script(mut script: ModelScript) -> AxumResponse {
                 script = *then;
             }
             ModelScript::StreamHold { hold } => return model_stream_hold(hold),
+            ModelScript::StreamDoneHold { hold } => return model_stream_done_hold(hold),
             ModelScript::StreamFailureHold { hold } => return model_stream_failure_hold(hold),
+            ModelScript::LargeStream { bytes } => return model_large_stream(bytes),
             ModelScript::Final { text } => return model_stream(final_chunks(&text)),
             ModelScript::ToolCall {
                 tool_call_id,
@@ -3176,6 +3796,11 @@ fn model_stream(chunks: Vec<bytes::Bytes>) -> AxumResponse {
         .expect("model fixture stream response builds")
 }
 
+fn model_large_stream(bytes: usize) -> AxumResponse {
+    let body = bytes::Bytes::from(vec![b'x'; bytes]);
+    model_stream(vec![body])
+}
+
 fn model_stream_with_failure(chunks: Vec<bytes::Bytes>) -> AxumResponse {
     let body = stream! {
         for chunk in chunks {
@@ -3212,6 +3837,26 @@ fn model_stream_hold(hold: ModelHold) -> AxumResponse {
         .header(header::CONTENT_TYPE, "text/event-stream")
         .body(Body::from_stream(body))
         .expect("model fixture held stream response builds")
+}
+
+fn model_stream_done_hold(hold: ModelHold) -> AxumResponse {
+    let body = stream! {
+        for chunk in final_chunks("done before disconnect") {
+            yield Ok::<bytes::Bytes, std::io::Error>(chunk);
+        }
+        hold.entered.send_replace(true);
+        let mut released = hold.released.subscribe();
+        while !*released.borrow() {
+            if released.changed().await.is_err() {
+                return;
+            }
+        }
+    };
+    AxumResponse::builder()
+        .status(AxumStatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(body))
+        .expect("model fixture done-hold stream response builds")
 }
 
 fn model_stream_failure_hold(hold: ModelHold) -> AxumResponse {
@@ -3513,16 +4158,11 @@ pub fn reap_child_on_drop(child: Option<Child>) {
     let Some(child) = child else {
         return;
     };
-
-    if let Ok(handle) = Handle::try_current() {
-        if handle.runtime_flavor() == RuntimeFlavor::MultiThread {
-            tokio::task::block_in_place(|| {
-                let _ = handle.block_on(kill_and_reap(child));
-            });
-            return;
-        }
-    }
-
+    // Drop may run while Tokio is shutting down.  Calling `block_on` on the
+    // current runtime from that path can wait forever while the runtime waits
+    // for this Drop, leaving a real child unreaped and hiding the original
+    // readiness failure.  Always use a private current-thread runtime so
+    // cleanup is independent of the caller's scheduler lifecycle.
     let join = std::thread::spawn(move || {
         let Ok(runtime) = Builder::new_current_thread().enable_all().build() else {
             return;
