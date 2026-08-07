@@ -111,6 +111,52 @@ fatal and prevents the wire request from leaving the recorder. Promotion first
 secret-scans and proves red replay, then creates a new immutable `0444`
 cassette; existing files are never overwritten.
 
+If the recorder process exits after a capture set is flushed but before
+promotion, use the read-only recovery sequence:
+
+```js
+const journal = RecordingJournal.openFlushedCaptureRoot({ rootDir, ledger });
+journal.reloadCaptureSet(captureSetId);
+await journal.promoteFlushedCaptureSet(captureSetId, {
+  destinationDirectory,
+  replay: (envelope) => journal.replay(envelope, { baseUrl, boundaryBaseUrls }),
+});
+```
+
+The recovery constructor does not create a child directory, default manifest,
+or `promoted/` output under the forensic root. `reloadCaptureSet` rechecks the
+sealed anchor, raw-member digests, source/e2e/recording identity, first-failure
+member, and secret slots. Promotion requires the complete same-entry replay
+result list, binds its source digest/exchange count/response fingerprint, and
+uses an existing independent non-symlink directory as a create-new `0444`
+destination. Missing or boolean-only proofs, fabricated or mutated replay
+results, changed owner metadata, symlink/in-root destinations, and duplicate
+targets fail closed while preserving the original raw files.
+
+`proxyHttp` and the JWKS fixture arm a durable ingress record before parsing
+the target or applying a method/path guard. Request chunks and the terminal
+request digest are fsynced before any upstream forwarding, so body bounds,
+client aborts, malformed authorities, and wrong JWKS paths remain recoverable
+first occurrences even when the upstream receives no request.
+
+Capture cassettes retain the canonical `host`, `forwarded`, and
+`x-forwarded-host` request headers exactly. Replay validates and restores all
+three, so a management exchange cannot be replayed on the callback authority
+or with spoofed forwarding headers. Authorization, cookie, and Access
+assertion headers remain excluded from the safe envelope.
+
+Native HTTP replay uses `RecordingJournal.startReplayServer(cassette)` and
+therefore expects the caller to send the recorded authority headers exactly.
+Browser replay uses `startReplayEdge(cassette, { canonicalOrigin, timingMode })`;
+the local edge restores the canonical `Host` before forwarding to the replay
+server and restores recorded `Forwarded`/`X-Forwarded-Host` only when the
+browser omits them. Explicit incoming values remain visible to strict replay
+validation and produce a typed mismatch when spoofed. Exchange reservations
+remain held through request-body read, dispatch, and terminal response, so a
+later browser request cannot overtake a held body. The edge is test-only and
+runs with recording disabled, so replay cannot append members to a sealed
+capture set.
+
 Raw process logs and quarantine captures are test-only artifacts. They are
 created with restrictive permissions and are never printed on failure. The
 promoted cassette strips authorization/cookie headers and replaces every live

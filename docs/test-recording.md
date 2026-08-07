@@ -79,9 +79,9 @@ Each exchange contains:
 - sequence, logical round, and wire attempt where applicable;
 - request method, path, exact raw body bytes, parsed canonical JSON when valid,
   and body digest;
-- an allowlist of semantic headers such as `content-type`; authorization,
-  cookies, proxy credentials, trace baggage, and opaque account headers are
-  forbidden;
+- an allowlist of semantic headers such as `content-type`, canonical `host`,
+  `forwarded`, and `x-forwarded-host`; authorization, cookies, proxy
+  credentials, trace baggage, and opaque account headers are forbidden;
 - response status, allowlisted semantic headers, and ordered raw body/SSE
   chunks;
 - each chunk's offset from response start in microseconds;
@@ -90,8 +90,42 @@ Each exchange contains:
 
 Do not store the upstream credential-bearing URL, DNS result, Authorization
 value, cookie, raw Access assertion, OAuth token/code/state, callback bearer,
-or unredacted identity. Request bodies that contain a test secret replace the
-exact value with a named synthetic slot before promotion.
+or unredacted identity. Canonical authority headers are retained exactly so a
+management/callback surface cannot be replayed under the other surface or
+with forged forwarding headers. Request bodies that contain a test secret
+replace the exact value with a named synthetic slot before promotion.
+
+Native HTTP replay uses the shared replay server and compares these authority
+headers on every request. Browser replay must use the test-only canonical edge
+adapter (`startReplayEdge(cassette, { canonicalOrigin, timingMode })`), which
+restores the recorded canonical `Host` before forwarding while preserving the
+recorded forwarding headers. The adapter disables recording during replay and
+cannot append to a sealed capture set.
+
+The Node journal exposes a crash-safe recovery path for a writer that exited
+after flushing but before promotion. `RecordingJournal.openFlushedCaptureRoot`
+opens an existing quarantine directory without creating a `promoted` directory,
+manifest, or default capture set. The caller must first call
+`reloadCaptureSet(captureSetId)`, which revalidates the sealed manifest/anchor,
+raw-member digests, source identity, slots, and first-failure member. Then call
+`promoteFlushedCaptureSet(captureSetId, { destinationDirectory, replay })` with
+an independent destination and a callback that returns the complete results of
+`replay` through the same public local edge/base URLs. The helper binds source
+manifest digest, first-failure ID, exchange count, and response fingerprint to
+that result list, performs the safe scan again, and writes a new `0444`
+create-new cassette. A bare `{ ok: true }` proof, a missing callback, a callback
+that fabricates or mutates replay results, a changed owner, a symlink
+destination, a destination inside the forensic root, or an existing destination
+file is rejected without rewriting or deleting the flushed raw evidence. The
+callback must return the frozen result list produced by that same journal's
+`replay` primitive; the helper revalidates the complete envelope before writing.
+
+All shared HTTP edges call `beginIngress` before URL/authority parsing or body
+reading, append bounded chunks and a request-end digest durably, and only then
+forward upstream. Body-bound, aborted, malformed-target, and wrong-path
+requests therefore retain a partial or terminal raw exchange even when no
+upstream request is made. The JWKS fixture uses the same ingress boundary
+before its method/path guard.
 
 Startup-rejection incidents use the test-only
 `zode.process-incident-recording.v1` envelope. The shared
