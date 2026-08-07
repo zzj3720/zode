@@ -26,11 +26,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use support::{
     canonical_json, http_client, new_llm_recording_run_dir, run_provider_attempt_until_cancel,
-    run_provider_roundtrip_and_restart, scan_llm_recording_tree, sqlite_contains_secret,
-    write_endpoint_config, HttpFixture, LlmHttpObservedRequest, LlmHttpProxy, LlmHttpRecording,
-    LlmHttpRecordingMetadata, LlmHttpResponseOutcome, ModelFixture, ModelHold, ModelScript,
-    ProviderRoundtripSpec, TempDatabase, TestResult, LLM_HTTP_RECORDING_SCHEMA,
-    TEST_CONTROLLER_SECRET,
+    run_provider_failure, run_provider_roundtrip_and_restart, scan_llm_recording_tree,
+    sqlite_contains_secret, write_endpoint_config, HttpFixture, LlmHttpAttemptPlan,
+    LlmHttpObservedRequest, LlmHttpProxy, LlmHttpRecording, LlmHttpRecordingMetadata,
+    LlmHttpResponseOutcome, ModelFixture, ModelHold, ModelScript, ProviderRoundtripSpec,
+    TempDatabase, TestResult, LLM_HTTP_RECORDING_SCHEMA, MAX_LLM_CHUNK_DELAY_US,
+    MAX_LLM_RESPONSE_BYTES, TEST_CONTROLLER_SECRET,
 };
 use tokio::{sync::Notify, time::timeout};
 
@@ -312,16 +313,36 @@ async fn network_sentinel_request(State(state): State<NetworkSentinelState>) -> 
 }
 
 fn decode_hex(value: &str) -> TestResult<Vec<u8>> {
-    if !value.len().is_multiple_of(2) {
+    if !value.is_ascii() || !value.len().is_multiple_of(2) {
         return Err(Error::other("legacy replay chunk encoding was invalid").into());
     }
-    (0..value.len())
-        .step_by(2)
-        .map(|offset| {
-            u8::from_str_radix(&value[offset..offset + 2], 16)
-                .map_err(|_| Error::other("legacy replay chunk encoding was invalid").into())
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = legacy_hex_nibble(pair[0])
+                .ok_or_else(|| Error::other("legacy replay chunk encoding was invalid"))?;
+            let low = legacy_hex_nibble(pair[1])
+                .ok_or_else(|| Error::other("legacy replay chunk encoding was invalid"))?;
+            Ok((high << 4) | low)
         })
         .collect()
+}
+
+fn digest_without_validation(mut recording: LlmHttpRecording) -> TestResult<LlmHttpRecording> {
+    recording.envelope_sha256.clear();
+    let preimage = serde_json::to_vec(&recording)?;
+    recording.envelope_sha256 = format!("{:x}", Sha256::digest(preimage));
+    Ok(recording)
+}
+
+fn legacy_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn config_for_replay(database: &Path) -> TestResult<PathBuf> {
@@ -495,7 +516,12 @@ async fn replay_recording_roundtrip_with_environment(
     let marker_values = replay_markers();
     let marker_refs = marker_values.iter().map(String::as_str).collect::<Vec<_>>();
     assert_recording_secret_free(recording, &marker_refs)?;
-    let mut proxy = LlmHttpProxy::replay(recording.clone(), captured_timing).await?;
+    let mut proxy = LlmHttpProxy::replay_with_authorization(
+        recording.clone(),
+        captured_timing,
+        Some(REPLAY_SECRET.to_owned()),
+    )
+    .await?;
     let provider_path = recording
         .requests
         .first()
@@ -642,6 +668,12 @@ fn assert_pre_stream_retry_recording(recording: &LlmHttpRecording) -> TestResult
 }
 
 async fn capture_pre_stream_retry() -> TestResult<(LlmHttpRecording, PathBuf)> {
+    capture_pre_stream_retry_with_plan(None).await
+}
+
+async fn capture_pre_stream_retry_with_plan(
+    attempt_plan: Option<Vec<LlmHttpAttemptPlan>>,
+) -> TestResult<(LlmHttpRecording, PathBuf)> {
     let mut provider = ModelFixture::start(vec![
         ModelScript::status(503),
         ModelScript::final_text("ZODE_LIVE_OK"),
@@ -654,7 +686,7 @@ async fn capture_pre_stream_retry() -> TestResult<(LlmHttpRecording, PathBuf)> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| Error::other("pre-stream recording run id was invalid"))?
         .to_owned();
-    let mut recorder = LlmHttpProxy::record(
+    let mut recorder = LlmHttpProxy::record_with_attempt_plan(
         provider.origin(),
         PROVIDER,
         MODEL,
@@ -666,6 +698,7 @@ async fn capture_pre_stream_retry() -> TestResult<(LlmHttpRecording, PathBuf)> {
             boundary: "endpoint_aimux_provider_http".to_owned(),
             secret_slots: vec!["SLOT_PROVIDER_AUTHORIZATION_HEADER".to_owned()],
         },
+        attempt_plan,
     )
     .await?;
     let database = TempDatabase::new("record-pre-stream-retry")?;
@@ -705,6 +738,274 @@ async fn capture_pre_stream_retry() -> TestResult<(LlmHttpRecording, PathBuf)> {
     Ok((recording, run_directory))
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_llm_recorder_redacts_authorization_into_named_synthetic_slot() -> TestResult<()> {
+    const SLOT: &str = "SLOT_PROVIDER_AUTHORIZATION_HEADER";
+    let mut provider =
+        ModelFixture::start(vec![ModelScript::final_text("auth slot final")]).await?;
+    let (mut recorder, run_directory) = start_synthetic_recorder(
+        provider.origin(),
+        "synthetic_authorization_slot",
+        "e2e_llm_recorder_redacts_authorization_into_named_synthetic_slot",
+    )
+    .await?;
+    let database = TempDatabase::new("recording-authorization-slot")?;
+    let config = config_for_replay(database.path())?;
+    let cancel = Arc::new(Notify::new());
+    let attempt = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database,
+            config,
+            recorder.base_url("/v1"),
+            "recording-authorization-slot",
+        ),
+        cancel.clone(),
+    ));
+    recorder.wait_for_completed_exchanges(1).await?;
+    cancel.notify_one();
+    attempt.await.map_err(|error| {
+        Error::other(format!("authorization-slot exercise task failed: {error}"))
+    })??;
+    let upstream_headers = provider
+        .request_headers(0)
+        .ok_or_else(|| Error::other("provider fixture did not retain request headers"))?;
+    let authorization = upstream_headers["authorization"]
+        .as_str()
+        .ok_or_else(|| Error::other("provider fixture request omitted authorization"))?;
+    if !authorization.contains(REPLAY_SECRET) {
+        return Err(
+            Error::other("provider fixture did not receive the installed authorization").into(),
+        );
+    }
+    recorder.stop().await?;
+    provider.stop().await?;
+    let recording = recorder.recording()?;
+    if !recording.secret_slots.iter().any(|slot| slot == SLOT) {
+        return Err(Error::other("recording omitted the authorization synthetic slot").into());
+    }
+    assert_recording_secret_free(&recording, &[REPLAY_SECRET])?;
+    let bytes = serde_json::to_vec(&recording)?;
+    if bytes
+        .windows(b"authorization".len())
+        .any(|window| window == b"authorization")
+    {
+        return Err(Error::other("recording retained authorization material").into());
+    }
+    let first = recording
+        .requests
+        .first()
+        .ok_or_else(|| Error::other("authorization recording omitted its first request"))?;
+    let body = decode_hex(&first.request.raw_body_hex)?;
+    for literal in [
+        None,
+        Some("Bearer SLOT_PROVIDER_AUTHORIZATION_HEADER"),
+        Some("Bearer wrong-provider-key"),
+    ] {
+        let mut replay = LlmHttpProxy::replay_with_authorization(
+            recording.clone(),
+            false,
+            Some(REPLAY_SECRET.to_owned()),
+        )
+        .await?;
+        let mut request = http_client()?.post(replay.base_url(&first.request.path));
+        for semantic in &first.request.semantic_headers {
+            request = request.header(&semantic.name, &semantic.value);
+        }
+        if let Some(value) = literal {
+            request = request.header("authorization", value);
+        }
+        let response = request.body(body.clone()).send().await?;
+        if response.status().as_u16() != StatusCode::CONFLICT.as_u16() {
+            return Err(Error::other(
+                "replay accepted a missing or literal synthetic authorization",
+            )
+            .into());
+        }
+        replay.stop().await?;
+    }
+    let mut replay = LlmHttpProxy::replay_with_authorization(
+        recording.clone(),
+        false,
+        Some(REPLAY_SECRET.to_owned()),
+    )
+    .await?;
+    let mut request = http_client()?.post(replay.base_url(&first.request.path));
+    for semantic in &first.request.semantic_headers {
+        request = request.header(&semantic.name, &semantic.value);
+    }
+    let response = request
+        .header("authorization", format!("Bearer {REPLAY_SECRET}"))
+        .body(body)
+        .send()
+        .await?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(Error::other("replay rejected the bound authorization value").into());
+    }
+    let _ = response.bytes().await?;
+    if !replay.replay_exhausted() {
+        return Err(Error::other("bound authorization replay did not consume its exchange").into());
+    }
+    replay.stop().await?;
+    replay_recording_roundtrip(&recording, false, "replay-authorization-slot").await?;
+    recording.write_atomic(
+        &run_directory.join("recording.json"),
+        &[REPLAY_SECRET, TEST_CONTROLLER_SECRET],
+    )?;
+    scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_llm_recorder_explicit_authorization_requirement_covers_custom_slot() -> TestResult<()>
+{
+    const CUSTOM_SLOT: &str = "SLOT_PROVIDER_AUTH";
+    let mut provider =
+        ModelFixture::start(vec![ModelScript::final_text("custom auth slot final")]).await?;
+    let run_directory = new_llm_recording_run_dir()?;
+    let recording_id = run_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::other("custom auth recording run id was invalid"))?
+        .to_owned();
+    let mut recorder = LlmHttpProxy::record_with_attempt_plan_and_authorization(
+        provider.origin(),
+        PROVIDER,
+        MODEL,
+        &run_directory,
+        LlmHttpRecordingMetadata {
+            recording_id,
+            purpose: "explicit_custom_authorization_slot".to_owned(),
+            owner: "e2e_llm_recorder_explicit_authorization_requirement_covers_custom_slot"
+                .to_owned(),
+            boundary: "endpoint_aimux_provider_http".to_owned(),
+            secret_slots: vec![CUSTOM_SLOT.to_owned()],
+        },
+        None,
+        true,
+    )
+    .await?;
+    let database = TempDatabase::new("recording-custom-auth-slot")?;
+    let config = config_for_replay(database.path())?;
+    let cancel = Arc::new(Notify::new());
+    let attempt = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database,
+            config,
+            recorder.base_url("/v1"),
+            "recording-custom-auth-slot",
+        ),
+        cancel.clone(),
+    ));
+    recorder.wait_for_completed_exchanges(1).await?;
+    cancel.notify_one();
+    attempt
+        .await
+        .map_err(|error| Error::other(format!("custom auth-slot exercise failed: {error}")))??;
+    recorder.stop().await?;
+    provider.stop().await?;
+    let recording = recorder.recording()?;
+    if recording.secret_slots != vec![CUSTOM_SLOT.to_owned()] {
+        return Err(Error::other("custom authorization slot was not retained").into());
+    }
+    let first = recording
+        .requests
+        .first()
+        .ok_or_else(|| Error::other("custom authorization recording omitted its request"))?;
+    let body = decode_hex(&first.request.raw_body_hex)?;
+    let path = first.request.path.clone();
+    let semantic_headers = first.request.semantic_headers.clone();
+    let mut replay = LlmHttpProxy::replay_with_authorization(
+        recording.clone(),
+        false,
+        Some(REPLAY_SECRET.into()),
+    )
+    .await?;
+    let mut request = http_client()?.post(replay.base_url(&path));
+    for semantic in &semantic_headers {
+        request = request.header(&semantic.name, &semantic.value);
+    }
+    let response = request.body(body.clone()).send().await?;
+    if response.status() != reqwest::StatusCode::CONFLICT {
+        return Err(Error::other(
+            "replay accepted a missing Authorization header for an explicit custom slot",
+        )
+        .into());
+    }
+    replay.stop().await?;
+    let mut replay = LlmHttpProxy::replay_with_authorization(
+        recording.clone(),
+        false,
+        Some(REPLAY_SECRET.into()),
+    )
+    .await?;
+    let mut request = http_client()?.post(replay.base_url(&path));
+    for semantic in &semantic_headers {
+        request = request.header(&semantic.name, &semantic.value);
+    }
+    let response = request
+        .header("authorization", format!("Bearer {REPLAY_SECRET}"))
+        .body(body)
+        .send()
+        .await?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(Error::other(
+            "replay rejected the bound Authorization header for a custom slot",
+        )
+        .into());
+    }
+    let _ = response.bytes().await?;
+    replay.stop().await?;
+    recording.write_atomic(
+        &run_directory.join("recording.json"),
+        &[REPLAY_SECRET, TEST_CONTROLLER_SECRET],
+    )?;
+    scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_model_replay_rejects_wrong_provider_authorization() -> TestResult<()> {
+    const WRONG_PROVIDER_REPLICA: &str = "wrong-provider-replica-key";
+
+    // Capture through the real Endpoint + temporary SQLite process before
+    // exercising the compatibility replay entry.  This keeps the cassette's
+    // provider request and synthetic Authorization slot tied to the public
+    // model path rather than a hand-built request.
+    let (recording, _run_directory) =
+        capture_complete_recording_for("e2e_model_replay_rejects_wrong_provider_authorization")
+            .await?;
+    let mut replay = LlmHttpProxy::replay(recording, false).await?;
+    let database = TempDatabase::new("model-replay-wrong-provider-authorization")?;
+    let config = config_for_replay(database.path())?;
+    let mut spec = synthetic_spec(
+        &database,
+        config,
+        replay.base_url("/v1"),
+        "model-replay-wrong-provider-authorization",
+    );
+    spec.provider_secret = WRONG_PROVIDER_REPLICA.to_owned();
+    spec.forbidden.push(WRONG_PROVIDER_REPLICA.to_owned());
+
+    // The replay proxy must reject the wrong replica with a typed HTTP
+    // failure before consuming the cassette.  The Endpoint's public SSE
+    // path consequently reports model_attempt_failed and cannot commit an
+    // assistant message from the replayed response.
+    run_provider_failure(spec).await?;
+    if !replay.observed_requests().is_empty() {
+        return Err(Error::other(
+            "wrong provider authorization reached cassette matching and could produce an assistant",
+        )
+        .into());
+    }
+    if replay.replay_exhausted() {
+        return Err(
+            Error::other("wrong provider authorization consumed the replay exchange").into(),
+        );
+    }
+    replay.stop().await?;
+    Ok(())
+}
+
 fn synthetic_spec(
     database: &TempDatabase,
     config: PathBuf,
@@ -735,13 +1036,22 @@ async fn start_synthetic_recorder(
     purpose: &str,
     owner: &str,
 ) -> TestResult<(LlmHttpProxy, PathBuf)> {
+    start_synthetic_recorder_with_plan(upstream, purpose, owner, None).await
+}
+
+async fn start_synthetic_recorder_with_plan(
+    upstream: String,
+    purpose: &str,
+    owner: &str,
+    attempt_plan: Option<Vec<LlmHttpAttemptPlan>>,
+) -> TestResult<(LlmHttpProxy, PathBuf)> {
     let run_directory = new_llm_recording_run_dir()?;
     let recording_id = run_directory
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| Error::other("synthetic recording run id was invalid"))?
         .to_owned();
-    let recorder = LlmHttpProxy::record(
+    let recorder = LlmHttpProxy::record_with_attempt_plan(
         upstream,
         PROVIDER,
         MODEL,
@@ -753,6 +1063,7 @@ async fn start_synthetic_recorder(
             boundary: "endpoint_aimux_provider_http".to_owned(),
             secret_slots: vec!["SLOT_PROVIDER_AUTHORIZATION_HEADER".to_owned()],
         },
+        attempt_plan,
     )
     .await?;
     Ok((recorder, run_directory))
@@ -775,9 +1086,143 @@ async fn finish_synthetic_recorder(
     Ok(recording)
 }
 
+async fn capture_stream_error_recording() -> TestResult<(LlmHttpRecording, PathBuf)> {
+    let hold = ModelHold::new();
+    let mut provider =
+        ModelFixture::start(vec![ModelScript::stream_failure_hold(hold.clone())]).await?;
+    let (mut recorder, run_directory) = start_synthetic_recorder(
+        provider.origin(),
+        "synthetic_aborted_terminal_stream",
+        "e2e_recorded_provider_replay_does_not_count_aborted_terminal_stream",
+    )
+    .await?;
+    let database = TempDatabase::new("recording-aborted-terminal-stream")?;
+    let config = config_for_replay(database.path())?;
+    let cancel = Arc::new(Notify::new());
+    let attempt = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database,
+            config,
+            recorder.base_url("/v1"),
+            "recording-aborted-terminal-stream",
+        ),
+        cancel.clone(),
+    ));
+    hold.wait_entered().await?;
+    recorder.wait_for_recorded_chunks(1).await?;
+    hold.release();
+    recorder.wait_for_completed_exchanges(1).await?;
+    cancel.notify_one();
+    attempt
+        .await
+        .map_err(|error| Error::other(format!("terminal-stream capture task failed: {error}")))??;
+    recorder.stop().await?;
+    provider.stop().await?;
+    let recording = recorder.recording()?;
+    if recording.requests.len() != 1
+        || !matches!(
+            recording.requests[0].response.outcome,
+            LlmHttpResponseOutcome::StreamError
+        )
+    {
+        return Err(Error::other("terminal-stream fixture did not retain StreamError").into());
+    }
+    recording.write_atomic(
+        &run_directory.join("recording.json"),
+        &[REPLAY_SECRET, TEST_CONTROLLER_SECRET],
+    )?;
+    scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    Ok((recording, run_directory))
+}
+
+async fn capture_transport_error_recording() -> TestResult<(LlmHttpRecording, PathBuf)> {
+    let (mut recorder, run_directory) = start_synthetic_recorder(
+        "http://127.0.0.1:1".to_owned(),
+        "synthetic_transport_terminal_consumption",
+        "e2e_recorded_provider_replay_requires_transport_error_terminal_consumption",
+    )
+    .await?;
+    let database = TempDatabase::new("recording-transport-terminal-consumption")?;
+    let config = config_for_replay(database.path())?;
+    run_provider_failure(synthetic_spec(
+        &database,
+        config,
+        recorder.base_url("/v1"),
+        "recording-transport-terminal-consumption",
+    ))
+    .await?;
+    recorder.stop().await?;
+    let recording = recorder.recording()?;
+    if recording.requests.len() != 1
+        || !matches!(
+            recording.requests[0].response.outcome,
+            LlmHttpResponseOutcome::TransportError
+        )
+    {
+        return Err(Error::other("transport-error fixture did not retain TransportError").into());
+    }
+    recording.write_atomic(
+        &run_directory.join("recording.json"),
+        &[REPLAY_SECRET, TEST_CONTROLLER_SECRET],
+    )?;
+    scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    Ok((recording, run_directory))
+}
+
+async fn capture_complete_recording() -> TestResult<(LlmHttpRecording, PathBuf)> {
+    capture_complete_recording_for(
+        "e2e_recorded_provider_replay_does_not_count_aborted_complete_before_terminal",
+    )
+    .await
+}
+
+async fn capture_complete_recording_for(owner: &str) -> TestResult<(LlmHttpRecording, PathBuf)> {
+    let mut provider =
+        ModelFixture::start(vec![ModelScript::final_text("complete terminal hold")]).await?;
+    let (mut recorder, run_directory) =
+        start_synthetic_recorder(provider.origin(), "synthetic_complete_terminal_hold", owner)
+            .await?;
+    let database = TempDatabase::new("recording-complete-terminal-hold")?;
+    let config = config_for_replay(database.path())?;
+    let cancel = Arc::new(Notify::new());
+    let attempt = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database,
+            config,
+            recorder.base_url("/v1"),
+            "recording-complete-terminal-hold",
+        ),
+        cancel.clone(),
+    ));
+    recorder.wait_for_completed_exchanges(1).await?;
+    cancel.notify_one();
+    attempt.await.map_err(|error| {
+        Error::other(format!("complete-terminal capture task failed: {error}"))
+    })??;
+    recorder.stop().await?;
+    provider.stop().await?;
+    let recording = recorder.recording()?;
+    if recording.requests.len() != 1
+        || !matches!(
+            recording.requests[0].response.outcome,
+            LlmHttpResponseOutcome::Complete { .. }
+        )
+    {
+        return Err(Error::other("complete-terminal fixture did not retain Complete").into());
+    }
+    recording.write_atomic(
+        &run_directory.join("recording.json"),
+        &[REPLAY_SECRET, TEST_CONTROLLER_SECRET],
+    )?;
+    scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    Ok((recording, run_directory))
+}
+
 async fn replay_synthetic_failure(recording: LlmHttpRecording, prefix: &str) -> TestResult<()> {
     let expected = recording.requests.len();
-    let mut replay = LlmHttpProxy::replay(recording, false).await?;
+    let mut replay =
+        LlmHttpProxy::replay_with_authorization(recording, false, Some(REPLAY_SECRET.to_owned()))
+            .await?;
     let database = TempDatabase::new(prefix)?;
     let config = config_for_replay(database.path())?;
     let cancel = Arc::new(Notify::new());
@@ -837,6 +1282,388 @@ async fn e2e_llm_recorder_captures_pre_stream_retry_as_ordered_wire_attempts() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_llm_recorder_uses_explicit_attempt_plan_for_identical_round_bodies() -> TestResult<()>
+{
+    let plan = vec![
+        LlmHttpAttemptPlan {
+            logical_round: 0,
+            wire_attempt: 0,
+        },
+        LlmHttpAttemptPlan {
+            logical_round: 1,
+            wire_attempt: 0,
+        },
+        LlmHttpAttemptPlan {
+            logical_round: 2,
+            wire_attempt: 0,
+        },
+    ];
+    let (recording, run_directory) = capture_pre_stream_retry_with_plan(Some(plan.clone())).await?;
+    let attempts = recording
+        .requests
+        .iter()
+        .map(|exchange| (exchange.logical_round, exchange.wire_attempt))
+        .collect::<Vec<_>>();
+    if attempts != vec![(0, 0), (1, 0), (2, 0)] {
+        return Err(Error::other(format!(
+            "explicit attempt plan was not retained: {attempts:?}"
+        ))
+        .into());
+    }
+    if recording.requests[0].request.canonical_json != recording.requests[1].request.canonical_json
+    {
+        return Err(Error::other(
+            "explicit-plan fixture did not exercise identical request bodies",
+        )
+        .into());
+    }
+    let persisted = LlmHttpRecording::load(&run_directory.join("recording.json"))?;
+    if persisted
+        .requests
+        .iter()
+        .map(|exchange| (exchange.logical_round, exchange.wire_attempt))
+        .collect::<Vec<_>>()
+        != attempts
+    {
+        return Err(Error::other("persisted attempt plan differed from capture").into());
+    }
+    replay_recording_roundtrip(&persisted, false, "replay-explicit-attempt-plan").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_recorded_provider_replay_does_not_count_aborted_terminal_stream() -> TestResult<()> {
+    let (recording, _run_directory) = capture_stream_error_recording().await?;
+    let chunk_count = recording.requests[0].response.chunks.len() as u64;
+    let terminal_hold = Arc::new(Notify::new());
+    let mut replay = LlmHttpProxy::replay_with_terminal_hold(
+        recording,
+        false,
+        Some(REPLAY_SECRET.to_owned()),
+        terminal_hold.clone(),
+    )
+    .await?;
+    let database = TempDatabase::new("replay-aborted-terminal-stream")?;
+    let config = config_for_replay(database.path())?;
+    let cancel = Arc::new(Notify::new());
+    let attempt = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database,
+            config,
+            replay.base_url("/v1"),
+            "replay-aborted-terminal-stream",
+        ),
+        cancel.clone(),
+    ));
+    replay.wait_for_replayed_chunks(chunk_count).await?;
+    cancel.notify_one();
+    attempt.await.map_err(|error| {
+        Error::other(format!(
+            "aborted terminal-stream replay task failed: {error}"
+        ))
+    })??;
+    if replay.replay_exhausted() {
+        return Err(
+            Error::other("aborted terminal stream was counted as an exhausted replay").into(),
+        );
+    }
+    // Assert while the terminal outcome is still held.  Releasing the hold
+    // first would let a graceful proxy shutdown race the cancellation and
+    // accidentally turn the aborted stream into a consumed terminal error.
+    terminal_hold.notify_one();
+    replay.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_recorded_provider_replay_does_not_count_aborted_complete_before_terminal(
+) -> TestResult<()> {
+    let (recording, _run_directory) = capture_complete_recording().await?;
+    let chunk_count = recording.requests[0].response.chunks.len() as u64;
+    let terminal_hold = Arc::new(Notify::new());
+    let mut replay = LlmHttpProxy::replay_with_terminal_hold(
+        recording,
+        false,
+        Some(REPLAY_SECRET.to_owned()),
+        terminal_hold.clone(),
+    )
+    .await?;
+    let database = TempDatabase::new("replay-aborted-complete-terminal").map_err(|error| {
+        Error::other(format!("complete-terminal replay database failed: {error}"))
+    })?;
+    let config = config_for_replay(database.path())?;
+    let cancel = Arc::new(Notify::new());
+    let attempt = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database,
+            config,
+            replay.base_url("/v1"),
+            "replay-aborted-complete-terminal",
+        ),
+        cancel.clone(),
+    ));
+    replay.wait_for_replayed_chunks(chunk_count).await?;
+    cancel.notify_one();
+    attempt.await.map_err(|error| {
+        Error::other(format!(
+            "aborted complete-terminal replay task failed: {error}"
+        ))
+    })??;
+    if replay.replay_exhausted() {
+        return Err(Error::other(
+            "aborted Complete stream was counted before terminal confirmation",
+        )
+        .into());
+    }
+    terminal_hold.notify_one();
+    replay.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_recorded_provider_replay_requires_transport_error_terminal_consumption(
+) -> TestResult<()> {
+    let (recording, _run_directory) = capture_transport_error_recording().await?;
+    let terminal_hold = Arc::new(Notify::new());
+    let mut replay = LlmHttpProxy::replay_with_terminal_hold(
+        recording,
+        false,
+        Some(REPLAY_SECRET.to_owned()),
+        terminal_hold.clone(),
+    )
+    .await?;
+    let database = TempDatabase::new("replay-transport-terminal-consumption")?;
+    let config = config_for_replay(database.path())?;
+    let cancel = Arc::new(Notify::new());
+    let attempt = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database,
+            config,
+            replay.base_url("/v1"),
+            "replay-transport-terminal-consumption",
+        ),
+        cancel.clone(),
+    ));
+    replay.wait_for_replay_terminal_hold().await?;
+    cancel.notify_one();
+    attempt
+        .await
+        .map_err(|error| Error::other(format!("transport terminal abort failed: {error}")))??;
+    if replay.replay_exhausted() {
+        return Err(Error::other(
+            "transport-error replay was counted before terminal body consumption",
+        )
+        .into());
+    }
+    terminal_hold.notify_one();
+    replay.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_recorded_provider_replay_rejects_oversized_response_cassette() -> TestResult<()> {
+    let (recording, _run_directory) = capture_complete_recording().await?;
+    let mut oversized = recording;
+    let response = &mut oversized.requests[0].response;
+    let chunk = response
+        .chunks
+        .first_mut()
+        .ok_or_else(|| Error::other("oversized cassette fixture omitted a response chunk"))?;
+    chunk.bytes_hex = "78".repeat(MAX_LLM_RESPONSE_BYTES + 1);
+    chunk.sequence = 0;
+    chunk.at_us = 0;
+    response.chunks.truncate(1);
+    response.outcome = LlmHttpResponseOutcome::Complete { done_seen: false };
+    let oversized = digest_without_validation(oversized)?;
+    let result = LlmHttpProxy::replay(oversized, false).await;
+    let error = match result {
+        Ok(_) => {
+            return Err(Error::other(
+                "replay accepted a digest-valid response cassette above the capture bound",
+            )
+            .into())
+        }
+        Err(error) => error,
+    };
+    if !error.to_string().contains("byte bound") {
+        return Err(Error::other(format!(
+            "oversized cassette was rejected with the wrong typed failure: {error}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_recorded_provider_replay_rejects_unbounded_captured_timing() -> TestResult<()> {
+    let (recording, _run_directory) = capture_complete_recording().await?;
+    let mut unbounded = recording;
+    for chunk in &mut unbounded.requests[0].response.chunks {
+        chunk.at_us = MAX_LLM_CHUNK_DELAY_US + 1;
+    }
+    let unbounded = digest_without_validation(unbounded)?;
+    let result = LlmHttpProxy::replay(unbounded, true).await;
+    let error = match result {
+        Ok(_) => {
+            return Err(
+                Error::other("captured replay accepted an unbounded chunk timing value").into(),
+            )
+        }
+        Err(error) => error,
+    };
+    if !error.to_string().contains("timing bound") {
+        return Err(Error::other(format!(
+            "unbounded captured timing was rejected with the wrong typed failure: {error}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_llm_recorder_rejects_ambiguous_attempt_identity() -> TestResult<()> {
+    let mut provider = ModelFixture::start(vec![
+        ModelScript::final_text("ambiguous first"),
+        ModelScript::final_text("ambiguous second"),
+    ])
+    .await?;
+    let (mut recorder, run_directory) = start_synthetic_recorder(
+        provider.origin(),
+        "synthetic_ambiguous_attempt_identity",
+        "e2e_llm_recorder_rejects_ambiguous_attempt_identity",
+    )
+    .await?;
+
+    let database_a = TempDatabase::new("recording-ambiguous-attempt-a")?;
+    let config_a = config_for_replay(database_a.path())?;
+    let cancel_a = Arc::new(Notify::new());
+    let task_a = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database_a,
+            config_a,
+            recorder.base_url("/v1"),
+            "recording-ambiguous-attempt-a",
+        ),
+        cancel_a.clone(),
+    ));
+    recorder.wait_for_completed_exchanges(1).await?;
+    cancel_a.notify_one();
+    task_a
+        .await
+        .map_err(|error| Error::other(format!("first ambiguous attempt failed: {error}")))??;
+
+    let database_b = TempDatabase::new("recording-ambiguous-attempt-b")?;
+    let config_b = config_for_replay(database_b.path())?;
+    let cancel_b = Arc::new(Notify::new());
+    let task_b = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database_b,
+            config_b,
+            recorder.base_url("/v1"),
+            "recording-ambiguous-attempt-b",
+        ),
+        cancel_b.clone(),
+    ));
+    recorder.wait_for_completed_exchanges(2).await?;
+    cancel_b.notify_one();
+    task_b
+        .await
+        .map_err(|error| Error::other(format!("second ambiguous attempt failed: {error}")))??;
+    let observed = recorder.observed_requests();
+    if observed.len() != 2 || observed[0].canonical_json != observed[1].canonical_json {
+        return Err(Error::other(
+            "ambiguous-attempt fixture did not produce identical canonical bodies",
+        )
+        .into());
+    }
+    recorder.stop().await?;
+    provider.stop().await?;
+    let result = recorder.recording();
+    if result
+        .as_ref()
+        .err()
+        .and_then(|error| {
+            error
+                .to_string()
+                .contains("ambiguous attempt identity")
+                .then_some(())
+        })
+        .is_none()
+    {
+        return Err(Error::other(
+            "recorder silently inferred a retry for identical logical-round bodies",
+        )
+        .into());
+    }
+    scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_llm_recorder_rejects_interleaved_attempt_without_explicit_plan() -> TestResult<()> {
+    let first_hold = ModelHold::new();
+    let mut provider = ModelFixture::start(vec![
+        ModelScript::hold_entered(first_hold.clone(), ModelScript::final_text("first")),
+        ModelScript::final_text("second"),
+    ])
+    .await?;
+    let (mut recorder, run_directory) = start_synthetic_recorder(
+        provider.origin(),
+        "synthetic_interleaved_attempt_identity",
+        "e2e_llm_recorder_rejects_interleaved_attempt_without_explicit_plan",
+    )
+    .await?;
+    let database_a = TempDatabase::new("recording-interleaved-attempt-a")?;
+    let config_a = config_for_replay(database_a.path())?;
+    let cancel_a = Arc::new(Notify::new());
+    let task_a = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database_a,
+            config_a,
+            recorder.base_url("/v1"),
+            "recording-interleaved-attempt-a",
+        ),
+        cancel_a.clone(),
+    ));
+    first_hold.wait_entered().await?;
+
+    let database_b = TempDatabase::new("recording-interleaved-attempt-b")?;
+    let config_b = config_for_replay(database_b.path())?;
+    let mut spec_b = synthetic_spec(
+        &database_b,
+        config_b,
+        recorder.base_url("/v1"),
+        "recording-interleaved-attempt-b",
+    );
+    spec_b.first_prompt = "distinct interleaved logical round".to_owned();
+    let cancel_b = Arc::new(Notify::new());
+    let task_b = tokio::spawn(run_provider_attempt_until_cancel(spec_b, cancel_b.clone()));
+    recorder.wait_for_submitted_exchanges(1).await?;
+    first_hold.release();
+    recorder.wait_for_submitted_exchanges(2).await?;
+    cancel_a.notify_one();
+    cancel_b.notify_one();
+    task_a
+        .await
+        .map_err(|error| Error::other(format!("interleaved first task failed: {error}")))??;
+    task_b
+        .await
+        .map_err(|error| Error::other(format!("interleaved second task failed: {error}")))??;
+    recorder.stop().await?;
+    provider.stop().await?;
+    let error = recorder
+        .recording()
+        .expect_err("interleaved no-plan capture silently inferred attempt identity");
+    if !error.to_string().contains("ambiguous attempt identity") {
+        return Err(Error::other(format!(
+            "interleaved capture returned the wrong failure class: {error}"
+        ))
+        .into());
+    }
+    scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_llm_recording_flush_failure_blocks_live_promotion() -> TestResult<()> {
     let mut provider = ModelFixture::start(vec![ModelScript::final_text("fixture final")]).await?;
     let (mut recorder, run_directory) = start_synthetic_recorder(
@@ -865,7 +1692,12 @@ async fn e2e_llm_recording_flush_failure_blocks_live_promotion() -> TestResult<(
         ),
         cancel.clone(),
     ));
-    recorder.wait_for_completed_exchanges(1).await?;
+    recorder.wait_for_observed_requests(1).await?;
+    if provider.request_count() != 0 {
+        return Err(
+            Error::other("provider request escaped after durable ingress capture failed").into(),
+        );
+    }
     cancel.notify_one();
     attempt
         .await
@@ -888,6 +1720,178 @@ async fn e2e_llm_recording_flush_failure_blocks_live_promotion() -> TestResult<(
     }
     if promotion.exists() {
         return Err(Error::other("an incomplete recording was eligible for live promotion").into());
+    }
+    scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_llm_recorder_terminal_flush_failure_fails_live_stream() -> TestResult<()> {
+    let mut provider =
+        ModelFixture::start(vec![ModelScript::final_text("terminal flush failure")]).await?;
+    let (mut recorder, run_directory) = start_synthetic_recorder(
+        provider.origin(),
+        "synthetic_terminal_flush_failure",
+        "e2e_llm_recorder_terminal_flush_failure_fails_live_stream",
+    )
+    .await?;
+    let occupied_exchange = run_directory.join("exchange-00000000000000000000.json");
+    fs::write(&occupied_exchange, b"test-owned terminal flush collision")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&occupied_exchange, fs::Permissions::from_mode(0o600))?;
+    }
+    let database = TempDatabase::new("recording-terminal-flush-failure")?;
+    let config = config_for_replay(database.path())?;
+    run_provider_failure(synthetic_spec(
+        &database,
+        config,
+        recorder.base_url("/v1"),
+        "recording-terminal-flush-failure",
+    ))
+    .await?;
+    if provider.request_count() != 1 {
+        return Err(Error::other(
+            "terminal flush failure did not traverse the provider boundary exactly once",
+        )
+        .into());
+    }
+    recorder.stop().await?;
+    provider.stop().await?;
+    let flush_error = recorder
+        .flush_error()
+        .ok_or_else(|| Error::other("terminal exchange write failure was not fatal"))?;
+    if !flush_error.contains("recording exchange flush failed") {
+        return Err(Error::other(format!(
+            "terminal exchange failure lost its typed flush classification: {flush_error}"
+        ))
+        .into());
+    }
+    if recorder.recording().is_ok() {
+        return Err(Error::other(
+            "terminal exchange flush failure produced a promotable recording",
+        )
+        .into());
+    }
+    scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_llm_recorder_stream_capture_bound_fails_closed() -> TestResult<()> {
+    let mut provider =
+        ModelFixture::start(vec![ModelScript::large_stream(MAX_LLM_RESPONSE_BYTES + 1)]).await?;
+    let (mut recorder, run_directory) = start_synthetic_recorder(
+        provider.origin(),
+        "synthetic_stream_capture_bound",
+        "e2e_llm_recorder_stream_capture_bound_fails_closed",
+    )
+    .await?;
+    let database = TempDatabase::new("recording-stream-capture-bound")?;
+    let config = config_for_replay(database.path())?;
+    run_provider_failure(synthetic_spec(
+        &database,
+        config,
+        recorder.base_url("/v1"),
+        "recording-stream-capture-bound",
+    ))
+    .await?;
+    if provider.request_count() != 1 {
+        return Err(Error::other(
+            "bounded stream exercise did not traverse the provider boundary exactly once",
+        )
+        .into());
+    }
+    recorder.stop().await?;
+    provider.stop().await?;
+    let flush_error = recorder
+        .flush_error()
+        .ok_or_else(|| Error::other("oversized provider response was not rejected fail-closed"))?;
+    if !flush_error.contains("capture bound") {
+        return Err(Error::other(format!(
+            "oversized response returned the wrong failure class: {flush_error}"
+        ))
+        .into());
+    }
+    if recorder.recording().is_ok() {
+        return Err(
+            Error::other("oversized provider response produced a promotable recording").into(),
+        );
+    }
+    scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_llm_recording_promotion_is_private_then_immutable_0444() -> TestResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut provider =
+        ModelFixture::start(vec![ModelScript::final_text("promotion final")]).await?;
+    let (mut recorder, run_directory) = start_synthetic_recorder(
+        provider.origin(),
+        "synthetic_promotion_modes",
+        "e2e_llm_recording_promotion_is_private_then_immutable_0444",
+    )
+    .await?;
+    let database = TempDatabase::new("recording-promotion-modes")?;
+    let config = config_for_replay(database.path())?;
+    let cancel = Arc::new(Notify::new());
+    let attempt = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database,
+            config,
+            recorder.base_url("/v1"),
+            "recording-promotion-modes",
+        ),
+        cancel.clone(),
+    ));
+    recorder.wait_for_completed_exchanges(1).await?;
+    cancel.notify_one();
+    attempt
+        .await
+        .map_err(|error| Error::other(format!("promotion exercise task failed: {error}")))??;
+    recorder.stop().await?;
+    provider.stop().await?;
+    let recording = recorder.recording()?;
+    let quarantine_path = run_directory.join("recording.json");
+    recording.write_atomic(&quarantine_path, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    let quarantine_mode = fs::metadata(&quarantine_path)?.permissions().mode() & 0o777;
+    if quarantine_mode != 0o600 {
+        return Err(Error::other(format!(
+            "quarantine recording mode was {quarantine_mode:04o}, expected 0600"
+        ))
+        .into());
+    }
+    let promotion = database
+        .path()
+        .parent()
+        .ok_or_else(|| Error::other("promotion database had no parent"))?
+        .join("promoted-recording.json");
+    recording.promote_immutable(&promotion, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    let promoted_mode = fs::metadata(&promotion)?.permissions().mode() & 0o777;
+    if promoted_mode != 0o444 {
+        return Err(Error::other(format!(
+            "promoted recording mode was {promoted_mode:04o}, expected 0444"
+        ))
+        .into());
+    }
+    let original = fs::read(&promotion)?;
+    let overwrite =
+        recording.promote_immutable(&promotion, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET]);
+    if !matches!(
+        overwrite
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<std::io::Error>()),
+        Some(error) if error.kind() == ErrorKind::AlreadyExists
+    ) {
+        return Err(Error::other("immutable promotion accepted an overwrite").into());
+    }
+    if fs::read(&promotion)? != original {
+        return Err(Error::other("immutable promotion changed existing bytes").into());
     }
     scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
     Ok(())
@@ -937,14 +1941,12 @@ async fn e2e_recorded_provider_replay_is_three_immediate_one_captured_and_networ
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e_promoted_provider_cassette_is_0444_immutable_and_not_quarantine() -> TestResult<()> {
-    use std::os::unix::fs::PermissionsExt;
-
+async fn e2e_promoted_provider_cassette_is_immutable_and_not_quarantine() -> TestResult<()> {
     let path = recording_path();
     let recording = LlmHttpRecording::load(&path)?;
     replay_recording_roundtrip(&recording, false, "recorded-immutable").await?;
     let original_bytes = fs::read(&path)?;
-    let overwrite = recording.write_atomic(&path, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET]);
+    let overwrite = recording.promote_immutable(&path, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET]);
     match overwrite {
         Err(error)
             if error
@@ -978,17 +1980,6 @@ async fn e2e_promoted_provider_cassette_is_0444_immutable_and_not_quarantine() -
                 .any(|component| component.as_os_str() == "quarantine")
         {
             return Err(Error::other("promoted provider cassette remained in quarantine").into());
-        }
-        let mode = fs::metadata(&canonical)?.permissions().mode() & 0o777;
-        if mode != 0o444 {
-            return Err(Error::other(format!(
-                "promoted provider cassette {} mode was {mode:04o}, expected 0444",
-                canonical
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("<invalid>")
-            ))
-            .into());
         }
     }
     Ok(())
@@ -1163,5 +2154,151 @@ async fn e2e_llm_recorder_preserves_failure_outcomes() -> TestResult<()> {
         return Err(Error::other("client disconnect was not recorded").into());
     }
     replay_synthetic_failure(recording, "replay-client-disconnect").await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_llm_recorder_done_then_transport_disconnect_replays_as_complete() -> TestResult<()> {
+    let hold = ModelHold::new();
+    let mut provider =
+        ModelFixture::start(vec![ModelScript::stream_done_hold(hold.clone())]).await?;
+    let (mut recorder, run_directory) = start_synthetic_recorder(
+        provider.origin(),
+        "synthetic_done_then_disconnect",
+        "e2e_llm_recorder_done_then_transport_disconnect_replays_as_complete",
+    )
+    .await?;
+    let database = TempDatabase::new("recording-done-then-disconnect")?;
+    let config = config_for_replay(database.path())?;
+    let cancel = Arc::new(Notify::new());
+    let attempt = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database,
+            config,
+            recorder.base_url("/v1"),
+            "recording-done-then-disconnect",
+        ),
+        cancel.clone(),
+    ));
+    hold.wait_entered().await?;
+    recorder.wait_for_recorded_chunks(3).await?;
+    cancel.notify_one();
+    attempt.await.map_err(|error| {
+        Error::other(format!("done-disconnect exercise task failed: {error}"))
+    })??;
+    hold.release();
+    recorder.wait_for_completed_exchanges(1).await?;
+    provider.stop().await?;
+    let recording = finish_synthetic_recorder(&mut recorder, &run_directory).await?;
+    if !recording.requests.iter().any(|exchange| {
+        matches!(
+            exchange.response.outcome,
+            LlmHttpResponseOutcome::ClientDisconnect
+        ) && exchange
+            .response
+            .chunks
+            .iter()
+            .filter_map(|chunk| decode_hex(&chunk.bytes_hex).ok())
+            .any(|bytes| {
+                bytes
+                    .windows(b"data: [DONE]".len())
+                    .any(|window| window == b"data: [DONE]")
+            })
+    }) {
+        return Err(Error::other(
+            "DONE followed by transport disconnect was not retained as raw termination",
+        )
+        .into());
+    }
+    replay_synthetic_failure(recording, "replay-done-then-disconnect").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_llm_recorder_concurrent_completions_are_durably_persisted_in_sequence(
+) -> TestResult<()> {
+    let first_hold = ModelHold::new();
+    let mut provider = ModelFixture::start(vec![
+        ModelScript::hold_entered(
+            first_hold.clone(),
+            ModelScript::final_text("first concurrent"),
+        ),
+        ModelScript::final_text("second concurrent"),
+    ])
+    .await?;
+    let (mut recorder, run_directory) = start_synthetic_recorder_with_plan(
+        provider.origin(),
+        "synthetic_concurrent_completions",
+        "e2e_llm_recorder_concurrent_completions_are_durably_persisted_in_sequence",
+        Some(vec![
+            LlmHttpAttemptPlan {
+                logical_round: 0,
+                wire_attempt: 0,
+            },
+            LlmHttpAttemptPlan {
+                logical_round: 1,
+                wire_attempt: 0,
+            },
+        ]),
+    )
+    .await?;
+
+    let database_a = TempDatabase::new("recording-concurrent-a")?;
+    let config_a = config_for_replay(database_a.path())?;
+    let database_b = TempDatabase::new("recording-concurrent-b")?;
+    let config_b = config_for_replay(database_b.path())?;
+    let cancel_a = Arc::new(Notify::new());
+    let cancel_b = Arc::new(Notify::new());
+    let task_a = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database_a,
+            config_a,
+            recorder.base_url("/v1"),
+            "recording-concurrent-a",
+        ),
+        cancel_a.clone(),
+    ));
+    first_hold.wait_entered().await?;
+    let task_b = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database_b,
+            config_b,
+            recorder.base_url("/v1"),
+            "recording-concurrent-b",
+        ),
+        cancel_b.clone(),
+    ));
+    provider.wait_for_requests(2).await?;
+    // The second response completes first and is held in the ordered pending
+    // map until the first response's durable fact arrives.
+    recorder.wait_for_submitted_exchanges(2).await?;
+    first_hold.release();
+    recorder.wait_for_completed_exchanges(2).await?;
+    cancel_a.notify_one();
+    cancel_b.notify_one();
+    task_a
+        .await
+        .map_err(|error| Error::other(format!("concurrent first task failed: {error}")))??;
+    task_b
+        .await
+        .map_err(|error| Error::other(format!("concurrent second task failed: {error}")))??;
+    recorder.stop().await?;
+    provider.stop().await?;
+    let recording = recorder.recording()?;
+    let sequences = recording
+        .requests
+        .iter()
+        .map(|exchange| exchange.sequence)
+        .collect::<Vec<_>>();
+    if sequences != vec![0, 1] {
+        return Err(Error::other(format!(
+            "concurrent recording was not persisted in sequence: {sequences:?}"
+        ))
+        .into());
+    }
+    recording.write_atomic(
+        &run_directory.join("recording.json"),
+        &[REPLAY_SECRET, TEST_CONTROLLER_SECRET],
+    )?;
+    scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
     Ok(())
 }

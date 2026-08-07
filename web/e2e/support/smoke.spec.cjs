@@ -44,7 +44,7 @@ test.describe('Zode web E2E public infrastructure', () => {
     guard.attachContext(page.context());
 
     try {
-      harness = await createWebE2EHarness();
+      harness = await createWebE2EHarness({ uiMode: 'assets' });
       guard.ledger = harness.ledger;
       await harness.endpointIdentity();
 

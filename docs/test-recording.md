@@ -23,6 +23,16 @@ responses, provider errors, pre-stream retries, partial streams, disconnects,
 and requests made before or after Endpoint restart. Failure to flush one
 exchange fails the live test; an unrecorded direct real-LLM test is forbidden.
 
+Provider-boundary tests should use
+`LlmHttpProxy::record_with_attempt_plan_and_authorization(..., true)` when the
+wire contract requires authorization; the flag is authoritative and
+independent of the opaque synthetic-slot spelling. The compatibility recorder
+may infer the requirement from the provider boundary for existing suites, but
+new opaque-slot cases must not rely on that inference. Replay must use
+`replay_with_authorization` with the test-only slot value. Authorization is
+never serialized into a cassette, and omitting the explicit requirement in a
+new case is a test-harness contract error rather than a silent fallback.
+
 For other real-path defects, retain the earliest failing exchange observed in
 the test environment after this rule was adopted. Capture the inbound public
 request and each external-boundary exchange needed to reproduce the defect
@@ -82,6 +92,32 @@ Do not store the upstream credential-bearing URL, DNS result, Authorization
 value, cookie, raw Access assertion, OAuth token/code/state, callback bearer,
 or unredacted identity. Request bodies that contain a test secret replace the
 exact value with a named synthetic slot before promotion.
+
+Startup-rejection incidents use the test-only
+`zode.process-incident-recording.v1` envelope. The shared
+`tests/support/process_capture.rs` seam records the already slot-substituted
+config bytes and each real child observation (bounded stdout, stderr, exit
+code, signal, and termination classification). `capture_config` must happen
+before the child is spawned; `capture_process` durably seals every observed
+child before another startup; `flush` must succeed before the test asserts the
+failure or retries. Config and process records are private `0600` files under
+the ignored run directory, and the final envelope carries a whole-envelope
+digest. This seam records no environment map, JWT, bearer, or live secret.
+For a tracked startup cassette, the read-only
+`ProcessIncidentReplay::load(path, expected_e2e_name, forbidden_markers)` API
+is the only loader: it checks the schema/version, recording and E2E identity,
+whole-envelope digest, config digest, bounded process observations, and the
+`ProcessStopObservation` observed/reaped/leaked/timed-out/flush proof. It also
+scans the serialized envelope and decoded config/stdout/stderr against the
+forbidden markers before returning a projection. Callers can read only
+`config_label()`, `config_bytes()`, `classification()`, `first_observed()`,
+and `source_digest()`; no unvalidated JSON or process facts are exposed.
+Its `promote_immutable` method requires a non-empty replay fingerprint and the
+exact source digest from the same public replay, then creates a new `0444`
+file without overwriting an existing destination. The public E2E owns the
+semantic assertion represented by that fingerprint; this helper only binds it
+to the exact flushed source and rejects placeholder digests.
+It is a test module only and must not be imported by production code.
 
 ## 5. Promotion and secret scan
 

@@ -602,7 +602,12 @@ impl ModelNetworkFixture {
             })
         } else {
             let recording = incident_recording(cassette, owner)?;
-            let proxy = LlmHttpProxy::replay(recording, captured_timing).await?;
+            let proxy = LlmHttpProxy::replay_with_authorization(
+                recording,
+                captured_timing,
+                Some(TEST_PROVIDER_SECRET.to_owned()),
+            )
+            .await?;
             Ok(Self {
                 proxy,
                 upstream: None,
