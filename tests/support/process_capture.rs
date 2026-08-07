@@ -123,6 +123,9 @@ pub struct ProcessReplayProof {
 /// real startup path.
 #[derive(Clone, Debug)]
 pub struct ProcessIncidentReplay {
+    source_path: PathBuf,
+    recording_id: String,
+    e2e_name: String,
     config_label: String,
     config_bytes: Vec<u8>,
     classification: String,
@@ -143,11 +146,7 @@ impl ProcessIncidentReplay {
         }
         let bytes = fs::read(path)?;
         let value = parse_valid_envelope(&bytes, None, Some(expected_e2e_name.as_ref()))?;
-        let markers = forbidden_markers
-            .iter()
-            .filter(|marker| !marker.is_empty())
-            .map(|marker| marker.as_bytes().to_vec())
-            .collect::<Vec<_>>();
+        let markers = marker_bytes(forbidden_markers);
         scan_incident_value(&value, &markers)?;
         let config = value
             .get("config")
@@ -157,6 +156,16 @@ impl ProcessIncidentReplay {
             .get("label")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| IoError::other("process incident config label is invalid"))?
+            .to_owned();
+        let recording_id = value
+            .get("recording_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| IoError::other("process incident recording identity is invalid"))?
+            .to_owned();
+        let e2e_name = value
+            .get("e2e_name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| IoError::other("process incident e2e identity is invalid"))?
             .to_owned();
         let config_hex = config
             .get("bytes_hex")
@@ -174,6 +183,9 @@ impl ProcessIncidentReplay {
             .ok_or_else(|| IoError::other("process incident first observation is invalid"))?
             .to_owned();
         Ok(Self {
+            source_path: path.to_path_buf(),
+            recording_id,
+            e2e_name,
             config_label,
             config_bytes,
             classification,
@@ -200,6 +212,35 @@ impl ProcessIncidentReplay {
 
     pub fn source_digest(&self) -> &str {
         &self.source_digest
+    }
+
+    /// Recovery promotion for a flushed cassette after the capture owner has
+    /// exited.  The source is read and validated again; this never trusts the
+    /// projection retained by the previous process or rewrites the raw file.
+    pub fn promote_immutable(
+        &self,
+        destination: impl AsRef<Path>,
+        proof: &ProcessReplayProof,
+        forbidden_markers: &[&str],
+    ) -> ProcessCaptureResult<PathBuf> {
+        let markers = marker_bytes(forbidden_markers);
+        let bytes = read_validated_source(
+            &self.source_path,
+            Some(&self.recording_id),
+            Some(&self.e2e_name),
+            &markers,
+        )?;
+        let source_digest = digest(&bytes);
+        if source_digest != self.source_digest {
+            return Err(IoError::other("process incident source digest changed").into());
+        }
+        promote_bytes(
+            &bytes,
+            &self.recording_id,
+            destination.as_ref(),
+            proof,
+            &source_digest,
+        )
     }
 }
 
@@ -320,7 +361,9 @@ impl ProcessCaptureSet {
                 error
             })?;
         if let Some(stop) = observation.stop.as_ref() {
-            validate_stop_observation(stop)?;
+            if let Err(error) = validate_stop_observation(stop) {
+                return self.fail_with(error);
+            }
         }
         if observation.stdout.len() > MAX_OUTPUT_BYTES
             || observation.stderr.len() > MAX_OUTPUT_BYTES
@@ -428,44 +471,20 @@ impl ProcessCaptureSet {
             .flushed
             .as_ref()
             .ok_or_else(|| IoError::other("process capture must be flushed before promotion"))?;
-        let bytes = fs::read(source)?;
-        validate_flushed_envelope(&bytes, &self.recording_id, &self.e2e_name)?;
-        self.scan(&bytes)?;
+        let bytes = read_validated_source(
+            source,
+            Some(&self.recording_id),
+            Some(&self.e2e_name),
+            &self.forbidden,
+        )?;
         let source_digest = digest(&bytes);
-        if !proof.matched
-            || !valid_nonzero_digest(&proof.fingerprint)
-            || !valid_digest(&proof.source_digest)
-            || proof.source_digest != source_digest
-        {
-            return Err(IoError::other("process capture replay proof is missing").into());
-        }
-        let destination = destination.as_ref();
-        let parent = destination
-            .parent()
-            .ok_or_else(|| IoError::other("process cassette destination has no parent"))?;
-        create_private_dir(parent)?;
-        let temporary = parent.join(format!(".{}.tmp-{}", self.recording_id, std::process::id()));
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        set_open_mode(&mut options, 0o600);
-        let mut file = options.open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        set_mode(&temporary, 0o444)?;
-        File::open(&temporary)?.sync_all()?;
-        if let Err(error) = fs::hard_link(&temporary, destination) {
-            let _ = fs::remove_file(&temporary);
-            return Err(if error.kind() == ErrorKind::AlreadyExists {
-                IoError::new(ErrorKind::AlreadyExists, "process cassette is immutable")
-            } else {
-                error
-            }
-            .into());
-        }
-        fs::remove_file(&temporary)?;
-        sync_dir(parent)?;
-        Ok(destination.to_path_buf())
+        promote_bytes(
+            &bytes,
+            &self.recording_id,
+            destination.as_ref(),
+            proof,
+            &source_digest,
+        )
     }
 
     fn ensure_open(&self) -> ProcessCaptureResult<()> {
@@ -504,6 +523,80 @@ impl ProcessCaptureSet {
         self.failed = true;
         Err(error)
     }
+}
+
+fn marker_bytes(markers: &[&str]) -> Vec<Vec<u8>> {
+    markers
+        .iter()
+        .filter(|marker| !marker.is_empty())
+        .map(|marker| marker.as_bytes().to_vec())
+        .collect()
+}
+
+fn read_validated_source(
+    path: &Path,
+    expected_recording_id: Option<&str>,
+    expected_e2e_name: Option<&str>,
+    forbidden_markers: &[Vec<u8>],
+) -> ProcessCaptureResult<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Err(IoError::other("process incident source is not a regular file").into());
+    }
+    let bytes = fs::read(path)?;
+    let value = parse_valid_envelope(&bytes, expected_recording_id, expected_e2e_name)?;
+    scan_incident_value(&value, forbidden_markers)?;
+    Ok(bytes)
+}
+
+fn promote_bytes(
+    bytes: &[u8],
+    recording_id: &str,
+    destination: &Path,
+    proof: &ProcessReplayProof,
+    source_digest: &str,
+) -> ProcessCaptureResult<PathBuf> {
+    if !proof.matched
+        || !valid_nonzero_digest(&proof.fingerprint)
+        || !valid_digest(&proof.source_digest)
+        || proof.source_digest != source_digest
+    {
+        return Err(IoError::other("process capture replay proof is missing").into());
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| IoError::other("process cassette destination has no parent"))?;
+    create_private_dir(parent)?;
+    validate_recording_id(recording_id)?;
+    let temporary = parent.join(format!(".{}.tmp-{}", recording_id, std::process::id()));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    set_open_mode(&mut options, 0o600);
+    let write_result = (|| -> ProcessCaptureResult<()> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        set_mode(&temporary, 0o444)?;
+        File::open(&temporary)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::hard_link(&temporary, destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(if error.kind() == ErrorKind::AlreadyExists {
+            IoError::new(ErrorKind::AlreadyExists, "process cassette is immutable")
+        } else {
+            error
+        }
+        .into());
+    }
+    fs::remove_file(&temporary)?;
+    sync_dir(parent)?;
+    Ok(destination.to_path_buf())
 }
 
 fn create_private_dir(path: &Path) -> ProcessCaptureResult<()> {
@@ -564,6 +657,9 @@ fn validate_stop_observation(stop: &ProcessStopObservation) -> ProcessCaptureRes
     if stop.proof != derived {
         return Err(IoError::other("process stop proof flag is inconsistent").into());
     }
+    if stop.proof && (observed.is_empty() || reaped.is_empty()) {
+        return Err(IoError::other("process stop proof has no observed or reaped PID").into());
+    }
     if stop.proof
         && observed
             .iter()
@@ -571,15 +667,6 @@ fn validate_stop_observation(stop: &ProcessStopObservation) -> ProcessCaptureRes
     {
         return Err(IoError::other("process stop proof omitted an observed PID").into());
     }
-    Ok(())
-}
-
-fn validate_flushed_envelope(
-    bytes: &[u8],
-    expected_recording_id: &str,
-    expected_e2e_name: &str,
-) -> ProcessCaptureResult<()> {
-    let _ = parse_valid_envelope(bytes, Some(expected_recording_id), Some(expected_e2e_name))?;
     Ok(())
 }
 
@@ -607,7 +694,7 @@ fn parse_valid_envelope(
         .get("recording_id")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| IoError::other("process capture recording identity is missing"))?;
-    bounded_text(recording_id.to_owned(), "recording_id")?;
+    validate_recording_id(recording_id)?;
     if expected_recording_id.is_some_and(|expected| expected != recording_id) {
         return Err(IoError::other("process capture recording identity is invalid").into());
     }
@@ -689,11 +776,26 @@ fn parse_valid_envelope(
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| IoError::other("process capture termination is missing"))?;
         bounded_text(termination.to_owned(), "termination")?;
+        let exit_code = process
+            .get("exit_code")
+            .ok_or_else(|| IoError::other("process capture exit code is missing"))?;
+        if !exit_code.is_null() {
+            let exit_code = exit_code
+                .as_i64()
+                .ok_or_else(|| IoError::other("process capture exit code is invalid"))?;
+            if !(i32::MIN as i64..=i32::MAX as i64).contains(&exit_code) {
+                return Err(
+                    IoError::other("process capture exit code is outside its bound").into(),
+                );
+            }
+        }
         if let Some(signal) = process.get("signal") {
-            let signal = signal
-                .as_str()
-                .ok_or_else(|| IoError::other("process capture signal is invalid"))?;
-            bounded_text(signal.to_owned(), "signal")?;
+            if !signal.is_null() {
+                let signal = signal
+                    .as_str()
+                    .ok_or_else(|| IoError::other("process capture signal is invalid"))?;
+                bounded_text(signal.to_owned(), "signal")?;
+            }
         }
         let stdout_hex = process
             .get("stdout_hex")
@@ -789,6 +891,20 @@ fn valid_digest(value: &str) -> bool {
 
 fn valid_nonzero_digest(value: &str) -> bool {
     valid_digest(value) && value.bytes().any(|byte| byte != b'0')
+}
+
+fn validate_recording_id(value: &str) -> ProcessCaptureResult<()> {
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(
+            IoError::other("process capture recording identity is outside its bound").into(),
+        );
+    }
+    Ok(())
 }
 
 fn bounded_text(value: String, field: &str) -> ProcessCaptureResult<String> {

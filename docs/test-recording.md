@@ -103,6 +103,11 @@ child before another startup; `flush` must succeed before the test asserts the
 failure or retries. Config and process records are private `0600` files under
 the ignored run directory, and the final envelope carries a whole-envelope
 digest. This seam records no environment map, JWT, bearer, or live secret.
+Natural exits encode `exit_code` as an integer and `signal` as JSON `null`;
+signal-terminated children encode the inverse. A successful stop proof must
+contain at least one observed and reaped PID, must have no leaked PID, must
+not time out, and must report a durable `flush_status` of `ok`; an empty or
+placeholder proof is rejected and permanently fails that capture run.
 For a tracked startup cassette, the read-only
 `ProcessIncidentReplay::load(path, expected_e2e_name, forbidden_markers)` API
 is the only loader: it checks the schema/version, recording and E2E identity,
@@ -112,11 +117,23 @@ scans the serialized envelope and decoded config/stdout/stderr against the
 forbidden markers before returning a projection. Callers can read only
 `config_label()`, `config_bytes()`, `classification()`, `first_observed()`,
 and `source_digest()`; no unvalidated JSON or process facts are exposed.
-Its `promote_immutable` method requires a non-empty replay fingerprint and the
-exact source digest from the same public replay, then creates a new `0444`
-file without overwriting an existing destination. The public E2E owns the
-semantic assertion represented by that fingerprint; this helper only binds it
-to the exact flushed source and rejects placeholder digests.
+`ProcessIncidentReplay::promote_immutable(destination, proof, forbidden_markers)`
+re-reads that existing flushed raw, revalidates schema/version, recording and
+E2E identity, envelope/config/process integrity, stop proof, and markers, then
+requires the exact `source_digest` plus a non-empty replay fingerprint from the
+same public replay. It creates a new `0444` file with create-new semantics and
+never overwrites or rewrites the raw source. The public E2E owns the semantic
+assertion represented by that fingerprint; this helper only binds it to the
+exact flushed source and rejects placeholder or later-occurrence proofs. The
+live `ProcessCaptureSet::promote_immutable` path uses the same validation and
+promotion primitive before the capture owner exits.
+The shared regression anchors are
+`e2e_process_capture_replays_natural_exit_with_null_signal`,
+`e2e_process_capture_promotes_flushed_raw_after_writer_exit`, and the
+malformed-stop, retry-after-failure, exit-code, and recording-identity
+rejection cases in `tests/process_capture_e2e.rs`. The recovery case spawns a
+writer that exits after durable flush and promotes only from the reloaded raw
+source.
 It is a test module only and must not be imported by production code.
 
 ## 5. Promotion and secret scan
