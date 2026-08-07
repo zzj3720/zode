@@ -1,10 +1,9 @@
 # UI release-pipeline E2E
 
-This directory is an independent black-box harness because the repository has
-no release-test manifest yet. It never imports `zode`, starts no mock router,
-and does not implement a release manager. The release driver supplied to it
-must be the real product release entry that starts the built Server and its
-built-in Endpoint.
+This directory is an independent black-box harness. It never imports `zode`,
+starts no mock router, and does not implement a release manager. The release
+driver supplied to it must be the real product release entry that starts the
+built Server with its built-in Endpoint.
 
 The executable entry is `run_release_e2e.sh`:
 
@@ -16,6 +15,16 @@ ZODE_RELEASE_DRIVER_RELATIVE_PATH=path/to/the/real-release-entry \
 ZODE_RELEASE_UI_URL=http://127.0.0.1:<management-port>/ \
 ./tests/release_e2e/run_release_e2e.sh --promote-incident
 ```
+
+The test channel supplies the existing authentication inputs through
+`ZODE_RELEASE_ACCESS_ASSERTION` (or `_ACCESS_JWT_ASSERTION`) and
+`ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER` (or `_CONTROLLER_BEARER`). Optional
+`ZODE_RELEASE_SERVER_LISTEN` and `ZODE_RELEASE_ENDPOINT_LISTEN` pin the stable
+loopback listeners; otherwise the driver allocates isolated loopback ports.
+Issuer/JWKS/audience configuration is passed by the corresponding
+`ZODE_RELEASE_ACCESS_ISSUER`, `_ACCESS_JWKS_URL`, and `_ACCESS_AUDIENCE`
+variable names. Values are never written to manifests, locators, stop reports,
+logs, or health JSON.
 
 All three revisions must resolve to immutable commits. The harness archives
 each revision into a fresh temporary checkout, builds `web`, `server`, and the
@@ -32,18 +41,26 @@ copy without a shell using this protocol:
 ```text
 <driver> bootstrap --release-root <dir> --artifact <dir> --json
 <driver> stage    --release-root <dir> --artifact <dir> --json
+<driver> promote  --release-root <dir> --json
 <driver> health   --release-root <dir> --json
 <driver> rollback --release-root <dir> --json
 <driver> teardown --release-root <dir> --json
 ```
 
-`bootstrap` must install the baseline without a browser promotion. `stage`
+`bootstrap` must install the baseline without a promotion. `stage`
 must run the real install/readiness gate and leave `current` untouched until
-the browser promotion action. A failed readiness gate must exit non-zero and
-leave `current` byte-for-byte unchanged. The driver owns starting the real
-Server and built-in Endpoint; it must not use a mock HTTP handler. The release
-root is test-owned and must expose `current` and `previous`, each resolving to
-a directory containing the checked manifest.
+the driver `promote` action. A failed readiness gate must exit non-zero and
+leave `current` and `previous` byte-for-byte unchanged. The driver owns
+starting the real Server and built-in Endpoint; it must not use a mock HTTP
+handler. The release root is test-owned and must expose `current` and
+`previous`, each resolving to a directory containing the checked manifest.
+The active `current` process keeps the all-in-one Endpoint runtime store,
+Server control store, catalog identity, controller authority, subject key, and
+secret directory in one run-owned persistent state directory; each promoted or
+rolled-back revision points at those same stores rather than resetting them.
+An independently staged `candidate` receives isolated stores and authority so
+its SQLite ownership cannot conflict with `current`; promotion adopts the
+candidate artifact onto the persistent current stores.
 
 `teardown` must stop and reap every Server/Endpoint child started for the run;
 the harness invokes it on success and failure. The harness independently checks
@@ -71,38 +88,42 @@ The failed-stage Server/Endpoint PIDs, immutable executables, listener ports,
 and HTTP bodies are independently observed before the baseline health check;
 all PIDs observed in either successful or failed staging are rechecked after
 teardown.
-Process discovery uses the kernel-reported executable name, resolved executable
-path, and observed PIDs; it does not require `releaseRoot` to appear in argv.
+Process identity is consumed from `health.processes.locator_paths`, whose files
+must use the exact `zode.e2e.process-locator.v1` contract. Production processes
+do not write these files: the driver creates test-owned locators only after
+binding the Server PID/parent process group and its one known Endpoint child
+by exact installed executable/argv/config/listen, listener ownership, and
+authenticated identity/capabilities. The harness never binds a release
+instance by scanning unrelated same-name processes. Teardown must return one
+or more exact `zode.e2e.process-stop.v1` reports; each `observed_pids` entry
+includes the PID, role, process-group/session identity, executable path, and
+SHA-256 digest, while `reaped_pids`/`leaked_pids` contain only those observed
+PIDs. Every observed instance and PID must be accounted for.
 
 The browser portion only starts after a real management page returns a
-successful document response. It verifies the product shell (`Sessions`,
-`Endpoints`, and `Providers`) before treating absent release controls as a
-behavioral failure. The release UI must expose these black-box DOM semantics:
-
-- `[data-zode-release-current-revision]`
-- `[data-zode-release-previous-revision]`
-- `[data-zode-release-staged-revision]`
-- `[data-zode-release-runtime-revision]`
-- `[data-zode-release-ui-revision]`
-- `[data-zode-release-server-revision]`
-- `[data-zode-release-endpoint-revision]`
-- `[data-zode-release-ui-tree-sha256]`
-- `[data-zode-release-server-binary-sha256]`
-- `[data-zode-release-endpoint-binary-sha256]`
-- an accessible `Promote staged release` button;
-- an accessible `Rollback current release` button.
-
+successful document response. It verifies the product's existing management
+shell and normal Access-protected UI → Server → built-in Endpoint path;
+promotion and rollback are operator driver actions, not browser controls.
+The browser must receive successful `zode.system.v1`, `zode.endpoints.v1`, and
+`zode.providers.v1` responses through the same origin, and the endpoint catalog
+must contain the `local_endpoint_id` from `zode.system.v1`; these are existing
+management routes, not release metadata APIs.
+The product is not required to expose release pointers, component digests, or
+test-only DOM markers. The harness independently reads the selected manifest
+and `current`/`previous` pointers, hashes the served UI tree, and binds the
+observed Server/Endpoint PIDs to their executable digests.
 The test first stages the health-failing build and proves that `current` does
 not change, then stages the candidate and proves it still does not change.
-Only a real browser click may promote it. During promotion the harness watches
-the real release-root filesystem and requires a positive event showing the
+The operator driver then promotes it. During promotion the harness watches the
+real release-root filesystem and requires a positive event showing the
 canonical before and after pointer states; a torn or unparsable
 `current`/`previous` fails the scenario. Only `rename`/`change` events whose
-filename is exactly `current` or `previous` count, and both pointer names
-must be observed after the action.
-It then clicks rollback, reloads the browser entry, and proves that the
+filename is exactly `pointer-state` (the atomic transaction link) count; a
+legacy direct-pointer event is accepted only when its post-event pair is also
+canonical. Both pointer names must be observed after the action.
+It then invokes operator rollback, reloads the browser entry, and proves that the
 baseline is current again, the candidate is previous, and browser runtime
-markers still agree with live health after reload. Packaged UI, Server, and
+document still loads through the normal path after reload. Packaged UI, Server, and
 Endpoint payloads are immutable, hashed before staging, and re-hashed after
 teardown so a driver cannot mutate the staged payload in place.
 
@@ -121,17 +142,23 @@ Exit codes:
   red and is never promoted to a cassette.
 
 For a semantic failure, the harness writes the first post-rule exchange to a
-`0700` quarantine directory under this directory. `--promote-incident` creates
-one new `zode.http-incident-recording.v1` cassette with exclusive creation,
+`0700` directory under `target/test-recordings/quarantine/<run-id>` (or the
+explicit `ZODE_RELEASE_QUARANTINE` test override). `--promote-incident` creates
+one new `zode.http-incident-recording.v1` cassette under this suite's
+`fixtures/incidents/` (or the explicit `ZODE_RELEASE_CASSETTES` test override)
+with exclusive creation,
 allowlisted headers, synthetic slots, an exact binding to the first captured
 failing browser exchange, a whole-envelope SHA-256, and mode `0444`. Secret
 scanning is fail-closed, including configured secret values, headers, all
 recorded fields, and decoded bodies. It never overwrites an existing cassette.
-`--replay <cassette>` validates its unique exact `exchange_sequence`, passes
-that same immutable cassette to the real driver, and repeats the same browser
-entry; replay must reproduce that exact sequence and exchange fingerprints,
-including the original request query, `requestfailed`, and disconnect markers,
-and remain red for the recorded safe reason. Cassette body values must be canonical
+`--replay <cassette>` (with `ZODE_RELEASE_REPLAY_EXPECTATION=red` before a
+repair or `green` after it) validates its unique exact `exchange_sequence`, passes
+that same immutable cassette through a test-owned replay adapter (never to the
+production driver), and repeats the same browser entry. Before the production
+repair the replay must reproduce the exact sequence and exchange fingerprints,
+including the original request query, `requestfailed`, and disconnect markers;
+after the repair the same cassette and named E2E must pass. Cassette body values
+must be canonical
 RFC 4648 base64 before secret scanning. The raw quarantine and cassettes are
 never production inputs.
 
@@ -145,13 +172,10 @@ The harness does not make an LLM request. If the real release path adds one,
 the release driver must route it through the test-owned recorder mandated by
 `docs/test-recording.md`; a direct provider URL is outside this E2E's scope.
 
-Immutable-source premise: the current frozen `HEAD` has only 39 tracked
-files. The harness obtains every candidate source with `git archive` of its
-canonical commit; it never copies a dirty candidate worktree or fills an
-archive from uncommitted files. The candidate worktree currently contains
-many uncommitted files, but the current `HEAD` archive lacks the real driver,
-build manifests, UI entry, and current/previous release store
-(`web/package.json`, `server/Cargo.toml`, and related tracked inputs). The
-command must remain `78` BLOCKED on that missing immutable source surface,
-even if the dirty worktree happens to contain those files; it must not copy
-them and must not create a fabricated 404/compile cassette.
+Immutable-source premise: the harness obtains every candidate source with
+`git archive` of its canonical commit; it never copies a dirty candidate
+worktree or fills an archive from uncommitted files. Every revision must carry
+the complete tracked build surface, including the release driver path. A
+revision missing that surface remains `78` BLOCKED even if the dirty worktree
+happens to contain the files; the harness must not copy them or create a
+fabricated 404/compile cassette.

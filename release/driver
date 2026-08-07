@@ -1,0 +1,1582 @@
+#!/usr/bin/env node
+
+/*
+ * The release driver deliberately has no dependency on the application
+ * crates.  It is an operator-facing process boundary: an artifact is checked
+ * before it is copied, pointers are switched with one atomic transaction-link
+ * rename(2), and the Server-owned Endpoint child is bound to the same run.
+ */
+const {
+  chmodSync,
+  closeSync,
+  cpSync,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} = require("node:fs");
+const { createHash, randomBytes, randomUUID } = require("node:crypto");
+const { spawn, spawnSync } = require("node:child_process");
+const { request: httpRequest } = require("node:http");
+const netModule = require("node:net");
+const { basename, dirname, isAbsolute, join, relative, resolve, sep } = require("node:path");
+
+const ARTIFACT_SCHEMA = "zode.release-artifact.v1";
+const LOCATOR_SCHEMA = "zode.e2e.process-locator.v1";
+const STOP_SCHEMA = "zode.e2e.process-stop.v1";
+const MAX_MANIFEST_BYTES = 256 * 1024;
+const MAX_HTTP_BYTES = 2 * 1024 * 1024;
+const READINESS_MS = 20_000;
+const STOP_MS = 5_000;
+const POINTERS = new Set(["current", "previous", "staged"]);
+const FORBIDDEN_ENV = [
+  "ZODE_RELEASE_REPLAY_CASSETTE",
+  "ZODE_RELEASE_REPLAY_EXPECTATION",
+  "ZODE_RELEASE_REPLAY_ADAPTER",
+  "ZODE_RELEASE_SECRET_VALUES_JSON",
+  "ZODE_RELEASE_QUARANTINE",
+  "ZODE_RELEASE_CASSETTES",
+  "ZODE_RELEASE_E2E_OWNER",
+  "ZODE_RELEASE_E2E_NAME",
+  "ZODE_RELEASE_DRIVER_ARGS_JSON",
+  "ZODE_RELEASE_TEST_MODE",
+  "ZODE_RELEASE_RECORDER",
+  "ZODE_RELEASE_E2E_MODE",
+];
+
+function validRevision(value) {
+  return typeof value === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value);
+}
+
+class DriverError extends Error {
+  constructor(code, message, details = {}, status = 1) {
+    super(message);
+    this.code = code;
+    this.details = details;
+    this.status = status;
+  }
+}
+
+function fail(code, message, details = {}, status = 1) {
+  throw new DriverError(code, message, details, status);
+}
+
+function now() {
+  return Date.now();
+}
+
+function jsonBytes(value) {
+  return Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function sha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function ensureDirectory(path, mode = 0o700) {
+  const value = resolve(path);
+  const existing = statOrNull(value);
+  if (existing?.isSymbolicLink()) {
+    fail("release_path_invalid", "release state directory must not be a symlink", { path: value });
+  }
+  mkdirSync(value, { recursive: true, mode });
+  const checked = statOrNull(value);
+  if (!checked || !checked.isDirectory() || checked.isSymbolicLink()) {
+    fail("release_path_invalid", "release state path is not a regular directory", { path: value });
+  }
+  chmodSync(value, mode);
+  return value;
+}
+
+function statOrNull(path) {
+  try { return lstatSync(path); } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function contained(root, candidate) {
+  const rel = relative(resolve(root), resolve(candidate));
+  return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+}
+
+function canonicalDirectory(path, label) {
+  const value = resolve(path);
+  const stat = statOrNull(value);
+  if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) {
+    fail("release_root_invalid", `${label} must be a regular directory`, { path: value });
+  }
+  let real;
+  try { real = realpathSync(value); } catch (error) {
+    fail("release_root_invalid", `${label} cannot be resolved`, { path: value, error: String(error) });
+  }
+  if (real !== value) fail("release_root_invalid", `${label} must not resolve through a symlink`, { path: value });
+  return value;
+}
+
+function regularFile(path, label, immutable = false) {
+  const stat = statOrNull(path);
+  if (!stat || !stat.isFile() || stat.isSymbolicLink()) {
+    fail("release_artifact_invalid", `${label} must be a regular file`, { path });
+  }
+  if (immutable && (stat.mode & 0o222) !== 0) {
+    fail("release_artifact_invalid", `${label} must be immutable`, { path });
+  }
+  return stat;
+}
+
+function immutableTree(path, label) {
+  const stat = statOrNull(path);
+  if (!stat || stat.isSymbolicLink() || !stat.isDirectory()) {
+    fail("release_artifact_invalid", `${label} must be an immutable directory`, { path });
+  }
+  if ((stat.mode & 0o222) !== 0) fail("release_artifact_invalid", `${label} is writable`, { path });
+  for (const name of readdirSync(path).sort()) {
+    const child = join(path, name);
+    const childStat = statOrNull(child);
+    if (!childStat || childStat.isSymbolicLink()) fail("release_artifact_invalid", `${label} contains a symlink`, { path: child });
+    if ((childStat.mode & 0o222) !== 0) fail("release_artifact_invalid", `${label} contains a writable entry`, { path: child });
+    if (childStat.isDirectory()) immutableTree(child, label);
+    else if (!childStat.isFile()) fail("release_artifact_invalid", `${label} contains a non-regular entry`, { path: child });
+  }
+}
+
+function treeDigest(path) {
+  const entries = [];
+  function visit(root, relRoot) {
+    for (const name of readdirSync(root).sort()) {
+      const absolute = join(root, name);
+      const rel = join(relRoot, name);
+      const stat = statOrNull(absolute);
+      if (!stat || stat.isSymbolicLink() || (stat.mode & 0o222) !== 0) {
+        fail("release_artifact_invalid", "UI tree is not immutable", { path: absolute });
+      }
+      if (stat.isDirectory()) visit(absolute, rel);
+      else if (stat.isFile()) entries.push({ path: rel, mode: stat.mode & 0o777, sha256: sha256(readFileSync(absolute)) });
+      else fail("release_artifact_invalid", "UI tree contains a non-regular entry", { path: absolute });
+    }
+  }
+  const root = statOrNull(path);
+  if (!root || !root.isDirectory() || root.isSymbolicLink() || (root.mode & 0o222) !== 0) {
+    fail("release_artifact_invalid", "UI tree root is not immutable", { path });
+  }
+  visit(path, "");
+  return sha256(jsonBytes(entries));
+}
+
+function assertPath(artifact, value, expected) {
+  if (value !== expected || resolve(artifact, value) !== join(artifact, expected)) {
+    fail("release_manifest_mismatch", `${expected} manifest path is not canonical`, { expected, observed: value });
+  }
+  return join(artifact, expected);
+}
+
+function validateManifest(artifactPath) {
+  const artifact = canonicalDirectory(artifactPath, "artifact");
+  const artifactStat = statOrNull(artifact);
+  if (!artifactStat || (artifactStat.mode & 0o222) !== 0) {
+    fail("release_manifest_mismatch", "artifact root must be immutable", { path: artifact });
+  }
+  const manifestPath = join(artifact, "manifest.json");
+  const manifestStat = regularFile(manifestPath, "manifest", true);
+  if (manifestStat.size > MAX_MANIFEST_BYTES) fail("release_manifest_mismatch", "manifest exceeds its bound", { bytes: manifestStat.size });
+  let manifest;
+  try { manifest = JSON.parse(readFileSync(manifestPath, "utf8")); } catch (error) {
+    fail("release_manifest_mismatch", "manifest is not valid JSON", { error: String(error) });
+  }
+  const { manifest_sha256: digest, ...withoutDigest } = manifest ?? {};
+  if (typeof digest !== "string" || sha256(jsonBytes(withoutDigest)) !== digest) {
+    fail("release_manifest_mismatch", "manifest envelope digest does not match");
+  }
+  if (manifest.schema !== ARTIFACT_SCHEMA || !validRevision(manifest.revision)) {
+    fail("release_manifest_mismatch", "manifest schema or revision is invalid");
+  }
+  if (!manifest.source || manifest.source.kind !== "git-archive"
+      || manifest.source.revision !== manifest.revision
+      || !/^[a-f0-9]{64}$/.test(String(manifest.source.tree_sha256 ?? ""))
+      || manifest.binding?.source_tree_sha256 !== manifest.source.tree_sha256) {
+    fail("release_manifest_mismatch", "manifest does not bind the immutable archived source tree");
+  }
+  const names = Object.keys(manifest.components ?? {}).sort();
+  if (JSON.stringify(names) !== JSON.stringify(["endpoint", "server", "ui"])) {
+    fail("release_manifest_mismatch", "manifest must bind exactly UI, Server and Endpoint");
+  }
+  const components = manifest.components;
+  const binding = manifest.binding;
+  if (!binding || binding.revision !== manifest.revision
+      || typeof binding.ui_tree_sha256 !== "string"
+      || typeof binding.server_binary_sha256 !== "string"
+      || typeof binding.endpoint_binary_sha256 !== "string"
+      || typeof binding.driver_binary_sha256 !== "string") {
+    fail("release_manifest_mismatch", "manifest has no complete revision binding");
+  }
+  for (const [name, expectedKind, digestKey] of [
+    ["ui", "tree", "ui_tree_sha256"],
+    ["server", "binary", "server_binary_sha256"],
+    ["endpoint", "binary", "endpoint_binary_sha256"],
+  ]) {
+    const component = components[name];
+    if (!component || component.kind !== expectedKind || component.revision !== manifest.revision
+        || component[digestKey] !== binding[digestKey]) {
+      fail("release_manifest_mismatch", `${name} component is not bound to the manifest revision`);
+    }
+  }
+  const driver = manifest.driver;
+  if (!driver || driver.kind !== "executable" || driver.path !== "release-driver"
+      || driver.revision !== manifest.revision || driver.binary_sha256 !== binding.driver_binary_sha256) {
+    fail("release_manifest_mismatch", "release driver is not bound to the artifact");
+  }
+  const ui = assertPath(artifact, components.ui.path, "ui");
+  const server = assertPath(artifact, components.server.path, "zode-server");
+  const endpoint = assertPath(artifact, components.endpoint.path, "zode");
+  const driverPath = assertPath(artifact, driver.path, "release-driver");
+  immutableTree(ui, "UI artifact tree");
+  if (treeDigest(ui) !== components.ui.tree_sha256) fail("release_manifest_mismatch", "UI tree digest does not match manifest");
+  for (const [path, expected, label] of [
+    [server, components.server.binary_sha256, "Server binary"],
+    [endpoint, components.endpoint.binary_sha256, "Endpoint binary"],
+    [driverPath, driver.binary_sha256, "release driver"],
+  ]) {
+    const stat = regularFile(path, label, true);
+    if ((stat.mode & 0o111) === 0 || sha256(readFileSync(path)) !== expected) {
+      fail("release_manifest_mismatch", `${label} digest or executable mode does not match manifest`, { path });
+    }
+  }
+  return { artifact, manifest, manifestPath, digest, paths: { ui, server, endpoint, driver: driverPath } };
+}
+
+function fsyncDirectory(path) {
+  try { const fd = openSync(path, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } } catch { /* best effort on macOS */ }
+}
+
+function exclusiveJson(path, value, mode = 0o600) {
+  const fd = openSync(path, "wx", mode);
+  try { writeFileSync(fd, jsonBytes(value)); fsyncSync(fd); } finally { closeSync(fd); }
+  chmodSync(path, mode);
+}
+
+function writeText(path, value, mode = 0o600) {
+  writeFileSync(path, value, { mode });
+  chmodSync(path, mode);
+}
+
+function privateFile(path, value, mode = 0o600) {
+  const existing = statOrNull(path);
+  if (existing) {
+    if (!existing.isFile() || existing.isSymbolicLink() || (existing.mode & 0o077) !== 0) {
+      fail("release_state_invalid", "persistent private file is not a restricted regular file", { path });
+    }
+    return;
+  }
+  const fd = openSync(path, "wx", mode);
+  try { writeFileSync(fd, value); fsyncSync(fd); } finally { closeSync(fd); }
+  chmodSync(path, mode);
+}
+
+function validatePrivateTree(path) {
+  const stat = statOrNull(path);
+  if (!stat || !stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
+    fail("release_state_invalid", "private state directory is not restricted", { path });
+  }
+  for (const name of readdirSync(path)) {
+    const child = join(path, name);
+    const childStat = statOrNull(child);
+    if (!childStat || childStat.isSymbolicLink()) {
+      fail("release_state_invalid", "private state contains a symlink or missing entry", { path: child });
+    }
+    if (childStat.isDirectory()) validatePrivateTree(child);
+    else if (!childStat.isFile() || (childStat.mode & 0o077) !== 0) {
+      fail("release_state_invalid", "private state contains an unrestricted entry", { path: child });
+    }
+  }
+}
+
+function removeIfExists(path) {
+  try { unlinkSync(path); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+}
+
+function pointerPath(root, name) {
+  if (!POINTERS.has(name)) fail("release_pointer_invalid", "pointer name is not canonical", { name });
+  return join(root, name);
+}
+
+const POINTER_STATE_LINK = "pointer-state";
+
+function pointerStatePath(root) {
+  return join(root, POINTER_STATE_LINK);
+}
+
+function assertPointerStateRoot(root, stateRoot) {
+  if (!contained(root, stateRoot) || !basename(stateRoot).startsWith(".pointer-state.")) {
+    fail("release_pointer_invalid", "pointer-state transaction directory is outside the driver-owned namespace", { path: stateRoot });
+  }
+  return stateRoot;
+}
+
+function pointerAliasTarget(root, name, path) {
+  const stateLink = pointerStatePath(root);
+  const stateStat = statOrNull(stateLink);
+  if (!stateStat || !stateStat.isSymbolicLink()) return null;
+  let stateRoot;
+  try {
+    stateRoot = realpathSync(stateLink);
+  } catch (error) {
+    fail("release_pointer_invalid", "pointer-state transaction link cannot be resolved", { error: String(error) });
+  }
+  assertPointerStateRoot(root, stateRoot);
+  const alias = readlinkSync(path);
+  if (alias !== `${POINTER_STATE_LINK}/${name}`) return null;
+  const target = join(stateRoot, name);
+  if (!statOrNull(target)) return { missing: true, stateRoot };
+  return { target, stateRoot };
+}
+
+function pointerTarget(root, name, allowMissing = true) {
+  const path = pointerPath(root, name);
+  const stat = statOrNull(path);
+  if (!stat) { if (allowMissing) return null; fail("release_pointer_invalid", `${name} pointer is missing`); }
+  let target = path;
+  try {
+    if (stat.isSymbolicLink()) {
+      const alias = pointerAliasTarget(root, name, path);
+      if (alias?.missing) {
+        if (allowMissing) return null;
+        fail("release_pointer_invalid", `${name} pointer is missing`);
+      }
+      target = realpathSync(path);
+    }
+  } catch (error) {
+    fail("release_pointer_invalid", `${name} pointer cannot be resolved`, { error: String(error) });
+  }
+  if (!contained(root, target)) fail("release_pointer_invalid", `${name} pointer resolves outside release root`);
+  try {
+    // A pointer is an artifact admission boundary, not just a self-signed
+    // JSON label.  Re-run the complete immutable component/digest check so a
+    // same-revision manifest replacement cannot detach health from payload.
+    const record = validateManifest(target);
+    return { path, target, manifest: record.manifest, manifestPath: record.manifestPath, digest: record.digest };
+  } catch (error) {
+    if (error instanceof DriverError) {
+      fail("release_pointer_invalid", `${name} pointer artifact failed immutable validation`, { cause: error.code, details: error.details });
+    }
+    throw error;
+  }
+}
+
+function pointerIdentity(value) {
+  return value ? { revision: value.manifest.revision, manifest_sha256: sha256(readFileSync(value.manifestPath)) } : { revision: null, manifest_sha256: null };
+}
+
+function pointerLink(root, name, target) {
+  const path = pointerPath(root, name);
+  const temp = join(root, `.${name}.next-${randomUUID()}`);
+  const rel = relative(root, target) || ".";
+  symlinkSync(rel, temp, "dir");
+  try { renameSync(temp, path); } catch (error) { removeIfExists(temp); throw error; }
+  fsyncDirectory(root);
+}
+
+function ensurePointerLayout(root) {
+  const stateLink = pointerStatePath(root);
+  const current = pointerPath(root, "current");
+  const previous = pointerPath(root, "previous");
+  const stateStat = statOrNull(stateLink);
+  if (!stateStat) {
+    const emptyState = join(root, `.${POINTER_STATE_LINK}.initial-${randomUUID()}`);
+    mkdirSync(emptyState, { mode: 0o755 });
+    chmodSync(emptyState, 0o755);
+    const nextState = join(root, `.${POINTER_STATE_LINK}.next-${randomUUID()}`);
+    symlinkSync(relative(root, emptyState), nextState, "dir");
+    try { renameSync(nextState, stateLink); } catch (error) { removeIfExists(nextState); throw error; }
+    fsyncDirectory(root);
+  } else if (!stateStat.isSymbolicLink()) {
+    fail("release_pointer_invalid", "pointer-state must be a symbolic transaction link");
+  } else {
+    let stateRoot;
+    try { stateRoot = realpathSync(stateLink); } catch (error) { fail("release_pointer_invalid", "pointer-state transaction link cannot be resolved", { error: String(error) }); }
+    assertPointerStateRoot(root, stateRoot);
+  }
+  for (const name of ["current", "previous"]) {
+    const path = name === "current" ? current : previous;
+    const stat = statOrNull(path);
+    if (!stat) {
+      const temp = join(root, `.${name}.alias-${randomUUID()}`);
+      symlinkSync(`${POINTER_STATE_LINK}/${name}`, temp, "dir");
+      try { renameSync(temp, path); } catch (error) { removeIfExists(temp); throw error; }
+    } else if (!stat.isSymbolicLink() || readlinkSync(path) !== `${POINTER_STATE_LINK}/${name}`) {
+      fail("release_pointer_invalid", `${name} pointer is not the canonical transaction alias`);
+    }
+  }
+  fsyncDirectory(root);
+}
+
+/* current/previous are stable aliases into one immutable pointer-state
+ * directory.  Promotion replaces only pointer-state, so readers never see a
+ * pair assembled from two different revisions. */
+function switchPointers(root, currentTarget, previousTarget) {
+  ensurePointerLayout(root);
+  const stateLink = pointerStatePath(root);
+  const oldState = statOrNull(stateLink)?.isSymbolicLink()
+    ? assertPointerStateRoot(root, realpathSync(stateLink))
+    : null;
+  const nextState = join(root, `.${POINTER_STATE_LINK}.next-${randomUUID()}`);
+  const stateDirectory = join(root, `.${POINTER_STATE_LINK}.set-${randomUUID()}`);
+  mkdirSync(stateDirectory, { mode: 0o700 });
+  const currentRel = relative(stateDirectory, currentTarget) || ".";
+  const previousRel = previousTarget ? (relative(stateDirectory, previousTarget) || ".") : null;
+  symlinkSync(currentRel, join(stateDirectory, "current"), "dir");
+  if (previousRel) symlinkSync(previousRel, join(stateDirectory, "previous"), "dir");
+  chmodSync(stateDirectory, 0o755);
+  // Persist the complete transaction directory before publishing its link.
+  // The link rename is the visibility boundary; without this fsync a crash
+  // can leave a durable pointer-state link to an unpersisted directory.
+  fsyncDirectory(stateDirectory);
+  symlinkSync(relative(root, stateDirectory), nextState, "dir");
+  try {
+    renameSync(nextState, stateLink);
+  } catch (error) {
+    removeIfExists(nextState);
+    chmodSync(stateDirectory, 0o700);
+    rmSync(stateDirectory, { recursive: true, force: true });
+    throw error;
+  }
+  fsyncDirectory(root);
+  if (oldState && contained(root, oldState) && oldState !== stateDirectory) {
+    // Cleanup is post-commit housekeeping.  A read-only/temporarily busy old
+    // transaction must not turn a committed pointer switch into an error or
+    // leave the caller to guess which revision is live.
+    try {
+      chmodSync(oldState, 0o700);
+      rmSync(oldState, { recursive: true, force: true });
+    } catch { /* retain old transaction for a later safe cleanup */ }
+  }
+}
+
+function copyImmutableTree(source, destination) {
+  const sourceStat = statOrNull(source);
+  if (!sourceStat || sourceStat.isSymbolicLink()) fail("release_artifact_invalid", "artifact contains a symlink", { path: source });
+  if (sourceStat.isDirectory()) {
+    mkdirSync(destination, { mode: 0o755 });
+    for (const name of readdirSync(source).sort()) copyImmutableTree(join(source, name), join(destination, name));
+    chmodSync(destination, 0o555);
+  } else if (sourceStat.isFile()) {
+    cpSync(source, destination, { force: false, errorOnExist: true });
+    chmodSync(destination, sourceStat.mode & 0o555);
+  } else fail("release_artifact_invalid", "artifact contains a non-regular entry", { path: source });
+}
+
+function installArtifact(root, artifactRecord) {
+  const id = `${artifactRecord.manifest.revision}-${artifactRecord.digest.slice(0, 16)}`;
+  const releases = join(root, "releases");
+  ensureDirectory(releases, 0o700);
+  const destination = join(releases, id);
+  const existing = statOrNull(destination);
+  if (existing) {
+    if (!existing.isDirectory() || existing.isSymbolicLink()) fail("release_install_invalid", "installed artifact path is not a directory", { path: destination });
+    const checked = validateManifest(destination);
+    if (checked.digest !== artifactRecord.digest) fail("release_install_invalid", "installed artifact digest differs from the requested artifact");
+    return { ...artifactRecord, installPath: destination, installId: id };
+  }
+  const temp = join(releases, `.${id}.install-${randomUUID()}`);
+  ensureDirectory(temp, 0o700);
+  try {
+    for (const name of ["ui", "zode-server", "zode", "release-driver", "manifest.json"]) {
+      copyImmutableTree(join(artifactRecord.artifact, name), join(temp, name));
+    }
+    chmodSync(temp, 0o555);
+    renameSync(temp, destination);
+    fsyncDirectory(releases);
+  } catch (error) {
+    rmSync(temp, { recursive: true, force: true });
+    throw error;
+  }
+  return { ...artifactRecord, installPath: destination, installId: id };
+}
+
+function commandOutput(command, args) {
+  const result = spawnSync(command, args, {
+    stdio: ["ignore", "pipe", "ignore"],
+    encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024,
+    timeout: 5_000,
+  });
+  if (result.error || result.status !== 0) return "";
+  return String(result.stdout ?? "").trim();
+}
+
+async function processIdentity(pid) {
+  const output = await commandOutput("ps", ["-p", String(pid), "-o", "pgid=,sid="]);
+  const parts = output.trim().split(/\s+/);
+  if (parts.length < 2 || !/^\d+$/.test(parts[0]) || !/^\d+$/.test(parts[1])) return null;
+  return { process_group_id: Number(parts[0]), session_id: parts[1] };
+}
+
+function isAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (error) { return error?.code === "EPERM"; }
+}
+
+function sleep(ms) { return new Promise((resolvePromise) => setTimeout(resolvePromise, ms)); }
+
+function probeHttp(url, headers = {}) {
+  return new Promise((resolvePromise) => {
+    let settled = false;
+    const finish = (value) => { if (!settled) { settled = true; resolvePromise(value); } };
+    let parsed;
+    try { parsed = new URL(url); } catch { finish({ status: 0, body: Buffer.alloc(0), error: "invalid_url" }); return; }
+    const request = httpRequest({ hostname: parsed.hostname, port: parsed.port, path: `${parsed.pathname}${parsed.search}`, method: "GET", headers, timeout: 4_000 }, (response) => {
+      const chunks = []; let size = 0;
+      response.on("data", (chunk) => { size += chunk.length; if (size <= MAX_HTTP_BYTES) chunks.push(chunk); });
+      response.on("end", () => finish({ status: response.statusCode ?? 0, body: Buffer.concat(chunks), error: size > MAX_HTTP_BYTES ? "oversize" : null }));
+    });
+    request.on("error", (error) => finish({ status: 0, body: Buffer.alloc(0), error: String(error) }));
+    request.on("timeout", () => { request.destroy(); finish({ status: 0, body: Buffer.alloc(0), error: "timeout" }); });
+    request.end();
+  });
+}
+
+function parseJsonBody(observation) {
+  if (!observation.body.length || observation.error) return null;
+  try { return JSON.parse(observation.body.toString("utf8")); } catch { return null; }
+}
+
+function probeHeaders(role, secret) {
+  if (role === "server" || role === "ui") {
+    const value = process.env.ZODE_RELEASE_ACCESS_ASSERTION || process.env.ZODE_RELEASE_ACCESS_JWT_ASSERTION;
+    return value ? { "Cf-Access-Jwt-Assertion": value } : {};
+  }
+  const value = process.env.ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER || process.env.ZODE_RELEASE_CONTROLLER_BEARER || secret;
+  return value ? { authorization: `Bearer ${value}` } : {};
+}
+
+async function probeInstance(instance) {
+  const server = await probeHttp(instance.probes.server_url, probeHeaders("server"));
+  const endpoint = await probeHttp(instance.probes.endpoint_url, probeHeaders("endpoint", instance.endpointSecret));
+  const ui = await probeHttp(instance.probes.ui_url, probeHeaders("ui"));
+  const serverBody = parseJsonBody(server);
+  const endpointBody = parseJsonBody(endpoint);
+  const serverReady = server.status >= 200 && server.status < 300
+    && serverBody?.schema === "zode.system.v1"
+    // An installed release must expose the built-in Endpoint through the
+    // composed Server process.  A server_only response is a valid development
+    // mode, but it is not release readiness and must never be promoted.
+    && serverBody.deployment === "all_in_one"
+    && typeof serverBody.local_endpoint_id === "string"
+    && serverBody.ingress?.management_auth === "cloudflare_access"
+    && serverBody.ingress?.callback_origin === "separate";
+  const endpointReady = endpoint.status >= 200 && endpoint.status < 300
+    && endpointBody?.schema === "zode.endpoint-health.v1"
+    && typeof endpointBody.protocol_version === "string"
+    && typeof endpointBody.endpoint_id === "string"
+    && endpointBody.status === "ready";
+  const uiReady = ui.status >= 200 && ui.status < 300 && /(?:<!doctype\s+html|<html\b|<body\b|<script\b)/i.test(ui.body.toString("utf8"));
+  return {
+    status: serverReady && endpointReady && uiReady ? "ok" : "failed",
+    source: "live_process",
+    checks: { ui: uiReady ? "ok" : "failed", server: serverReady ? "ok" : "failed", endpoint: endpointReady ? "ok" : "failed" },
+    observations: { ui: ui.status, server: server.status, endpoint: endpoint.status },
+    ready: serverReady && endpointReady && uiReady,
+  };
+}
+
+function componentHealth(artifact) {
+  const c = artifact.manifest.components;
+  return {
+    revision: artifact.manifest.revision,
+    ui_revision: c.ui.revision,
+    server_revision: c.server.revision,
+    endpoint_revision: c.endpoint.revision,
+    ui_tree_sha256: c.ui.tree_sha256,
+    server_binary_sha256: c.server.binary_sha256,
+    endpoint_binary_sha256: c.endpoint.binary_sha256,
+  };
+}
+
+function healthPayload(instance, probe) {
+  const components = instance.artifact.manifest.components;
+  return {
+    status: probe.status,
+    source: "live_process",
+    checks: probe.checks,
+    ui_mode: "assets",
+    ui_assets_directory: "ui",
+    revision: instance.artifact.manifest.revision,
+    components: {
+      ui: { revision: components.ui.revision, tree_sha256: components.ui.tree_sha256 },
+      server: { revision: components.server.revision, binary_sha256: components.server.binary_sha256 },
+      endpoint: { revision: components.endpoint.revision, binary_sha256: components.endpoint.binary_sha256 },
+    },
+    probes: { server_url: instance.probes.server_url, endpoint_url: instance.probes.endpoint_url },
+    processes: { locator_paths: instance.roles.map((role) => role.locatorPath) },
+  };
+}
+
+function statePath(root, instanceId) { return join(root, "instances", instanceId, "state.json"); }
+function stopReportPath(root, instanceId) { return join(root, "stop-reports", `${instanceId}.json`); }
+
+function persistStopReport(root, report) {
+  const directory = ensureDirectory(join(root, "stop-reports"), 0o700);
+  const path = stopReportPath(root, report.instance_id);
+  // A release instance has one first stop admission.  Preserve that report
+  // as the run-owned ledger even after its runtime directory is discarded;
+  // promotion/rollback teardown must account for every instance it observed.
+  if (statOrNull(path)) return;
+  const temporary = `${path}.next-${randomUUID()}`;
+  exclusiveJson(temporary, report, 0o600);
+  renameSync(temporary, path);
+  fsyncDirectory(directory);
+}
+
+function persistState(root, instance) {
+  const persisted = {
+    ...instance,
+    endpointSecret: undefined,
+    // State survives beyond the immutable source checkout.  Keep only the
+    // installed artifact identity needed for health/teardown; never retain a
+    // path into the harness's temporary or dirty worktree as a restart input.
+    artifact: instance.artifact
+      ? {
+        manifest: instance.artifact.manifest,
+        digest: instance.artifact.digest,
+        installPath: instance.artifact.installPath,
+      }
+      : undefined,
+  };
+  const path = statePath(root, instance.instance_id);
+  const temporary = `${path}.next-${randomUUID()}`;
+  exclusiveJson(temporary, persisted, 0o600);
+  renameSync(temporary, path);
+  fsyncDirectory(dirname(path));
+}
+
+function ownedPath(root, value, label, { directory = false, privateFile = false } = {}) {
+  if (typeof value !== "string" || !isAbsolute(value)) {
+    fail("release_state_invalid", `${label} must be an absolute path`);
+  }
+  const stat = statOrNull(value);
+  if (!stat || stat.isSymbolicLink() || (directory ? !stat.isDirectory() : !stat.isFile())) {
+    fail("release_state_invalid", `${label} must be a regular ${directory ? "directory" : "file"}`, { path: value });
+  }
+  if (privateFile && (stat.mode & 0o077) !== 0) {
+    fail("release_state_invalid", `${label} must be private`, { path: value });
+  }
+  let real;
+  try { real = realpathSync(value); } catch (error) {
+    fail("release_state_invalid", `${label} cannot be resolved`, { error: String(error) });
+  }
+  if (!contained(root, real)) {
+    fail("release_state_invalid", `${label} resolves outside the release root`, { path: value });
+  }
+  return real;
+}
+
+function assertLoopbackProbe(value, label, pathName) {
+  let parsed;
+  try { parsed = new URL(value); } catch {
+    fail("release_state_invalid", `${label} is not a valid probe URL`);
+  }
+  if (parsed.protocol !== "http:" || !["127.0.0.1", "localhost", "::1"].includes(parsed.hostname)
+      || parsed.pathname !== pathName || parsed.username || parsed.password) {
+    fail("release_state_invalid", `${label} must be a loopback ${pathName} URL`);
+  }
+}
+
+function readState(path, root, instanceName) {
+  if (!/^(?:current|candidate)-[a-f0-9]{12}-[0-9a-f-]{36}$/.test(instanceName)) {
+    fail("release_state_invalid", "instance directory name is not a driver-issued identifier");
+  }
+  const expectedDirectory = join(root, "instances", instanceName);
+  if (resolve(path) !== resolve(join(expectedDirectory, "state.json"))) {
+    fail("release_state_invalid", "instance state path is outside its instance directory");
+  }
+  ownedPath(root, expectedDirectory, "instance directory", { directory: true });
+  ownedPath(root, path, "instance state", { privateFile: true });
+  let value;
+  try { value = JSON.parse(readFileSync(path, "utf8")); } catch (error) {
+    fail("release_state_invalid", "instance state is not valid JSON", { path, error: String(error) });
+  }
+  if (!value || value.schema !== "zode.release-instance.v1" || !Array.isArray(value.roles)
+      || value.instance_id !== instanceName || !["current", "candidate"].includes(value.kind)
+      || value.directory !== expectedDirectory) {
+    fail("release_state_invalid", "instance state is invalid", { path });
+  }
+  ownedPath(root, value.directory, "instance directory", { directory: true });
+  ownedPath(root, value.endpoint_secret_path, "endpoint controller secret", { privateFile: true });
+  ownedPath(root, value.persistent_directory, "persistent state directory", { directory: true });
+  if (!value.artifact || typeof value.artifact !== "object" || typeof value.artifact.installPath !== "string"
+      || !validRevision(value.artifact.manifest?.revision) || !/^[a-f0-9]{64}$/.test(value.artifact.digest)) {
+    fail("release_state_invalid", "instance state has no valid installed artifact identity");
+  }
+  const artifactPath = ownedPath(root, value.artifact.installPath, "installed artifact", { directory: true });
+  const checkedArtifact = validateManifest(artifactPath);
+  if (checkedArtifact.manifest.revision !== value.artifact.manifest.revision || checkedArtifact.digest !== value.artifact.digest) {
+    fail("release_state_invalid", "instance state artifact does not match its immutable install");
+  }
+  assertLoopbackProbe(value.probes?.server_url, "server probe", "/v1/system");
+  assertLoopbackProbe(value.probes?.endpoint_url, "endpoint probe", "/v1/health");
+  assertLoopbackProbe(value.probes?.ui_url, "UI probe", "/");
+  if (!Array.isArray(value.roles)) fail("release_state_invalid", "instance state roles are invalid");
+  for (const role of value.roles) {
+    if (!role || !["server", "endpoint"].includes(role.role)
+        || !Number.isSafeInteger(role.pid) || role.pid <= 0
+        || !Number.isSafeInteger(role.process_group_id) || role.process_group_id <= 0
+        || typeof role.session_id !== "string" || !/^\d+$/.test(role.session_id)
+        || typeof role.executablePath !== "string" || !isAbsolute(role.executablePath)) {
+      fail("release_state_invalid", "instance state role identity is invalid");
+    }
+    const executable = ownedPath(root, role.executablePath, `${role.role} executable`);
+    if (!contained(artifactPath, executable)) fail("release_state_invalid", `${role.role} executable is outside its artifact`);
+    const expectedExecutable = join(artifactPath, role.role === "server" ? "zode-server" : "zode");
+    if (executable !== realpathSync(expectedExecutable)) {
+      fail("release_state_invalid", `${role.role} executable is not the manifest component`, { path: role.executablePath });
+    }
+    if (role.locatorPath !== undefined) {
+      const locator = ownedPath(root, role.locatorPath, `${role.role} locator`, { privateFile: false });
+      const locatorStat = statOrNull(locator);
+      if (!locatorStat || (locatorStat.mode & 0o222) !== 0 || (locatorStat.mode & 0o777) !== 0o444) {
+        fail("release_state_invalid", `${role.role} locator is not immutable`, { path: role.locatorPath });
+      }
+    }
+  }
+  if (!value.endpointSecret && value.endpoint_secret_path) {
+    try { value.endpointSecret = readFileSync(value.endpoint_secret_path, "utf8").trim(); } catch { value.endpointSecret = ""; }
+  }
+  if (!value.endpointSecret) fail("release_state_invalid", "instance controller secret is empty");
+  return value;
+}
+
+function allStates(root) {
+  const dir = join(root, "instances");
+  const dirStat = statOrNull(dir);
+  if (!dirStat) return [];
+  if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) fail("release_state_invalid", "instances root is not a regular directory");
+  return readdirSync(dir).sort().flatMap((name) => {
+    const instanceDirectory = join(dir, name);
+    const instanceStat = statOrNull(instanceDirectory);
+    if (!instanceStat || !instanceStat.isDirectory() || instanceStat.isSymbolicLink()) {
+      fail("release_state_invalid", "instance entry is not a regular directory", { path: instanceDirectory });
+    }
+    const path = statePath(root, name);
+    if (!statOrNull(path)) fail("release_state_invalid", "instance directory has no state file", { path });
+    return [readState(path, root, name)];
+  });
+}
+
+function locatorFor(role, instance, executablePath, pid, identity) {
+  return {
+    schema: LOCATOR_SCHEMA,
+    instance_id: instance.instance_id,
+    role,
+    pid,
+    started_at_unix_ms: instance.started_at_unix_ms,
+    process_group_id: identity.process_group_id,
+    session_id: identity.session_id,
+    executable_path: executablePath,
+    executable_sha256: sha256(readFileSync(executablePath)),
+    control_origin: role === "server" ? instance.probes.server_url.replace(/\/v1\/system$/, "") : instance.probes.endpoint_url.replace(/\/v1\/health$/, ""),
+  };
+}
+
+async function startProcess(instance, role, executablePath, args, env) {
+  const logPath = join(instance.directory, `${role}.log`);
+  const logFd = openSync(logPath, "a", 0o600);
+  chmodSync(logPath, 0o600);
+  let child;
+  try {
+    // Detached children must not keep a pipe referenced by this Node process;
+    // direct file descriptors preserve diagnostics while allowing the driver
+    // CLI to return once readiness is observed.
+    child = spawn(executablePath, args, { cwd: instance.directory, detached: true, stdio: ["ignore", logFd, logFd], env });
+  } finally {
+    closeSync(logFd);
+  }
+  const pid = child.pid;
+  if (!pid) fail("release_process_start_failed", `${role} process did not expose a PID`);
+  child.unref();
+  const identity = await processIdentity(pid);
+  if (!identity) fail("release_process_start_failed", `${role} process identity could not be observed`);
+  return { role, pid, process_group_id: identity.process_group_id, session_id: identity.session_id, executablePath };
+}
+
+async function reservePort() {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const net = netModule;
+    const server = net.createServer();
+    server.once("error", rejectPromise);
+    server.listen(0, "127.0.0.1", () => {
+      const port = server.address().port;
+      server.close(() => resolvePromise(port));
+    });
+  });
+}
+
+function endpointConfig(instance, endpointPort, secretPath, persistent) {
+  return {
+    schema: "zode.config.v1",
+    listen: `127.0.0.1:${endpointPort}`,
+    runtime_store: { kind: "sqlite", path: persistent.endpoint_store },
+    controller_auth: [{ authority_id: persistent.authority_id, revision: 1, kind: "bearer_secret_file", secret_file: secretPath }],
+  };
+}
+
+function serverConfig(instance, serverPort, uiPath, endpointPath, endpointConfigPath, endpointPort, endpointSecretPath, persistent) {
+  const issuer = process.env.ZODE_RELEASE_ACCESS_ISSUER || "http://127.0.0.1/";
+  const jwksUrl = process.env.ZODE_RELEASE_ACCESS_JWKS_URL || "http://127.0.0.1:9/jwks";
+  const audience = process.env.ZODE_RELEASE_ACCESS_AUDIENCE || "zode-release";
+  return {
+    schema: "zode.server-config.v1",
+    listen: `127.0.0.1:${serverPort}`,
+    server_authority_id: persistent.authority_id,
+    deployment: "all_in_one",
+    local_endpoint: {
+      executable: relative(instance.directory, endpointPath),
+      config: relative(instance.directory, endpointConfigPath),
+      listen: `127.0.0.1:${endpointPort}`,
+      bootstrap_controller_secret_file: relative(instance.directory, endpointSecretPath),
+    },
+    ui_mode: "assets",
+    ui_assets_directory: relative(instance.directory, uiPath),
+    control_database: persistent.server_database,
+    secret_directory: persistent.server_secrets,
+    access: { issuer, audiences: [audience], jwks_url: jwksUrl, subject_key_file: persistent.subject_key, subject_key_version: 1 },
+  };
+}
+
+function processExecutablePath(pid) {
+  const procPath = `/proc/${pid}/exe`;
+  try {
+    if (statOrNull(procPath)) return realpathSync(procPath);
+  } catch { /* fall through to lsof on macOS */ }
+  const output = commandOutput("lsof", ["-nP", "-a", "-p", String(pid), "-d", "txt", "-Fn"]);
+  const line = output.split(/\r?\n/).find((entry) => entry.startsWith("n"));
+  if (!line || line.length === 1) return null;
+  return realpathSync(line.slice(1));
+}
+
+function processCommandLine(pid) {
+  return commandOutput("ps", ["-p", String(pid), "-o", "command="]).trim();
+}
+
+function listenerOwnedBy(pid, port) {
+  try {
+    const output = commandOutput("lsof", ["-nP", "-a", "-p", String(pid), `-iTCP:${port}`, "-sTCP:LISTEN", "-Fn"]);
+    return output.split(/\r?\n/).some((line) => line.startsWith("n"));
+  } catch {
+    return false;
+  }
+}
+
+function directChildren(parentPid) {
+  const output = commandOutput("ps", ["-axo", "pid=,ppid="]);
+  return output.split(/\r?\n/).flatMap((line) => {
+    const match = line.trim().match(/^(\d+)\s+(\d+)$/);
+    return match && Number(match[2]) === parentPid ? [Number(match[1])] : [];
+  });
+}
+
+async function observeEndpointChild(instance, serverRole, endpointPath, endpointConfigPath, endpointPort) {
+  const expectedExecutable = realpathSync(endpointPath);
+  const expectedConfig = realpathSync(endpointConfigPath);
+  const expectedListen = `127.0.0.1:${endpointPort}`;
+  const deadline = now() + READINESS_MS;
+  while (now() < deadline && isAlive(serverRole.pid)) {
+    const matches = [];
+    for (const pid of directChildren(serverRole.pid)) {
+      if (!isAlive(pid)) continue;
+      let executable;
+      try { executable = processExecutablePath(pid); } catch { continue; }
+      if (executable !== expectedExecutable) continue;
+      let command;
+      try { command = processCommandLine(pid); } catch { continue; }
+      const expectedCommand = `${expectedExecutable} --config ${expectedConfig} --listen ${expectedListen}`;
+      if (command !== expectedCommand) continue;
+      if (!listenerOwnedBy(pid, endpointPort)) continue;
+      const identity = await probeHttp(`http://127.0.0.1:${endpointPort}/v1/identity`, probeHeaders("endpoint", instance.endpointSecret));
+      const capabilities = await probeHttp(`http://127.0.0.1:${endpointPort}/v1/capabilities`, probeHeaders("endpoint", instance.endpointSecret));
+      const identityBody = parseJsonBody(identity);
+      const capabilitiesBody = parseJsonBody(capabilities);
+      if (identity.status < 200 || identity.status >= 300 || capabilities.status < 200 || capabilities.status >= 300) continue;
+      if (
+        identityBody?.schema !== "zode.identity.v1"
+        || identityBody.protocol_version !== "zode.endpoint.v1"
+        || typeof identityBody.endpoint_id !== "string"
+        || identityBody.authority_id !== instance.authority_id
+        || identityBody.revision !== 1
+        || capabilitiesBody?.schema !== "zode.endpoint-capabilities.v1"
+        || capabilitiesBody.protocol_version !== "zode.endpoint.v1"
+        || capabilitiesBody.endpoint_id !== identityBody.endpoint_id
+      ) continue;
+      const processInfo = await processIdentity(pid);
+      if (!processInfo) continue;
+      matches.push({ role: "endpoint", pid, executablePath: executable, process_group_id: processInfo.process_group_id, session_id: processInfo.session_id });
+    }
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) fail("release_endpoint_child_ambiguous", "Server has more than one matching Endpoint child", { pids: matches.map((entry) => entry.pid) });
+    await sleep(100);
+  }
+  fail("release_endpoint_child_missing", "Server did not expose one authenticated matching Endpoint child before readiness deadline", {
+    server_pid: serverRole.pid,
+    executable_path: expectedExecutable,
+    config_path: expectedConfig,
+    listen: expectedListen,
+  });
+}
+
+function parseListenAddress(value, label) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const match = value.trim().match(/^([^:]+):(\d+)$/);
+  if (!match) fail("release_channel_config_invalid", `${label} must be host:port`, { label });
+  const host = match[1];
+  const port = Number(match[2]);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535 || !["127.0.0.1", "localhost", "::1"].includes(host)) {
+    fail("release_channel_config_invalid", `${label} must be a loopback host and non-zero port`, { label });
+  }
+  return { host, port, value: `${host}:${port}` };
+}
+
+async function stableChannelAddresses() {
+  let server = parseListenAddress(process.env.ZODE_RELEASE_SERVER_LISTEN, "ZODE_RELEASE_SERVER_LISTEN");
+  if (!server && process.env.ZODE_RELEASE_UI_URL) {
+    try {
+      const parsed = new URL(process.env.ZODE_RELEASE_UI_URL);
+      if (parsed.protocol === "http:" && ["127.0.0.1", "localhost", "::1"].includes(parsed.hostname)) {
+        server = parseListenAddress(`${parsed.hostname}:${parsed.port || "80"}`, "ZODE_RELEASE_UI_URL");
+      }
+    } catch { /* the harness will report an invalid browser URL separately */ }
+  }
+  if (!server) {
+    const port = await reservePort();
+    server = { host: "127.0.0.1", port, value: `127.0.0.1:${port}` };
+  }
+  let endpoint = parseListenAddress(process.env.ZODE_RELEASE_ENDPOINT_LISTEN, "ZODE_RELEASE_ENDPOINT_LISTEN");
+  if (!endpoint) {
+    const port = await reservePort();
+    endpoint = { host: "127.0.0.1", port, value: `127.0.0.1:${port}` };
+  }
+  if (endpoint.value === server.value) fail("release_channel_config_invalid", "Server and Endpoint listeners must be distinct");
+  return { server, endpoint };
+}
+
+function persistentReleaseState(root, instanceId, kind) {
+  const directory = ensureDirectory(
+    kind === "candidate"
+      ? join(root, "instances", instanceId, "persistent")
+      : join(root, "persistent"),
+    0o700,
+  );
+  const metadataPath = join(directory, "identity.json");
+  let metadata;
+  const existing = statOrNull(metadataPath);
+  if (existing) {
+    if (!existing.isFile() || existing.isSymbolicLink() || (existing.mode & 0o077) !== 0) {
+      fail("release_state_invalid", "persistent identity metadata is not a restricted regular file", { path: metadataPath });
+    }
+    try { metadata = JSON.parse(readFileSync(metadataPath, "utf8")); } catch (error) {
+      fail("release_state_invalid", "persistent identity metadata is not valid JSON", { path: metadataPath, error: String(error) });
+    }
+  } else {
+    metadata = {
+      schema: "zode.release-persistent.v1",
+    authority_id: `release-${randomUUID()}`,
+      created_at_unix_ms: now(),
+    };
+    exclusiveJson(metadataPath, metadata, 0o600);
+  }
+  if (
+    !metadata
+    || metadata.schema !== "zode.release-persistent.v1"
+    || typeof metadata.authority_id !== "string"
+    || !/^release-[0-9a-f-]{36}$/.test(metadata.authority_id)
+  ) {
+    fail("release_state_invalid", "persistent identity metadata has an invalid authority", { path: metadataPath });
+  }
+  const endpointSecretPath = join(directory, "endpoint-controller.secret");
+  // Each instance owns a separate private secret file.  The local test
+  // channel may supply one controller bearer for its authenticated probes;
+  // authority IDs and stores remain isolated between current and candidate.
+  const requestedSecret = process.env.ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER
+    || process.env.ZODE_RELEASE_CONTROLLER_BEARER
+    || null;
+  const existingSecret = statOrNull(endpointSecretPath);
+  if (existingSecret) {
+    if (!existingSecret.isFile() || existingSecret.isSymbolicLink() || (existingSecret.mode & 0o077) !== 0) {
+      fail("release_state_invalid", "persistent controller secret is not a private regular file", { path: endpointSecretPath });
+    }
+    const storedSecret = readFileSync(endpointSecretPath, "utf8").trim();
+    if (!storedSecret) fail("release_state_invalid", "persistent controller secret is empty", { path: endpointSecretPath });
+    if (requestedSecret && requestedSecret !== storedSecret) {
+      fail("release_state_invalid", "configured controller secret differs from the persistent release authority");
+    }
+  } else {
+    privateFile(endpointSecretPath, `${requestedSecret || randomBytes(32).toString("base64url")}\n`);
+  }
+  const subjectKeyPath = join(directory, "subject.key");
+  privateFile(subjectKeyPath, randomBytes(32));
+  const serverSecrets = ensureDirectory(join(directory, "server-secrets"), 0o700);
+  validatePrivateTree(serverSecrets);
+  for (const databasePath of [join(directory, "endpoint.sqlite3"), join(directory, "server.sqlite3")]) {
+    const databaseStat = statOrNull(databasePath);
+    if (databaseStat && (!databaseStat.isFile() || databaseStat.isSymbolicLink() || (databaseStat.mode & 0o077) !== 0)) {
+      fail("release_state_invalid", "persistent database is not a private regular file", { path: databasePath });
+    }
+  }
+  return {
+    directory,
+    authority_id: metadata.authority_id,
+    endpoint_secret_path: endpointSecretPath,
+    endpoint_store: join(directory, "endpoint.sqlite3"),
+    server_database: join(directory, "server.sqlite3"),
+    server_secrets: serverSecrets,
+    subject_key: subjectKeyPath,
+    endpoint_secret: readFileSync(endpointSecretPath, "utf8").trim(),
+  };
+}
+
+async function createInstance(root, artifact, kind, addresses = null) {
+  const instanceId = `${kind}-${artifact.manifest.revision.slice(0, 12)}-${randomUUID()}`;
+  const directory = join(root, "instances", instanceId);
+  ensureDirectory(directory, 0o700);
+  const persistent = persistentReleaseState(root, instanceId, kind);
+  const selected = addresses ?? { server: null, endpoint: null };
+  const serverAddress = selected.server ?? { host: "127.0.0.1", port: await reservePort(), value: null };
+  serverAddress.value ??= `${serverAddress.host}:${serverAddress.port}`;
+  const endpointAddress = selected.endpoint ?? { host: "127.0.0.1", port: await reservePort(), value: null };
+  endpointAddress.value ??= `${endpointAddress.host}:${endpointAddress.port}`;
+  if (serverAddress.value === endpointAddress.value) fail("release_channel_config_invalid", "Server and Endpoint listeners must be distinct");
+  const serverPort = serverAddress.port;
+  const endpointPort = endpointAddress.port;
+  const endpointSecret = persistent.endpoint_secret;
+  const endpointSecretPath = persistent.endpoint_secret_path;
+  const instance = {
+    schema: "zode.release-instance.v1",
+    instance_id: instanceId,
+    kind,
+    directory,
+    started_at_unix_ms: now(),
+    artifact,
+    endpointSecret,
+    endpoint_secret_path: endpointSecretPath,
+    authority_id: persistent.authority_id,
+    persistent_directory: persistent.directory,
+    probes: { server_url: `http://${serverAddress.host}:${serverPort}/v1/system`, endpoint_url: `http://${endpointAddress.host}:${endpointPort}/v1/health`, ui_url: `http://${serverAddress.host}:${serverPort}/` },
+    roles: [],
+  };
+  const endpointConfigPath = join(directory, "endpoint.json");
+  const serverConfigPath = join(directory, "server.json");
+  exclusiveJson(endpointConfigPath, endpointConfig(instance, endpointPort, endpointSecretPath, persistent), 0o600);
+  const installedEndpointPath = join(artifact.installPath, "zode");
+  exclusiveJson(serverConfigPath, serverConfig(
+    instance,
+    serverPort,
+    join(artifact.installPath, "ui"),
+    installedEndpointPath,
+    endpointConfigPath,
+    endpointPort,
+    endpointSecretPath,
+    persistent,
+  ), 0o600);
+  persistState(root, instance);
+  const childEnv = { ...process.env, ZODE_RELEASE_INSTANCE_ID: instanceId, ZODE_RELEASE_ARTIFACT_REVISION: artifact.manifest.revision };
+  // Access/controller assertions and test recorder controls belong only to
+  // this driver's probe process.  Never place them in Server/Endpoint
+  // environments where /proc or diagnostics could expose them.
+  for (const key of [
+    "ZODE_RELEASE_ACCESS_ASSERTION",
+    "ZODE_RELEASE_ACCESS_JWT_ASSERTION",
+    "ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER",
+    "ZODE_RELEASE_CONTROLLER_BEARER",
+    "ZODE_RELEASE_REPLAY_CASSETTE",
+    "ZODE_RELEASE_REPLAY_EXPECTATION",
+    "ZODE_RELEASE_SECRET_VALUES_JSON",
+    "ZODE_RELEASE_REPLAY_ADAPTER",
+    "ZODE_RELEASE_QUARANTINE",
+    "ZODE_RELEASE_CASSETTES",
+    "ZODE_RELEASE_TEST_MODE",
+    "ZODE_RELEASE_RECORDER",
+    "ZODE_RELEASE_E2E_MODE",
+  ]) delete childEnv[key];
+  try {
+    const server = await startProcess(instance, "server", artifact.paths.server.replace(artifact.artifact, artifact.installPath), ["--config", serverConfigPath], { ...childEnv, ZODE_RELEASE_ROLE: "server" });
+    instance.roles.push(server);
+    persistState(root, instance);
+    // The Server owns the Endpoint child in all_in_one mode.  The driver does
+    // not ask the product to emit a locator; it binds the direct child using
+    // kernel parentage, exact argv/config/listen, executable digest, listener,
+    // and authenticated identity/capabilities facts before publishing its
+    // test-owned locator below.
+    const endpoint = await observeEndpointChild(instance, server, installedEndpointPath, endpointConfigPath, endpointPort);
+    instance.roles.push(endpoint);
+    persistState(root, instance);
+    for (const role of instance.roles) {
+      const executablePath = realpathSync(role.executablePath);
+      const locatorPath = join(directory, `locator-${role.role}.json`);
+      const locator = locatorFor(role.role, instance, executablePath, role.pid, { process_group_id: role.process_group_id, session_id: role.session_id });
+      exclusiveJson(locatorPath, locator, 0o444);
+      chmodSync(locatorPath, 0o444);
+      role.locatorPath = locatorPath;
+      role.executablePath = executablePath;
+      process.stdout.write(`ZODE_PROCESS_READY ${locatorPath}\n`);
+    }
+    persistState(root, instance);
+    return instance;
+  } catch (error) {
+    await stopInstance(instance);
+    throw error;
+  }
+}
+
+function rolePids(instance) {
+  return instance.roles.flatMap((role) => role.pid > 0 ? [role.pid] : []);
+}
+
+async function descendants(pids) {
+  const output = await commandOutput("ps", ["-axo", "pid=,ppid="]);
+  const entries = output.split(/\r?\n/).flatMap((line) => {
+    const match = line.trim().match(/^(\d+)\s+(\d+)$/); return match ? [{ pid: Number(match[1]), ppid: Number(match[2]) }] : [];
+  });
+  const all = new Set(pids); let changed = true;
+  while (changed) { changed = false; for (const entry of entries) if (all.has(entry.ppid) && !all.has(entry.pid)) { all.add(entry.pid); changed = true; } }
+  return [...all].sort((a, b) => a - b);
+}
+
+async function stopInstance(instance) {
+  const requestedAt = now();
+  // Include the instance's recorded role PIDs even if a child exited before
+  // teardown.  A stop report must account for every PID observed during the
+  // run, not silently drop a process that happened to die first.
+  let observed = [...new Set([...(await descendants(rolePids(instance))), ...rolePids(instance)])].sort((a, b) => a - b);
+  const knownRoles = new Map(instance.roles.map((role) => [role.pid, role]));
+  const observedEvidence = [];
+  let evidenceFailure = false;
+  const captureEvidence = async (pid) => {
+    const rootRole = knownRoles.get(pid);
+    let identity = rootRole
+      ? { process_group_id: rootRole.process_group_id, session_id: rootRole.session_id }
+      : await processIdentity(pid);
+    let executablePath = rootRole?.executablePath;
+    if (executablePath) {
+      try { executablePath = realpathSync(executablePath); } catch { identity = null; }
+    } else {
+      try { executablePath = processExecutablePath(pid); } catch { executablePath = null; }
+    }
+    if (!identity || !executablePath) {
+      evidenceFailure = true;
+      return;
+    }
+    try {
+      observedEvidence.push({
+        pid,
+        role: rootRole?.role ?? "supervisor",
+        started_at_unix_ms: instance.started_at_unix_ms,
+        process_group_id: identity.process_group_id,
+        session_id: identity.session_id,
+        executable_path: executablePath,
+        executable_sha256: sha256(readFileSync(executablePath)),
+      });
+    } catch {
+      evidenceFailure = true;
+    }
+  };
+  for (const pid of observed) await captureEvidence(pid);
+  for (const role of instance.roles) {
+    try { process.kill(-role.process_group_id, "SIGTERM"); } catch { try { process.kill(role.pid, "SIGTERM"); } catch { /* already gone */ } }
+  }
+  // Stop admission is a second process-set boundary: a Server may have
+  // spawned a direct child after the initial snapshot.  Include and signal
+  // those PIDs before waiting, rather than silently declaring the old set
+  // reaped.
+  const admitted = await descendants(rolePids(instance));
+  const lateAdmission = admitted.filter((pid) => !observed.includes(pid));
+  if (lateAdmission.length) {
+    observed = [...new Set([...observed, ...lateAdmission])].sort((a, b) => a - b);
+    for (const pid of lateAdmission) {
+      await captureEvidence(pid);
+      try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
+    }
+  }
+  const deadline = now() + STOP_MS;
+  while (now() < deadline && observed.some((pid) => isAlive(pid))) await sleep(50);
+  const finalObserved = await descendants(rolePids(instance));
+  const lateFinal = finalObserved.filter((pid) => !observed.includes(pid));
+  if (lateFinal.length) {
+    observed = [...new Set([...observed, ...lateFinal])].sort((a, b) => a - b);
+    for (const pid of lateFinal) {
+      await captureEvidence(pid);
+      try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  }
+  if (observed.some((pid) => isAlive(pid))) {
+    for (const role of instance.roles) {
+      try { process.kill(-role.process_group_id, "SIGKILL"); } catch { try { process.kill(role.pid, "SIGKILL"); } catch { /* gone */ } }
+    }
+    for (const pid of observed) {
+      if (!isAlive(pid)) continue;
+      try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+    }
+    await sleep(100);
+  }
+  const leaked = observed.filter((pid) => isAlive(pid));
+  const reported = new Set(observedEvidence.map((entry) => entry.pid));
+  const reaped = observed.filter((pid) => !leaked.includes(pid) && reported.has(pid));
+  const reportedLeaked = leaked.filter((pid) => reported.has(pid));
+  const report = {
+    schema: STOP_SCHEMA,
+    instance_id: instance.instance_id,
+    requested_at_unix_ms: requestedAt,
+    observed_pids: observedEvidence,
+    reaped_pids: reaped,
+    leaked_pids: reportedLeaked,
+    timed_out: leaked.length > 0 || evidenceFailure,
+    exit_status: leaked.length || evidenceFailure ? null : 0,
+    flush_status: evidenceFailure ? "failed" : "success",
+  };
+  const instancesRoot = dirname(instance.directory);
+  const root = dirname(instancesRoot);
+  persistStopReport(root, report);
+  if (!report.timed_out && report.flush_status === "success" && report.exit_status === 0) {
+    const state = statePath(root, instance.instance_id);
+    const directory = statOrNull(instance.directory);
+    if (basename(instancesRoot) === "instances" && directory?.isDirectory() && !directory.isSymbolicLink()) {
+      removeIfExists(state);
+      rmSync(instance.directory, { recursive: true, force: true });
+    }
+  }
+  return report;
+}
+
+function findState(root, revision, kind = null) {
+  return allStates(root).find((instance) => instance.roles.length > 0
+    && (!kind || instance.kind === kind)
+    && instance.artifact?.manifest?.revision === revision
+    && instance.roles.every((role) => {
+      if (!isAlive(role.pid)) return false;
+      try {
+        return processExecutablePath(role.pid) === realpathSync(role.executablePath);
+      } catch {
+        return false;
+      }
+    })) ?? null;
+}
+
+async function stageArtifact(root, record) {
+  const installed = installArtifact(root, record);
+  const oldStaged = pointerTarget(root, "staged");
+  const current = pointerTarget(root, "current");
+  if (!current) fail("release_current_missing", "stage requires an initialized current release");
+  if (current?.manifest.revision === installed.manifest.revision) {
+    fail("release_candidate_matches_current", "candidate revision is already current");
+  }
+  if (oldStaged && oldStaged.manifest.revision !== installed.manifest.revision) {
+    const oldState = allStates(root).find((item) => item.artifact?.manifest?.revision === oldStaged.manifest.revision && item.kind === "candidate");
+    if (oldState) {
+      const stop = await stopInstance(oldState);
+      if (stop.timed_out || stop.leaked_pids.length || stop.flush_status !== "success") {
+        fail("release_staged_stop_failed", "the previous candidate did not stop cleanly before staging", { stop });
+      }
+    }
+  }
+  if (oldStaged?.manifest.revision === installed.manifest.revision) {
+    fail("release_candidate_already_staged", "the requested candidate revision is already staged");
+  }
+  const instance = await createInstance(root, installed, "candidate");
+  pointerLink(root, "staged", installed.installPath);
+  const readiness = await waitReadiness(instance);
+  const health = healthPayload(instance, readiness);
+  return { installed, instance, health, readiness };
+}
+
+async function waitReadiness(instance) {
+  const deadline = now() + READINESS_MS;
+  let probe = await probeInstance(instance);
+  while (!probe.ready && now() < deadline && instance.roles.every((role) => isAlive(role.pid))) {
+    await sleep(100);
+    probe = await probeInstance(instance);
+  }
+  return probe;
+}
+
+async function activeHealth(root) {
+  const current = pointerTarget(root, "current", false);
+  const instance = findState(root, current.manifest.revision, "current");
+  if (!instance || realpathSync(instance.artifact.installPath) !== realpathSync(current.target)
+      || instance.artifact.digest !== current.digest) {
+    const artifact = validateManifest(current.target);
+    const components = componentHealth(artifact);
+    return { status: "failed", source: "live_process", checks: { ui: "failed", server: "failed", endpoint: "failed" }, ui_mode: "assets", ui_assets_directory: "ui", ...components, components: artifact.manifest.components, probes: { server_url: "http://127.0.0.1:1/v1/system", endpoint_url: "http://127.0.0.1:1/v1/health" }, processes: { locator_paths: [] } };
+  }
+  const readiness = await probeInstance(instance);
+  return { instance, health: healthPayload(instance, readiness), readiness };
+}
+
+async function bootstrap(root, record) {
+  const installed = installArtifact(root, record);
+  for (const instance of allStates(root)) {
+    const stop = await stopInstance(instance);
+    if (stop.timed_out || stop.leaked_pids.length || stop.flush_status !== "success") {
+      fail("release_existing_instance_stop_failed", "bootstrap could not reap a previous release instance", { stop });
+    }
+  }
+  const instance = await createInstance(root, installed, "current", await stableChannelAddresses());
+  const readiness = await waitReadiness(instance);
+  if (!readiness.ready) {
+    await stopInstance(instance);
+    fail("release_baseline_not_ready", "baseline release failed the initial readiness gate", {
+      health: healthPayload(instance, readiness),
+    });
+  }
+  switchPointers(root, installed.installPath, null);
+  removeIfExists(pointerPath(root, "staged"));
+  const health = healthPayload(instance, readiness);
+  return { installed, instance, health, readiness };
+}
+
+async function promote(root) {
+  const staged = pointerTarget(root, "staged", false);
+  const current = pointerTarget(root, "current", false);
+  const previousPointer = pointerTarget(root, "previous", true);
+  const stagedInstance = findState(root, staged.manifest.revision, "candidate");
+  if (!stagedInstance) fail("release_candidate_missing", "staged candidate has no live process instance");
+  const stagedReadiness = await waitReadiness(stagedInstance);
+  if (!stagedReadiness.ready) fail("release_candidate_not_ready", "staged candidate failed the readiness gate", { health: healthPayload(stagedInstance, stagedReadiness) });
+
+  // A staged instance listens on isolated ports.  Promotion adopts the exact
+  // same immutable artifact on the stable management/Endpoint listeners only
+  // after the old current instance has been stopped; the pointer switch then
+  // names the already-ready stable instance.  A failed adoption is recovered
+  // by restarting the previous current artifact before returning an error.
+  const previousRecord = current ? validateManifest(current.target) : null;
+  const oldCurrent = current ? findState(root, current.manifest.revision, "current") : null;
+  const originalCurrentTarget = current?.target ?? null;
+  const originalPreviousTarget = previousPointer?.target ?? null;
+  let adopted = null;
+  let pointerCommitted = false;
+  try {
+    if (oldCurrent) {
+      const currentStop = await stopInstance(oldCurrent);
+      if (currentStop.timed_out || currentStop.leaked_pids.length || currentStop.flush_status !== "success") {
+        fail("release_current_stop_failed", "current release did not stop cleanly before promotion", { stop: currentStop });
+      }
+    }
+    const addresses = await stableChannelAddresses();
+    adopted = await createInstance(root, validateManifest(staged.target), "current", addresses);
+    const readiness = await waitReadiness(adopted);
+    if (!readiness.ready) {
+      await stopInstance(adopted);
+      adopted = null;
+      throw new DriverError("release_candidate_not_ready", "promoted candidate failed the stable listener readiness gate", {
+        health: healthPayload(adopted ?? stagedInstance, readiness),
+      });
+    }
+    const stagedStop = await stopInstance(stagedInstance);
+    if (stagedStop.timed_out || stagedStop.leaked_pids.length || stagedStop.flush_status !== "success") {
+      fail("release_candidate_stop_failed", "staged candidate did not stop cleanly before promotion", { stop: stagedStop });
+    }
+    removeIfExists(pointerPath(root, "staged"));
+    switchPointers(root, staged.target, current?.target ?? null);
+    pointerCommitted = true;
+    return { current: pointerIdentity(pointerTarget(root, "current")), previous: pointerIdentity(pointerTarget(root, "previous")), health: healthPayload(adopted, readiness) };
+  } catch (error) {
+    if (adopted) await stopInstance(adopted);
+    if (pointerCommitted && originalCurrentTarget) {
+      try { switchPointers(root, originalCurrentTarget, originalPreviousTarget); } catch { /* retain the original failure */ }
+    }
+    let recovery = { status: "not_attempted" };
+    if (previousRecord) {
+      try {
+        const recovered = await createInstance(root, previousRecord, "current", await stableChannelAddresses());
+        const readiness = await waitReadiness(recovered);
+        if (readiness.ready) recovery = { status: "ok" };
+        else recovery = { status: "not_ready", stop: await stopInstance(recovered) };
+      } catch (recoveryError) {
+        recovery = { status: "failed", code: recoveryError?.code ?? "unknown" };
+      }
+    }
+    if (error && typeof error === "object") error.details = { ...(error.details ?? {}), recovery };
+    throw error;
+  }
+}
+
+async function rollback(root) {
+  const current = pointerTarget(root, "current", false);
+  const previous = pointerTarget(root, "previous", false);
+  const originalPreviousPointer = previous;
+  const previousRecord = validateManifest(previous.target);
+  const oldCurrent = findState(root, current.manifest.revision, "current");
+  const originalCurrentTarget = current.target;
+  const originalPreviousTarget = originalPreviousPointer.target;
+  let adopted = null;
+  let pointerCommitted = false;
+  try {
+    if (oldCurrent) {
+      const currentStop = await stopInstance(oldCurrent);
+      if (currentStop.timed_out || currentStop.leaked_pids.length || currentStop.flush_status !== "success") {
+        fail("release_current_stop_failed", "current release did not stop cleanly before rollback", { stop: currentStop });
+      }
+    }
+    adopted = await createInstance(root, previousRecord, "current", await stableChannelAddresses());
+    const readiness = await waitReadiness(adopted);
+    if (!readiness.ready) fail("release_previous_not_ready", "previous release failed the stable listener readiness gate", { health: healthPayload(adopted, readiness) });
+    const staged = pointerTarget(root, "staged");
+    if (staged) {
+      const stagedInstance = findState(root, staged.manifest.revision, "candidate");
+      if (stagedInstance) {
+        const stagedStop = await stopInstance(stagedInstance);
+        if (stagedStop.timed_out || stagedStop.leaked_pids.length || stagedStop.flush_status !== "success") {
+          fail("release_candidate_stop_failed", "staged candidate did not stop cleanly before rollback", { stop: stagedStop });
+        }
+      }
+    }
+    removeIfExists(pointerPath(root, "staged"));
+    switchPointers(root, previous.target, current.target);
+    pointerCommitted = true;
+    return { current: pointerIdentity(pointerTarget(root, "current")), previous: pointerIdentity(pointerTarget(root, "previous")), health: healthPayload(adopted, readiness) };
+  } catch (error) {
+    if (adopted) await stopInstance(adopted);
+    if (pointerCommitted) {
+      try { switchPointers(root, originalCurrentTarget, originalPreviousTarget); } catch { /* preserve the original rollback error */ }
+    }
+    let recovery = { status: "not_attempted" };
+    try {
+      const recovered = await createInstance(root, validateManifest(current.target), "current", await stableChannelAddresses());
+      const readiness = await waitReadiness(recovered);
+      if (readiness.ready) recovery = { status: "ok" };
+      else recovery = { status: "not_ready", stop: await stopInstance(recovered) };
+    } catch (recoveryError) {
+      recovery = { status: "failed", code: recoveryError?.code ?? "unknown" };
+    }
+    if (error && typeof error === "object") error.details = { ...(error.details ?? {}), recovery };
+    throw error;
+  }
+}
+
+async function teardown(root) {
+  const reports = [];
+  const seen = new Set();
+  for (const instance of allStates(root)) {
+    if (!instance.roles.length) {
+      removeIfExists(statePath(root, instance.instance_id));
+      continue;
+    }
+    const report = await stopInstance(instance);
+    reports.push(report);
+    seen.add(report.instance_id);
+  }
+  const ledger = join(root, "stop-reports");
+  const ledgerStat = statOrNull(ledger);
+  if (ledgerStat && ledgerStat.isDirectory() && !ledgerStat.isSymbolicLink()) {
+    for (const name of readdirSync(ledger).filter((entry) => entry.endsWith(".json")).sort()) {
+      const path = join(ledger, name);
+      const stat = statOrNull(path);
+      if (!stat || !stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
+        fail("release_stop_report_invalid", "stop report ledger entry is not a private regular file", { path });
+      }
+      let report;
+      try { report = JSON.parse(readFileSync(path, "utf8")); } catch (error) {
+        fail("release_stop_report_invalid", "stop report ledger entry is not valid JSON", { path, error: String(error) });
+      }
+      if (!report || report.schema !== STOP_SCHEMA || typeof report.instance_id !== "string") {
+        fail("release_stop_report_invalid", "stop report ledger entry has an invalid schema", { path });
+      }
+      if (!seen.has(report.instance_id)) reports.push(report);
+    }
+  }
+  return { stop_reports: reports };
+}
+
+function parseCli(argv) {
+  if (FORBIDDEN_ENV.some((key) => process.env[key])) fail("production_driver_replay_forbidden", "release driver does not accept cassette, replay, recorder, or test mode");
+  const operation = argv.shift();
+  if (!["bootstrap", "stage", "promote", "health", "rollback", "teardown"].includes(operation)) fail("driver_usage", "unknown release operation", { operation }, 2);
+  let root = null; let artifact = null; let json = false;
+  while (argv.length) {
+    const arg = argv.shift();
+    if (arg === "--release-root") root = argv.shift();
+    else if (arg === "--artifact") artifact = argv.shift();
+    else if (arg === "--json") json = true;
+    else fail("driver_usage", "unknown release driver argument", { argument: arg }, 2);
+  }
+  if (!root || !json) fail("driver_usage", "--release-root and --json are required", {}, 2);
+  if (["bootstrap", "stage"].includes(operation) && !artifact) fail("driver_usage", `${operation} requires --artifact`, {}, 2);
+  if (!["bootstrap", "stage"].includes(operation) && artifact) fail("driver_usage", `${operation} does not accept --artifact`, {}, 2);
+  return { operation, root: resolve(root), artifact: artifact ? resolve(artifact) : null };
+}
+
+function acquireOperationLock(root) {
+  const path = join(root, ".release-operation.lock");
+  let fd;
+  try { fd = openSync(path, "wx", 0o600); } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    let owner = null;
+    try { owner = JSON.parse(readFileSync(path, "utf8")); } catch { /* malformed lock remains fail-closed */ }
+    let alive = true;
+    if (Number.isSafeInteger(owner?.pid) && owner.pid > 0) {
+      try { process.kill(owner.pid, 0); } catch (probeError) { alive = probeError?.code !== "ESRCH"; }
+    }
+    if (alive) fail("release_operation_busy", "another release operation is active", { root, owner_pid: owner?.pid ?? null });
+    try { unlinkSync(path); } catch (unlinkError) {
+      fail("release_operation_busy", "a stale release operation lock could not be removed", { root, error: String(unlinkError) });
+    }
+    fd = openSync(path, "wx", 0o600);
+  }
+  try { writeFileSync(fd, jsonBytes({ pid: process.pid, acquired_at_unix_ms: now() })); fsyncSync(fd); } finally { closeSync(fd); }
+  return path;
+}
+
+async function main() {
+  const cli = parseCli(process.argv.slice(2));
+  const root = canonicalDirectory(cli.root, "releaseRoot");
+  const lockPath = acquireOperationLock(root);
+  try {
+  ensureDirectory(join(root, "releases"), 0o700);
+  ensureDirectory(join(root, "instances"), 0o700);
+  let record = null;
+  if (cli.artifact) record = validateManifest(cli.artifact);
+  let payload;
+  let status = 0;
+  if (cli.operation === "bootstrap") {
+    const result = await bootstrap(root, record);
+    payload = { ok: result.readiness.ready, operation: "bootstrap", revision: record.manifest.revision, health: result.health };
+    status = result.readiness.ready ? 0 : 1;
+  } else if (cli.operation === "stage") {
+    const result = await stageArtifact(root, record);
+    payload = { ok: result.readiness.ready, operation: "stage", revision: record.manifest.revision, health: result.health };
+    status = result.readiness.ready ? 0 : 1;
+  } else if (cli.operation === "promote") {
+    payload = { ok: true, operation: "promote", ...(await promote(root)) };
+  } else if (cli.operation === "rollback") {
+    payload = { ok: true, operation: "rollback", ...(await rollback(root)) };
+  } else if (cli.operation === "health") {
+    const result = await activeHealth(root);
+    payload = { ok: result.health.status === "ok", operation: "health", health: result.health };
+    status = result.health.status === "ok" ? 0 : 1;
+  } else {
+    const result = await teardown(root);
+    payload = { ok: result.stop_reports.every((report) => !report.timed_out && !report.leaked_pids?.length && report.flush_status === "success" && report.exit_status === 0), operation: "teardown", ...result };
+    status = payload.ok ? 0 : 1;
+  }
+  process.stdout.write(`${JSON.stringify(payload)}\n`);
+  return status;
+  } finally {
+    try { unlinkSync(lockPath); } catch { /* preserve the operation result */ }
+  }
+}
+
+main().then((status) => {
+  process.exitCode = status;
+}).catch((error) => {
+  const status = error instanceof DriverError ? error.status : 1;
+  const payload = error instanceof DriverError
+    ? { ok: false, error: { code: error.code, message: error.message, details: error.details } }
+    : { ok: false, error: { code: "driver_error", message: String(error) } };
+  process.stdout.write(`${JSON.stringify(payload)}\n`);
+  process.exitCode = status;
+});
