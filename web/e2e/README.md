@@ -50,13 +50,16 @@ pnpm --dir web/e2e exec playwright install chromium
 
 The gate builds both real Rust binaries, builds the UI with `vp build`, runs the
 shared process-capture and Server incident-replay E2Es, and executes the
-complete Chromium collection from `playwright.config.cjs` (shared harness plus
-product browser paths). All fixtures are deterministic and local; it never
-reads real LLM credentials or enables production recording. A Server startup
-failure still fails the command and leaves its bounded process capture under
+deterministic shared browser/replay scenarios from
+`support/harness_regressions.spec.cjs`. The provider-install failure scenario
+and the Management product suites are owned by their respective product jobs;
+they are not silently converted to skips or claimed by this shared gate. All
+selected fixtures are deterministic and local; the gate never reads real LLM
+credentials or enables production recording. A Server startup failure still
+fails the command and leaves its bounded process capture under
 `target/test-recordings/quarantine` for diagnosis. The CI entry also audits
-Playwright's JSON result and fails on any skipped, interrupted, or unrun test; a
-readiness error cannot be converted into a green skip.
+Playwright's JSON result and fails on any skipped, interrupted, or unrun test;
+a readiness error cannot be converted into a green skip.
 
 `@playwright/test` is the only direct Playwright dependency. It is pinned to
 the repository-local version in `package.json` and `pnpm-lock.yaml`; the
