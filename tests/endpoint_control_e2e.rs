@@ -12,8 +12,9 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 
+use hmac::{Hmac, Mac};
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
     Client, RequestBuilder, Response, StatusCode,
@@ -168,6 +169,100 @@ fn rotation_body(authority_id: &str, revision: u64, secret: &str) -> Value {
             "payload": secret
         }
     })
+}
+
+type TestHmacSha256 = Hmac<Sha256>;
+
+#[derive(Serialize)]
+struct TestRotationSecret<'a> {
+    encoding: &'static str,
+    payload: &'a str,
+}
+
+#[derive(Serialize)]
+struct TestRotationRequest<'a> {
+    schema: &'static str,
+    authority_id: &'a str,
+    revision: u64,
+    secret: TestRotationSecret<'a>,
+}
+
+fn control_digest(key: &[u8], purpose: &[u8], bytes: &[u8]) -> String {
+    let mut mac = TestHmacSha256::new_from_slice(key).expect("test HMAC key is valid");
+    mac.update(purpose);
+    mac.update(&[0]);
+    mac.update(bytes);
+    let digest = mac.finalize().into_bytes();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    format!("hmac-sha256:v1:{encoded}")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+async fn append_stale_rotation_intent_without_secret(
+    database: &Path,
+    authority_id: &str,
+    revision: u64,
+    secret: &str,
+    idempotency_key: &str,
+) -> TestResult<()> {
+    let control_directory = controller_auth_dir(database);
+    let key = fs::read(control_directory.join("fingerprint.key"))?;
+    let request_bytes = serde_json::to_vec(&TestRotationRequest {
+        schema: "zode.controller-auth.rotate.v1",
+        authority_id,
+        revision,
+        secret: TestRotationSecret {
+            encoding: "application/zode-secret-envelope",
+            payload: secret,
+        },
+    })?;
+    let fingerprint = control_digest(&key, b"rotation-fingerprint:v1", &request_bytes);
+    let mut operation_input = Vec::new();
+    operation_input.extend_from_slice(b"zode.controller-auth.rotate.v1");
+    operation_input.push(0);
+    operation_input.extend_from_slice(authority_id.as_bytes());
+    operation_input.push(0);
+    operation_input.push(0);
+    operation_input.extend_from_slice(idempotency_key.as_bytes());
+    let operation_id = control_digest(&key, b"rotation-operation:v1", &operation_input);
+    let secret_ref = format!(
+        "secret-{}-{revision}-{}.secret",
+        sha256_hex(authority_id.as_bytes()),
+        sha256_hex(operation_id.as_bytes())
+    );
+    let intent = json!({
+        "operation_id": operation_id,
+        "authority_id": authority_id,
+        "revision": revision,
+        "fingerprint": fingerprint,
+        "secret_ref": secret_ref,
+        "phase": "intent",
+        "status": 0,
+        "response": null
+    });
+    let journal = control_directory.join("operations.jsonl");
+    let mut options = fs::OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(journal)?;
+    serde_json::to_writer(&mut file, &intent)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
 }
 
 async fn rotate_once(
@@ -1653,6 +1748,62 @@ async fn e2e_identity_is_endpoint_owned_and_restart_stable() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_bootstrap_seed_is_consumed_after_active_manifest_and_stale_seed_cannot_reclaim(
+) -> TestResult<()> {
+    let database = TempDatabase::new("control-bootstrap-seed")?;
+    let config = config_for(&database)?;
+    let root = database
+        .path()
+        .parent()
+        .ok_or_else(|| Error::other("temporary database has no parent directory"))?;
+    let seed = root.join("controller.secret");
+    assert!(seed.is_file(), "test bootstrap seed was not created");
+
+    let client = support::http_client()?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let identity_path = sidecar_path(database.path(), ".endpoint-id");
+    let initialization_path = controller_auth_dir(database.path()).join("initialization.json");
+    assert!(
+        initialization_path.is_file(),
+        "active controller initialization manifest was not durable before readiness"
+    );
+    assert!(
+        !seed.exists(),
+        "bootstrap seed remained after active manifest became durable"
+    );
+    assert!(
+        identity_path.is_file(),
+        "endpoint identity was not persisted"
+    );
+    server.stop().await?;
+
+    fs::write(&seed, "stale-bootstrap-controller-secret")?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&seed)?.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&seed, permissions)?;
+    }
+
+    let mut restarted = ConfiguredServer::start(&database, &config).await?;
+    let (status, _) = identity_with_secret(&client, &restarted, TEST_CONTROLLER_SECRET).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "durable controller secret no longer works"
+    );
+    let (stale_status, stale_body) =
+        identity_with_secret(&client, &restarted, "stale-bootstrap-controller-secret").await?;
+    assert_eq!(
+        stale_status,
+        StatusCode::UNAUTHORIZED,
+        "stale seed reclaimed authority: {stale_body}"
+    );
+    restarted.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_invalid_controller_auth_and_subject_fail_before_lookup() -> TestResult<()> {
     let database = TempDatabase::new("control-auth-validation")?;
     let config = config_for(&database)?;
@@ -2495,6 +2646,9 @@ async fn e2e_auth_replica_recovery_does_not_split_active_and_receipt_metadata() 
     let config = config_for(&database)?;
     let mut model =
         ModelFixture::start(vec![ModelScript::final_text("replica recovery assistant")]).await?;
+    // The provider policy now treats a host-only origin as that host's
+    // default port, so this dynamic fixture must be explicitly allowlisted.
+    set_provider_execution_policy(&config, &["openai_compatible"], &[&model.origin()])?;
     let mut server = ConfiguredServer::start(&database, &config).await?;
     let client = support::http_client()?;
     let capture_first_occurrence = env::var_os("ZODE_CAPTURE_FIRST_OCCURRENCE").is_some();
@@ -2802,9 +2956,9 @@ async fn e2e_model_create_rejects_disabled_adapter_before_receipt() -> TestResul
     run_provider_policy_admission_case(
         "control-create-disabled-adapter",
         &[],
-        &["http://127.0.0.1"],
+        &["http://127.0.0.1:41000"],
         &["openai_compatible"],
-        &["http://127.0.0.1"],
+        &["http://127.0.0.1:41000"],
         model_create_body("http://127.0.0.1:41000/v1", "openai_compatible", 1),
         "control-create-disabled-adapter",
     )
@@ -2816,9 +2970,9 @@ async fn e2e_model_create_rejects_disallowed_origin_before_receipt() -> TestResu
     run_provider_policy_admission_case(
         "control-create-disallowed-origin",
         &["openai_compatible"],
-        &["http://127.0.0.1"],
+        &["http://127.0.0.1:41000"],
         &["openai_compatible"],
-        &["http://localhost"],
+        &["http://localhost:41000"],
         model_create_body("http://localhost:41000/v1", "openai_compatible", 1),
         "control-create-disallowed-origin",
     )
@@ -3874,6 +4028,7 @@ async fn run_replica_admission_case(
 ) -> TestResult<()> {
     let database = TempDatabase::new(name)?;
     let config = config_for(&database)?;
+    set_provider_execution_policy(&config, &["openai_compatible"], &["http://127.0.0.1:41000"])?;
     let capture = env::var(CREATE_INCIDENT_CAPTURE_ENV)
         .ok()
         .is_some_and(|value| value == owning_e2e);
@@ -4472,6 +4627,108 @@ async fn e2e_controller_auth_rotation_lost_response_fences_old_secret_and_surviv
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_stale_controller_rotation_intent_without_secret_reconciles_after_restart(
+) -> TestResult<()> {
+    let database = TempDatabase::new("control-stale-rotation-recovery")?;
+    let config = config_for(&database)?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    assert_rotation_succeeded(
+        &client,
+        &server,
+        TEST_CONTROLLER_SECRET,
+        "controller-e2e",
+        AUTHORITY_A_NEW_SECRET,
+        2,
+        "stale-recovery-seed",
+    )
+    .await?;
+    server.stop().await?;
+
+    // Model the crash window after a stale revision's intent was appended but
+    // before the request could persist its 409 receipt. A stale request never
+    // stages secret bytes, so this valid intent intentionally has no secret
+    // file beside the journal.
+    let stale_secret = "stale-recovery-candidate-control-e2e";
+    append_stale_rotation_intent_without_secret(
+        database.path(),
+        "controller-e2e",
+        1,
+        stale_secret,
+        "stale-recovery-key",
+    )
+    .await?;
+
+    let mut restarted = ConfiguredServer::start(&database, &config).await?;
+    let (status, identity_body) =
+        identity_with_secret(&client, &restarted, AUTHORITY_A_NEW_SECRET).await?;
+    assert_eq!(status, StatusCode::OK, "stale recovery identity failed");
+    assert_eq!(identity_body["revision"], 2);
+
+    let (status, body) = rotate_once(
+        &client,
+        &restarted,
+        AUTHORITY_A_NEW_SECRET,
+        "controller-e2e",
+        stale_secret,
+        1,
+        "stale-recovery-key",
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    restarted.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_stale_controller_rotation_intent_before_first_manifest_reconciles_after_restart(
+) -> TestResult<()> {
+    let database = TempDatabase::new("control-stale-initial-rotation-recovery")?;
+    let config = config_for(&database)?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let (status, identity_body) = identity(&client, &server).await?;
+    assert_eq!(status, StatusCode::OK, "initial identity failed");
+    assert_eq!(identity_body["revision"], 1);
+    server.stop().await?;
+
+    // Bootstrap revision 1 is already the authority fence even though no
+    // active promotion manifest exists yet. Model a crash after a stale
+    // intent was appended but before its 409 receipt was persisted.
+    let stale_secret = "stale-initial-recovery-candidate-control-e2e";
+    append_stale_rotation_intent_without_secret(
+        database.path(),
+        "controller-e2e",
+        1,
+        stale_secret,
+        "stale-initial-recovery-key",
+    )
+    .await?;
+
+    let mut restarted = ConfiguredServer::start(&database, &config).await?;
+    let (status, identity_body) = identity(&client, &restarted).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "stale initial recovery identity failed"
+    );
+    assert_eq!(identity_body["revision"], 1);
+    let (status, body) = rotate_once(
+        &client,
+        &restarted,
+        TEST_CONTROLLER_SECRET,
+        "controller-e2e",
+        stale_secret,
+        1,
+        "stale-initial-recovery-key",
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    restarted.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_controller_secret_is_absent_from_public_logs_sqlite_snapshots_and_blobs(
 ) -> TestResult<()> {
     let database = TempDatabase::new("control-secret-nondisclosure")?;
@@ -4484,7 +4741,7 @@ async fn e2e_controller_secret_is_absent_from_public_logs_sqlite_snapshots_and_b
     let old_secret = TEST_CONTROLLER_SECRET;
     let new_secret = "secret-nondisclosure-next-control-e2e";
     let markers = [old_secret, new_secret];
-    let mut endpoint = TestZode::start(&database.path(), &config, &markers).await?;
+    let mut endpoint = TestZode::start(database.path(), &config, &markers).await?;
     let client = support::http_client()?;
 
     let scenario = async {
@@ -4556,11 +4813,10 @@ async fn e2e_controller_secret_is_absent_from_public_logs_sqlite_snapshots_and_b
         assert_response_headers_secret_free(&events, &markers);
         assert_eq!(events.status(), StatusCode::OK);
         let first_chunk = timeout(Duration::from_secs(5), events.chunk())
-            .await?
+            .await??
             .ok_or_else(|| {
                 Error::other("controller secret nondisclosure SSE ended before a frame")
-            })??
-            .ok_or_else(|| Error::other("controller secret nondisclosure SSE returned no frame"))?;
+            })?;
         assert_rotation_secret_free(&String::from_utf8_lossy(&first_chunk), &markers);
         drop(events);
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
@@ -4828,8 +5084,8 @@ async fn e2e_missing_controller_auth_state_is_rejected_before_ready() -> TestRes
         "identity sidecar disappeared before damage"
     );
     assert!(
-        bootstrap.is_file(),
-        "bootstrap controller secret disappeared before damage"
+        !bootstrap.exists(),
+        "bootstrap controller secret was not consumed before damage"
     );
     let state_entries = fs::read_dir(&auth_dir)?.count();
     assert!(
@@ -5293,7 +5549,10 @@ async fn e2e_file_backend_manifest_authority_binding_corruption_is_rejected_befo
         fs::read(root.join("controller-0.secret"))? == AUTHORITY_A_SECRET.as_bytes(),
         "restart configuration did not retain A bootstrap secret"
     );
-    assert!(root.join("controller-1.secret").is_file());
+    assert!(
+        !root.join("controller-1.secret").exists(),
+        "B bootstrap seed was not consumed after initial durable state"
+    );
 
     match ConfiguredServer::start_with_readiness_timeout(
         database.path(),

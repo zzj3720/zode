@@ -932,6 +932,191 @@ async fn e2e_malformed_message_json_is_rejected_without_effect(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_callback_unknown_or_unauthorized_is_safe_not_found(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let database_path = test_database("callback-safe-not-found")?;
+    let mut server = TestServer::start(&database_path).await?;
+    let client = http_client()?;
+    let callback_url = server.url("/v1/callbacks/opaque-callback-id");
+    let body = json!({
+        "status": "completed",
+        "result": {"content": "must not be admitted"}
+    });
+
+    let missing_bearer = client
+        .post(&callback_url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send_with_timeout()
+        .await?;
+    let missing_status = missing_bearer.status();
+    let missing_body = response_text(missing_bearer).await?;
+
+    let wrong_bearer = client
+        .post(&callback_url)
+        .header("Authorization", "Bearer wrong-callback-bearer")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send_with_timeout()
+        .await?;
+    let wrong_status = wrong_bearer.status();
+    let wrong_body = response_text(wrong_bearer).await?;
+
+    assert_eq!(missing_status, StatusCode::NOT_FOUND, "{missing_body}");
+    assert_eq!(wrong_status, StatusCode::NOT_FOUND, "{wrong_body}");
+    assert_eq!(missing_body, wrong_body);
+    let error: Value = serde_json::from_str(&missing_body)?;
+    assert_eq!(error["error"]["code"], "callback_not_found");
+    assert!(!missing_body.contains("opaque-callback-id"));
+    assert!(!missing_body.contains("wrong-callback-bearer"));
+
+    server.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_message_replay_only_replays_receipt_without_new_event(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let database_path = test_database("message-replay-only")?;
+    let mut server = TestServer::start(&database_path).await?;
+    let client = http_client()?;
+    let subject = "message-replay-only-subject";
+    let (session_id, _) =
+        create_subject_session(&client, &server, subject, "message-replay-create").await?;
+
+    let append = |key: &str, content: &str, replay_only: bool| {
+        let mut request = authenticated_as(
+            client.post(server.url(&format!("/v1/sessions/{session_id}/messages"))),
+            subject,
+        )
+        .header("Idempotency-Key", key)
+        .json(&json!({"content": content}));
+        if replay_only {
+            request = request.header("Zode-Idempotency-Mode", "replay-only");
+        }
+        request
+    };
+
+    let first = append("message-replay-key", "once", false)
+        .send_with_timeout()
+        .await?;
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let first_body = response_text(first).await?;
+
+    let replay = append("message-replay-key", "once", false)
+        .send_with_timeout()
+        .await?;
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(response_text(replay).await?, first_body);
+
+    let replay_only = append("message-replay-key", "once", true)
+        .send_with_timeout()
+        .await?;
+    assert_eq!(replay_only.status(), StatusCode::ACCEPTED);
+    assert_eq!(response_text(replay_only).await?, first_body);
+
+    let conflict = append("message-replay-key", "changed", true)
+        .send_with_timeout()
+        .await?;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(response_json(conflict).await?["error"]["code"], "conflict");
+
+    let miss = append("message-replay-miss", "must not append", true)
+        .send_with_timeout()
+        .await?;
+    assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response_json(miss).await?["error"]["code"],
+        "idempotency_receipt_not_found"
+    );
+
+    let events = authenticated_as(
+        client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
+        subject,
+    )
+    .header("Last-Event-ID", "0")
+    .send_with_timeout()
+    .await?;
+    assert_eq!(events.status(), StatusCode::OK);
+    let records = read_sse_events(events, 2).await?;
+    assert_eq!(records[0].event, "session_created");
+    assert_eq!(records[1].event, "message_appended");
+
+    server.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn e2e_sse_concurrent_commits_are_replayed_in_durable_order(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let database_path = test_database("sse-commit-order")?;
+    let mut server = TestServer::start(&database_path).await?;
+    let client = http_client()?;
+    let subject = "sse-commit-order-subject";
+    let (session_id, _) =
+        create_subject_session(&client, &server, subject, "sse-commit-order-create").await?;
+
+    let stream = authenticated_as(
+        client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
+        subject,
+    )
+    .header("Last-Event-ID", "0")
+    .send_with_timeout()
+    .await?;
+    assert_eq!(stream.status(), StatusCode::OK);
+
+    const MESSAGE_COUNT: usize = 12;
+    let mut tasks = Vec::with_capacity(MESSAGE_COUNT);
+    for index in 0..MESSAGE_COUNT {
+        let client = client.clone();
+        let url = server.url(&format!("/v1/sessions/{session_id}/messages"));
+        let key = format!("sse-commit-order-{index}");
+        tasks.push(tokio::spawn(async move {
+            for _attempt in 0..32 {
+                let response = authenticated_as(client.post(&url), subject)
+                    .header("Idempotency-Key", &key)
+                    .json(&json!({"content": format!("concurrent-{index}")}))
+                    .send_with_timeout()
+                    .await?;
+                if response.status() == StatusCode::ACCEPTED {
+                    return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
+                }
+                let status = response.status();
+                let body = response_text(response).await?;
+                if status != StatusCode::CONFLICT {
+                    return Err(Error::other(format!(
+                        "concurrent append failed with {status}: {body}"
+                    ))
+                    .into());
+                }
+                tokio::task::yield_now().await;
+            }
+            Err(Error::other("concurrent append did not admit").into())
+        }));
+    }
+    for task in tasks {
+        task.await??;
+    }
+
+    let records = read_sse_events(stream, MESSAGE_COUNT + 1).await?;
+    assert_eq!(records.len(), MESSAGE_COUNT + 1);
+    let mut previous = 0_u64;
+    for (index, record) in records.iter().enumerate() {
+        let id = record.id.parse::<u64>()?;
+        assert!(id > previous, "SSE id regressed at {index}: {records:?}");
+        previous = id;
+        if index == 0 {
+            assert_eq!(record.event, "session_created");
+        } else {
+            assert_eq!(record.event, "message_appended");
+        }
+    }
+
+    server.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_invalid_last_event_id_is_malformed_request(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let database_path = test_database("invalid-last-event-id")?;
@@ -970,7 +1155,7 @@ async fn e2e_get_exposes_explicit_durable_model_selection(
             "schema": "zode.provider-execution.v1",
             "revision": 1,
             "kind": "openai_compatible",
-            "base_url": "http://127.0.0.1:41000/v1"
+            "base_url": "http://127.0.0.1/v1"
         },
         "model": "fixture-model",
         "auth_authority_id": support::TEST_CONTROLLER_AUTHORITY,

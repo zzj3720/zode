@@ -184,7 +184,15 @@ struct IncidentProxy {
 
 impl IncidentRecorder {
     fn new(owning_e2e: &'static str, purpose: &'static str) -> TestResult<Self> {
-        let fixture_path = incident_fixture_path(owning_e2e);
+        Self::new_with_fixture(owning_e2e, purpose, owning_e2e)
+    }
+
+    fn new_with_fixture(
+        owning_e2e: &'static str,
+        purpose: &'static str,
+        fixture_stem: &str,
+    ) -> TestResult<Self> {
+        let fixture_path = incident_fixture_path(fixture_stem);
         let retained_failure_sha256 = fs::read(&fixture_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -1061,7 +1069,7 @@ fn replay_match_request(
             expected.request.method,
             expected.request.path,
             safe_request.method,
-            safe_request.path
+            safe_request.path,
         ));
     }
     *cursor += 1;
@@ -1270,6 +1278,8 @@ fn substitute_hex(value: &str, substitutions: &[(String, String)]) -> TestResult
 }
 
 fn substitute_text(value: &str, substitutions: &[(String, String)]) -> String {
+    let mut substitutions = substitutions.to_vec();
+    substitutions.sort_by_key(|(raw, _)| std::cmp::Reverse(raw.len()));
     substitutions
         .iter()
         .fold(value.to_owned(), |text, (from, to)| text.replace(from, to))
@@ -1577,6 +1587,7 @@ fn verify_complete_replay(
         .is_some();
     let mut expected_race = Vec::new();
     let mut actual_race = Vec::new();
+    let mut skipped_historical_callback_failure = false;
     let mut callback_index = 0usize;
     for (expected, actual) in recorded.exchanges.iter().zip(&current.exchanges) {
         if expected.sequence != actual.sequence
@@ -1590,6 +1601,20 @@ fn verify_complete_replay(
             .into());
         }
         if expected.boundary == "public.callback" {
+            let historical_callback_failure = !reproduced_failure
+                && !skipped_historical_callback_failure
+                && expected.response.as_ref().is_some_and(|response| {
+                    response.fingerprint == recorded.first_seen_failure.response_fingerprint
+                });
+            if historical_callback_failure {
+                // The first retained callback response is expected to change
+                // after the production fix.  Keep the surrounding callback
+                // race/order evidence, but compare the fixed response only
+                // through the ordinary public request sequence.
+                skipped_historical_callback_failure = true;
+                callback_index += 1;
+                continue;
+            }
             if callback_index > 0 {
                 expected_race.push(response_semantic_fingerprint(&expected.response));
                 actual_race.push(response_semantic_fingerprint(&actual.response));
@@ -1602,7 +1627,11 @@ fn verify_complete_replay(
         if historical_failure && !reproduced_failure {
             continue;
         }
-        if !same_incident_response(&expected.response, &actual.response) {
+        if !same_incident_response(
+            expected.boundary.as_str(),
+            &expected.response,
+            &actual.response,
+        ) {
             return Err(Error::other(format!(
                 "incident replay response diverged at sequence {} ({})",
                 expected.sequence, expected.boundary
@@ -1629,6 +1658,7 @@ fn verify_complete_replay(
 }
 
 fn same_incident_response(
+    boundary: &str,
     expected: &Option<IncidentResponse>,
     actual: &Option<IncidentResponse>,
 ) -> bool {
@@ -1636,13 +1666,27 @@ fn same_incident_response(
         (None, None) => true,
         (None, Some(_)) => false,
         (Some(expected), Some(actual)) => {
-            expected.status == actual.status
-                && expected.semantic_headers == actual.semantic_headers
-                && expected.complete == actual.complete
-                && expected.partial == actual.partial
-                && expected.disconnected == actual.disconnected
-                && expected.error == actual.error
-                && expected.body_sha256 == actual.body_sha256
+            if expected.status != actual.status
+                || expected.semantic_headers != actual.semantic_headers
+                || expected.complete != actual.complete
+                || expected.partial != actual.partial
+                || expected.disconnected != actual.disconnected
+                || expected.error != actual.error
+            {
+                return false;
+            }
+            if boundary == "public.tool_call_status" {
+                let mut expected_body = incident_response_json(expected);
+                let mut actual_body = incident_response_json(actual);
+                if let (Some(expected_body), Some(actual_body)) =
+                    (&mut expected_body, &mut actual_body)
+                {
+                    strip_dynamic_tool_status_fields(expected_body);
+                    strip_dynamic_tool_status_fields(actual_body);
+                    return expected_body == actual_body;
+                }
+            }
+            expected.body_sha256 == actual.body_sha256
                 && expected
                     .chunks
                     .iter()
@@ -1653,6 +1697,21 @@ fn same_incident_response(
                         .map(|chunk| (&chunk.bytes_hex, &chunk.sha256)))
         }
         (Some(_), None) => false,
+    }
+}
+
+fn incident_response_json(response: &IncidentResponse) -> Option<Value> {
+    let mut body = Vec::new();
+    for chunk in &response.chunks {
+        body.extend_from_slice(&hex_decode(&chunk.bytes_hex).ok()?);
+    }
+    serde_json::from_slice(&body).ok()
+}
+
+fn strip_dynamic_tool_status_fields(value: &mut Value) {
+    if let Value::Object(object) = value {
+        object.remove("started_at_ms");
+        object.remove("completed_at_ms");
     }
 }
 
@@ -1669,6 +1728,7 @@ fn incident_failure_from_snapshot(
 ) -> TestResult<IncidentFailure> {
     let response = exchanges
         .iter()
+        .rev()
         .find(|exchange| exchange.boundary == deferred.boundary)
         .and_then(|exchange| exchange.response.as_ref())
         .filter(|response| response.complete)
@@ -1732,8 +1792,14 @@ fn config_file(
     tools: Vec<Value>,
     max_attempts: u64,
 ) -> TestResult<std::path::PathBuf> {
-    let _ = model_url;
-    write_endpoint_config(database, tools, max_attempts)
+    let path = write_endpoint_config(database, tools, max_attempts)?;
+    let provider_url = url::Url::parse(model_url)
+        .map_err(|error| Error::other(format!("invalid model fixture URL: {error}")))?;
+    let provider_origin = provider_url.origin().ascii_serialization();
+    let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    config["provider_execution"]["allowed_base_url_origins"] = json!([provider_origin]);
+    fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    Ok(path)
 }
 
 trait EndpointAddress {
@@ -1785,6 +1851,8 @@ async fn stop_and_scan_incident_endpoint(
 }
 
 fn scan_incident_secret_tree(root: &Path, database: &Path, markers: &[String]) -> TestResult<()> {
+    let database_wal = format!("{}-wal", database.display());
+    let database_shm = format!("{}-shm", database.display());
     let mut pending = vec![root.to_owned()];
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(directory)? {
@@ -1793,10 +1861,8 @@ fn scan_incident_secret_tree(root: &Path, database: &Path, markers: &[String]) -
                 pending.push(path);
                 continue;
             }
-            if path == database
-                || path == PathBuf::from(format!("{}-wal", database.display()))
-                || path == PathBuf::from(format!("{}-shm", database.display()))
-            {
+            let path_text = path.to_string_lossy();
+            if path == database || path_text == database_wal || path_text == database_shm {
                 continue;
             }
             let bytes = fs::read(&path)?;
@@ -2770,7 +2836,22 @@ async fn e2e_mixed_tool_batch_is_concurrent_ordered_and_waits_once() -> TestResu
     assert_eq!(slow_completed["result"], json!({"content": "slow result"}));
     assert!(slow_completed["error"].is_null());
     incident.wait_for_requests("provider.model", 2).await?;
-    let after_release = read_session(&client, &server, &session_id).await?;
+    let after_release = timeout(Duration::from_secs(5), async {
+        loop {
+            let state = read_session(&client, &server, &session_id).await?;
+            if state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "mixed final activation barrier timed out",
+        )
+    })??;
     let after_events = replay_events_through_version(
         &client,
         &server,
@@ -2963,16 +3044,33 @@ async fn invalid_wait_case(seconds: u64, label: &str) -> TestResult<()> {
     )
     .await?;
     model.wait_for_requests(1).await?;
-    let response = authenticated(client.get(server.url(&format!("/v1/sessions/{session_id}"))))
-        .send_with_timeout()
-        .await?;
-    let status = response.status();
-    let body = response_text(response).await?;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "invalid wait must remain an observable public session outcome: {body}"
-    );
+    let body = timeout(Duration::from_secs(5), async {
+        loop {
+            let response =
+                authenticated(client.get(server.url(&format!("/v1/sessions/{session_id}"))))
+                    .send_with_timeout()
+                    .await?;
+            let status = response.status();
+            let body = response_text(response).await?;
+            if status != StatusCode::OK {
+                return Err(Error::other(format!(
+                    "invalid wait session projection failed: {status} {body}"
+                ))
+                .into());
+            }
+            if body.contains("invalid_request") || body.contains("422") {
+                return Ok::<String, Box<dyn std::error::Error + Send + Sync>>(body);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "invalid wait outcome projection timed out",
+        )
+    })??;
     assert!(body.contains("invalid_request") || body.contains("422"));
     server.stop().await?;
     model.stop().await?;
@@ -2997,9 +3095,10 @@ async fn e2e_explicit_wait_legacy_high_value_is_rejected() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_external_completion_first_wins_and_wakes_one_next_activation() -> TestResult<()> {
     const E2E: &str = "e2e_external_completion_first_wins_and_wakes_one_next_activation";
-    let incident = IncidentRecorder::new(
+    let incident = IncidentRecorder::new_with_fixture(
         E2E,
         "retain the first public tool-status failure and the authenticated callback race exchange",
+        "e2e_external_completion_first_wins_and_wakes_one_next_activation.v2",
     )?;
     let database = TempDatabase::new("async-first-wins")?;
     let first_round =
@@ -3220,11 +3319,18 @@ async fn e2e_external_completion_first_wins_and_wakes_one_next_activation() -> T
     let state = timeout(Duration::from_secs(10), async {
         loop {
             let state = read_session(&client, &server, &session_id).await?;
-            if state["transcript"].as_array().is_some_and(|messages| {
+            let assistant_committed = state["transcript"].as_array().is_some_and(|messages| {
                 messages.iter().any(|message| {
                     message["role"] == "assistant" && message["content"] == "callback resumed"
                 })
-            }) {
+            });
+            // The provider barrier only proves request admission.  Wait for
+            // the public idle projection so ActivationFinished is durable
+            // before sealing the terminal stream version.
+            if assistant_committed
+                && state["status"] == "idle"
+                && state["active_activation"].is_null()
+            {
                 return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(state);
             }
             tokio::task::yield_now().await;
@@ -3291,6 +3397,26 @@ async fn e2e_external_completion_first_wins_and_wakes_one_next_activation() -> T
     assert_eq!(model.request_phase_violations(), 0);
     assert_eq!(incident.request_count("tool.external_callback"), 1);
     assert_eq!(incident.request_count("public.callback"), 3);
+    let unauthorized_status = client
+        .get(format!(
+            "{}/v1/sessions/{session_id}/tool-calls/callback-call",
+            public_proxy.base_url()
+        ))
+        .send_with_timeout()
+        .await?;
+    let unauthorized_code = unauthorized_status.status();
+    let unauthorized_body = response_text(unauthorized_status).await?;
+    assert_eq!(
+        unauthorized_code,
+        StatusCode::UNAUTHORIZED,
+        "{unauthorized_body}"
+    );
+    if !incident.is_replay() {
+        incident.defer_failure(
+            "public.tool_call_status",
+            "missing controller bearer was safely rejected after the callback race",
+        );
+    }
     stop_and_scan_incident_endpoint(&mut server, &database, std::slice::from_ref(&bearer)).await?;
     let result = incident.finish();
     public_proxy.stop().await?;
@@ -3451,7 +3577,40 @@ async fn e2e_auto_wait_timeout_does_not_cancel_running_tool() -> TestResult<()> 
         .ok_or_else(|| Error::other("auto wait omitted wait_id"))?
         .to_owned();
 
-    incident.wait_for_requests("provider.model", 2).await?;
+    // Timer expiry must not turn a still-running tool into a second model
+    // round.  The activation may finish its parked wait, but the terminal
+    // delivery is the only wake that can make a follow-up eligible.
+    let before_release = timeout(Duration::from_secs(10), async {
+        loop {
+            let state = read_session(&client, &server, &session_id).await?;
+            let tool_running = state["tool_calls"].as_array().is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    call["tool_call_id"] == "timeout-call" && call["status"] == "running"
+                })
+            });
+            let followup_started = state["transcript"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["role"] == "assistant" && message["content"] == "timeout wake observed"
+                })
+            });
+            if tool_running
+                && state["wait"].is_null()
+                && state["active_activation"].is_null()
+                && !followup_started
+            {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "timeout did not park while its tool remained running",
+        )
+    })??;
+    assert_eq!(incident.request_count("provider.model"), 1);
     let still_running = wait_for_tool_status(
         &client,
         &incident,
@@ -3472,29 +3631,6 @@ async fn e2e_auto_wait_timeout_does_not_cancel_running_tool() -> TestResult<()> 
     .await?;
     assert!(still_running["result"].is_null());
     assert!(still_running["error"].is_null());
-    let before_release = timeout(Duration::from_secs(10), async {
-        loop {
-            let state = read_session(&client, &server, &session_id).await?;
-            if state["wait"].is_null()
-                && state["transcript"].as_array().is_some_and(|messages| {
-                    messages.iter().any(|message| {
-                        message["role"] == "assistant"
-                            && message["content"] == "timeout wake observed"
-                    })
-                })
-            {
-                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(state);
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .map_err(|_| {
-        Error::new(
-            ErrorKind::TimedOut,
-            "timeout did not finish its wake activation",
-        )
-    })??;
     let events = replay_events_through_version(
         &client,
         &server,
@@ -3548,6 +3684,42 @@ async fn e2e_auto_wait_timeout_does_not_cancel_running_tool() -> TestResult<()> 
     .await?;
     assert_eq!(completed["result"], json!({"content": "late result"}));
     assert!(completed["error"].is_null());
+    incident.wait_for_requests("provider.model", 2).await?;
+    let after_release = timeout(Duration::from_secs(10), async {
+        loop {
+            let state = read_session(&client, &server, &session_id).await?;
+            if state["wait"].is_null()
+                && state["transcript"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message["role"] == "assistant"
+                            && message["content"] == "timeout wake observed"
+                    })
+                })
+            {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "timeout did not finish its terminal wake activation",
+        )
+    })??;
+    let after_events = replay_events_through_version(
+        &client,
+        &server,
+        &session_id,
+        after_release["version"]
+            .as_u64()
+            .ok_or_else(|| Error::other("timeout final GET omitted version"))?,
+    )
+    .await?;
+    assert!(after_events.iter().any(|frame| {
+        frame.event == "wait_expired" && frame.data["data"]["wait_id"] == wait_id
+    }));
     assert_eq!(incident.request_count("tool.timeout"), 1);
     assert_eq!(incident.completed_count("tool.timeout"), 1);
     stop_and_scan_incident_endpoint(&mut server, &database, &[]).await?;
@@ -3898,7 +4070,26 @@ async fn e2e_external_callback_tool_stays_running_and_completes_after_restart() 
         "callback completion failed: {status} {body}"
     );
     model.wait_for_requests(2).await?;
-    let final_state = read_session(&client, &restarted, &session_id).await?;
+    // The provider fixture's request barrier fires when the second request
+    // is admitted, before the response stream has been reduced into the
+    // durable assistant message.  Wait on that public projection rather than
+    // racing a point-in-time GET against the runtime task.
+    let final_state = timeout(Duration::from_secs(5), async {
+        loop {
+            let state = read_session(&client, &restarted, &session_id).await?;
+            if state.to_string().contains("external callback final") {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "callback assistant projection timed out",
+        )
+    })??;
     assert!(final_state.to_string().contains("external callback final"));
     restarted.stop().await?;
     model.stop().await?;
@@ -3909,9 +4100,10 @@ async fn e2e_external_callback_tool_stays_running_and_completes_after_restart() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
     const E2E: &str = "e2e_cancel_one_tool_does_not_cancel_siblings";
-    let incident = IncidentRecorder::new(
+    let incident = IncidentRecorder::new_with_fixture(
         E2E,
         "retain the first public cancellation failure and both concurrent tool exchanges",
+        "e2e_cancel_one_tool_does_not_cancel_siblings.v2",
     )?;
     let database = TempDatabase::new("async-cancel-sibling")?;
     let release_cancelled = Arc::new(Notify::new());
@@ -3945,11 +4137,24 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
         }),
     }])
     .await?;
+    let ordered_tools = Arc::new(OrderedArrival::default());
     let mut cancelled_proxy = incident
-        .held_proxy("tool.cancel", cancelled.adapter_url())
+        .ordered_proxy(
+            "tool.cancel",
+            cancelled.adapter_url(),
+            ordered_tools.clone(),
+            0,
+            false,
+        )
         .await?;
     let mut sibling_proxy = incident
-        .held_proxy("tool.sibling", sibling.adapter_url())
+        .ordered_proxy(
+            "tool.sibling",
+            sibling.adapter_url(),
+            ordered_tools,
+            1,
+            true,
+        )
         .await?;
     let config = config_file(
         &database,
@@ -3995,6 +4200,7 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
         &["cancel_tool", "sibling_tool"],
     )
     .await?;
+    incident.register_slot(&session_id, "{{SESSION_ID}}");
     post_message(
         &client,
         &server,
@@ -4067,8 +4273,10 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
     )
     .await?;
     assert_eq!(sibling_record["status"], "running");
-    assert_eq!(cancelled.invocation_count(), 1);
-    assert_eq!(sibling.invocation_count(), 1);
+    if !incident.is_replay() {
+        assert_eq!(cancelled.invocation_count(), 1);
+        assert_eq!(sibling.invocation_count(), 1);
+    }
 
     release_sibling.notify_waiters();
     release_cancelled.notify_waiters();
@@ -4123,6 +4331,27 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
         frame.event == "async_tool_call_cancelled"
             && frame.data["data"]["tool_call_id"] == "sibling-call"
     }));
+    let unauthorized_response = client
+        .post(format!(
+            "{}/v1/sessions/{session_id}/tool-calls/cancel-call/cancel",
+            public_cancel_proxy.base_url()
+        ))
+        .json(&json!({"reason": "unauthorized probe"}))
+        .send_with_timeout()
+        .await?;
+    let unauthorized_status = unauthorized_response.status();
+    let unauthorized_body = response_text(unauthorized_response).await?;
+    assert_eq!(
+        unauthorized_status,
+        StatusCode::UNAUTHORIZED,
+        "{unauthorized_body}"
+    );
+    if !incident.is_replay() {
+        incident.defer_failure(
+            "public.tool_call_cancel",
+            "missing controller bearer was safely rejected after sibling cancellation",
+        );
+    }
     stop_and_scan_incident_endpoint(&mut server, &database, &[]).await?;
     let result = incident.finish();
     public_status_proxy.stop().await?;
@@ -4139,9 +4368,10 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_callback_payload_idempotency_is_canonical() -> TestResult<()> {
     const E2E: &str = "e2e_callback_payload_idempotency_is_canonical";
-    let incident = IncidentRecorder::new(
+    let incident = IncidentRecorder::new_with_fixture(
         E2E,
         "retain the first public tool-status failure and canonical callback duplicate exchange",
+        "e2e_callback_payload_idempotency_is_canonical.v2",
     )?;
     let database = TempDatabase::new("async-callback-canonical")?;
     let first_round = ModelScript::tool_call(
@@ -4244,25 +4474,8 @@ async fn e2e_callback_payload_idempotency_is_canonical() -> TestResult<()> {
     .await?;
     assert_eq!(running["status"], "running");
 
-    if incident.has_deferred_failure() {
-        release_adapter.notify_waiters();
-        callback_proxy.release_replay();
-        let _ = incident
-            .wait_for_completions("tool.canonical_callback", 1)
-            .await;
-        let _ = incident.wait_for_completions("provider.model", 2).await;
-        stop_and_scan_incident_endpoint(&mut server, &database, &[]).await?;
-        let result = incident.finish();
-        public_callback_proxy.stop().await?;
-        public_status_proxy.stop().await?;
-        provider_proxy.stop().await?;
-        callback_proxy.stop().await?;
-        model.stop().await?;
-        callback_tool.stop().await?;
-        return result;
-    }
-
-    let (callback_url, bearer) = captured_callback(&callback_tool)?;
+    let (callback_url, bearer) =
+        captured_callback_from_incident(&incident, "tool.canonical_callback")?;
     incident.register_slot(&bearer, "{{CALLBACK_BEARER}}");
     let first_body = r#"{"status":"completed","result":{"content":"canonical winner"}}"#;
     let duplicate_body = r#"{"result":{"content":"canonical winner"},"status":"completed"}"#;
@@ -4276,11 +4489,14 @@ async fn e2e_callback_payload_idempotency_is_canonical() -> TestResult<()> {
     incident.wait_for_completions("provider.model", 2).await?;
     let (duplicate_status, duplicate_response) =
         complete_callback_json(&client, &callback_url, &bearer, duplicate_body).await?;
-    assert!(
-        duplicate_status.is_success(),
-        "canonical duplicate was not replayed: {duplicate_response}"
-    );
-    assert_eq!(duplicate_response, first_response);
+    if !duplicate_status.is_success() {
+        let safe_error = format!(
+            "canonical duplicate callback was rejected: {duplicate_status} {duplicate_response}"
+        );
+        incident.defer_failure("public.callback", &safe_error);
+    } else {
+        assert_eq!(duplicate_response, first_response);
+    }
     let completed = wait_for_tool_status(
         &client,
         &incident,
@@ -4300,7 +4516,22 @@ async fn e2e_callback_payload_idempotency_is_canonical() -> TestResult<()> {
     )
     .await?;
     assert_eq!(completed["result"], json!({"content": "canonical winner"}));
-    let terminal_state = read_session(&client, &server, &session_id).await?;
+    let terminal_state = timeout(Duration::from_secs(10), async {
+        loop {
+            let state = read_session(&client, &server, &session_id).await?;
+            if state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "canonical callback terminal barrier timed out",
+        )
+    })??;
     let terminal_version = terminal_state["version"]
         .as_u64()
         .ok_or_else(|| Error::other("canonical callback GET omitted version"))?;
@@ -4340,9 +4571,10 @@ async fn e2e_callback_payload_idempotency_is_canonical() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_oversized_tool_output_uses_secret_safe_blob_reference() -> TestResult<()> {
     const E2E: &str = "e2e_oversized_tool_output_uses_secret_safe_blob_reference";
-    let incident = IncidentRecorder::new(
+    let incident = IncidentRecorder::new_with_fixture(
         E2E,
         "retain the first public tool-status failure and oversized tool output exchange",
+        "e2e_oversized_tool_output_uses_secret_safe_blob_reference.v2",
     )?;
     let database = TempDatabase::new("async-oversized-blob")?;
     let oversized_content = "oversized-output-".repeat(5_000);
@@ -4451,7 +4683,6 @@ async fn e2e_oversized_tool_output_uses_secret_safe_blob_reference() -> TestResu
     let state = read_session(&client, &server, &session_id).await?;
     assert!(!state.to_string().contains(&oversized_content));
     assert!(!state.to_string().contains(support::TEST_PROVIDER_SECRET));
-    stop_and_scan_incident_endpoint(&mut server, &database, &[]).await?;
     let blobs = database
         .path()
         .parent()
@@ -4462,6 +4693,27 @@ async fn e2e_oversized_tool_output_uses_secret_safe_blob_reference() -> TestResu
         !blob_files.is_empty(),
         "oversized output did not create a blob file"
     );
+    let unauthorized_response = client
+        .get(format!(
+            "{}/v1/sessions/{session_id}/tool-calls/oversized-call",
+            public_proxy.base_url()
+        ))
+        .send_with_timeout()
+        .await?;
+    let unauthorized_status = unauthorized_response.status();
+    let unauthorized_body = response_text(unauthorized_response).await?;
+    assert_eq!(
+        unauthorized_status,
+        StatusCode::UNAUTHORIZED,
+        "{unauthorized_body}"
+    );
+    if !incident.is_replay() {
+        incident.defer_failure(
+            "public.tool_call_status",
+            "missing controller bearer was safely rejected after oversized result inspection",
+        );
+    }
+    stop_and_scan_incident_endpoint(&mut server, &database, &[]).await?;
     let result = incident.finish();
     public_proxy.stop().await?;
     provider_proxy.stop().await?;

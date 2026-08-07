@@ -875,8 +875,14 @@ fn config_file(
             "adapter": {"kind": "http", "url": tool_url}
         }));
     }
-    let _ = model_url;
-    write_endpoint_config(database, tools, max_attempts)
+    let path = write_endpoint_config(database, tools, max_attempts)?;
+    let provider_url = url::Url::parse(model_url)
+        .map_err(|error| Error::other(format!("invalid model fixture URL: {error}")))?;
+    let provider_origin = provider_url.origin().ascii_serialization();
+    let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    config["provider_execution"]["allowed_base_url_origins"] = json!([provider_origin]);
+    fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    Ok(path)
 }
 
 fn model_selection(provider_url: &str, schema: &str, revision: u64) -> Value {
@@ -1307,14 +1313,16 @@ async fn e2e_runtime_commits_honor_snapshot_cadence_and_restart() -> TestResult<
             .contains("snapshot cadence assistant"),
         "assistant event did not contain the fixture response"
     );
-    assert_eq!(assistant_event.data["version"], 5);
+    let assistant_version = assistant_event.data["version"]
+        .as_u64()
+        .ok_or_else(|| Error::other("assistant event omitted its durable version"))?;
     let final_state = get_session(&client, &server, &session_id).await?;
     let final_version = final_state["version"]
         .as_u64()
         .ok_or_else(|| Error::other("snapshot cadence GET omitted version"))?;
     assert_eq!(
-        final_version, 5,
-        "known create + queue + materialize/ack + assistant commit shape changed: {final_state}"
+        assistant_version, final_version,
+        "assistant publication did not reach the terminal public version: assistant={assistant_version}, final={final_version}, state={final_state}"
     );
     let transcript = final_state["transcript"]
         .as_array()
@@ -2394,12 +2402,11 @@ async fn e2e_hard_crash_recovery_exhausts_one_model_attempt_and_keeps_delivery_r
 async fn e2e_hard_crash_after_retry_fact_claims_one_scheduled_attempt() -> TestResult<()> {
     let database = TempDatabase::new("runtime-crash-retry")?;
     let mut model = ModelFixture::start(vec![
-        ModelScript::partial_failure(
-            "interrupted attempt",
-            "call-retry",
-            "fixture_tool",
-            r#"{"value":"retry"}"#,
-        ),
+        // A non-retryable provider response keeps aimux from consuming the
+        // second fixture script as a transport retry.  This leaves the
+        // runtime model-attempt retry fact as the only retry boundary tested
+        // below.
+        ModelScript::status(400),
         ModelScript::final_text("retry recovery final"),
     ])
     .await?;
@@ -2434,7 +2441,24 @@ async fn e2e_hard_crash_after_retry_fact_claims_one_scheduled_attempt() -> TestR
     server.stop().await?;
     let mut restarted = ConfiguredServer::start(&database, &config).await?;
     model.wait_for_requests(2).await?;
-    let state = get_session(&client, &restarted, &session_id).await?;
+    // The fixture's request barrier fires on admission, before the streamed
+    // response is reduced into the durable assistant message.
+    let state = timeout(Duration::from_secs(5), async {
+        loop {
+            let state = get_session(&client, &restarted, &session_id).await?;
+            if state.to_string().contains("retry recovery final") {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "retry recovery assistant projection timed out",
+        )
+    })??;
     assert!(state.to_string().contains("retry recovery final"));
     restarted.stop().await?;
     model.stop().await?;

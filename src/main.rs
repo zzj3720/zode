@@ -21,11 +21,12 @@ struct Cli {
 }
 
 struct Composition {
-    snapshot_every: Option<u64>,
+    runtime_options: zode::runtime::RuntimeOptions,
     control: Arc<ControlState>,
     replicas: Arc<ReplicaStore>,
     provider_policy: ProviderExecutionPolicy,
     tool_specs: Vec<zode::tools::HttpToolSpec>,
+    blob_store: Option<Arc<dyn zode::runtime::BlobStore>>,
     health_body: Vec<u8>,
     capabilities_body: Vec<u8>,
 }
@@ -120,18 +121,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?);
     let database_path = control.runtime_store_path().to_path_buf();
     let listen_addr = config.listen_addr()?;
-    let snapshot_every = config.snapshot_every_events();
+    let runtime_options = config.runtime_options();
     let credential_replica_directory = control.credential_replica_directory().map(PathBuf::from);
     let replicas = Arc::new(ReplicaStore::open(credential_replica_directory.as_deref())?);
     let (adapter_kinds, allowed_origins) = config.provider_execution_policy();
-    let capabilities_body = api::build_capabilities_body(
+    let capabilities_body = api::build_capabilities_body_with_callback(
         control.endpoint_id(),
         adapter_kinds.clone(),
         config.capability_tools(),
+        true,
     )?;
     let health_body = api::build_health_body(control.endpoint_id())?;
     let provider_policy = ProviderExecutionPolicy::new(adapter_kinds, allowed_origins);
     let tool_specs = config.tool_specs();
+    let blob_store = config
+        .blob_store_directory()
+        .map(zode::tools::FileBlobStore::open)
+        .transpose()?;
+    let blob_store = blob_store.map(|store| Arc::new(store) as Arc<dyn zode::runtime::BlobStore>);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -140,11 +147,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         database_path,
         listen_addr,
         Composition {
-            snapshot_every,
+            runtime_options,
             control,
             replicas,
             provider_policy,
             tool_specs,
+            blob_store,
             health_body,
             capabilities_body,
         },
@@ -163,8 +171,15 @@ async fn run(
         composition.replicas.clone(),
         composition.provider_policy.clone(),
     ));
-    let tools = Arc::new(HttpToolExecutor::new(composition.tool_specs));
-    let runtime = Runtime::new(store.clone(), provider, tools, composition.snapshot_every);
+    let tools = match composition.blob_store {
+        Some(blob_store) => Arc::new(HttpToolExecutor::new_with_blob_store(
+            composition.tool_specs,
+            blob_store,
+        )),
+        None => Arc::new(HttpToolExecutor::new(composition.tool_specs)),
+    };
+    let runtime =
+        Runtime::new_with_options(store.clone(), provider, tools, composition.runtime_options);
     runtime.queue_startup_recovery().await?;
     let state = api::AppState::new(
         store,

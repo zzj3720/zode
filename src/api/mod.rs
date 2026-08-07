@@ -6,11 +6,8 @@ use std::{
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{
-        rejection::{JsonRejection, QueryRejection},
-        Path, Query, Request, State,
-    },
-    http::{HeaderMap, StatusCode},
+    extract::{rejection::QueryRejection, Path, Query, Request, State},
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::{
         sse::{Event as SseEvent, KeepAlive, Sse},
         IntoResponse, Response,
@@ -24,8 +21,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use zode_protocol::{
     encode_json_bounded, CapabilityTool as WireCapabilityTool, EndpointCapabilities,
-    EndpointHealth, AUTH_REPLICA_CREDENTIAL_SCHEMA_V1, MAX_CAPABILITIES_BODY_BYTES,
-    MAX_HEALTH_BODY_BYTES, PROVIDER_HTTP_CAPABILITY, TOOL_HTTP_CAPABILITY, WAIT_FOR_TOOL,
+    EndpointHealth, AUTH_REPLICA_CREDENTIAL_SCHEMA_V1, EXTERNAL_CALLBACK_CAPABILITY,
+    MAX_CAPABILITIES_BODY_BYTES, MAX_HEALTH_BODY_BYTES, PROVIDER_HTTP_CAPABILITY,
+    TOOL_HTTP_CAPABILITY, WAIT_FOR_TOOL,
 };
 
 use crate::{
@@ -34,18 +32,19 @@ use crate::{
         MAX_ROTATION_REQUEST_BYTES,
     },
     domain::{
-        ActiveWait, AsyncToolCallRecord, DeliveryKind, DurablePayload, EventDraft, EventRecord,
-        ProviderExecutionSelection, QueuedDelivery, SessionEvent, SessionModelSelection,
-        SessionOwner, SessionSelection, SessionState, ToolCall, TranscriptMessage,
+        ActiveWait, AsyncToolCallRecord, CompletionMode, DeliveryKind, DurablePayload, EventDraft,
+        EventRecord, ProviderExecutionSelection, QueuedDelivery, SessionEvent,
+        SessionModelSelection, SessionOwner, SessionSelection, SessionState, ToolCall,
+        TranscriptMessage, MAX_ERROR_MESSAGE_BYTES, MAX_IDENTIFIER_BYTES,
     },
     provider::{
         ProviderExecutionPolicy, ReplicaError, ReplicaInstallRequest, ReplicaMutation,
         ReplicaStore, ReplicaTombstoneRequest, MAX_REPLICA_REQUEST_BYTES,
     },
-    runtime::Runtime,
+    runtime::{CallbackCompletion, Runtime, RuntimeCommandError},
     storage::{
         EventStore, RehydrateError, SessionCreate, SessionCreateCommand, SessionListCursor,
-        SessionListItem, StoreError,
+        StoreError, MAX_SESSION_LIST_LIMIT,
     },
 };
 
@@ -99,9 +98,24 @@ pub fn build_health_body(endpoint_id: &str) -> Result<Vec<u8>, String> {
 
 pub fn build_capabilities_body(
     endpoint_id: &str,
+    provider_adapter_kinds: Vec<String>,
+    tools: Vec<CapabilityTool>,
+) -> Result<Vec<u8>, String> {
+    build_capabilities_body_with_callback(endpoint_id, provider_adapter_kinds, tools, false)
+}
+
+/// Build the bounded capability projection from the effective composition.
+/// External-callback tools are advertised only when their public route and
+/// durable runtime lifecycle are ready; dormant configuration is hidden.
+pub fn build_capabilities_body_with_callback(
+    endpoint_id: &str,
     mut provider_adapter_kinds: Vec<String>,
     mut tools: Vec<CapabilityTool>,
+    callback_lifecycle_enabled: bool,
 ) -> Result<Vec<u8>, String> {
+    if !callback_lifecycle_enabled {
+        tools.retain(|tool| tool.completion_mode != EXTERNAL_CALLBACK_CAPABILITY);
+    }
     provider_adapter_kinds.sort_unstable();
     tools.sort_unstable_by(|left, right| left.name.cmp(&right.name));
     let mut outbound_capabilities = Vec::new();
@@ -110,6 +124,13 @@ pub fn build_capabilities_body(
     }
     if !tools.is_empty() {
         outbound_capabilities.push(TOOL_HTTP_CAPABILITY.to_owned());
+    }
+    if callback_lifecycle_enabled
+        && tools
+            .iter()
+            .any(|tool| tool.completion_mode == EXTERNAL_CALLBACK_CAPABILITY)
+    {
+        outbound_capabilities.push(EXTERNAL_CALLBACK_CAPABILITY.to_owned());
     }
     let body = EndpointCapabilities::v1(
         endpoint_id.to_owned(),
@@ -136,6 +157,7 @@ struct PublicEvent {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionListQuery {
     #[serde(default)]
     limit: Option<u64>,
@@ -181,6 +203,42 @@ struct MessageRequest {
     content: String,
     #[serde(default)]
     message_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalCallbackRequest {
+    status: ExternalCallbackStatus,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    error: Option<ExternalCallbackError>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExternalCallbackStatus {
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalCallbackError {
+    class: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolCancelRequest {
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolReconcileRequest {
+    action: String,
 }
 
 struct ModelDeliverySpec {
@@ -310,6 +368,24 @@ impl ApiError {
         }
     }
 
+    fn tool_not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "tool_call_not_found",
+            message: "tool call was not found".into(),
+            retryable: false,
+        }
+    }
+
+    fn callback_not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "callback_not_found",
+            message: "callback was not found".into(),
+            retryable: false,
+        }
+    }
+
     fn internal() -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -419,14 +495,27 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sessions/{id}", get(get_session))
         .route("/v1/sessions/{id}/messages", post(append_message))
         .route("/v1/sessions/{id}/model", put(select_model))
+        .route(
+            "/v1/sessions/{id}/tool-calls/{tool_call_id}",
+            get(read_tool_call),
+        )
+        .route(
+            "/v1/sessions/{id}/tool-calls/{tool_call_id}/cancel",
+            post(cancel_tool_call),
+        )
+        .route(
+            "/v1/sessions/{id}/tool-calls/{tool_call_id}/reconcile",
+            post(reconcile_tool_call),
+        )
+        .route(
+            "/v1/callbacks/{callback_id}",
+            post(complete_external_callback),
+        )
         .route("/v1/sessions/{id}/events", get(stream_events))
         .with_state(state)
 }
 
-async fn health(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
+async fn health(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     state
         .control
         .authenticate_controller(&headers)
@@ -520,6 +609,7 @@ async fn install_auth_replica(
         .authenticate_controller(&headers)
         .map_err(ApiError::from_control)?;
     let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
+    require_json_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_REPLICA_REQUEST_BYTES)
         .await
         .map_err(|_| ApiError::payload_too_large())?;
@@ -594,17 +684,19 @@ async fn rotate_controller_auth(
         .authenticate_controller(request.headers())
         .map_err(ApiError::from_control)?;
     let idempotency_key = rotation_idempotency_key(request.headers())?;
+    require_json_content_type(request.headers())?;
     let body = to_bytes(request.into_body(), MAX_ROTATION_REQUEST_BYTES)
         .await
         .map_err(|_| ApiError::payload_too_large())?;
     let rotation: ControllerAuthRotationRequest =
         serde_json::from_slice(&body).map_err(|_| ApiError::malformed())?;
     let control = state.control.clone();
-    let outcome =
-        tokio::task::spawn_blocking(move || control.rotate(&controller, &idempotency_key, &rotation))
-            .await
-            .map_err(|_| ApiError::internal())?
-            .map_err(ApiError::from_rotation)?;
+    let outcome = tokio::task::spawn_blocking(move || {
+        control.rotate(&controller, &idempotency_key, &rotation)
+    })
+    .await
+    .map_err(|_| ApiError::internal())?
+    .map_err(ApiError::from_rotation)?;
 
     let mut response = Response::new(Body::from(outcome.body));
     *response.status_mut() =
@@ -625,6 +717,7 @@ async fn create_session(
         .control
         .authenticate(&headers)
         .map_err(ApiError::from_control)?;
+    require_json_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_SESSION_REQUEST_BYTES)
         .await
         .map_err(|_| ApiError::payload_too_large())?;
@@ -713,8 +806,10 @@ async fn list_sessions(
         .map_err(ApiError::from_control)?;
     let Query(query) = query.map_err(|_| ApiError::malformed())?;
     let limit = query.limit.unwrap_or(50);
-    if !(1..=100).contains(&limit) {
-        return Err(ApiError::invalid("limit must be between 1 and 100"));
+    if !(1..=MAX_SESSION_LIST_LIMIT as u64).contains(&limit) {
+        return Err(ApiError::invalid(format!(
+            "limit must be between 1 and {MAX_SESSION_LIST_LIMIT}"
+        )));
     }
     let owner = SessionOwner::new(context.authority_id(), context.subject());
     let cursor = query
@@ -730,11 +825,10 @@ async fn list_sessions(
         return Err(ApiError::malformed());
     }
     let store = state.store.clone();
-    let page = run_blocking(move || {
-        list_owned_sessions(&*store, &owner, cursor.as_ref(), limit as usize)
-    })
-        .await
-        .map_err(ApiError::from_service)?;
+    let page =
+        run_blocking(move || list_owned_sessions(&*store, &owner, cursor.as_ref(), limit as usize))
+            .await
+            .map_err(ApiError::from_service)?;
     Ok(Json(json!({
         "schema": "zode.session-list.v1",
         "items": page.items,
@@ -764,14 +858,23 @@ async fn append_message(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
-    request: Result<Json<MessageRequest>, JsonRejection>,
+    request: Request,
 ) -> Result<(StatusCode, Json<CommandResponse>), ApiError> {
     let context = state
         .control
         .authenticate(&headers)
         .map_err(ApiError::from_control)?;
-    let Json(request) = request.map_err(api_error_from_json_rejection)?;
     let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
+    let replay_only = replay_only_mode(&headers).map_err(ApiError::from_service)?;
+    require_json_content_type(&headers)?;
+    let body = to_bytes(request.into_body(), MAX_SESSION_REQUEST_BYTES)
+        .await
+        .map_err(|_| ApiError::payload_too_large())?;
+    let request: MessageRequest =
+        serde_json::from_slice(&body).map_err(|error| match error.classify() {
+            serde_json::error::Category::Data => ApiError::invalid("invalid message request"),
+            _ => ApiError::malformed(),
+        })?;
     let owner = SessionOwner::new(context.authority_id(), context.subject());
     let owner_digest = owner_digest(&owner.authority_id, &owner.subject);
     let command_id = format!(
@@ -811,6 +914,44 @@ async fn append_message(
     let key = idempotency_key.clone();
     let runtime_owner = owner.clone();
     let operation = run_blocking(move || {
+        let expected_message = TranscriptMessage {
+            message_id: message_id.clone(),
+            role: crate::domain::TranscriptRole::User,
+            content: request.content.clone(),
+            tool_call_id: None,
+            tool_calls: Vec::<ToolCall>::new(),
+            dedupe_key: Some(key.clone()),
+            source_queue_id: None,
+        };
+        let requested_delivery = DurablePayload::inline(json!({
+            "message_id": &message_id,
+            "content": &request.content,
+        }))
+        .ok()
+        .map(|payload| QueuedDelivery {
+            queue_id: 0,
+            delivery_id: delivery_id.clone(),
+            kind: DeliveryKind::UserInput,
+            payload,
+            dedupe_key: delivery_dedupe_key.clone(),
+            wake: true,
+            created_at_ms: Some(created_at_ms),
+            source_tool_call_id: None,
+            materialized_message_id: None,
+        });
+        if let Some(replay) = replay_message_command(
+            &*store,
+            &owner,
+            &id,
+            &command_id,
+            &expected_message,
+            requested_delivery.as_ref(),
+        )? {
+            return Ok(replay);
+        }
+        if replay_only {
+            return Err(ServiceError::IdempotencyReceiptNotFound);
+        }
         let current = store
             .rehydrate_owned(&owner, &id)
             .map_err(ServiceError::rehydrate)?;
@@ -832,15 +973,7 @@ async fn append_message(
             );
         }
         let event = SessionEvent::MessageAppended {
-            message: TranscriptMessage {
-                message_id,
-                role: crate::domain::TranscriptRole::User,
-                content: request.content,
-                tool_call_id: None,
-                tool_calls: Vec::<ToolCall>::new(),
-                dedupe_key: Some(key.clone()),
-                source_queue_id: None,
-            },
+            message: expected_message,
             wake_wait: true,
         };
         let append = store
@@ -864,7 +997,9 @@ async fn append_message(
         .runtime
         .observe_commit(&operation.0, &operation.1)
         .await;
-    state.runtime.wake(runtime_owner, session_id.clone());
+    if !operation.0.replayed {
+        state.runtime.wake(runtime_owner, session_id.clone());
+    }
     Ok((
         StatusCode::ACCEPTED,
         Json(CommandResponse {
@@ -888,6 +1023,7 @@ async fn select_model(
         .map_err(ApiError::from_control)?;
     let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
     let replay_only = replay_only_mode(&headers).map_err(ApiError::from_service)?;
+    require_json_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_SESSION_REQUEST_BYTES)
         .await
         .map_err(|_| ApiError::payload_too_large())?;
@@ -903,20 +1039,24 @@ async fn select_model(
     let id = session_id.clone();
     let expected_model = model.clone();
     let operation = run_blocking(move || {
-        if replay_only {
-            return replay_session_command(
-                &*store,
-                &owner,
-                &id,
-                &command_id,
-                |event| match event {
-                    SessionEvent::ModelSelectionChanged { selection } => {
-                        selection.model.as_ref() == Some(&expected_model)
-                    }
-                    _ => false,
-                },
-            );
+        let replay =
+            lookup_session_command(&*store, &owner, &id, &command_id, |event| match event {
+                SessionEvent::ModelSelectionChanged { selection } => {
+                    selection.model.as_ref() == Some(&expected_model)
+                }
+                _ => false,
+            })?;
+        if let Some(replay) = replay {
+            return Ok(replay);
         }
+        if replay_only {
+            return Err(ServiceError::IdempotencyReceiptNotFound);
+        }
+        // Resolve ownership/existence before provider policy or replica state
+        // so a cross-owner or missing session cannot probe credential status.
+        let current = store
+            .rehydrate_owned(&owner, &id)
+            .map_err(ServiceError::rehydrate)?;
         provider_policy
             .validate(&model.provider_execution)
             .map_err(|_| ServiceError::Invalid("invalid provider execution".into()))?;
@@ -936,9 +1076,6 @@ async fn select_model(
                 }
                 _ => ServiceError::Backend,
             })?;
-        let current = store
-            .rehydrate_owned(&owner, &id)
-            .map_err(ServiceError::rehydrate)?;
         let mut selection = current.selection;
         selection.model = Some(model);
         let append = store
@@ -965,7 +1102,9 @@ async fn select_model(
         .runtime
         .observe_commit(&operation.0, &operation.1)
         .await;
-    state.runtime.wake(runtime_owner, session_id.clone());
+    if !operation.0.replayed {
+        state.runtime.wake(runtime_owner, session_id.clone());
+    }
     Ok((
         StatusCode::ACCEPTED,
         Json(CommandResponse {
@@ -975,6 +1114,205 @@ async fn select_model(
             version: operation.0.stream_version,
         }),
     ))
+}
+
+async fn read_tool_call(
+    State(state): State<AppState>,
+    Path((session_id, tool_call_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let context = state
+        .control
+        .authenticate(&headers)
+        .map_err(ApiError::from_control)?;
+    if session_id.is_empty() || tool_call_id.is_empty() {
+        return Err(ApiError::tool_not_found());
+    }
+    let owner = SessionOwner::new(context.authority_id(), context.subject());
+    let record = state
+        .runtime
+        .read_tool_call(owner, session_id.clone(), tool_call_id)
+        .await
+        .map_err(api_error_from_runtime_tool)?
+        .ok_or_else(ApiError::tool_not_found)?;
+    Ok(Json(public_tool_status(session_id, record)))
+}
+
+async fn cancel_tool_call(
+    State(state): State<AppState>,
+    Path((session_id, tool_call_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    let context = state
+        .control
+        .authenticate(&headers)
+        .map_err(ApiError::from_control)?;
+    let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
+    require_json_content_type(&headers)?;
+    let body = to_bytes(request.into_body(), MAX_SESSION_REQUEST_BYTES)
+        .await
+        .map_err(|_| ApiError::payload_too_large())?;
+    let request: ToolCancelRequest = serde_json::from_slice(&body).map_err(|error| match error
+        .classify()
+    {
+        serde_json::error::Category::Data => ApiError::invalid("invalid tool cancellation request"),
+        _ => ApiError::malformed(),
+    })?;
+    if request.reason.is_empty() {
+        return Err(ApiError::invalid("cancellation reason is required"));
+    }
+    if request.reason.len() > MAX_ERROR_MESSAGE_BYTES {
+        return Err(ApiError::payload_too_large());
+    }
+    let owner = SessionOwner::new(context.authority_id(), context.subject());
+    let command_id = session_command_id("tool-cancel", &owner, &session_id, &idempotency_key);
+    let record = state
+        .runtime
+        .cancel_tool_call(
+            owner,
+            session_id.clone(),
+            tool_call_id,
+            request.reason,
+            command_id,
+        )
+        .await
+        .map_err(api_error_from_runtime_tool)?;
+    Ok(Json(public_tool_status(session_id, record)))
+}
+
+async fn reconcile_tool_call(
+    State(state): State<AppState>,
+    Path((session_id, tool_call_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    let context = state
+        .control
+        .authenticate(&headers)
+        .map_err(ApiError::from_control)?;
+    let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
+    require_json_content_type(&headers)?;
+    let body = to_bytes(request.into_body(), MAX_SESSION_REQUEST_BYTES)
+        .await
+        .map_err(|_| ApiError::payload_too_large())?;
+    let request: ToolReconcileRequest =
+        serde_json::from_slice(&body).map_err(|error| match error.classify() {
+            serde_json::error::Category::Data => {
+                ApiError::invalid("invalid tool reconciliation request")
+            }
+            _ => ApiError::malformed(),
+        })?;
+    if request.action != "retry_dispatch" {
+        return Err(ApiError::invalid("unsupported reconciliation action"));
+    }
+    let owner = SessionOwner::new(context.authority_id(), context.subject());
+    let command_id = session_command_id("tool-reconcile", &owner, &session_id, &idempotency_key);
+    let record = state
+        .runtime
+        .reconcile_tool_call(
+            owner,
+            session_id.clone(),
+            tool_call_id,
+            request.action,
+            command_id,
+        )
+        .await
+        .map_err(api_error_from_runtime_tool)?;
+    Ok(Json(public_tool_status(session_id, record)))
+}
+
+async fn complete_external_callback(
+    State(state): State<AppState>,
+    Path(callback_id): Path<String>,
+    headers: HeaderMap,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    let Some(bearer) = callback_bearer(&headers) else {
+        return Err(ApiError::callback_not_found());
+    };
+    if callback_id.is_empty() || callback_id.len() > 256 {
+        return Err(ApiError::callback_not_found());
+    }
+    require_json_content_type(&headers)?;
+    let body = to_bytes(request.into_body(), MAX_SESSION_REQUEST_BYTES)
+        .await
+        .map_err(|_| ApiError::payload_too_large())?;
+    let value: Value = serde_json::from_slice(&body).map_err(|error| match error.classify() {
+        serde_json::error::Category::Data => ApiError::invalid("invalid callback request"),
+        _ => ApiError::malformed(),
+    })?;
+    let request: ExternalCallbackRequest = serde_json::from_value(value.clone())
+        .map_err(|_| ApiError::invalid("invalid callback request"))?;
+    match request.status {
+        ExternalCallbackStatus::Completed => {
+            if request.result.is_none() || request.error.is_some() {
+                return Err(ApiError::invalid("invalid callback completion"));
+            }
+        }
+        ExternalCallbackStatus::Failed => {
+            let Some(error) = request.error.as_ref() else {
+                return Err(ApiError::invalid("invalid callback failure"));
+            };
+            if request.result.is_some()
+                || error.class.trim().is_empty()
+                || error.message.trim().is_empty()
+            {
+                return Err(ApiError::invalid("invalid callback failure"));
+            }
+            if error.class.len() > MAX_IDENTIFIER_BYTES
+                || error.message.len() > MAX_ERROR_MESSAGE_BYTES
+            {
+                return Err(ApiError::payload_too_large());
+            }
+        }
+    }
+    let completion = state
+        .runtime
+        .complete_external_callback(callback_id, bearer, value)
+        .await
+        .map_err(api_error_from_runtime_callback)?;
+    let body = match completion {
+        CallbackCompletion::Admitted(body) | CallbackCompletion::Replayed(body) => body,
+    };
+    Ok(Json(body))
+}
+
+fn callback_bearer(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let value = value.to_str().ok()?.trim();
+    let (scheme, token) = value.split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty() && !token.chars().any(char::is_whitespace)).then(|| token.to_owned())
+}
+
+fn api_error_from_runtime_tool(error: RuntimeCommandError) -> ApiError {
+    match error {
+        RuntimeCommandError::NotFound => ApiError::tool_not_found(),
+        RuntimeCommandError::Conflict => {
+            ApiError::conflict("tool call conflicts with its current state")
+        }
+        RuntimeCommandError::Invalid(_) => ApiError::invalid("invalid tool call request"),
+        RuntimeCommandError::Backend => ApiError::internal(),
+    }
+}
+
+fn api_error_from_runtime_callback(error: RuntimeCommandError) -> ApiError {
+    match error {
+        RuntimeCommandError::NotFound => ApiError::callback_not_found(),
+        RuntimeCommandError::Conflict => {
+            ApiError::conflict("callback conflicts with its terminal result")
+        }
+        RuntimeCommandError::Invalid(_) => ApiError::invalid("invalid callback request"),
+        RuntimeCommandError::Backend => ApiError::internal(),
+    }
 }
 
 fn enqueue_model_delivery(
@@ -1106,6 +1444,65 @@ fn same_delivery_request(left: &QueuedDelivery, right: &QueuedDelivery) -> bool 
         && left.source_tool_call_id == right.source_tool_call_id
 }
 
+/// Look up an already admitted message command before inspecting current
+/// session state. The same key and semantic request returns the original
+/// append; a different request conflicts without appending a new event.
+fn replay_message_command(
+    store: &dyn EventStore,
+    owner: &SessionOwner,
+    session_id: &str,
+    command_id: &str,
+    expected_message: &TranscriptMessage,
+    requested_delivery: Option<&QueuedDelivery>,
+) -> Result<Option<(crate::storage::AppendResult, SessionState)>, ServiceError> {
+    let records = match store.read_stream_owned(owner, session_id, 0) {
+        Ok(records) => records,
+        Err(StoreError::SessionNotFound) => return Ok(None),
+        Err(error) => return Err(ServiceError::read_store(error)),
+    };
+    let events = records
+        .into_iter()
+        .filter(|record| record.command_id == command_id)
+        .collect::<Vec<_>>();
+    let Some(first) = events.first() else {
+        return Ok(None);
+    };
+    if events.len() != 1 {
+        return Err(ServiceError::Conflict(
+            "request conflicts with an existing command".into(),
+        ));
+    }
+    let matches = match &first.event {
+        SessionEvent::MessageAppended { message, .. } => message == expected_message,
+        SessionEvent::DeliveryQueued { delivery } => {
+            requested_delivery.is_some_and(|requested| same_delivery_request(delivery, requested))
+        }
+        _ => false,
+    };
+    if !matches {
+        return Err(ServiceError::Conflict(
+            "request conflicts with an existing command".into(),
+        ));
+    }
+    let state = store
+        .rehydrate_owned(owner, session_id)
+        .map_err(ServiceError::rehydrate)?;
+    let stream_version = events
+        .last()
+        .map(|record| record.stream_version)
+        .unwrap_or(state.stream_version);
+    Ok(Some((
+        crate::storage::AppendResult {
+            stream_id: session_id.to_owned(),
+            command_id: command_id.to_owned(),
+            events,
+            stream_version,
+            replayed: true,
+        },
+        state,
+    )))
+}
+
 fn service_error_from_domain(error: crate::domain::DomainError) -> ServiceError {
     match error {
         crate::domain::DomainError::DurablePayloadTooLarge { .. }
@@ -1138,7 +1535,9 @@ async fn stream_events(
         for record in replay {
             if record.global_position > last_position {
                 last_position = record.global_position;
-                yield Ok::<SseEvent, Infallible>(sse_event(public_event(&record)));
+                if let Some(public) = public_event(&record) {
+                    yield Ok::<SseEvent, Infallible>(sse_event(public));
+                }
             }
         }
 
@@ -1147,8 +1546,33 @@ async fn stream_events(
             match receiver.recv().await {
                 Ok(event) if event.stream_id == session_id
                     && event.global_position > last_position => {
-                    last_position = event.global_position;
-                    yield Ok::<SseEvent, Infallible>(sse_event(public_event(&event)));
+                    // Publication is a notification, not the ordering authority. A
+                    // concurrent commit may publish a later event before an earlier
+                    // commit's observer runs, so recover the complete durable tail
+                    // before yielding anything from this notification.
+                    let store = state.store.clone();
+                    let id = session_id.clone();
+                    let owner = owner.clone();
+                    match run_blocking(move || {
+                        read_session_events_after(&*store, &owner, &id, last_position)
+                    })
+                    .await
+                    {
+                        Ok(records) => for record in records {
+                            if record.global_position > last_position {
+                                last_position = record.global_position;
+                                if let Some(public) = public_event(&record) {
+                                    yield Ok::<SseEvent, Infallible>(sse_event(public));
+                                }
+                            }
+                        },
+                        Err(_) => {
+                            yield Ok::<SseEvent, Infallible>(SseEvent::default()
+                                .event("error")
+                                .data(sse_internal_error_data()));
+                            break;
+                        }
+                    }
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1163,7 +1587,9 @@ async fn stream_events(
                         Ok(records) => for record in records {
                             if record.global_position > last_position {
                                 last_position = record.global_position;
-                                yield Ok::<SseEvent, Infallible>(sse_event(public_event(&record)));
+                                if let Some(public) = public_event(&record) {
+                                    yield Ok::<SseEvent, Infallible>(sse_event(public));
+                                }
                             }
                         },
                         Err(_) => {
@@ -1224,24 +1650,29 @@ fn model_selection_from_request(model: CreateModelSelection) -> SessionModelSele
 fn session_command_id(kind: &str, owner: &SessionOwner, session_id: &str, key: &str) -> String {
     semantic_digest(
         &format!("session.{kind}.command"),
-        &format!("{}:{}:{}", owner_digest(&owner.authority_id, &owner.subject), session_id, key),
+        &format!(
+            "{}:{}:{}",
+            owner_digest(&owner.authority_id, &owner.subject),
+            session_id,
+            key
+        ),
         key,
     )
 }
 
-fn replay_session_command<F>(
+fn lookup_session_command<F>(
     store: &dyn EventStore,
     owner: &SessionOwner,
     session_id: &str,
     command_id: &str,
     matches_request: F,
-) -> Result<(crate::storage::AppendResult, SessionState), ServiceError>
+) -> Result<Option<(crate::storage::AppendResult, SessionState)>, ServiceError>
 where
     F: Fn(&SessionEvent) -> bool,
 {
     let records = match store.read_stream_owned(owner, session_id, 0) {
         Ok(records) => records,
-        Err(StoreError::SessionNotFound) => return Err(ServiceError::IdempotencyReceiptNotFound),
+        Err(StoreError::SessionNotFound) => return Ok(None),
         Err(error) => return Err(ServiceError::read_store(error)),
     };
     let events = records
@@ -1249,7 +1680,7 @@ where
         .filter(|record| record.command_id == command_id)
         .collect::<Vec<_>>();
     let Some(first) = events.first() else {
-        return Err(ServiceError::IdempotencyReceiptNotFound);
+        return Ok(None);
     };
     if events.len() != 1 || !matches_request(&first.event) {
         return Err(ServiceError::Conflict(
@@ -1259,7 +1690,7 @@ where
     let state = store
         .rehydrate_owned(owner, session_id)
         .map_err(ServiceError::rehydrate)?;
-    Ok((
+    Ok(Some((
         crate::storage::AppendResult {
             stream_id: session_id.to_owned(),
             command_id: command_id.to_owned(),
@@ -1271,7 +1702,7 @@ where
             replayed: true,
         },
         state,
-    ))
+    )))
 }
 
 fn default_auth_revision() -> u64 {
@@ -1324,14 +1755,11 @@ fn list_owned_sessions(
                         "version": item.version,
                         "status": item.status,
                         "created_at_ms": item.created_at_ms,
-                        "model": item.selection.model,
+                        "model": item.selection.model.map(public_model),
                     })
                 })
                 .collect();
-            Ok(PublicSessionListPage {
-                items,
-                next_cursor,
-            })
+            Ok(PublicSessionListPage { items, next_cursor })
         })
         .map_err(ServiceError::store)?
 }
@@ -1389,28 +1817,37 @@ where
 }
 
 fn parse_last_event_id(headers: &HeaderMap) -> Result<Option<u64>, ServiceError> {
-    headers
-        .get("last-event-id")
-        .map(|value| {
-            value
-                .to_str()
-                .map_err(|_| ServiceError::Malformed)?
-                .parse::<u64>()
-                .map_err(|_| ServiceError::Malformed)
-        })
-        .transpose()
+    let mut values = headers.get_all("last-event-id").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ServiceError::Malformed);
+    }
+    value
+        .to_str()
+        .map_err(|_| ServiceError::Malformed)?
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| ServiceError::Malformed)
 }
 
-fn api_error_from_json_rejection(error: JsonRejection) -> ApiError {
-    match error {
-        JsonRejection::JsonSyntaxError(_) => ApiError::malformed(),
-        JsonRejection::JsonDataError(_) => ApiError::invalid("invalid message request"),
-        JsonRejection::MissingJsonContentType(_) => {
-            ApiError::invalid("content type must be application/json")
-        }
-        JsonRejection::BytesRejection(_) => ApiError::internal(),
-        _ => ApiError::internal(),
+fn require_json_content_type(headers: &HeaderMap) -> Result<(), ApiError> {
+    let mut values = headers.get_all(axum::http::header::CONTENT_TYPE).iter();
+    let Some(value) = values.next() else {
+        return Err(ApiError::invalid("content type must be application/json"));
+    };
+    if values.next().is_some() {
+        return Err(ApiError::malformed());
     }
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::invalid("content type must be application/json"))?;
+    let media_type = value.split(';').next().map(str::trim).unwrap_or_default();
+    if !media_type.eq_ignore_ascii_case("application/json") {
+        return Err(ApiError::invalid("content type must be application/json"));
+    }
+    Ok(())
 }
 
 fn optional_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ServiceError> {
@@ -1446,9 +1883,7 @@ fn replay_only_mode(headers: &HeaderMap) -> Result<bool, ServiceError> {
     let value = value.to_str().map_err(|_| ServiceError::Malformed)?;
     match value {
         "replay-only" => Ok(true),
-        _ => Err(ServiceError::Invalid(
-            "unsupported idempotency mode".into(),
-        )),
+        _ => Err(ServiceError::Invalid("unsupported idempotency mode".into())),
     }
 }
 
@@ -1496,6 +1931,52 @@ fn digest_fields(kind: &str, fields: &[&str]) -> String {
 
 fn session_view(state: SessionState) -> Value {
     let model = state.selection.model.map(public_model);
+    let active_activation = state.active_activation.map(|activation| {
+        json!({
+            "activation_id": activation.activation_id,
+            "selection_version": activation.selection_version,
+            "minimum_auth_revision": activation.minimum_auth_revision,
+            "started_at_ms": activation.started_at_ms,
+            "rounds_started": activation.rounds_started,
+            "model": activation.selection.model.map(public_model),
+            "tools": activation.selection.tools,
+        })
+    });
+    let active_model_round = state.active_model_round.map(|round| {
+        json!({
+            "activation_id": round.activation_id,
+            "round_id": round.round_id,
+            "delivery_through_queue_id": round.delivery_through_queue_id,
+            "request": round.request.map(|request| json!({
+                "request_id": request.request_id,
+                "maximum_attempts": request.maximum_attempts,
+                "minimum_auth_revision": request.minimum_auth_revision,
+            })),
+            "attempt": round.attempt.map(|attempt| json!({
+                "attempt_id": attempt.attempt_id,
+                "attempt_number": attempt.attempt_number,
+                "auth_revision": attempt.auth_revision,
+                "outcome": attempt.outcome,
+            })),
+            "retry": round.retry.map(|retry| json!({
+                "failed_attempt_number": retry.failed_attempt_number,
+                "next_attempt_number": retry.next_attempt_number,
+                "delay_ms": retry.delay_ms,
+                "maximum_attempts": retry.maximum_attempts,
+                "error_class": retry.error_class,
+            })),
+        })
+    });
+    let last_model_attempts_exhausted = state.last_model_attempts_exhausted.map(|fact| {
+        json!({
+            "activation_id": fact.activation_id,
+            "round_id": fact.round_id,
+            "attempt_number": fact.attempt_number,
+            "maximum_attempts": fact.maximum_attempts,
+            "finished_at_ms": fact.finished_at_ms,
+            "reason": "model_attempts_exhausted",
+        })
+    });
     let pending = state
         .delivery_queue
         .into_iter()
@@ -1525,6 +2006,9 @@ fn session_view(state: SessionState) -> Value {
         "delivery": { "acknowledged_through": state.delivery_ack, "pending": pending },
         "wait": state.active_wait.map(public_wait),
         "tool_calls": tools,
+        "active_activation": active_activation,
+        "active_model_round": active_model_round,
+        "last_model_attempts_exhausted": last_model_attempts_exhausted,
     })
 }
 
@@ -1567,48 +2051,133 @@ fn public_wait(wait: ActiveWait) -> Value {
 }
 
 fn public_tool(record: AsyncToolCallRecord) -> Value {
+    let status = record.status.clone();
+    let reconciliation = public_reconciliation(&status);
     json!({
         "tool_call_id": record.tool_call_id,
         "tool_name": record.tool_name,
-        "status": record.status,
+        "status": status,
         "started_at_ms": record.started_at_ms,
         "auto_wait_seconds": record.auto_wait_seconds,
-        "completion_mode": record.completion_mode,
-        "error": record.error.map(|error| json!({
-            "class": error.class,
-            "message": error.message,
-        })),
+        "completion_mode": public_completion_mode(&record.completion_mode),
+        "result": record.result.map(public_payload),
+        "error": record.error.map(public_tool_error),
+        "cancel_reason": record.cancel_reason,
         "completed_at_ms": record.completed_at_ms,
+        "reconciliation": reconciliation,
     })
 }
 
-fn public_event(record: &EventRecord) -> PublicEvent {
+fn public_completion_mode(mode: &CompletionMode) -> &'static str {
+    match mode {
+        CompletionMode::ProcessLocal => "response",
+        CompletionMode::ExternalCallback => EXTERNAL_CALLBACK_CAPABILITY,
+    }
+}
+
+fn public_tool_status(session_id: String, record: AsyncToolCallRecord) -> Value {
+    let mut body = public_tool(record);
+    if let Value::Object(object) = &mut body {
+        object.insert("schema".into(), Value::String("zode.tool-call.v1".into()));
+        object.insert("session_id".into(), Value::String(session_id));
+    }
+    body
+}
+
+fn public_payload(payload: DurablePayload) -> Value {
+    match payload {
+        DurablePayload::Inline(value) => value.value().clone(),
+        DurablePayload::BlobRef(blob) => json!({
+            "blob": {
+                "id": blob.blob_id,
+                "media_type": blob.media_type,
+                "bytes": blob.byte_len,
+            }
+        }),
+        DurablePayload::Redacted(_) => json!({ "redacted": true }),
+    }
+}
+
+fn public_reconciliation(status: &crate::domain::AsyncToolStatus) -> Value {
+    if matches!(status, crate::domain::AsyncToolStatus::UnknownOutcome) {
+        json!({ "reason": "unknown_outcome" })
+    } else {
+        Value::Null
+    }
+}
+
+fn public_tool_error(error: crate::domain::ToolError) -> Value {
+    let (class, message) = match error.class.as_str() {
+        "tool_execution_failed" => ("tool_execution_failed", "tool execution failed"),
+        "tool_unavailable" => ("tool_unavailable", "tool unavailable"),
+        "tool_cancelled" => ("tool_cancelled", "tool call cancelled"),
+        _ => ("tool_failed", "tool call failed"),
+    };
+    json!({ "class": class, "message": message })
+}
+
+fn public_event(record: &EventRecord) -> Option<PublicEvent> {
+    // Durable storage contains private coordination facts (prepared request
+    // envelopes, attempt claims, dedupe/index details).  They remain in the
+    // stream for replay but never become public SSE frames.
     let kind = match &record.event {
+        SessionEvent::ModelRequestPrepared { .. }
+        | SessionEvent::ModelAttemptStarted { .. }
+        | SessionEvent::ModelRequestCompleted { .. }
+        | SessionEvent::WaitTimerScheduled { .. }
+        | SessionEvent::AsyncToolCallCallbackPlanned { .. }
+        | SessionEvent::DedupeRecorded { .. } => return None,
         SessionEvent::MessageAppended { message, .. }
             if message.role == crate::domain::TranscriptRole::Assistant
                 && message.tool_calls.is_empty() =>
         {
-            "assistant_message_committed".to_owned()
+            "assistant_message_committed"
         }
-        _ => record.event.kind().to_owned(),
+        SessionEvent::ModelAttemptsExhausted { .. } => "model_attempts_exhausted",
+        SessionEvent::ModelStepRetryScheduled { .. } => "model_step_retrying",
+        SessionEvent::AsyncToolCallCallbackCompleted { .. } => "async_tool_call_completed",
+        SessionEvent::AsyncToolCallCallbackFailed { .. } => "async_tool_call_failed",
+        SessionEvent::SessionCreated { .. }
+        | SessionEvent::ModelSelectionChanged { .. }
+        | SessionEvent::StatusChanged { .. }
+        | SessionEvent::DeliveryQueued { .. }
+        | SessionEvent::DeliveryAcknowledged { .. }
+        | SessionEvent::DeliveryMaterialized { .. }
+        | SessionEvent::MessageAppended { .. }
+        | SessionEvent::ActivationStarted { .. }
+        | SessionEvent::ModelRoundStarted { .. }
+        | SessionEvent::ModelAttemptFailedFact { .. }
+        | SessionEvent::ModelAttemptInterrupted { .. }
+        | SessionEvent::ActivationFinished { .. }
+        | SessionEvent::ModelAttemptFailed { .. }
+        | SessionEvent::WaitSet { .. }
+        | SessionEvent::WaitCleared { .. }
+        | SessionEvent::WaitExpired { .. }
+        | SessionEvent::AsyncToolCallStarted { .. }
+        | SessionEvent::AsyncToolCallRunning { .. }
+        | SessionEvent::AsyncToolCallUnknownOutcome { .. }
+        | SessionEvent::AsyncToolCallRuntimeRestarted { .. }
+        | SessionEvent::AsyncToolCallProgress { .. }
+        | SessionEvent::AsyncToolCallCompleted { .. }
+        | SessionEvent::AsyncToolCallFailed { .. }
+        | SessionEvent::AsyncToolCallCancelled { .. } => record.event.kind(),
     };
-    PublicEvent {
+    Some(PublicEvent {
         schema: PUBLIC_SCHEMA,
         id: record.global_position.to_string(),
         session_id: record.stream_id.clone(),
         version: record.stream_version,
-        kind,
+        kind: kind.to_owned(),
         data: public_event_data(&record.event),
-    }
+    })
 }
 
 fn public_event_data(event: &SessionEvent) -> Value {
     match event {
         SessionEvent::SessionCreated { session_id, .. } => json!({ "session_id": session_id }),
         SessionEvent::ModelSelectionChanged { selection } => json!({
-            "model": selection.model,
+            "model": selection.model.clone().map(public_model),
             "tools": selection.tools,
-            "callback_base_url": selection.callback_base_url,
         }),
         SessionEvent::StatusChanged { status } => json!({ "status": serializable(status) }),
         SessionEvent::DeliveryQueued { delivery } => json!({
@@ -1629,6 +2198,81 @@ fn public_event_data(event: &SessionEvent) -> Value {
             "message": public_message(message.clone()),
             "wake_wait": wake_wait,
         }),
+        SessionEvent::ActivationStarted {
+            activation_id,
+            selection,
+            selection_version,
+            minimum_auth_revision,
+            started_at_ms,
+        } => json!({
+            "activation_id": activation_id,
+            "selection_version": selection_version,
+            "minimum_auth_revision": minimum_auth_revision,
+            "started_at_ms": started_at_ms,
+            "model": selection.model.clone().map(public_model),
+            "tools": selection.tools,
+        }),
+        SessionEvent::ModelRoundStarted {
+            activation_id,
+            round_id,
+            delivery_through_queue_id,
+            started_at_ms,
+        } => json!({
+            "activation_id": activation_id,
+            "round_id": round_id,
+            "delivery_through_queue_id": delivery_through_queue_id,
+            "started_at_ms": started_at_ms,
+        }),
+        SessionEvent::ModelAttemptFailedFact {
+            activation_id,
+            round_id,
+            attempt_number,
+            error_class,
+            retryable,
+            ..
+        } => json!({
+            "activation_id": activation_id,
+            "round_id": round_id,
+            "attempt_number": attempt_number,
+            "error": { "class": error_class, "retryable": retryable },
+        }),
+        SessionEvent::ModelAttemptInterrupted {
+            activation_id,
+            round_id,
+            attempt_number,
+            ..
+        } => json!({
+            "activation_id": activation_id,
+            "round_id": round_id,
+            "attempt_number": attempt_number,
+            "reason": "model_attempt_interrupted",
+        }),
+        SessionEvent::ModelAttemptsExhausted { fact } => json!({
+            "activation_id": fact.activation_id,
+            "round_id": fact.round_id,
+            "attempt_number": fact.attempt_number,
+            "maximum_attempts": fact.maximum_attempts,
+            "reason": "model_attempts_exhausted",
+            "finished_at_ms": fact.finished_at_ms,
+        }),
+        SessionEvent::ModelStepRetryScheduled { schedule } => json!({
+            "activation_id": schedule.activation_id,
+            "round_id": schedule.round_id,
+            "failed_attempt_number": schedule.failed_attempt_number,
+            "next_attempt_number": schedule.next_attempt_number,
+            "delay_ms": schedule.delay_ms,
+            "maximum_attempts": schedule.maximum_attempts,
+            "error_class": schedule.error_class,
+        }),
+        SessionEvent::ActivationFinished {
+            activation_id,
+            outcome,
+            finished_at_ms,
+        } => json!({
+            "activation_id": activation_id,
+            "outcome": serializable(outcome),
+            "finished_at_ms": finished_at_ms,
+        }),
         SessionEvent::ModelAttemptFailed { failure } => json!({
             "trigger_message_id": failure.trigger_message_id,
             "error": serializable(&failure.error),
@@ -1641,8 +2285,43 @@ fn public_event_data(event: &SessionEvent) -> Value {
             "tool_call_id": record.tool_call_id,
             "tool_name": record.tool_name,
             "status": serializable(&record.status),
-            "completion_mode": serializable(&record.completion_mode),
+            "completion_mode": public_completion_mode(&record.completion_mode),
             "auto_wait_seconds": record.auto_wait_seconds,
+        }),
+        SessionEvent::AsyncToolCallRunning { tool_call_id } => json!({
+            "tool_call_id": tool_call_id,
+            "status": "running",
+        }),
+        SessionEvent::AsyncToolCallUnknownOutcome { tool_call_id, .. } => json!({
+            "tool_call_id": tool_call_id,
+            "status": "unknown_outcome",
+        }),
+        SessionEvent::AsyncToolCallRuntimeRestarted {
+            tool_call_id,
+            completed_at_ms,
+            ..
+        } => json!({
+            "tool_call_id": tool_call_id,
+            "completed_at_ms": completed_at_ms,
+            "status": "runtime_restarted",
+        }),
+        SessionEvent::AsyncToolCallCallbackCompleted {
+            tool_call_id,
+            completed_at_ms,
+            ..
+        } => json!({
+            "tool_call_id": tool_call_id,
+            "completed_at_ms": completed_at_ms,
+            "status": "completed",
+        }),
+        SessionEvent::AsyncToolCallCallbackFailed {
+            tool_call_id,
+            completed_at_ms,
+            ..
+        } => json!({
+            "tool_call_id": tool_call_id,
+            "completed_at_ms": completed_at_ms,
+            "status": "failed",
         }),
         SessionEvent::AsyncToolCallProgress { tool_call_id, .. } => {
             json!({ "tool_call_id": tool_call_id })
@@ -1664,7 +2343,7 @@ fn public_event_data(event: &SessionEvent) -> Value {
             "tool_call_id": tool_call_id,
             "completed_at_ms": completed_at_ms,
             "status": "failed",
-            "error": { "class": error.class, "message": error.message },
+            "error": public_tool_error(error.clone()),
         }),
         SessionEvent::AsyncToolCallCancelled {
             tool_call_id,
@@ -1676,7 +2355,10 @@ fn public_event_data(event: &SessionEvent) -> Value {
             "status": "cancelled",
             "reason": reason,
         }),
-        SessionEvent::DedupeRecorded { .. } => json!({ "recorded": true }),
+        // Private events are filtered by `public_event` before this mapping
+        // is used. Keep an explicit neutral fallback so a future durable fact
+        // cannot accidentally expose its serialized payload.
+        _ => Value::Null,
     }
 }
 

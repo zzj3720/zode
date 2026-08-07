@@ -467,6 +467,16 @@ async fn create_model_session(
     require_ulid(&serde_json::from_str(&body)?)
 }
 
+fn set_provider_origin(config: &Path, provider_url: &str) -> TestResult<()> {
+    let mut value: Value = serde_json::from_slice(&fs::read(config)?)?;
+    let origin = url::Url::parse(provider_url)?
+        .origin()
+        .ascii_serialization();
+    value["provider_execution"]["allowed_base_url_origins"] = json!([origin]);
+    fs::write(config, serde_json::to_vec_pretty(&value)?)?;
+    Ok(())
+}
+
 async fn read_endpoint_id(client: &Client, server: &TestZode) -> TestResult<String> {
     let response = authenticated_as(client.get(server.url("/v1/identity")), TEST_SUBJECT)
         .send_with_timeout()
@@ -609,6 +619,25 @@ fn configured_response_tool(name: &str, adapter_url: &str) -> Value {
         "auto_wait_timeout_seconds": 20,
         "recovery": {
             "on_running_restart": "unknown_outcome",
+            "retry_dispatch": "never"
+        },
+        "adapter": {"kind": "http", "url": adapter_url}
+    })
+}
+
+fn configured_external_callback_tool(name: &str, adapter_url: &str) -> Value {
+    json!({
+        "name": name,
+        "description": "external callback capability fixture",
+        "input_schema": {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "additionalProperties": false
+        },
+        "completion_mode": "external_callback",
+        "auto_wait_timeout_seconds": 20,
+        "recovery": {
+            "on_running_restart": "await_callback",
             "retry_dispatch": "never"
         },
         "adapter": {"kind": "http", "url": adapter_url}
@@ -862,6 +891,7 @@ async fn e2e_endpoint_health_is_controller_authenticated_and_independent_of_acti
     )
     .await?;
     let model_url = provider_proxy.base_url("/v1");
+    set_provider_origin(&config, &model_url)?;
     let process_forbidden = [
         TEST_CONTROLLER_SECRET,
         TEST_PROVIDER_SECRET,
@@ -1048,6 +1078,7 @@ async fn e2e_endpoint_capabilities_are_restart_stable_bounded_and_non_secret() -
     let config = write_endpoint_config(database.path(), configured_tools(&tool_url), 1)?;
     let mut model = ModelFixture::start(vec![ModelScript::final_text(ASSISTANT_MARKER)]).await?;
     let model_url = model.provider_url();
+    set_provider_origin(&config, &model_url)?;
     let process_forbidden = [
         TEST_CONTROLLER_SECRET,
         TEST_PROVIDER_SECRET,
@@ -1242,4 +1273,47 @@ async fn e2e_endpoint_capabilities_are_restart_stable_bounded_and_non_secret() -
         cleanup_errors.push("capabilities database had no artifact root".to_owned());
     }
     merge_result(primary, cleanup_errors, "Endpoint capabilities E2E")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_external_callback_capability_is_advertised_when_runtime_ready() -> TestResult<()> {
+    let database = TempDatabase::new("endpoint-capabilities-callback-advertised")?;
+    let mut tool = ToolFixture::start(Vec::new()).await?;
+    let config = write_endpoint_config(
+        database.path(),
+        vec![configured_external_callback_tool(
+            "callback_fixture_tool",
+            &tool.adapter_url(),
+        )],
+        1,
+    )?;
+    let mut server = TestZode::start(database.path(), &config, &[TEST_CONTROLLER_SECRET]).await?;
+    let client = http_client()?;
+    let exchange = metadata_probe(
+        &client,
+        &server.url(""),
+        "callback-capabilities.advertised",
+        "/v1/capabilities",
+        Some(TEST_CONTROLLER_SECRET),
+    )
+    .await;
+    exchange.response.require_complete()?;
+    assert_eq!(exchange.response.status(), Some(StatusCode::OK));
+    let body: Value = serde_json::from_slice(&exchange.response.body)?;
+    let tools = body["tools"]
+        .as_array()
+        .ok_or_else(|| Error::other("callback capability tools was not an array"))?;
+    assert!(tools.iter().any(|tool| {
+        tool["name"] == "callback_fixture_tool" && tool["completion_mode"] == "external_callback"
+    }));
+    let outbound = body["outbound_capabilities"]
+        .as_array()
+        .ok_or_else(|| Error::other("callback capability outbound list was not an array"))?;
+    assert!(outbound
+        .iter()
+        .any(|capability| capability == "external_callback"));
+
+    server.stop(&[TEST_CONTROLLER_SECRET]).await?;
+    tool.stop().await?;
+    Ok(())
 }

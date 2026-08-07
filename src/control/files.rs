@@ -162,6 +162,11 @@ pub(crate) fn remove_best_effort(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
+pub(crate) fn consume_private_file(path: &Path) -> Result<(), ControlInitError> {
+    fs::remove_file(path).map_err(ControlInitError::Storage)?;
+    sync_parent(path)
+}
+
 pub(crate) fn sync_parent(path: &Path) -> Result<(), ControlInitError> {
     #[cfg(unix)]
     {
