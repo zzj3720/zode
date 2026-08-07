@@ -1728,6 +1728,7 @@ fn incident_failure_from_snapshot(
 ) -> TestResult<IncidentFailure> {
     let response = exchanges
         .iter()
+        .rev()
         .find(|exchange| exchange.boundary == deferred.boundary)
         .and_then(|exchange| exchange.response.as_ref())
         .filter(|response| response.complete)
@@ -3094,9 +3095,10 @@ async fn e2e_explicit_wait_legacy_high_value_is_rejected() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_external_completion_first_wins_and_wakes_one_next_activation() -> TestResult<()> {
     const E2E: &str = "e2e_external_completion_first_wins_and_wakes_one_next_activation";
-    let incident = IncidentRecorder::new(
+    let incident = IncidentRecorder::new_with_fixture(
         E2E,
         "retain the first public tool-status failure and the authenticated callback race exchange",
+        "e2e_external_completion_first_wins_and_wakes_one_next_activation.v2",
     )?;
     let database = TempDatabase::new("async-first-wins")?;
     let first_round =
@@ -3395,6 +3397,26 @@ async fn e2e_external_completion_first_wins_and_wakes_one_next_activation() -> T
     assert_eq!(model.request_phase_violations(), 0);
     assert_eq!(incident.request_count("tool.external_callback"), 1);
     assert_eq!(incident.request_count("public.callback"), 3);
+    let unauthorized_status = client
+        .get(format!(
+            "{}/v1/sessions/{session_id}/tool-calls/callback-call",
+            public_proxy.base_url()
+        ))
+        .send_with_timeout()
+        .await?;
+    let unauthorized_code = unauthorized_status.status();
+    let unauthorized_body = response_text(unauthorized_status).await?;
+    assert_eq!(
+        unauthorized_code,
+        StatusCode::UNAUTHORIZED,
+        "{unauthorized_body}"
+    );
+    if !incident.is_replay() {
+        incident.defer_failure(
+            "public.tool_call_status",
+            "missing controller bearer was safely rejected after the callback race",
+        );
+    }
     stop_and_scan_incident_endpoint(&mut server, &database, std::slice::from_ref(&bearer)).await?;
     let result = incident.finish();
     public_proxy.stop().await?;
@@ -4078,9 +4100,10 @@ async fn e2e_external_callback_tool_stays_running_and_completes_after_restart() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
     const E2E: &str = "e2e_cancel_one_tool_does_not_cancel_siblings";
-    let incident = IncidentRecorder::new(
+    let incident = IncidentRecorder::new_with_fixture(
         E2E,
         "retain the first public cancellation failure and both concurrent tool exchanges",
+        "e2e_cancel_one_tool_does_not_cancel_siblings.v2",
     )?;
     let database = TempDatabase::new("async-cancel-sibling")?;
     let release_cancelled = Arc::new(Notify::new());
@@ -4114,11 +4137,24 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
         }),
     }])
     .await?;
+    let ordered_tools = Arc::new(OrderedArrival::default());
     let mut cancelled_proxy = incident
-        .held_proxy("tool.cancel", cancelled.adapter_url())
+        .ordered_proxy(
+            "tool.cancel",
+            cancelled.adapter_url(),
+            ordered_tools.clone(),
+            0,
+            false,
+        )
         .await?;
     let mut sibling_proxy = incident
-        .held_proxy("tool.sibling", sibling.adapter_url())
+        .ordered_proxy(
+            "tool.sibling",
+            sibling.adapter_url(),
+            ordered_tools,
+            1,
+            true,
+        )
         .await?;
     let config = config_file(
         &database,
@@ -4164,6 +4200,7 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
         &["cancel_tool", "sibling_tool"],
     )
     .await?;
+    incident.register_slot(&session_id, "{{SESSION_ID}}");
     post_message(
         &client,
         &server,
@@ -4236,8 +4273,10 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
     )
     .await?;
     assert_eq!(sibling_record["status"], "running");
-    assert_eq!(cancelled.invocation_count(), 1);
-    assert_eq!(sibling.invocation_count(), 1);
+    if !incident.is_replay() {
+        assert_eq!(cancelled.invocation_count(), 1);
+        assert_eq!(sibling.invocation_count(), 1);
+    }
 
     release_sibling.notify_waiters();
     release_cancelled.notify_waiters();
@@ -4292,6 +4331,27 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
         frame.event == "async_tool_call_cancelled"
             && frame.data["data"]["tool_call_id"] == "sibling-call"
     }));
+    let unauthorized_response = client
+        .post(format!(
+            "{}/v1/sessions/{session_id}/tool-calls/cancel-call/cancel",
+            public_cancel_proxy.base_url()
+        ))
+        .json(&json!({"reason": "unauthorized probe"}))
+        .send_with_timeout()
+        .await?;
+    let unauthorized_status = unauthorized_response.status();
+    let unauthorized_body = response_text(unauthorized_response).await?;
+    assert_eq!(
+        unauthorized_status,
+        StatusCode::UNAUTHORIZED,
+        "{unauthorized_body}"
+    );
+    if !incident.is_replay() {
+        incident.defer_failure(
+            "public.tool_call_cancel",
+            "missing controller bearer was safely rejected after sibling cancellation",
+        );
+    }
     stop_and_scan_incident_endpoint(&mut server, &database, &[]).await?;
     let result = incident.finish();
     public_status_proxy.stop().await?;
@@ -4511,9 +4571,10 @@ async fn e2e_callback_payload_idempotency_is_canonical() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_oversized_tool_output_uses_secret_safe_blob_reference() -> TestResult<()> {
     const E2E: &str = "e2e_oversized_tool_output_uses_secret_safe_blob_reference";
-    let incident = IncidentRecorder::new(
+    let incident = IncidentRecorder::new_with_fixture(
         E2E,
         "retain the first public tool-status failure and oversized tool output exchange",
+        "e2e_oversized_tool_output_uses_secret_safe_blob_reference.v2",
     )?;
     let database = TempDatabase::new("async-oversized-blob")?;
     let oversized_content = "oversized-output-".repeat(5_000);
@@ -4622,7 +4683,6 @@ async fn e2e_oversized_tool_output_uses_secret_safe_blob_reference() -> TestResu
     let state = read_session(&client, &server, &session_id).await?;
     assert!(!state.to_string().contains(&oversized_content));
     assert!(!state.to_string().contains(support::TEST_PROVIDER_SECRET));
-    stop_and_scan_incident_endpoint(&mut server, &database, &[]).await?;
     let blobs = database
         .path()
         .parent()
@@ -4633,6 +4693,27 @@ async fn e2e_oversized_tool_output_uses_secret_safe_blob_reference() -> TestResu
         !blob_files.is_empty(),
         "oversized output did not create a blob file"
     );
+    let unauthorized_response = client
+        .get(format!(
+            "{}/v1/sessions/{session_id}/tool-calls/oversized-call",
+            public_proxy.base_url()
+        ))
+        .send_with_timeout()
+        .await?;
+    let unauthorized_status = unauthorized_response.status();
+    let unauthorized_body = response_text(unauthorized_response).await?;
+    assert_eq!(
+        unauthorized_status,
+        StatusCode::UNAUTHORIZED,
+        "{unauthorized_body}"
+    );
+    if !incident.is_replay() {
+        incident.defer_failure(
+            "public.tool_call_status",
+            "missing controller bearer was safely rejected after oversized result inspection",
+        );
+    }
+    stop_and_scan_incident_endpoint(&mut server, &database, &[]).await?;
     let result = incident.finish();
     public_proxy.stop().await?;
     provider_proxy.stop().await?;
