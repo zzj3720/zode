@@ -515,18 +515,25 @@ fabricate or relabel a later capture as the historical first occurrence.
 - The main agent owns the authoritative design, the major E2E behavior matrix,
   cross-module decisions, and final repository review. It should not become the
   default production implementer after those boundaries are fixed.
-- Give each implementation agent one module or disjoint file set and its
-  nearest `AGENTS.md`. Agents are not alone in the worktree and must preserve
-  concurrent changes outside their ownership.
+- Give each implementation thread or agent one coherent task outcome, normally
+  bound to one GitHub issue. Task ownership is behavioral, not directory-based:
+  the owner may change any module needed to deliver the complete vertical path
+  and must read the full `AGENTS.md` chain for every path it touches. A list of
+  likely files or modules is coordination context, never a write prohibition.
+- When active tasks overlap in behavior or files, their owners coordinate in
+  Chinese before duplicating work, choose one PR to own the shared change, and
+  declare the dependency or merge order from the other task. Do not block a
+  necessary cross-module change merely because it falls outside a task's
+  nominal module; do preserve concurrent changes unrelated to the task.
 - Do not cancel, replace, or restart an assigned agent merely because it is
   slow. Let it finish, provide corrective context when needed, and preserve the
   value of the work already performed.
-- Use a separate adversarial reviewer for each substantial module. A reviewer
+- Use a separate adversarial reviewer for each substantial task or PR. A reviewer
   reports concrete correctness, recovery, security, simplicity, or operability
   findings and does not silently patch the implementation it reviews.
 - Every behavioral review finding must state a constructible public red E2E.
   Send it to the assigned E2E owner, who demonstrates that failure before the
-  module's implementation owner fixes production code. Production workers and
+  task's implementation owner fixes production code. Production workers and
   reviewers may not rewrite a frozen E2E to fit their preferred implementation.
 - Send the fix back to the same reviewer until its findings converge, then use
   an independent final repository review to catch cross-module failures.
