@@ -324,7 +324,7 @@ mod unix_process_capture {
         file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
-        File::open(path.parent().expect("mutation parent").to_owned())?.sync_all()?;
+        File::open(path.parent().expect("mutation parent"))?.sync_all()?;
         Ok(path)
     }
 

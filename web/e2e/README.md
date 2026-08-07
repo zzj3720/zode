@@ -7,12 +7,16 @@ behind a recording proxy, signs RS256 Access application assertions with a
 local JWKS fixture, and sends browser traffic through a local Access-edge
 reverse proxy. The browser never calls Endpoint or the provider directly.
 
-Each harness config carries distinct loopback HTTP `management_origin` and
+Each harness run uses distinct loopback HTTP `management_origin` and
 `callback_origin` authorities (`http://127.0.0.1` and `http://127.0.0.2` by
 default). The management and callback edges use those canonical Host
 authorities while retaining incoming `Forwarded`/`X-Forwarded-Host` unless a
 fixture explicitly overrides them. `harness.managementUrl` and
-`harness.callbackUrl` remain the actual local edge URLs.
+`harness.callbackUrl` remain the actual local edge URLs. The current Server
+config schema does not accept those two top-level fields; callers targeting a
+Server that has adopted that schema extension pass `includeServerOrigins: true`
+to `createWebE2EHarness`. The default keeps the current baseline config
+strictly schema-valid and never probes this by spawning a second process.
 
 The harness has no mock router, MSW, imported Zode module, hidden product
 route, or retry. Readiness is a positive public `/v1/system` plus Endpoint
@@ -32,6 +36,27 @@ vp install --frozen-lockfile -- --ignore-workspace
 vp run test --list
 vp run smoke
 ```
+
+## Run the locked CI gate locally
+
+From the repository root, install the frozen web workspace and the pinned
+Chromium once, then use the same entry point as GitHub Actions:
+
+```sh
+pnpm --dir web install --frozen-lockfile
+pnpm --dir web/e2e exec playwright install chromium
+./scripts/ci/verify.sh
+```
+
+The gate builds both real Rust binaries, builds the UI with `vp build`, runs the
+shared process-capture and Server incident-replay E2Es, and executes the
+complete Chromium collection from `playwright.config.cjs` (shared harness plus
+product browser paths). All fixtures are deterministic and local; it never
+reads real LLM credentials or enables production recording. A Server startup
+failure still fails the command and leaves its bounded process capture under
+`target/test-recordings/quarantine` for diagnosis. The CI entry also audits
+Playwright's JSON result and fails on any skipped, interrupted, or unrun test; a
+readiness error cannot be converted into a green skip.
 
 `@playwright/test` is the only direct Playwright dependency. It is pinned to
 the repository-local version in `package.json` and `pnpm-lock.yaml`; the
