@@ -10,7 +10,7 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
 
 use crate::{
     domain::{
@@ -309,7 +309,8 @@ impl Runtime {
             .map_err(|_| RuntimeCommandError::Backend)?
             .map_err(|_| RuntimeCommandError::Backend)?
             {
-                self.wake(lookup.owner, lookup.session_id);
+                self.wake_and_wait_for_activation(lookup.owner, lookup.session_id)
+                    .await;
             }
         }
         Ok(completion)
@@ -537,6 +538,30 @@ impl Runtime {
     }
 
     pub fn wake(self: &Arc<Self>, owner: SessionOwner, session_id: String) {
+        self.spawn_wake(owner, session_id, None);
+    }
+
+    /// Schedule a wake and wait only until the next activation has been
+    /// durably claimed.  Callback admission uses this short barrier so a
+    /// caller cannot observe an idle session between the durable delivery
+    /// append and the activation that will consume it.  The model round and
+    /// tool work continue asynchronously after the barrier is released.
+    async fn wake_and_wait_for_activation(
+        self: &Arc<Self>,
+        owner: SessionOwner,
+        session_id: String,
+    ) {
+        let (ready, completion) = oneshot::channel();
+        self.spawn_wake(owner, session_id, Some(ready));
+        let _ = completion.await;
+    }
+
+    fn spawn_wake(
+        self: &Arc<Self>,
+        owner: SessionOwner,
+        session_id: String,
+        mut ready: Option<oneshot::Sender<()>>,
+    ) {
         let key = SessionKey {
             authority_id: owner.authority_id.clone(),
             subject: owner.subject.clone(),
@@ -547,12 +572,23 @@ impl Runtime {
                 .entry(key)
                 .or_insert_with(|| Arc::new(AsyncMutex::new(())))
                 .clone(),
-            Err(_) => return,
+            Err(_) => {
+                if let Some(ready) = ready {
+                    let _ = ready.send(());
+                }
+                return;
+            }
         };
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
             let _guard = lock.lock().await;
-            if let Err(error) = runtime.activate(owner, session_id.clone()).await {
+            let result = runtime
+                .activate(owner, session_id.clone(), &mut ready)
+                .await;
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(());
+            }
+            if let Err(error) = result {
                 tracing::warn!(session_id = %session_id, error, "session activation stopped");
             }
         });
@@ -562,6 +598,7 @@ impl Runtime {
         self: &Arc<Self>,
         owner: SessionOwner,
         session_id: String,
+        ready: &mut Option<oneshot::Sender<()>>,
     ) -> Result<(), &'static str> {
         let mut state = rehydrate(self.store.clone(), owner.clone(), session_id.clone()).await?;
         let Some(selection) = state
@@ -570,6 +607,9 @@ impl Runtime {
             .and_then(|activation| activation.selection.model.clone())
             .or_else(|| state.selection.model.clone())
         else {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(());
+            }
             return Ok(());
         };
 
@@ -584,6 +624,9 @@ impl Runtime {
             .await?;
             self.observe_commit(&append, &next_state).await;
             state = next_state;
+        }
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(());
         }
 
         // Process-bound tool recovery is performed synchronously by
