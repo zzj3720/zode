@@ -508,6 +508,24 @@ and hashes of all three components. Promotion and rollback switch the complete
 artifact; a running release never combines a Server binary from one revision
 with UI assets from another.
 
+V0 release actuation belongs only to the operator release driver/CLI, whose
+operations are `bootstrap`, `stage`, `promote`, `health`, `rollback`, and
+`teardown`. Continuous test-release automation normally invokes that surface.
+`stage` starts and proves the candidate through real authenticated readiness
+without changing `current`; failure leaves the installed pointers unchanged.
+`promote` atomically makes the staged complete artifact current and starts or
+adopts its matching processes. `rollback` atomically restores the complete
+previous artifact. These are deployment operations outside the management
+Server HTTP API.
+
+The browser is an observer, not the release actuator. After operator promotion
+and rollback, the release E2E enters the Access-protected product through a real
+browser and proves that the UI tree, Server, and built-in Endpoint all report
+the selected revision and bound component digests. Web exposes no release
+buttons, and Server exposes no release-control route. Adding browser-triggered
+release management later requires a separately reviewed supervisor/API design
+and its own red E2Es.
+
 A Server configuration always names an explicit `ui_mode`: `assets` or
 `api_only`. `assets` requires `ui_assets_directory`, resolved relative to the
 Server configuration file, while `api_only` forbids that field. Omitting the
@@ -532,7 +550,9 @@ fallback.
 This boundary is frozen by
 `e2e_server_ui_delivery_serves_access_protected_management_assets_and_isolates_callback_origin`,
 `e2e_release_artifact_binds_server_endpoint_and_ui_tree`, and
-`e2e_release_promotion_never_mixes_server_and_ui_revision`.
+`e2e_release_promotion_never_mixes_server_and_ui_revision`. In the latter,
+operator driver actions perform promotion and rollback; the browser observes
+and verifies each resulting product state but never initiates the switch.
 
 ## 12. Acceptance strategy
 

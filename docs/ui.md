@@ -302,6 +302,7 @@ development proxy to a real local Server. It must not:
 - import Rust runtime/domain implementation details;
 - call Endpoint URLs directly;
 - implement provider OAuth or credential distribution in the browser;
+- expose release staging, promotion, rollback, or process-supervisor controls;
 - add mock-only product branches or hidden Server routes;
 - hardcode that a built-in Endpoint always exists;
 - introduce a second WebSocket protocol when HTTP plus SSE is sufficient.
@@ -324,6 +325,12 @@ UI and Server revisions. Source files, a Vite dev server, and a mutable working
 tree are not production asset fallbacks. An explicit API-only development/test
 Server uses `ui_mode: api_only` and must omit the directory; it is not a usable
 UI release.
+
+The operator release driver/CLI, normally called by continuous test-release
+automation, owns `stage`, `promote`, and `rollback`. The browser does not expose
+or invoke those actions. Release E2Es open the real Access-protected application
+after each operator action and verify that the served UI, Server, and built-in
+Endpoint belong to the same complete revision.
 
 ## 11. E2E-only acceptance
 

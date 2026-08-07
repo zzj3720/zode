@@ -250,8 +250,14 @@ replication is `docs/auth-replication.md`; ingress identity is
   store semantics. Browser history fallback applies only on the management
   origin to safe GET/HEAD HTML routes and never swallows `/v1`, asset misses,
   callbacks, or non-HTML requests.
-- Promotion and rollback switch the complete release directory and restart or
-  adopt the matching Server; no request may combine UI and Server revisions.
+- The operator release driver/CLI is the only v0 release-actuation surface.
+  `stage` leaves `current` unchanged; `promote` and `rollback` switch the
+  complete release directory and restart or adopt the matching Server. Do not
+  add Server release-control routes or accept browser commands for these
+  operations.
+- After each operator switch, a real browser verifies the Access-protected UI,
+  Server, and built-in Endpoint revision together; no request may combine UI
+  and Server revisions.
 
 ## E2E-only acceptance
 

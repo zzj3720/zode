@@ -22,6 +22,12 @@ Server never returns Endpoint control credentials, provider credentials,
 secret distribution payloads, OAuth state/PKCE, internal URLs, filesystem
 paths, or raw Endpoint/provider errors.
 
+The management API has no release, stage, promote, rollback, install, or
+process-supervisor resource. V0 release switching is an operator deployment
+action performed by the release driver/CLI outside this HTTP API. A real
+browser may verify the running product after that action, but it cannot trigger
+or authorize the switch through Server.
+
 Every Endpoint record, provider descriptor, profile, and default belongs to one
 Server authority. V0 has no Zode user, workspace, membership, role, or grant
 resource. Every human or service actor admitted by the configured Access
