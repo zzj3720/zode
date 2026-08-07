@@ -1931,6 +1931,10 @@ struct RecordingSinkState {
     // completion with a lower sequence means two logical attempts were
     // interleaved and body-based inference can no longer be trusted.
     last_submitted_sequence: Option<u64>,
+    // A request is allocated before its response headers/body are complete.
+    // Keep that durable in-flight fact separate from `active_sequences`,
+    // which is only used for no-plan attempt identity ambiguity.
+    in_flight_sequences: BTreeSet<u64>,
     active_sequences: BTreeSet<u64>,
 }
 
@@ -1973,6 +1977,7 @@ impl RecordingSink {
                 finalized: Vec::new(),
                 logical: None,
                 last_submitted_sequence: None,
+                in_flight_sequences: BTreeSet::new(),
                 active_sequences: BTreeSet::new(),
             }),
             flush_error: std::sync::Mutex::new(None),
@@ -1984,12 +1989,13 @@ impl RecordingSink {
     }
 
     fn begin_sequence(&self, sequence: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("LLM recording sink mutex poisoned");
+        state.in_flight_sequences.insert(sequence);
         if self.attempt_plan.is_none() {
-            self.state
-                .lock()
-                .expect("LLM recording sink mutex poisoned")
-                .active_sequences
-                .insert(sequence);
+            state.active_sequences.insert(sequence);
         }
     }
 
@@ -2083,6 +2089,7 @@ impl RecordingSink {
             .lock()
             .expect("LLM recording sink mutex poisoned");
         let mut exchange = exchange;
+        state.in_flight_sequences.remove(&exchange.sequence);
         let mut ambiguous_completion = false;
         let mut attempt_plan_error = false;
         if self.attempt_plan.is_none() {
@@ -2218,6 +2225,9 @@ impl RecordingSink {
             .state
             .lock()
             .expect("LLM recording sink mutex poisoned");
+        if !state.in_flight_sequences.is_empty() {
+            return None;
+        }
         if state.pending.is_empty() && state.finalized.len() as u64 == allocated {
             None
         } else {
@@ -2934,11 +2944,10 @@ async fn record_llm_http_request(
     // replayed.  Never send a provider request after that write failed.  The
     // observation above is retained solely as a barrier proving the request
     // reached the recorder, even when the durable write deliberately fails.
+    sink.begin_sequence(sequence);
     if sink.flush_error().is_some() {
         return llm_proxy_error(AxumStatusCode::SERVICE_UNAVAILABLE);
     }
-
-    sink.begin_sequence(sequence);
 
     if canonical_body.is_none() {
         let submit_result = sink.submit(LlmHttpRecordingExchange {

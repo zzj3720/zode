@@ -315,10 +315,7 @@ impl ProcessCaptureSet {
             .signal
             .map(|signal| bounded_text(signal, "signal"))
             .transpose()
-            .map_err(|error| {
-                self.failed = true;
-                error
-            })?;
+            .inspect_err(|_| self.failed = true)?;
         if let Some(stop) = observation.stop.as_ref() {
             validate_stop_observation(stop)?;
         }

@@ -184,7 +184,15 @@ struct IncidentProxy {
 
 impl IncidentRecorder {
     fn new(owning_e2e: &'static str, purpose: &'static str) -> TestResult<Self> {
-        let fixture_path = incident_fixture_path(owning_e2e);
+        Self::new_with_fixture(owning_e2e, purpose, owning_e2e)
+    }
+
+    fn new_with_fixture(
+        owning_e2e: &'static str,
+        purpose: &'static str,
+        fixture_stem: &str,
+    ) -> TestResult<Self> {
+        let fixture_path = incident_fixture_path(fixture_stem);
         let retained_failure_sha256 = fs::read(&fixture_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -1270,6 +1278,8 @@ fn substitute_hex(value: &str, substitutions: &[(String, String)]) -> TestResult
 }
 
 fn substitute_text(value: &str, substitutions: &[(String, String)]) -> String {
+    let mut substitutions = substitutions.to_vec();
+    substitutions.sort_by_key(|(raw, _)| std::cmp::Reverse(raw.len()));
     substitutions
         .iter()
         .fold(value.to_owned(), |text, (from, to)| text.replace(from, to))
@@ -1577,6 +1587,7 @@ fn verify_complete_replay(
         .is_some();
     let mut expected_race = Vec::new();
     let mut actual_race = Vec::new();
+    let mut skipped_historical_callback_failure = false;
     let mut callback_index = 0usize;
     for (expected, actual) in recorded.exchanges.iter().zip(&current.exchanges) {
         if expected.sequence != actual.sequence
@@ -1590,6 +1601,20 @@ fn verify_complete_replay(
             .into());
         }
         if expected.boundary == "public.callback" {
+            let historical_callback_failure = !reproduced_failure
+                && !skipped_historical_callback_failure
+                && expected.response.as_ref().is_some_and(|response| {
+                    response.fingerprint == recorded.first_seen_failure.response_fingerprint
+                });
+            if historical_callback_failure {
+                // The first retained callback response is expected to change
+                // after the production fix.  Keep the surrounding callback
+                // race/order evidence, but compare the fixed response only
+                // through the ordinary public request sequence.
+                skipped_historical_callback_failure = true;
+                callback_index += 1;
+                continue;
+            }
             if callback_index > 0 {
                 expected_race.push(response_semantic_fingerprint(&expected.response));
                 actual_race.push(response_semantic_fingerprint(&actual.response));
@@ -1602,7 +1627,11 @@ fn verify_complete_replay(
         if historical_failure && !reproduced_failure {
             continue;
         }
-        if !same_incident_response(&expected.response, &actual.response) {
+        if !same_incident_response(
+            expected.boundary.as_str(),
+            &expected.response,
+            &actual.response,
+        ) {
             return Err(Error::other(format!(
                 "incident replay response diverged at sequence {} ({})",
                 expected.sequence, expected.boundary
@@ -1629,6 +1658,7 @@ fn verify_complete_replay(
 }
 
 fn same_incident_response(
+    boundary: &str,
     expected: &Option<IncidentResponse>,
     actual: &Option<IncidentResponse>,
 ) -> bool {
@@ -1636,13 +1666,27 @@ fn same_incident_response(
         (None, None) => true,
         (None, Some(_)) => false,
         (Some(expected), Some(actual)) => {
-            expected.status == actual.status
-                && expected.semantic_headers == actual.semantic_headers
-                && expected.complete == actual.complete
-                && expected.partial == actual.partial
-                && expected.disconnected == actual.disconnected
-                && expected.error == actual.error
-                && expected.body_sha256 == actual.body_sha256
+            if expected.status != actual.status
+                || expected.semantic_headers != actual.semantic_headers
+                || expected.complete != actual.complete
+                || expected.partial != actual.partial
+                || expected.disconnected != actual.disconnected
+                || expected.error != actual.error
+            {
+                return false;
+            }
+            if boundary == "public.tool_call_status" {
+                let mut expected_body = incident_response_json(expected);
+                let mut actual_body = incident_response_json(actual);
+                if let (Some(expected_body), Some(actual_body)) =
+                    (&mut expected_body, &mut actual_body)
+                {
+                    strip_dynamic_tool_status_fields(expected_body);
+                    strip_dynamic_tool_status_fields(actual_body);
+                    return expected_body == actual_body;
+                }
+            }
+            expected.body_sha256 == actual.body_sha256
                 && expected
                     .chunks
                     .iter()
@@ -1653,6 +1697,21 @@ fn same_incident_response(
                         .map(|chunk| (&chunk.bytes_hex, &chunk.sha256)))
         }
         (Some(_), None) => false,
+    }
+}
+
+fn incident_response_json(response: &IncidentResponse) -> Option<Value> {
+    let mut body = Vec::new();
+    for chunk in &response.chunks {
+        body.extend_from_slice(&hex_decode(&chunk.bytes_hex).ok()?);
+    }
+    serde_json::from_slice(&body).ok()
+}
+
+fn strip_dynamic_tool_status_fields(value: &mut Value) {
+    if let Value::Object(object) = value {
+        object.remove("started_at_ms");
+        object.remove("completed_at_ms");
     }
 }
 
@@ -4249,9 +4308,10 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_callback_payload_idempotency_is_canonical() -> TestResult<()> {
     const E2E: &str = "e2e_callback_payload_idempotency_is_canonical";
-    let incident = IncidentRecorder::new(
+    let incident = IncidentRecorder::new_with_fixture(
         E2E,
         "retain the first public tool-status failure and canonical callback duplicate exchange",
+        "e2e_callback_payload_idempotency_is_canonical.v2",
     )?;
     let database = TempDatabase::new("async-callback-canonical")?;
     let first_round = ModelScript::tool_call(
@@ -4354,25 +4414,8 @@ async fn e2e_callback_payload_idempotency_is_canonical() -> TestResult<()> {
     .await?;
     assert_eq!(running["status"], "running");
 
-    if incident.has_deferred_failure() {
-        release_adapter.notify_waiters();
-        callback_proxy.release_replay();
-        let _ = incident
-            .wait_for_completions("tool.canonical_callback", 1)
-            .await;
-        let _ = incident.wait_for_completions("provider.model", 2).await;
-        stop_and_scan_incident_endpoint(&mut server, &database, &[]).await?;
-        let result = incident.finish();
-        public_callback_proxy.stop().await?;
-        public_status_proxy.stop().await?;
-        provider_proxy.stop().await?;
-        callback_proxy.stop().await?;
-        model.stop().await?;
-        callback_tool.stop().await?;
-        return result;
-    }
-
-    let (callback_url, bearer) = captured_callback(&callback_tool)?;
+    let (callback_url, bearer) =
+        captured_callback_from_incident(&incident, "tool.canonical_callback")?;
     incident.register_slot(&bearer, "{{CALLBACK_BEARER}}");
     let first_body = r#"{"status":"completed","result":{"content":"canonical winner"}}"#;
     let duplicate_body = r#"{"result":{"content":"canonical winner"},"status":"completed"}"#;
@@ -4386,11 +4429,14 @@ async fn e2e_callback_payload_idempotency_is_canonical() -> TestResult<()> {
     incident.wait_for_completions("provider.model", 2).await?;
     let (duplicate_status, duplicate_response) =
         complete_callback_json(&client, &callback_url, &bearer, duplicate_body).await?;
-    assert!(
-        duplicate_status.is_success(),
-        "canonical duplicate was not replayed: {duplicate_response}"
-    );
-    assert_eq!(duplicate_response, first_response);
+    if !duplicate_status.is_success() {
+        let safe_error = format!(
+            "canonical duplicate callback was rejected: {duplicate_status} {duplicate_response}"
+        );
+        incident.defer_failure("public.callback", &safe_error);
+    } else {
+        assert_eq!(duplicate_response, first_response);
+    }
     let completed = wait_for_tool_status(
         &client,
         &incident,
@@ -4410,7 +4456,22 @@ async fn e2e_callback_payload_idempotency_is_canonical() -> TestResult<()> {
     )
     .await?;
     assert_eq!(completed["result"], json!({"content": "canonical winner"}));
-    let terminal_state = read_session(&client, &server, &session_id).await?;
+    let terminal_state = timeout(Duration::from_secs(10), async {
+        loop {
+            let state = read_session(&client, &server, &session_id).await?;
+            if state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "canonical callback terminal barrier timed out",
+        )
+    })??;
     let terminal_version = terminal_state["version"]
         .as_u64()
         .ok_or_else(|| Error::other("canonical callback GET omitted version"))?;

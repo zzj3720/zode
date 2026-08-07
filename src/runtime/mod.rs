@@ -3065,6 +3065,55 @@ fn stable_digest(kind: &str, value: &str) -> String {
     format!("sha256:v1:{:x}", digest.finalize())
 }
 
+fn canonical_callback_payload(payload: &Value) -> Result<String, RuntimeCommandError> {
+    let mut bytes = Vec::new();
+    write_canonical_callback_json(payload, &mut bytes)?;
+    String::from_utf8(bytes).map_err(|_| RuntimeCommandError::Invalid("callback_payload"))
+}
+
+fn write_canonical_callback_json(
+    value: &Value,
+    output: &mut Vec<u8>,
+) -> Result<(), RuntimeCommandError> {
+    match value {
+        Value::Null => output.extend_from_slice(b"null"),
+        Value::Bool(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
+        Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
+        Value::String(value) => output.extend_from_slice(
+            &serde_json::to_vec(value)
+                .map_err(|_| RuntimeCommandError::Invalid("callback_payload"))?,
+        ),
+        Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                write_canonical_callback_json(value, output)?;
+            }
+            output.push(b']');
+        }
+        Value::Object(values) => {
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+            output.push(b'{');
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                output.extend_from_slice(
+                    &serde_json::to_vec(key)
+                        .map_err(|_| RuntimeCommandError::Invalid("callback_payload"))?,
+                );
+                output.push(b':');
+                write_canonical_callback_json(value, output)?;
+            }
+            output.push(b'}');
+        }
+    }
+    Ok(())
+}
+
 fn complete_external_callback_blocking(
     store: &dyn EventStore,
     callback_id: &str,
@@ -3075,8 +3124,7 @@ fn complete_external_callback_blocking(
         return Err(RuntimeCommandError::NotFound);
     }
     let (is_failure, result, error) = parse_callback_payload(&payload)?;
-    let canonical_payload = serde_json::to_string(&payload)
-        .map_err(|_| RuntimeCommandError::Invalid("callback_payload"))?;
+    let canonical_payload = canonical_callback_payload(&payload)?;
     let payload_fingerprint = stable_digest("callback-payload", &canonical_payload);
     let bearer_fingerprint = stable_digest("callback-bearer", bearer);
 
