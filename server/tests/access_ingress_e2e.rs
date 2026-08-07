@@ -2521,8 +2521,10 @@ fn build_test_ui(ui_assets_directory: &Path) -> TestResult<()> {
         .parent()
         .ok_or_else(|| io::Error::other("server manifest has no repository parent"))?;
     let web_root = repository_root.join("web").canonicalize()?;
-    let output = Command::new("vp")
+    let output = Command::new("pnpm")
         .current_dir(&web_root)
+        .arg("exec")
+        .arg("vp")
         .arg("build")
         .arg("--outDir")
         .arg(ui_assets_directory)
