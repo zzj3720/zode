@@ -466,7 +466,8 @@ impl Runtime {
                         .recover_startup_session(owner.clone(), session_id.clone())
                         .await
                     {
-                        Ok(()) => self.wake(owner, session_id),
+                        Ok(true) => self.wake(owner, session_id),
+                        Ok(false) => {}
                         Err(error) => {
                             tracing::warn!(
                                 error,
@@ -491,16 +492,15 @@ impl Runtime {
         self: &Arc<Self>,
         owner: SessionOwner,
         session_id: String,
-    ) -> Result<(), &'static str> {
+    ) -> Result<bool, &'static str> {
         let mut state = rehydrate(self.store.clone(), owner.clone(), session_id.clone()).await?;
-        if state.active_activation.is_none() {
-            return Ok(());
+        if state.active_activation.is_some() {
+            state = self
+                .recover_async_tools(owner.clone(), session_id.clone(), state)
+                .await?;
+            state = self.recover_model_round(owner, session_id, state).await?;
         }
-        state = self
-            .recover_async_tools(owner.clone(), session_id.clone(), state)
-            .await?;
-        let _ = self.recover_model_round(owner, session_id, state).await?;
-        Ok(())
+        Ok(startup_session_is_runnable(&state))
     }
 
     pub async fn observe_commit(&self, append: &AppendResult, state: &SessionState) {
@@ -1429,6 +1429,20 @@ fn unresolved_user(state: &SessionState) -> Option<&TranscriptMessage> {
     } else {
         None
     }
+}
+
+/// Startup recovery only schedules an activation when durable work can make
+/// progress.  In particular, a completed assistant-only turn has no pending
+/// delivery or unresolved model boundary; waking it would create an empty
+/// activation and advance the stream merely because the process restarted.
+fn startup_session_is_runnable(state: &SessionState) -> bool {
+    if !state.delivery_queue.is_empty() {
+        return true;
+    }
+    if state.active_wait.is_some() {
+        return false;
+    }
+    unresolved_user(state).is_some() || model_followup_identity(state).is_some()
 }
 
 /// Build the provider-facing context from the durable transcript.  Runtime
@@ -3003,18 +3017,39 @@ fn append_assistant_blocking(
                 state,
             ));
         }
+        // A final assistant result with no queued delivery also closes its
+        // activation.  Keep that lifecycle fact and the public assistant
+        // message in one optimistic transaction, with the assistant event
+        // last so its SSE version is the terminal stream version observed by
+        // a subsequent GET.  If a delivery races this rehydrate, the OCC
+        // retry below re-evaluates the queue and preserves the next-round
+        // steering path instead of closing the activation.
+        let mut drafts = Vec::with_capacity(2);
+        if state.delivery_queue.is_empty() {
+            if let Some(activation) = state.active_activation.as_ref() {
+                drafts.push(EventDraft::new(
+                    format!("model-assistant-finished-event:v1:{identity}"),
+                    SessionEvent::ActivationFinished {
+                        activation_id: activation.activation_id.clone(),
+                        outcome: ActivationOutcome::Finished,
+                        finished_at_ms: current_time_ms(),
+                    },
+                ));
+            }
+        }
+        drafts.push(EventDraft::new(
+            event_id.clone(),
+            SessionEvent::MessageAppended {
+                message: message.clone(),
+                wake_wait: false,
+            },
+        ));
         match store.append_owned(
             owner,
             session_id,
             state.stream_version,
             &command_id,
-            &[EventDraft::new(
-                event_id.clone(),
-                SessionEvent::MessageAppended {
-                    message: message.clone(),
-                    wake_wait: false,
-                },
-            )],
+            &drafts,
         ) {
             Ok(append) => {
                 let state = store
