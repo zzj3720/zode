@@ -5,8 +5,8 @@
   "type": "module",
   "devDependencies": {
     "typescript": "5.9.3",
-    "vite": "8.0.16",
-    "vite-plus": "0.1.24"
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
   },
   "packageManager": "pnpm@11.20.0"
 }
