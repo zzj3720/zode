@@ -28,6 +28,11 @@ candidate，再调用 operator promotion；stage 失败时报告 `current`/
 teardown，任何泄漏或 flush 失败都会返回非零。该入口不接受 cassette、replay、
 recorder、locator 或未认证 health 参数。
 
+外部 artifact 的 `install`/`bootstrap`/`stage` admission 先由 checkout 中的
+受信 driver 校验 manifest、组件 digest 和不可变树；不会先执行 artifact 自带
+的脚本。安装成功后，`promote`、`health` 和 `teardown` 才从 `current` 读取
+已安装且 digest 绑定的 driver。
+
 The driver does not implement Server or Web release-control resources.  The
 operator driver/CLI performs promotion and rollback; the browser only verifies
 the ordinary Access-protected UI → Server → built-in Endpoint path afterwards.

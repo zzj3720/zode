@@ -150,12 +150,19 @@ function driverForCurrent(root) {
     const current = realpathSync(join(root, 'current'));
     return driverForArtifact(current);
   } catch {
-    return SOURCE_DRIVER;
+    fail('channel_current_missing', 'no installed current release driver is available', { release_root: root });
   }
 }
 
 function invokeDriver(operation, root, artifact = null) {
-  const driver = artifact ? driverForArtifact(artifact) : driverForCurrent(root);
+  // An external artifact is data until the trusted checkout driver has
+  // validated its immutable manifest. Never execute its embedded driver for
+  // install/bootstrap/stage admission; those operations may copy or start
+  // files. Once installed, promote/health/teardown use the digest-bound copy
+  // under current.
+  const driver = artifact && ['install', 'bootstrap', 'stage'].includes(operation)
+    ? SOURCE_DRIVER
+    : artifact ? driverForArtifact(artifact) : driverForCurrent(root);
   const args = [operation, '--release-root', root];
   if (artifact) args.push('--artifact', artifact);
   args.push('--json');
@@ -200,9 +207,6 @@ function main(options) {
   const root = channelRoot(options);
   if (options.operation === 'install') {
     const artifact = requireValue(options, 'artifact');
-    // Install is itself an artifact operation: use the driver's copy that is
-    // hash-bound inside the artifact rather than a potentially dirty checkout
-    // driver.  This keeps build/install on one revision contract.
     const result = invokeDriver('install', root, artifact);
     if (result.status !== 0 || !result.payload?.ok) {
       emit({ ok: false, operation: 'install', release_root: root, ...(result.payload ?? {}) });
