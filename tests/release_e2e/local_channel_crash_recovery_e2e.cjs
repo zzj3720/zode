@@ -67,7 +67,9 @@ if (!artifact) {
       const found = findEmptyInstance();
       if (found) return found;
       if (child.exitCode !== null) break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      // The roles=[] window ends as soon as the detached Server is admitted;
+      // sample it at 1 ms so the crash barrier remains observable on macOS.
+      await new Promise((resolve) => setTimeout(resolve, 1));
     }
     return null;
   };
