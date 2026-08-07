@@ -10,9 +10,10 @@
  * stable build/install/start/stop/update vocabulary.  It has no cassette,
  * replay, recorder, browser, or release-control API input.
  */
-const { chmodSync, existsSync, lstatSync, mkdirSync, readlinkSync, realpathSync } = require('node:fs');
+const { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync } = require('node:fs');
+const { createHash } = require('node:crypto');
 const { spawnSync } = require('node:child_process');
-const { dirname, join, resolve } = require('node:path');
+const { dirname, join, relative, resolve, sep } = require('node:path');
 
 const MAX_OUTPUT = 16 * 1024 * 1024;
 const COMMAND_TIMEOUT_MS = 300_000;
@@ -116,6 +117,14 @@ function sameSnapshot(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function sha256(bytes) {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+function jsonBytes(value) {
+  return Buffer.from(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
+}
+
 function parseLastJson(stdout) {
   const lines = String(stdout ?? '').trim().split(/\r?\n/).filter(Boolean);
   for (let index = lines.length - 1; index >= 0; index -= 1) {
@@ -146,12 +155,64 @@ function driverForArtifact(artifact) {
 }
 
 function driverForCurrent(root) {
-  try {
-    const current = realpathSync(join(root, 'current'));
-    return driverForArtifact(current);
-  } catch {
-    fail('channel_current_missing', 'no installed current release driver is available', { release_root: root });
+  const rootReal = realpathSync(root);
+  let current;
+  try { current = realpathSync(join(rootReal, 'current')); } catch (error) {
+    fail('channel_current_missing', 'no installed current release driver is available', { release_root: root, error: String(error) });
   }
+  const currentRel = relative(rootReal, current);
+  if (currentRel === '..' || currentRel.startsWith(`..${sep}`) || currentRel === '') {
+    fail('channel_current_invalid', 'current does not resolve inside release-root', { release_root: root });
+  }
+  const releasesRoot = join(rootReal, 'releases');
+  const releasesRel = relative(releasesRoot, current);
+  if (releasesRel === '..' || releasesRel.startsWith(`..${sep}`) || releasesRel === '') {
+    fail('channel_current_invalid', 'current does not resolve to an installed release', { release_root: root });
+  }
+  const manifestPath = join(current, 'manifest.json');
+  const manifestStat = lstatSync(manifestPath);
+  if (!manifestStat.isFile() || manifestStat.isSymbolicLink() || (manifestStat.mode & 0o222) !== 0) {
+    fail('channel_current_invalid', 'current manifest is not an immutable regular file', { path: manifestPath });
+  }
+  let manifest;
+  try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch (error) {
+    fail('channel_current_invalid', 'current manifest is not valid JSON', { path: manifestPath, error: String(error) });
+  }
+  const { manifest_sha256: envelopeDigest, ...withoutDigest } = manifest ?? {};
+  if (typeof envelopeDigest !== 'string' || sha256(jsonBytes(withoutDigest)) !== envelopeDigest) {
+    fail('channel_current_invalid', 'current manifest envelope digest does not match', { path: manifestPath });
+  }
+
+  // Re-run the complete trusted checkout admission before executing any
+  // installed script.  A self-consistent envelope containing only a driver
+  // binding is not an artifact: source, UI, Server, Endpoint, immutable-tree,
+  // and component digests must all be present and tied to this exact path.
+  const admission = runExecutable(SOURCE_DRIVER, [
+    'install', '--release-root', rootReal, '--artifact', current, '--json',
+  ], { cwd: dirname(SOURCE_DRIVER) });
+  if (admission.status !== 0 || admission.payload?.ok !== true
+      || typeof admission.payload?.artifact !== 'string'
+      || realpathSync(admission.payload.artifact) !== current) {
+    fail('channel_current_invalid', 'current release failed trusted immutable artifact admission', {
+      path: current,
+      status: admission.status,
+      stdout: admission.stdout,
+      stderr: admission.stderr,
+    });
+  }
+  const expected = manifest?.driver;
+  const binding = manifest?.binding;
+  if (!expected || expected.path !== 'release-driver' || expected.revision !== manifest.revision
+      || expected.binary_sha256 !== binding?.driver_binary_sha256) {
+    fail('channel_current_invalid', 'current manifest has no valid driver binding', { path: manifestPath });
+  }
+  const driver = join(current, 'release-driver');
+  const driverStat = lstatSync(driver);
+  if (!driverStat.isFile() || driverStat.isSymbolicLink() || (driverStat.mode & 0o111) === 0 || (driverStat.mode & 0o222) !== 0
+      || sha256(readFileSync(driver)) !== expected.binary_sha256) {
+    fail('channel_current_invalid', 'current release driver digest or mode does not match its manifest', { path: driver });
+  }
+  return driver;
 }
 
 function invokeDriver(operation, root, artifact = null) {

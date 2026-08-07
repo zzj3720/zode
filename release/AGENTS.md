@@ -33,6 +33,12 @@ recorder、locator 或未认证 health 参数。
 的脚本。安装成功后，`promote`、`health` 和 `teardown` 才从 `current` 读取
 已安装且 digest 绑定的 driver。
 
+`health`/`teardown` 执行前还会由 checkout 中的受信 driver 对 `current` 的
+完整 artifact 重新做一次 admission，并要求它精确落在本通道的
+`releases/` 安装树；仅有自洽 envelope 或 driver 字段的伪造目录不可执行。
+如果 current 已安装但尚未有 live release instance，health 返回结构化失败
+状态，供 start/recovery 入口继续处理，不把缺失运行态变成 CLI 崩溃。
+
 The driver does not implement Server or Web release-control resources.  The
 operator driver/CLI performs promotion and rollback; the browser only verifies
 the ordinary Access-protected UI → Server → built-in Endpoint path afterwards.

@@ -1315,7 +1315,8 @@ async function activeHealth(root) {
       || instance.artifact.digest !== current.digest) {
     const artifact = validateManifest(current.target);
     const components = componentHealth(artifact);
-    return { status: "failed", source: "live_process", checks: { ui: "failed", server: "failed", endpoint: "failed" }, ui_mode: "assets", ui_assets_directory: "ui", ...components, components: artifact.manifest.components, probes: { server_url: "http://127.0.0.1:1/v1/system", endpoint_url: "http://127.0.0.1:1/v1/health" }, processes: { locator_paths: [] } };
+    const health = { status: "failed", source: "live_process", checks: { ui: "failed", server: "failed", endpoint: "failed" }, ui_mode: "assets", ui_assets_directory: "ui", ...components, components: artifact.manifest.components, probes: { server_url: "http://127.0.0.1:1/v1/system", endpoint_url: "http://127.0.0.1:1/v1/health" }, processes: { locator_paths: [] } };
+    return { instance: null, health, readiness: { ready: false, reason: "release_instance_missing" } };
   }
   const readiness = await probeInstance(instance);
   return { instance, health: healthPayload(instance, readiness), readiness };
@@ -1553,7 +1554,9 @@ async function main() {
       operation: "install",
       revision: record.manifest.revision,
       artifact: installed.installPath,
-      manifest_sha256: installed.digest,
+      // The public handoff field is the digest of the immutable manifest file,
+      // not the inner envelope digest used to derive the install directory.
+      manifest_sha256: sha256(readFileSync(join(installed.installPath, "manifest.json"))),
     };
   } else if (cli.operation === "bootstrap") {
     const result = await bootstrap(root, record);
