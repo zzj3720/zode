@@ -272,6 +272,38 @@ test.describe('Zode web E2E harness regressions', () => {
     }
   });
 
+  test('e2e_harness_rejects_unicode_control_or_unpaired_surrogate_authority_before_process_spawn', async ({}, testInfo) => {
+    test.setTimeout(120_000);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-authority-validation-'));
+    const markerPath = path.join(root, 'spawned.marker');
+    const binaryPath = path.join(root, 'should-not-spawn.sh');
+    fs.writeFileSync(binaryPath, '#!/bin/sh\nprintf spawned > "$ZODE_AUTHORITY_SPAWN_MARKER"\nexit 1\n', { mode: 0o700 });
+    fs.chmodSync(binaryPath, 0o700);
+    const previousEndpointBinary = process.env.ZODE_ENDPOINT_BIN;
+    const previousServerBinary = process.env.ZODE_SERVER_BIN;
+    const previousMarker = process.env.ZODE_AUTHORITY_SPAWN_MARKER;
+    process.env.ZODE_ENDPOINT_BIN = binaryPath;
+    process.env.ZODE_SERVER_BIN = binaryPath;
+    process.env.ZODE_AUTHORITY_SPAWN_MARKER = markerPath;
+    try {
+      for (const authorityId of ['\u0085', '\ud800']) {
+        await assert.rejects(
+          createWebE2EHarness({ authorityId, e2eName: testInfo.title }),
+          (error) => error?.classification === 'AUTHORITY_INVALID',
+          `authority ${JSON.stringify(authorityId)} was not rejected before process startup`,
+        );
+      }
+      assert.equal(fs.existsSync(markerPath), false, 'invalid authority caused a product child to spawn');
+    } finally {
+      if (previousEndpointBinary === undefined) delete process.env.ZODE_ENDPOINT_BIN;
+      else process.env.ZODE_ENDPOINT_BIN = previousEndpointBinary;
+      if (previousServerBinary === undefined) delete process.env.ZODE_SERVER_BIN;
+      else process.env.ZODE_SERVER_BIN = previousServerBinary;
+      if (previousMarker === undefined) delete process.env.ZODE_AUTHORITY_SPAWN_MARKER;
+      else process.env.ZODE_AUTHORITY_SPAWN_MARKER = previousMarker;
+    }
+  });
+
   test('e2e_first_failure_cassette_tracks_real_browser_exchange', async ({ page }, testInfo) => {
     test.setTimeout(120_000);
     let harness;

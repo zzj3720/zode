@@ -3038,7 +3038,10 @@ function resolveAuthorityId(value, fallback) {
     throw new HarnessFailure('AUTHORITY_INVALID', 'authorityId must be a bounded non-control string');
   }
   for (const character of authorityId) {
-    if (character.charCodeAt(0) < 0x20 || character.charCodeAt(0) === 0x7f) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint < 0x20
+      || (codePoint >= 0x7f && codePoint <= 0x9f)
+      || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
       throw new HarnessFailure('AUTHORITY_INVALID', 'authorityId must be a bounded non-control string');
     }
   }
