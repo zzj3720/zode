@@ -3101,7 +3101,7 @@ async function buildUiAssets(directory, { ledger } = {}) {
   return directory;
 }
 
-function serverConfig({ root, issuer, jwksUrl, managementOrigin, callbackOrigin, uiMode = 'api_only', uiAssetsDirectory }) {
+function serverConfig({ root, issuer, jwksUrl, managementOrigin, callbackOrigin, uiMode = 'api_only', uiAssetsDirectory, includeServerOrigins = false }) {
   const management = loopbackOrigin(managementOrigin, 'management_origin');
   const callback = loopbackOrigin(callbackOrigin, 'callback_origin');
   if (management === callback) {
@@ -3120,13 +3120,11 @@ function serverConfig({ root, issuer, jwksUrl, managementOrigin, callbackOrigin,
   const subjectKey = path.join(root, 'subject.key');
   fs.writeFileSync(subjectKey, Buffer.alloc(32, 0x42), { flag: 'wx', mode: 0o600 });
   try { fs.chmodSync(subjectKey, 0o600); } catch {}
-  return writeJsonPrivate(path.join(root, 'server-config.json'), {
+  const config = {
     schema: 'zode.server-config.v1',
     listen: '127.0.0.1:0',
     server_authority_id: 'web-e2e-server',
     deployment: 'server_only',
-    management_origin: management,
-    callback_origin: callback,
     ui_mode: uiMode,
     ...(uiMode === 'assets' ? { ui_assets_directory: uiAssetsDirectory } : {}),
     control_database: path.join(root, 'server.sqlite3'),
@@ -3138,7 +3136,16 @@ function serverConfig({ root, issuer, jwksUrl, managementOrigin, callbackOrigin,
       subject_key_file: subjectKey,
       subject_key_version: 1,
     },
-  });
+  };
+  // The current Server config schema does not yet own the top-level origin
+  // fields. Keep the real Access edges canonical while allowing a consumer
+  // running a Server that has adopted that schema extension to opt in
+  // explicitly; never probe by spawning a second child after a config error.
+  if (includeServerOrigins) {
+    config.management_origin = management;
+    config.callback_origin = callback;
+  }
+  return writeJsonPrivate(path.join(root, 'server-config.json'), config);
 }
 
 function serverLogDir(runRoot, generation) {
@@ -3406,6 +3413,7 @@ async function createWebE2EHarness(options = {}) {
       callbackOrigin,
       uiMode,
       uiAssetsDirectory,
+      includeServerOrigins: options.includeServerOrigins === true,
     });
     const startupCaptureRoot = path.join(quarantineRoot, 'startup');
     const startupE2eName = options.e2eName || 'web-e2e-harness-run';

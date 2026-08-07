@@ -2521,8 +2521,10 @@ fn build_test_ui(ui_assets_directory: &Path) -> TestResult<()> {
         .parent()
         .ok_or_else(|| io::Error::other("server manifest has no repository parent"))?;
     let web_root = repository_root.join("web").canonicalize()?;
-    let output = Command::new("vp")
+    let output = Command::new("pnpm")
         .current_dir(&web_root)
+        .arg("exec")
+        .arg("vp")
         .arg("build")
         .arg("--outDir")
         .arg(ui_assets_directory)
@@ -3616,9 +3618,20 @@ fn validate_source_cassette(cassette: &IncidentCassette) -> TestResult<()> {
 }
 
 fn assert_immutable_fixture(path: &Path) -> TestResult<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::other("incident cassette is not a regular file").into());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Git records only the executable bit, not restrictive read-only
+        // modes. Normalize a tracked checkout before the immutable check;
+        // promotion itself still uses create-new + 0444 and this path is
+        // rejected above when it is a symlink.
+        if metadata.permissions().mode() & 0o222 != 0 {
+            set_readonly_permissions(path)?;
+        }
         if fs::metadata(path)?.permissions().mode() & 0o222 != 0 {
             return Err(io::Error::other("incident cassette was writable").into());
         }
