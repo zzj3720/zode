@@ -25,6 +25,9 @@ The root `AGENTS.md`, `docs/ui.md`, and `docs/server-api.md` are authoritative.
   navigation through the management origin rather than collecting credentials.
 - Generated API types may come from the versioned Server schema; do not edit
   generated files by hand or duplicate wire types ad hoc.
+- Do not add release staging, promotion, rollback, install, or process-control
+  UI. V0 release actuation belongs to the operator driver/CLI; browser E2Es
+  observe the real product only after those actions.
 - HTTP command acceptance is distinct from runtime completion. Durable UI state
   follows Server responses/events; transient token text remains provisional.
 
