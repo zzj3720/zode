@@ -10,6 +10,7 @@ const path = require('node:path');
 const { test } = require('@playwright/test');
 
 const {
+  Barrier,
   HarnessFailure,
   RealProcess,
   RecordingJournal,
@@ -1242,6 +1243,87 @@ test.describe('Zode web E2E harness regressions', () => {
       );
       assert.ok(fs.existsSync(first.rawPath), 'the retained first raw member was lost after rejection');
     } finally {
+      try { await edge?.close(); } catch {}
+      try { await upstream?.close(); } catch {}
+    }
+  });
+
+  test('e2e_browser_replay_accepts_same_bytes_after_transport_chunk_coalescing', async ({ page }, testInfo) => {
+    test.setTimeout(120_000);
+    const quarantineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-replay-chunk-coalescing-'));
+    const ledger = new SecretLedger();
+    const journal = new RecordingJournal({ rootDir: quarantineRoot, ledger });
+    const body = Buffer.from('chunk-one-chunk-two', 'utf8');
+    const firstChunkSent = new Barrier('chunk coalescing first chunk');
+    const releaseSecondChunk = new Barrier('chunk coalescing second chunk');
+    let upstream;
+    let edge;
+    let coalesced;
+    try {
+      upstream = await startHttpServer(async (request, response) => {
+        if (request.method !== 'GET' || request.url !== '/chunk-coalescing') {
+          response.writeHead(404, { 'content-type': 'text/plain' });
+          response.end('not found');
+          return;
+        }
+        response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        response.write(body.subarray(0, 10));
+        firstChunkSent.notify();
+        await releaseSecondChunk.wait();
+        response.end(body.subarray(10));
+      });
+      const captureSetId = journal.beginCaptureSet({ e2eName: testInfo.title, maxMembers: 1 });
+      edge = await startHttpServer((request, response) => proxyHttp({
+        targetBaseUrl: upstream.baseUrl,
+        request,
+        response,
+        boundary: 'replay-chunk-coalescing-edge',
+        journal,
+        ledger,
+        captureSetId,
+        canonicalOrigin: upstream.baseUrl,
+      }));
+
+      const navigation = page.goto(`${edge.baseUrl}/chunk-coalescing`, { waitUntil: 'load' });
+      await firstChunkSent.wait();
+      releaseSecondChunk.notify();
+      const captured = await navigation;
+      assert.equal(captured?.status(), 200, 'the real browser did not capture the chunked local edge response');
+      const first = journal.first({ boundary: 'replay-chunk-coalescing-edge', responseStatus: 200 });
+      assert.ok(first?.rawPath, 'the chunked browser exchange was not retained in quarantine');
+      const capturedBody = Buffer.concat(first.response.chunks.map((chunk) => Buffer.from(chunk.data_base64, 'base64')));
+      assert.deepEqual(capturedBody, body, 'the first browser exchange did not retain the complete response bytes');
+      assert.ok(first.response.chunks.length >= 2, 'the fixture did not create a distinct captured chunk boundary');
+
+      coalesced = await startHttpServer((request, response) => {
+        if (request.method !== 'GET' || request.url !== '/chunk-coalescing') {
+          response.writeHead(404, { 'content-type': 'text/plain' });
+          response.end('not found');
+          return;
+        }
+        // This is the same public response bytes delivered by a target that
+        // coalesces the two transport reads into one Node response chunk.
+        response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        response.end(body);
+      });
+      const promoted = await journal.promoteCaptureSet(captureSetId, {
+        e2eName: testInfo.title,
+        classification: 'HARNESS_TRANSPORT_CHUNK_RESEGMENTATION',
+        firstObserved: 'real browser response bytes were split by one HTTP hop and coalesced by the replay target',
+        firstFailureRecordingId: first.recordingId,
+        replay: async (envelope) => ({
+          ok: true,
+          results: await journal.replay(envelope, { baseUrl: coalesced.baseUrl }),
+        }),
+      });
+      assert.ok(promoted.cassettePath, 'same-entry replay did not promote the coalesced-byte cassette');
+      assert.equal(
+        promoted.replay?.results?.[0]?.chunks,
+        first.response.chunks.length,
+        'replay proof did not retain the captured logical chunk count',
+      );
+    } finally {
+      try { await coalesced?.close(); } catch {}
       try { await edge?.close(); } catch {}
       try { await upstream?.close(); } catch {}
     }

@@ -2337,9 +2337,15 @@ class RecordingJournal {
       }
     }
     const expectedChunks = exchange.response.chunks.map((chunk) => decodeBase64Strict(chunk.data_base64, 'replay response chunk', MAX_RECORDING_RESPONSE_BYTES));
-    const actualChunks = response.chunks.map((chunk) => redactBuffer(chunk.data, this.ledger));
-    if (response.status !== exchange.response.status || actualChunks.length !== expectedChunks.length
-      || actualChunks.some((chunk, index) => !chunk.equals(expectedChunks[index]))) {
+    // A live HTTP hop is allowed to coalesce or split transport reads.  The
+    // replay server below re-emits the captured chunk boundaries, but a
+    // same-entry replay through a real product/edge can only compare the
+    // ordered response bytes and terminal outcome.  Treating Node's read
+    // segmentation as product semantics makes a captured CSS/font response
+    // fail even when its status, headers, bytes, and termination all match.
+    const expectedBody = Buffer.concat(expectedChunks);
+    const actualBody = redactBuffer(Buffer.concat(response.chunks.map((chunk) => chunk.data)), this.ledger);
+    if (response.status !== exchange.response.status || !actualBody.equals(expectedBody)) {
       throw new HarnessFailure('REPLAY_MISMATCH', 'secret-safe cassette replay did not reproduce the public exchange', {
         expectedStatus: exchange.response.status,
         actualStatus: response.status,
@@ -2353,7 +2359,15 @@ class RecordingJournal {
         path: exchange.path,
       });
     }
-    return { status: response.status, path: exchange.path, outcome: response.outcome, chunks: response.chunks.length };
+    return {
+      status: response.status,
+      path: exchange.path,
+      outcome: response.outcome,
+      // Proof summaries use the captured logical chunk count.  The byte
+      // comparison above intentionally tolerates transport re-segmentation;
+      // startReplayServer remains the exact chunk-boundary replay primitive.
+      chunks: expectedChunks.length,
+    };
   }
 
   assertFlushed() {

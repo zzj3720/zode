@@ -198,7 +198,10 @@ start real Server and Endpoint processes where the original path did.
 The replay server verifies exact exchange order, method, path, semantic
 headers, request body bytes or approved synthetic-slot substitution, and total
 exchange count. An unexpected, missing, duplicate, or unconsumed request fails
-the E2E with a safe diff.
+the E2E with a safe diff. A same-entry replay through a live HTTP hop compares
+the complete ordered response bytes and terminal outcome; transport reads may
+be coalesced or split by that hop. `startReplayServer` remains the primitive
+that re-emits the captured response chunk boundaries exactly.
 
 Two timing modes are allowed:
 
