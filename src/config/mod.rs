@@ -635,7 +635,7 @@ fn validate_tools(
         return Err(ConfigError::Invalid("tools has too many entries"));
     }
     let mut names = HashSet::new();
-    for value in values {
+    for value in values.iter_mut() {
         validate_name(&value.name)?;
         validate_bounded_string(
             &value.description,

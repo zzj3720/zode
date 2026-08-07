@@ -228,13 +228,12 @@ impl ServerConfig {
                 "control and secret paths must be distinct",
             ));
         }
-
-
+        let public_listen = self.listen_addr()?;
         if let Some(local) = &mut self.local_endpoint {
             local.validate_and_resolve(
                 &base,
                 &self.server_authority_id,
-                self.listen_addr()?,
+                public_listen,
                 &self.control_database,
                 &self.secret_directory,
             )?;
