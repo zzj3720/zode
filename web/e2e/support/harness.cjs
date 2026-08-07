@@ -911,7 +911,7 @@ function restoreHeaders(headers, ledger) {
   return restored;
 }
 
-async function requestRaw(target, { method, headers, body, timeoutMs = HTTP_TIMEOUT_MS, expectedOutcome }) {
+async function requestRaw(target, { method, headers, body, timeoutMs = HTTP_TIMEOUT_MS }) {
   return withTimeout(new Promise((resolve, reject) => {
     const started = process.hrtime.bigint();
     const request = http.request(target, { method, headers }, (response) => {
@@ -932,14 +932,13 @@ async function requestRaw(target, { method, headers, body, timeoutMs = HTTP_TIME
         data: Buffer.from(chunk),
       }));
       response.once('end', () => finish('completed'));
-      response.once('aborted', () => {
-        finish(expectedOutcome === 'transport_error' || expectedOutcome === 'client_disconnected'
-          ? expectedOutcome
-          : 'disconnected');
-      });
-      response.once('error', () => finish(expectedOutcome || 'transport_error'));
+      // Terminal outcome is an observation of this replay target, never a
+      // hint from the captured cassette.  Otherwise a target that disconnects
+      // or errors differently could be relabeled as the expected outcome.
+      response.once('aborted', () => finish('disconnected'));
+      response.once('error', () => finish('transport_error'));
       response.once('close', () => {
-        if (!settled && !response.complete) finish(expectedOutcome || 'disconnected');
+        if (!settled && !response.complete) finish('disconnected');
       });
     });
     request.once('error', reject);
@@ -2326,7 +2325,6 @@ class RecordingJournal {
       headers: requestHeaders,
       body: requestBody,
       timeoutMs: HTTP_TIMEOUT_MS,
-      expectedOutcome: exchange.response.outcome,
     });
     const expectedResponseHeaders = normalizeHeaders(restoreHeaders(exchange.response.headers, this.ledger));
     const actualResponseHeaders = normalizeHeaders(publicHeaders(response.headers));
@@ -2337,9 +2335,15 @@ class RecordingJournal {
       }
     }
     const expectedChunks = exchange.response.chunks.map((chunk) => decodeBase64Strict(chunk.data_base64, 'replay response chunk', MAX_RECORDING_RESPONSE_BYTES));
-    const actualChunks = response.chunks.map((chunk) => redactBuffer(chunk.data, this.ledger));
-    if (response.status !== exchange.response.status || actualChunks.length !== expectedChunks.length
-      || actualChunks.some((chunk, index) => !chunk.equals(expectedChunks[index]))) {
+    // A live HTTP hop is allowed to coalesce or split transport reads.  The
+    // replay server below re-emits the captured chunk boundaries, but a
+    // same-entry replay through a real product/edge can only compare the
+    // ordered response bytes and terminal outcome.  Treating Node's read
+    // segmentation as product semantics makes a captured CSS/font response
+    // fail even when its status, headers, bytes, and termination all match.
+    const expectedBody = Buffer.concat(expectedChunks);
+    const actualBody = redactBuffer(Buffer.concat(response.chunks.map((chunk) => chunk.data)), this.ledger);
+    if (response.status !== exchange.response.status || !actualBody.equals(expectedBody)) {
       throw new HarnessFailure('REPLAY_MISMATCH', 'secret-safe cassette replay did not reproduce the public exchange', {
         expectedStatus: exchange.response.status,
         actualStatus: response.status,
@@ -2353,7 +2357,15 @@ class RecordingJournal {
         path: exchange.path,
       });
     }
-    return { status: response.status, path: exchange.path, outcome: response.outcome, chunks: response.chunks.length };
+    return {
+      status: response.status,
+      path: exchange.path,
+      outcome: response.outcome,
+      // Proof summaries use the captured logical chunk count.  The byte
+      // comparison above intentionally tolerates transport re-segmentation;
+      // startReplayServer remains the exact chunk-boundary replay primitive.
+      chunks: expectedChunks.length,
+    };
   }
 
   assertFlushed() {
@@ -3015,10 +3027,30 @@ function defaultEnv() {
   return env;
 }
 
-function endpointConfig({ root, database, providerOrigin, controllerSecret }) {
+function resolveAuthorityId(value, fallback) {
+  const authorityId = value === undefined ? fallback : value;
+  if (typeof authorityId !== 'string'
+    || authorityId.length === 0
+    || Buffer.byteLength(authorityId, 'utf8') > 64
+    || authorityId.trim() !== authorityId) {
+    throw new HarnessFailure('AUTHORITY_INVALID', 'authorityId must be a bounded non-control string');
+  }
+  for (const character of authorityId) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint < 0x20
+      || (codePoint >= 0x7f && codePoint <= 0x9f)
+      || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+      throw new HarnessFailure('AUTHORITY_INVALID', 'authorityId must be a bounded non-control string');
+    }
+  }
+  return authorityId;
+}
+
+function endpointConfig({ root, database, providerOrigin, controllerSecret, authorityId }) {
   const credentials = ensureDirectory(path.join(root, 'credentials'));
   const blobs = ensureDirectory(path.join(root, 'blobs'));
   const secretFile = writePrivateFile(path.join(root, 'controller.secret'), controllerSecret);
+  const controllerAuthorityId = resolveAuthorityId(authorityId, 'web-e2e-controller');
   return writeJsonPrivate(path.join(root, 'endpoint-config.json'), {
     schema: 'zode.config.v1',
     listen: '127.0.0.1:0',
@@ -3026,7 +3058,7 @@ function endpointConfig({ root, database, providerOrigin, controllerSecret }) {
     credential_replica_store: { kind: 'files', directory: credentials },
     blob_store: { kind: 'files', directory: blobs },
     controller_auth: [{
-      authority_id: 'web-e2e-controller',
+      authority_id: controllerAuthorityId,
       revision: 1,
       kind: 'bearer_secret_file',
       secret_file: secretFile,
@@ -3101,9 +3133,10 @@ async function buildUiAssets(directory, { ledger } = {}) {
   return directory;
 }
 
-function serverConfig({ root, issuer, jwksUrl, managementOrigin, callbackOrigin, uiMode = 'api_only', uiAssetsDirectory, includeServerOrigins = false }) {
+function serverConfig({ root, issuer, jwksUrl, managementOrigin, callbackOrigin, uiMode = 'api_only', uiAssetsDirectory, includeServerOrigins = false, authorityId }) {
   const management = loopbackOrigin(managementOrigin, 'management_origin');
   const callback = loopbackOrigin(callbackOrigin, 'callback_origin');
+  const serverAuthorityId = resolveAuthorityId(authorityId, 'web-e2e-server');
   if (management === callback) {
     throw new HarnessFailure('ORIGIN_INVALID', 'management_origin and callback_origin must be distinct');
   }
@@ -3123,7 +3156,7 @@ function serverConfig({ root, issuer, jwksUrl, managementOrigin, callbackOrigin,
   const config = {
     schema: 'zode.server-config.v1',
     listen: '127.0.0.1:0',
-    server_authority_id: 'web-e2e-server',
+    server_authority_id: serverAuthorityId,
     deployment: 'server_only',
     ui_mode: uiMode,
     ...(uiMode === 'assets' ? { ui_assets_directory: uiAssetsDirectory } : {}),
@@ -3168,7 +3201,7 @@ async function fetchJson(url, options = {}) {
 }
 
 class WebE2EHarness {
-  constructor({ runRoot, ledger, journal, fakeProvider, providerProxy, access, endpoint, server, edge, callbackEdge, managementOrigin, callbackOrigin, serverStartSpec, serverGeneration, controllerSecret, providerSecret, uiMode, uiAssetsDirectory }) {
+  constructor({ runRoot, ledger, journal, fakeProvider, providerProxy, access, endpoint, server, edge, callbackEdge, managementOrigin, callbackOrigin, authorityId, serverStartSpec, serverGeneration, controllerSecret, providerSecret, uiMode, uiAssetsDirectory }) {
     this.runRoot = runRoot;
     this.ledger = ledger;
     this.journal = journal;
@@ -3181,6 +3214,7 @@ class WebE2EHarness {
     this.callbackEdge = callbackEdge;
     this.managementOrigin = managementOrigin;
     this.callbackOrigin = callbackOrigin;
+    this.authorityId = authorityId;
     this.serverStartSpec = serverStartSpec;
     this.serverGeneration = serverGeneration;
     this.controllerSecret = controllerSecret;
@@ -3370,6 +3404,9 @@ async function createWebE2EHarness(options = {}) {
   const ledger = new SecretLedger();
   const controllerSecret = `web-e2e-controller-secret-${runId}`;
   const providerSecret = `web-e2e-provider-secret-${runId}`;
+  const authorityId = options.authorityId === undefined
+    ? undefined
+    : resolveAuthorityId(options.authorityId, 'web-e2e-controller');
   const managementOrigin = loopbackOrigin(options.managementOrigin || 'http://127.0.0.1', 'management_origin');
   const callbackOrigin = loopbackOrigin(options.callbackOrigin || 'http://127.0.0.2', 'callback_origin');
   if (managementOrigin === callbackOrigin) {
@@ -3399,6 +3436,7 @@ async function createWebE2EHarness(options = {}) {
       database: path.join(endpointRoot, 'endpoint.sqlite3'),
       providerOrigin: providerProxy.baseUrl,
       controllerSecret,
+      authorityId,
     });
     const uiMode = options.uiMode || process.env.ZODE_WEB_E2E_UI_MODE
       || (process.env.ZODE_UI_ASSETS_DIRECTORY ? 'assets' : 'api_only');
@@ -3414,6 +3452,7 @@ async function createWebE2EHarness(options = {}) {
       uiMode,
       uiAssetsDirectory,
       includeServerOrigins: options.includeServerOrigins === true,
+      authorityId,
     });
     const startupCaptureRoot = path.join(quarantineRoot, 'startup');
     const startupE2eName = options.e2eName || 'web-e2e-harness-run';
@@ -3466,6 +3505,7 @@ async function createWebE2EHarness(options = {}) {
       callbackEdge,
       managementOrigin,
       callbackOrigin,
+      authorityId,
       serverStartSpec,
       serverGeneration,
       controllerSecret,

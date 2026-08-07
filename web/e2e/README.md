@@ -111,6 +111,15 @@ product-behavior claim. A shallow 404 is classified as non-evidence and
 cannot satisfy that regression. A missing binary or asset build is reported
 as a harness failure and does not fabricate an HTTP incident.
 
+Consumers that exercise Server-to-Endpoint authority distribution may pass
+`createWebE2EHarness({ authorityId: 'web-e2e-shared-authority' })`. The bounded
+test-only value is written to both the Endpoint controller-auth entry and the
+Server `server_authority_id`; omitting it preserves the historical defaults
+(`web-e2e-controller` and `web-e2e-server`). When supplied, the harness
+exposes the selected value as `harness.authorityId` for request payloads;
+otherwise that property is undefined because the defaults are intentionally
+independent.
+
 Navigation-scoped evidence uses `RecordingJournal.beginCaptureSet` before the
 browser action; management HTML/assets, `/v1/system`, and the JWKS fixture are
 recorded with that same bounded `captureSetId`. `flushCaptureSet` must complete
@@ -175,6 +184,11 @@ assertion headers remain excluded from the safe envelope.
 
 Native HTTP replay uses `RecordingJournal.startReplayServer(cassette)` and
 therefore expects the caller to send the recorded authority headers exactly.
+Same-entry replay through a live product/edge compares the complete ordered
+response bytes and terminal outcome; an HTTP hop may coalesce or split Node
+transport reads. The target terminal outcome is observed independently rather
+than copied from the cassette; a difference is `REPLAY_TERMINATION_MISMATCH`.
+`startReplayServer` remains the exact captured-chunk replay primitive.
 Browser replay uses `startReplayEdge(cassette, { canonicalOrigin, timingMode })`;
 the local edge restores the canonical `Host` before forwarding to the replay
 server and restores recorded `Forwarded`/`X-Forwarded-Host` only when the

@@ -10,6 +10,7 @@ const path = require('node:path');
 const { test } = require('@playwright/test');
 
 const {
+  Barrier,
   HarnessFailure,
   RealProcess,
   RecordingJournal,
@@ -268,6 +269,38 @@ test.describe('Zode web E2E harness regressions', () => {
       // observation remain available for recovery after an early harness exit.
       try { await childProcess.exitPromise; } catch {}
       try { await childProcess.stop(); } catch {}
+    }
+  });
+
+  test('e2e_harness_rejects_unicode_control_or_unpaired_surrogate_authority_before_process_spawn', async ({}, testInfo) => {
+    test.setTimeout(120_000);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-authority-validation-'));
+    const markerPath = path.join(root, 'spawned.marker');
+    const binaryPath = path.join(root, 'should-not-spawn.sh');
+    fs.writeFileSync(binaryPath, '#!/bin/sh\nprintf spawned > "$ZODE_AUTHORITY_SPAWN_MARKER"\nexit 1\n', { mode: 0o700 });
+    fs.chmodSync(binaryPath, 0o700);
+    const previousEndpointBinary = process.env.ZODE_ENDPOINT_BIN;
+    const previousServerBinary = process.env.ZODE_SERVER_BIN;
+    const previousMarker = process.env.ZODE_AUTHORITY_SPAWN_MARKER;
+    process.env.ZODE_ENDPOINT_BIN = binaryPath;
+    process.env.ZODE_SERVER_BIN = binaryPath;
+    process.env.ZODE_AUTHORITY_SPAWN_MARKER = markerPath;
+    try {
+      for (const authorityId of ['\u0085', '\ud800']) {
+        await assert.rejects(
+          createWebE2EHarness({ authorityId, e2eName: testInfo.title }),
+          (error) => error?.classification === 'AUTHORITY_INVALID',
+          `authority ${JSON.stringify(authorityId)} was not rejected before process startup`,
+        );
+      }
+      assert.equal(fs.existsSync(markerPath), false, 'invalid authority caused a product child to spawn');
+    } finally {
+      if (previousEndpointBinary === undefined) delete process.env.ZODE_ENDPOINT_BIN;
+      else process.env.ZODE_ENDPOINT_BIN = previousEndpointBinary;
+      if (previousServerBinary === undefined) delete process.env.ZODE_SERVER_BIN;
+      else process.env.ZODE_SERVER_BIN = previousServerBinary;
+      if (previousMarker === undefined) delete process.env.ZODE_AUTHORITY_SPAWN_MARKER;
+      else process.env.ZODE_AUTHORITY_SPAWN_MARKER = previousMarker;
     }
   });
 
@@ -1244,6 +1277,158 @@ test.describe('Zode web E2E harness regressions', () => {
     } finally {
       try { await edge?.close(); } catch {}
       try { await upstream?.close(); } catch {}
+    }
+  });
+
+  test('e2e_browser_replay_accepts_same_bytes_after_transport_chunk_coalescing', async ({ page }, testInfo) => {
+    test.setTimeout(120_000);
+    const quarantineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-replay-chunk-coalescing-'));
+    const ledger = new SecretLedger();
+    const journal = new RecordingJournal({ rootDir: quarantineRoot, ledger });
+    const body = Buffer.from('chunk-one-chunk-two', 'utf8');
+    const firstChunkSent = new Barrier('chunk coalescing first chunk');
+    const releaseSecondChunk = new Barrier('chunk coalescing second chunk');
+    let upstream;
+    let edge;
+    let coalesced;
+    try {
+      upstream = await startHttpServer(async (request, response) => {
+        if (request.method !== 'GET' || request.url !== '/chunk-coalescing') {
+          response.writeHead(404, { 'content-type': 'text/plain' });
+          response.end('not found');
+          return;
+        }
+        response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        response.write(body.subarray(0, 10));
+        firstChunkSent.notify();
+        await releaseSecondChunk.wait();
+        response.end(body.subarray(10));
+      });
+      const captureSetId = journal.beginCaptureSet({ e2eName: testInfo.title, maxMembers: 1 });
+      edge = await startHttpServer((request, response) => proxyHttp({
+        targetBaseUrl: upstream.baseUrl,
+        request,
+        response,
+        boundary: 'replay-chunk-coalescing-edge',
+        journal,
+        ledger,
+        captureSetId,
+        canonicalOrigin: upstream.baseUrl,
+      }));
+
+      const navigation = page.goto(`${edge.baseUrl}/chunk-coalescing`, { waitUntil: 'load' });
+      await firstChunkSent.wait();
+      releaseSecondChunk.notify();
+      const captured = await navigation;
+      assert.equal(captured?.status(), 200, 'the real browser did not capture the chunked local edge response');
+      const first = journal.first({ boundary: 'replay-chunk-coalescing-edge', responseStatus: 200 });
+      assert.ok(first?.rawPath, 'the chunked browser exchange was not retained in quarantine');
+      const capturedBody = Buffer.concat(first.response.chunks.map((chunk) => Buffer.from(chunk.data_base64, 'base64')));
+      assert.deepEqual(capturedBody, body, 'the first browser exchange did not retain the complete response bytes');
+      assert.ok(first.response.chunks.length >= 2, 'the fixture did not create a distinct captured chunk boundary');
+
+      coalesced = await startHttpServer((request, response) => {
+        if (request.method !== 'GET' || request.url !== '/chunk-coalescing') {
+          response.writeHead(404, { 'content-type': 'text/plain' });
+          response.end('not found');
+          return;
+        }
+        // This is the same public response bytes delivered by a target that
+        // coalesces the two transport reads into one Node response chunk.
+        response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        response.end(body);
+      });
+      const promoted = await journal.promoteCaptureSet(captureSetId, {
+        e2eName: testInfo.title,
+        classification: 'HARNESS_TRANSPORT_CHUNK_RESEGMENTATION',
+        firstObserved: 'real browser response bytes were split by one HTTP hop and coalesced by the replay target',
+        firstFailureRecordingId: first.recordingId,
+        replay: async (envelope) => ({
+          ok: true,
+          results: await journal.replay(envelope, { baseUrl: coalesced.baseUrl }),
+        }),
+      });
+      assert.ok(promoted.cassettePath, 'same-entry replay did not promote the coalesced-byte cassette');
+      assert.equal(
+        promoted.replay?.results?.[0]?.chunks,
+        first.response.chunks.length,
+        'replay proof did not retain the captured logical chunk count',
+      );
+    } finally {
+      try { await coalesced?.close(); } catch {}
+      try { await edge?.close(); } catch {}
+      try { await upstream?.close(); } catch {}
+    }
+  });
+
+  test('e2e_browser_replay_rejects_same_bytes_with_terminal_outcome_mismatch', async ({ page }, testInfo) => {
+    test.setTimeout(120_000);
+    const quarantineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-replay-terminal-outcome-'));
+    const destinationDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-replay-terminal-destination-'));
+    const ledger = new SecretLedger();
+    const journal = new RecordingJournal({ rootDir: quarantineRoot, ledger });
+    let unavailable;
+    let edge;
+    let replayTarget;
+    try {
+      unavailable = await startHttpServer(() => {});
+      const unavailableBaseUrl = unavailable.baseUrl;
+      await unavailable.close();
+      unavailable = undefined;
+
+      const captureSetId = journal.beginCaptureSet({ e2eName: testInfo.title, maxMembers: 1 });
+      edge = await startHttpServer((request, response) => proxyHttp({
+        targetBaseUrl: unavailableBaseUrl,
+        request,
+        response,
+        boundary: 'replay-terminal-outcome-edge',
+        journal,
+        ledger,
+        captureSetId,
+        canonicalOrigin: unavailableBaseUrl,
+      }));
+      const captured = await page.goto(`${edge.baseUrl}/terminal-outcome`, { waitUntil: 'load' });
+      assert.equal(captured?.status(), 502, 'the real browser did not observe the captured upstream failure response');
+
+      const first = journal.first({ boundary: 'replay-terminal-outcome-edge', responseStatus: 502 });
+      assert.ok(first?.rawPath, 'the terminal-outcome first occurrence was not durably retained');
+      assert.equal(first.response.outcome, 'transport_error', 'the fixture did not capture a transport terminal outcome');
+      const capturedBody = Buffer.concat(first.response.chunks.map((chunk) => Buffer.from(chunk.data_base64, 'base64')));
+      assert.ok(capturedBody.length > 0, 'the captured failure response had no body bytes');
+
+      replayTarget = await startHttpServer((request, response) => {
+        if (request.method !== 'GET' || request.url !== '/terminal-outcome') {
+          response.writeHead(404, { 'content-type': 'text/plain' });
+          response.end('not found');
+          return;
+        }
+        // Keep status and bytes identical, but terminate by disconnecting the
+        // response.  Same-entry replay must reject this outcome difference.
+        response.writeHead(502, { 'content-type': 'application/json' });
+        response.write(capturedBody);
+        setImmediate(() => response.socket?.destroy());
+      });
+
+      await assert.rejects(
+        journal.promoteCaptureSet(captureSetId, {
+          e2eName: testInfo.title,
+          classification: 'HARNESS_TERMINAL_OUTCOME_MISMATCH',
+          firstObserved: 'real browser observed the same bytes before a replay target changed terminal outcome',
+          firstFailureRecordingId: first.recordingId,
+          destinationDirectory,
+          replay: async (envelope) => ({
+            ok: true,
+            results: await journal.replay(envelope, { baseUrl: replayTarget.baseUrl }),
+          }),
+        }),
+        (error) => error?.classification === 'REPLAY_TERMINATION_MISMATCH',
+        'same status/body with a different terminal outcome was accepted',
+      );
+      assert.deepEqual(fs.readdirSync(destinationDirectory), [], 'terminal-outcome mismatch wrote a cassette');
+    } finally {
+      try { await replayTarget?.close(); } catch {}
+      try { await edge?.close(); } catch {}
+      try { await unavailable?.close(); } catch {}
     }
   });
 });
