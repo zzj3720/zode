@@ -4,6 +4,7 @@ use std::{
     io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use serde::Deserialize;
@@ -24,6 +25,7 @@ const MAX_MODEL_STEP_ATTEMPTS: u64 = 64;
 const MAX_MODEL_RETRY_MS: u64 = 3_600_000;
 const MAX_AUTO_WAIT_TIMEOUT_SECONDS: u64 = 600;
 const MAX_NAME_BYTES: usize = 128;
+const MAX_AUTHORITY_ID_BYTES: usize = 64;
 const MAX_DESCRIPTION_BYTES: usize = 8 * 1024;
 const MAX_INPUT_SCHEMA_BYTES: usize = 64 * 1024;
 const MAX_LIST_ITEMS: usize = 1_024;
@@ -209,8 +211,15 @@ impl EndpointConfig {
         &self.runtime_store.path
     }
 
-    pub(crate) fn snapshot_every_events(&self) -> Option<u64> {
-        self.runtime.snapshot_every_events
+    pub(crate) fn runtime_options(&self) -> zode::runtime::RuntimeOptions {
+        zode::runtime::RuntimeOptions {
+            snapshot_every: self.runtime.snapshot_every_events,
+            tool_foreground: Duration::from_millis(self.runtime.tool_foreground_ms),
+            max_rounds_per_activation: self.runtime.max_rounds_per_activation as u32,
+            model_step_max_attempts: self.runtime.model_step_max_attempts as u32,
+            model_retry_base: Duration::from_millis(self.runtime.model_retry_base_ms),
+            model_retry_max: Duration::from_millis(self.runtime.model_retry_max_ms),
+        }
     }
 
     pub(crate) fn controller_auth_specs(&self) -> Vec<zode::control::ControllerAuthSpec> {
@@ -228,6 +237,12 @@ impl EndpointConfig {
 
     pub(crate) fn credential_replica_directory(&self) -> Option<&Path> {
         self.credential_replica_store
+            .as_ref()
+            .map(|store| store.directory.as_path())
+    }
+
+    pub(crate) fn blob_store_directory(&self) -> Option<&Path> {
+        self.blob_store
             .as_ref()
             .map(|store| store.directory.as_path())
     }
@@ -252,6 +267,30 @@ impl EndpointConfig {
                 description: tool.description.clone(),
                 input_schema: tool.input_schema.clone(),
                 adapter_url: tool.adapter.url.clone(),
+                completion_mode: match tool.completion_mode {
+                    CompletionMode::Response => zode::domain::CompletionMode::ProcessLocal,
+                    CompletionMode::ExternalCallback => {
+                        zode::domain::CompletionMode::ExternalCallback
+                    }
+                },
+                auto_wait_seconds: Some(tool.auto_wait_timeout_seconds as u32),
+                running_restart: match tool.recovery.on_running_restart {
+                    RunningRestart::UnknownOutcome => {
+                        zode::runtime::RunningRestartPolicy::UnknownOutcome
+                    }
+                    RunningRestart::RuntimeRestarted => {
+                        zode::runtime::RunningRestartPolicy::RuntimeRestarted
+                    }
+                    RunningRestart::AwaitCallback => {
+                        zode::runtime::RunningRestartPolicy::AwaitCallback
+                    }
+                },
+                retry_dispatch: match tool.recovery.retry_dispatch {
+                    RetryDispatch::Never => zode::runtime::RetryDispatchPolicy::Never,
+                    RetryDispatch::SameInvocationKeyDeduplicated => {
+                        zode::runtime::RetryDispatchPolicy::SameInvocationKeyDeduplicated
+                    }
+                },
             })
             .collect()
     }
@@ -545,6 +584,11 @@ fn validate_controller_auth(
     let mut authorities = HashSet::new();
     for value in &mut *values {
         validate_name(&value.authority_id)?;
+        if value.authority_id.len() > MAX_AUTHORITY_ID_BYTES {
+            return Err(ConfigError::Invalid(
+                "controller_auth.authority_id is too long",
+            ));
+        }
         validate_bounded_string(&value.kind, MAX_KIND_BYTES, "controller auth kind")?;
         if value.kind != "bearer_secret_file" {
             return Err(ConfigError::Invalid(
@@ -614,11 +658,6 @@ fn validate_provider_execution(config: &mut ProviderExecutionConfig) -> Result<(
     }
     config.adapter_kinds.sort();
     config.allowed_base_url_origins = parse_origins(&config.allowed_base_url_origins)?;
-    if config.adapter_kinds.is_empty() != config.allowed_base_url_origins.is_empty() {
-        return Err(ConfigError::Invalid(
-            "provider_execution adapter and outbound policy must agree",
-        ));
-    }
     Ok(())
 }
 
@@ -635,7 +674,7 @@ fn validate_tools(
         return Err(ConfigError::Invalid("tools has too many entries"));
     }
     let mut names = HashSet::new();
-    for value in values.iter_mut() {
+    for value in &mut *values {
         validate_name(&value.name)?;
         validate_bounded_string(
             &value.description,

@@ -57,6 +57,12 @@ fn reserved_wait_for_tool() -> Value {
     })
 }
 
+fn sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut value = database.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
 fn assert_active_nonzero_failure(label: &str, error: &dyn Error) -> TestResult<()> {
     let message = error.to_string();
     if message.contains("did not become ready") {
@@ -317,6 +323,42 @@ async fn e2e_reserved_wait_for_tool_name_is_rejected_before_ready() -> TestResul
         Ok(mut server) => {
             server.stop().await?;
             Err(IoError::other("Endpoint became ready with configured wait_for HTTP tool").into())
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_authority_id_over_control_bound_is_rejected_before_store_creation() -> TestResult<()> {
+    let database = TempDatabase::new("config-authority-bound")?;
+    let config = write_endpoint_config(&database, Vec::new(), 1)?;
+    let mut value: Value = serde_json::from_slice(&fs::read(&config)?)?;
+    value["controller_auth"][0]["authority_id"] = Value::String("a".repeat(65));
+    fs::write(&config, serde_json::to_vec_pretty(&value)?)?;
+
+    let result = ConfiguredServer::start(&database, &config).await;
+    match result {
+        Err(error) => {
+            assert_active_nonzero_failure("oversized controller authority", error.as_ref())?;
+            assert!(
+                !database.path().exists(),
+                "invalid authority config created the runtime SQLite path"
+            );
+            assert!(
+                !sidecar_path(database.path(), ".endpoint-id").exists(),
+                "invalid authority config created the Endpoint identity sidecar"
+            );
+            assert!(
+                !sidecar_path(database.path(), ".controller-auth").exists(),
+                "invalid authority config created the controller sidecar directory"
+            );
+            Ok(())
+        }
+        Ok(mut server) => {
+            server.stop().await?;
+            Err(
+                IoError::other("Endpoint became ready with an authority id over the control bound")
+                    .into(),
+            )
         }
     }
 }

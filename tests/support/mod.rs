@@ -1204,19 +1204,15 @@ impl ConfiguredServer {
                 base_url,
                 exit_status: None,
             }),
-            Ok(Err(failure)) => {
-                path_barrier_failure(child, failure).await
-            }
-            Err(_) => {
-                match kill_and_reap(child).await {
-                    Ok(status) => PathBarrierStart::TimeoutOrHarness(format!(
-                        "zode pid {pid} did not complete the path-barrier readiness deadline; child was force-killed with status {status}"
-                    )),
-                    Err(error) => {
-                        PathBarrierStart::TimeoutOrHarness(format!("path barrier cleanup failed: {error}"))
-                    }
-                }
-            }
+            Ok(Err(failure)) => path_barrier_failure(child, failure).await,
+            Err(_) => match kill_and_reap(child).await {
+                Ok(status) => PathBarrierStart::TimeoutOrHarness(format!(
+                    "zode pid {pid} did not complete the path-barrier readiness deadline; child was force-killed with status {status}"
+                )),
+                Err(error) => PathBarrierStart::TimeoutOrHarness(format!(
+                    "path barrier cleanup failed: {error}"
+                )),
+            },
         }
     }
 
@@ -3777,7 +3773,7 @@ async fn execute_model_script(mut script: ModelScript) -> AxumResponse {
                     &tool_call_id,
                     &tool_name,
                     &arguments,
-                ))
+                ));
             }
         }
     }

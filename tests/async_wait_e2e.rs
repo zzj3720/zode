@@ -1061,7 +1061,7 @@ fn replay_match_request(
             expected.request.method,
             expected.request.path,
             safe_request.method,
-            safe_request.path
+            safe_request.path,
         ));
     }
     *cursor += 1;
@@ -1732,8 +1732,14 @@ fn config_file(
     tools: Vec<Value>,
     max_attempts: u64,
 ) -> TestResult<std::path::PathBuf> {
-    let _ = model_url;
-    write_endpoint_config(database, tools, max_attempts)
+    let path = write_endpoint_config(database, tools, max_attempts)?;
+    let provider_url = url::Url::parse(model_url)
+        .map_err(|error| Error::other(format!("invalid model fixture URL: {error}")))?;
+    let provider_origin = provider_url.origin().ascii_serialization();
+    let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    config["provider_execution"]["allowed_base_url_origins"] = json!([provider_origin]);
+    fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    Ok(path)
 }
 
 trait EndpointAddress {
@@ -1785,6 +1791,8 @@ async fn stop_and_scan_incident_endpoint(
 }
 
 fn scan_incident_secret_tree(root: &Path, database: &Path, markers: &[String]) -> TestResult<()> {
+    let database_wal = format!("{}-wal", database.display());
+    let database_shm = format!("{}-shm", database.display());
     let mut pending = vec![root.to_owned()];
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(directory)? {
@@ -1793,10 +1801,8 @@ fn scan_incident_secret_tree(root: &Path, database: &Path, markers: &[String]) -
                 pending.push(path);
                 continue;
             }
-            if path == database
-                || path == PathBuf::from(format!("{}-wal", database.display()))
-                || path == PathBuf::from(format!("{}-shm", database.display()))
-            {
+            let path_text = path.to_string_lossy();
+            if path == database || path_text == database_wal || path_text == database_shm {
                 continue;
             }
             let bytes = fs::read(&path)?;
@@ -2770,7 +2776,22 @@ async fn e2e_mixed_tool_batch_is_concurrent_ordered_and_waits_once() -> TestResu
     assert_eq!(slow_completed["result"], json!({"content": "slow result"}));
     assert!(slow_completed["error"].is_null());
     incident.wait_for_requests("provider.model", 2).await?;
-    let after_release = read_session(&client, &server, &session_id).await?;
+    let after_release = timeout(Duration::from_secs(5), async {
+        loop {
+            let state = read_session(&client, &server, &session_id).await?;
+            if state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "mixed final activation barrier timed out",
+        )
+    })??;
     let after_events = replay_events_through_version(
         &client,
         &server,
@@ -2963,16 +2984,33 @@ async fn invalid_wait_case(seconds: u64, label: &str) -> TestResult<()> {
     )
     .await?;
     model.wait_for_requests(1).await?;
-    let response = authenticated(client.get(server.url(&format!("/v1/sessions/{session_id}"))))
-        .send_with_timeout()
-        .await?;
-    let status = response.status();
-    let body = response_text(response).await?;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "invalid wait must remain an observable public session outcome: {body}"
-    );
+    let body = timeout(Duration::from_secs(5), async {
+        loop {
+            let response =
+                authenticated(client.get(server.url(&format!("/v1/sessions/{session_id}"))))
+                    .send_with_timeout()
+                    .await?;
+            let status = response.status();
+            let body = response_text(response).await?;
+            if status != StatusCode::OK {
+                return Err(Error::other(format!(
+                    "invalid wait session projection failed: {status} {body}"
+                ))
+                .into());
+            }
+            if body.contains("invalid_request") || body.contains("422") {
+                return Ok::<String, Box<dyn std::error::Error + Send + Sync>>(body);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "invalid wait outcome projection timed out",
+        )
+    })??;
     assert!(body.contains("invalid_request") || body.contains("422"));
     server.stop().await?;
     model.stop().await?;
@@ -3220,11 +3258,18 @@ async fn e2e_external_completion_first_wins_and_wakes_one_next_activation() -> T
     let state = timeout(Duration::from_secs(10), async {
         loop {
             let state = read_session(&client, &server, &session_id).await?;
-            if state["transcript"].as_array().is_some_and(|messages| {
+            let assistant_committed = state["transcript"].as_array().is_some_and(|messages| {
                 messages.iter().any(|message| {
                     message["role"] == "assistant" && message["content"] == "callback resumed"
                 })
-            }) {
+            });
+            // The provider barrier only proves request admission.  Wait for
+            // the public idle projection so ActivationFinished is durable
+            // before sealing the terminal stream version.
+            if assistant_committed
+                && state["status"] == "idle"
+                && state["active_activation"].is_null()
+            {
                 return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(state);
             }
             tokio::task::yield_now().await;
@@ -3451,7 +3496,40 @@ async fn e2e_auto_wait_timeout_does_not_cancel_running_tool() -> TestResult<()> 
         .ok_or_else(|| Error::other("auto wait omitted wait_id"))?
         .to_owned();
 
-    incident.wait_for_requests("provider.model", 2).await?;
+    // Timer expiry must not turn a still-running tool into a second model
+    // round.  The activation may finish its parked wait, but the terminal
+    // delivery is the only wake that can make a follow-up eligible.
+    let before_release = timeout(Duration::from_secs(10), async {
+        loop {
+            let state = read_session(&client, &server, &session_id).await?;
+            let tool_running = state["tool_calls"].as_array().is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    call["tool_call_id"] == "timeout-call" && call["status"] == "running"
+                })
+            });
+            let followup_started = state["transcript"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["role"] == "assistant" && message["content"] == "timeout wake observed"
+                })
+            });
+            if tool_running
+                && state["wait"].is_null()
+                && state["active_activation"].is_null()
+                && !followup_started
+            {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "timeout did not park while its tool remained running",
+        )
+    })??;
+    assert_eq!(incident.request_count("provider.model"), 1);
     let still_running = wait_for_tool_status(
         &client,
         &incident,
@@ -3472,29 +3550,6 @@ async fn e2e_auto_wait_timeout_does_not_cancel_running_tool() -> TestResult<()> 
     .await?;
     assert!(still_running["result"].is_null());
     assert!(still_running["error"].is_null());
-    let before_release = timeout(Duration::from_secs(10), async {
-        loop {
-            let state = read_session(&client, &server, &session_id).await?;
-            if state["wait"].is_null()
-                && state["transcript"].as_array().is_some_and(|messages| {
-                    messages.iter().any(|message| {
-                        message["role"] == "assistant"
-                            && message["content"] == "timeout wake observed"
-                    })
-                })
-            {
-                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(state);
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .map_err(|_| {
-        Error::new(
-            ErrorKind::TimedOut,
-            "timeout did not finish its wake activation",
-        )
-    })??;
     let events = replay_events_through_version(
         &client,
         &server,
@@ -3548,6 +3603,42 @@ async fn e2e_auto_wait_timeout_does_not_cancel_running_tool() -> TestResult<()> 
     .await?;
     assert_eq!(completed["result"], json!({"content": "late result"}));
     assert!(completed["error"].is_null());
+    incident.wait_for_requests("provider.model", 2).await?;
+    let after_release = timeout(Duration::from_secs(10), async {
+        loop {
+            let state = read_session(&client, &server, &session_id).await?;
+            if state["wait"].is_null()
+                && state["transcript"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message["role"] == "assistant"
+                            && message["content"] == "timeout wake observed"
+                    })
+                })
+            {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "timeout did not finish its terminal wake activation",
+        )
+    })??;
+    let after_events = replay_events_through_version(
+        &client,
+        &server,
+        &session_id,
+        after_release["version"]
+            .as_u64()
+            .ok_or_else(|| Error::other("timeout final GET omitted version"))?,
+    )
+    .await?;
+    assert!(after_events.iter().any(|frame| {
+        frame.event == "wait_expired" && frame.data["data"]["wait_id"] == wait_id
+    }));
     assert_eq!(incident.request_count("tool.timeout"), 1);
     assert_eq!(incident.completed_count("tool.timeout"), 1);
     stop_and_scan_incident_endpoint(&mut server, &database, &[]).await?;
@@ -3898,7 +3989,26 @@ async fn e2e_external_callback_tool_stays_running_and_completes_after_restart() 
         "callback completion failed: {status} {body}"
     );
     model.wait_for_requests(2).await?;
-    let final_state = read_session(&client, &restarted, &session_id).await?;
+    // The provider fixture's request barrier fires when the second request
+    // is admitted, before the response stream has been reduced into the
+    // durable assistant message.  Wait on that public projection rather than
+    // racing a point-in-time GET against the runtime task.
+    let final_state = timeout(Duration::from_secs(5), async {
+        loop {
+            let state = read_session(&client, &restarted, &session_id).await?;
+            if state.to_string().contains("external callback final") {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "callback assistant projection timed out",
+        )
+    })??;
     assert!(final_state.to_string().contains("external callback final"));
     restarted.stop().await?;
     model.stop().await?;

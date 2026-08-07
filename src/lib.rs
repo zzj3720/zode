@@ -16,6 +16,6 @@ pub use domain::{
     REDUCER_SCHEMA_VERSION, STATE_SCHEMA_VERSION,
 };
 pub use storage::{
-    AppendResult, EventStore, RehydrateError, SessionListCursor, SessionListItem,
-    SessionListPage, SnapshotRecord, SqliteEventStore, StoreError, SNAPSHOT_ENCODING_JSON,
+    AppendResult, EventStore, RehydrateError, SessionListCursor, SessionListItem, SessionListPage,
+    SnapshotRecord, SqliteEventStore, StoreError, SNAPSHOT_ENCODING_JSON,
 };

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
@@ -13,17 +13,11 @@ use aimux_core::{
     language_model_message::{LanguageModelPrompt, LanguageModelPromptMessage},
     message::Role,
     options::CallOptions,
-    provider::Provider,
     stream_part::StreamPart,
     tool::{FunctionTool, Tool},
     types::FinishReasonUnified,
 };
-use aimux_providers::{
-    anthropic::{AnthropicConfig, AnthropicProvider},
-    google::{GoogleConfig, GoogleProvider},
-    mistral::{MistralConfig, MistralProvider},
-    openai::{OpenAIConfig, OpenAIProvider},
-};
+use aimux_providers::openai::{OpenAIConfig, OpenAIProvider};
 use futures_util::StreamExt;
 use getrandom::fill as fill_random;
 use hmac::{Hmac, Mac};
@@ -44,8 +38,6 @@ use crate::{
 
 const REPLICA_SCHEMA: &str = "zode.auth-replica.record.v1";
 const RECEIPT_SCHEMA: &str = "zode.auth-replica.receipt.v1";
-const MANIFEST_SCHEMA: &str = "zode.auth-replica.manifest.v1";
-const OPERATION_SCHEMA: &str = "zode.auth-replica.operation.v1";
 const INSTALL_SCHEMA: &str = "zode.auth-replica.install.v1";
 const TOMBSTONE_SCHEMA: &str = "zode.auth-replica.tombstone.v1";
 const SECRET_ENCODING: &str = "application/zode-secret-envelope";
@@ -56,10 +48,6 @@ const MAX_NAME_BYTES: usize = 256;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 1_024;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
-const MAX_REPLICA_FILES: usize = 4_096;
-const MAX_OPERATION_JOURNAL_BYTES: usize = 128 * 1024;
-const MAX_OPERATION_JOURNAL_LINES: usize = 32;
-const MAX_OPERATION_RECORD_BYTES: usize = 16 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -334,32 +322,21 @@ impl ReplicaStore {
             return Err(ReplicaError::Invalid);
         }
         let root = self.root.as_deref().ok_or(ReplicaError::Disabled)?;
-        let mut latest = None;
-        for entry in fs::read_dir(root).map_err(ReplicaError::Storage)? {
-            let entry = entry.map_err(ReplicaError::Storage)?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if !name.starts_with("receipt-") || !name.ends_with(".json") {
-                continue;
+        // The active replica record is the metadata authority. Receipts are
+        // historical idempotency facts and may legitimately lag the active
+        // promotion when a process crashes between the two atomic writes.
+        // Reading receipts as the current projection would therefore expose
+        // a stale revision after restart (the split-brain failure captured by
+        // the provider recovery E2E).
+        let path = replica_path(root, authority_id, profile_id);
+        let record = read_record(&path).map_err(|error| match error {
+            ReplicaError::Storage(ref source) if source.kind() == ErrorKind::NotFound => {
+                ReplicaError::NotFound
             }
-            let receipt = read_receipt(&entry.path())?;
-            if receipt.authority_id != authority_id || receipt.profile_id != profile_id {
-                continue;
-            }
-            validate_receipt(&receipt, authority_id, profile_id)?;
-            if latest
-                .as_ref()
-                .is_none_or(|current: &ReplicaReceipt| receipt.revision > current.revision)
-            {
-                latest = Some(receipt);
-            }
-        }
-        latest
-            .as_ref()
-            .map(metadata_from_receipt)
-            .ok_or(ReplicaError::NotFound)
+            other => other,
+        })?;
+        validate_record(&record, authority_id, profile_id)?;
+        Ok(metadata_from_record(&record))
     }
 
     pub fn list_metadata(&self, authority_id: &str) -> Result<Vec<ReplicaMetadata>, ReplicaError> {
@@ -367,29 +344,29 @@ impl ReplicaStore {
             return Err(ReplicaError::Invalid);
         }
         let root = self.root.as_deref().ok_or(ReplicaError::Disabled)?;
-        let mut latest = BTreeMap::<String, ReplicaReceipt>::new();
+        let mut records = BTreeMap::<String, ReplicaRecord>::new();
         for entry in fs::read_dir(root).map_err(ReplicaError::Storage)? {
             let entry = entry.map_err(ReplicaError::Storage)?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if !name.starts_with("receipt-") || !name.ends_with(".json") {
+            if !name.starts_with("replica-") || !name.ends_with(".json") {
                 continue;
             }
-            let receipt = read_receipt(&entry.path())?;
-            if receipt.authority_id != authority_id {
+            let record = read_record(&entry.path())?;
+            if record.authority_id != authority_id {
                 continue;
             }
-            validate_receipt(&receipt, authority_id, &receipt.profile_id)?;
-            let replace = latest
-                .get(&receipt.profile_id)
-                .is_none_or(|current| receipt.revision > current.revision);
+            validate_record(&record, authority_id, &record.profile_id)?;
+            let replace = records
+                .get(&record.profile_id)
+                .is_none_or(|current| record.revision > current.revision);
             if replace {
-                latest.insert(receipt.profile_id.clone(), receipt);
+                records.insert(record.profile_id.clone(), record);
             }
         }
-        Ok(latest.values().map(metadata_from_receipt).collect())
+        Ok(records.values().map(metadata_from_record).collect())
     }
 
     fn load_or_create_key(&self) -> Result<Vec<u8>, ReplicaError> {
@@ -597,10 +574,15 @@ impl AimuxProvider {
         }
         let finish = finish.ok_or(ModelError::ProviderFailed)?;
         match finish.unified {
-            FinishReasonUnified::Stop => Ok(ModelOutcome {
-                text,
-                tool_calls: Vec::new(),
-            }),
+            FinishReasonUnified::Stop => {
+                if !tool_calls.is_empty() {
+                    return Err(ModelError::ProviderFailed);
+                }
+                Ok(ModelOutcome {
+                    text,
+                    tool_calls: Vec::new(),
+                })
+            }
             FinishReasonUnified::ToolCalls => {
                 if tool_calls.is_empty() {
                     return Err(ModelError::ProviderFailed);
@@ -669,7 +651,18 @@ fn prompt_from_transcript(
                 TranscriptRole::Runtime => Role::System,
             };
             let mut content = Vec::new();
-            if message.role != TranscriptRole::Tool && !message.content.is_empty() {
+            // The durable transcript keeps any assistant preamble alongside
+            // its tool calls, but OpenAI-compatible tool-call turns use a
+            // null/omitted content field on the wire. Projecting that text
+            // back into the next request changes the provider conversation
+            // (and breaks replay) even though the text remains observable in
+            // Endpoint history.
+            let assistant_tool_turn =
+                message.role == TranscriptRole::Assistant && !message.tool_calls.is_empty();
+            if message.role != TranscriptRole::Tool
+                && !message.content.is_empty()
+                && !assistant_tool_turn
+            {
                 content.push(ContentPart::text(message.content.clone()));
             }
             if message.role == TranscriptRole::Assistant {
@@ -1024,11 +1017,16 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ReplicaError> {
 }
 
 fn read_private_file(path: &Path, maximum: usize) -> Result<Vec<u8>, ReplicaError> {
-    let file = File::open(path).map_err(ReplicaError::Storage)?;
+    let file = open_private_read(path).map_err(|error| match error {
+        ReplicaError::Storage(source) if source.kind() == ErrorKind::NotFound => {
+            ReplicaError::Storage(source)
+        }
+        ReplicaError::Storage(_) | ReplicaError::SecretUnavailable => {
+            ReplicaError::SecretUnavailable
+        }
+        other => other,
+    })?;
     let metadata = file.metadata().map_err(ReplicaError::Storage)?;
-    if !metadata.is_file() || metadata.len() > maximum as u64 {
-        return Err(ReplicaError::SecretUnavailable);
-    }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.take((maximum + 1) as u64)
         .read_to_end(&mut bytes)
@@ -1037,6 +1035,42 @@ fn read_private_file(path: &Path, maximum: usize) -> Result<Vec<u8>, ReplicaErro
         return Err(ReplicaError::SecretUnavailable);
     }
     Ok(bytes)
+}
+
+fn open_private_read(path: &Path) -> Result<File, ReplicaError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(ReplicaError::Storage)?;
+    let metadata = file.metadata().map_err(ReplicaError::Storage)?;
+    if !metadata.is_file() || !is_private_file(&metadata) {
+        return Err(ReplicaError::SecretUnavailable);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(ReplicaError::SecretUnavailable);
+        }
+    }
+    Ok(file)
+}
+
+fn is_private_file(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o077 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        true
+    }
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), ReplicaError> {
@@ -1099,8 +1133,9 @@ fn origin_allowed(base: &Url, allowed_origins: &[String]) -> bool {
         let Ok(allowed) = Url::parse(allowed) else {
             return false;
         };
-        allowed.scheme() == base.scheme()
-            && allowed.host_str() == base.host_str()
-            && allowed.port().is_none_or(|port| base.port() == Some(port))
+        // Compare complete URL origins. A host-only allowlist entry denotes
+        // that host's default origin; it must not wildcard arbitrary
+        // explicit listener ports on the same host.
+        allowed.origin() == base.origin()
     })
 }

@@ -28,11 +28,11 @@ const RECORDING_PATH: &str =
     "tests/fixtures/provider_recordings/opencode_go_deepseek_v4_flash.v2.json";
 const LIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
 
-fn live_config(database: &Path) -> TestResult<PathBuf> {
+fn live_config(database: &Path, provider_origin: &str) -> TestResult<PathBuf> {
     let path = write_endpoint_config(database, Vec::new(), 1)?;
     let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
     config["provider_execution"]["adapter_kinds"] = json!(["openai_compatible"]);
-    config["provider_execution"]["allowed_base_url_origins"] = json!(["http://127.0.0.1"]);
+    config["provider_execution"]["allowed_base_url_origins"] = json!([provider_origin]);
     fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
     Ok(path)
 }
@@ -73,7 +73,6 @@ async fn run_live_provider(api_key: String) -> TestResult<()> {
         .ok_or_else(|| Error::other("live recording run id was invalid"))?
         .to_owned();
     let database = TempDatabase::new("live-provider")?;
-    let config = live_config(database.path())?;
     let mut recorder = LlmHttpProxy::record(
         PROVIDER_UPSTREAM_ORIGIN,
         PROVIDER,
@@ -88,6 +87,7 @@ async fn run_live_provider(api_key: String) -> TestResult<()> {
         },
     )
     .await?;
+    let config = live_config(database.path(), &recorder.base_url(""))?;
     let primary = run_provider_roundtrip_and_restart(ProviderRoundtripSpec {
         database: database.path().to_owned(),
         config,
@@ -208,7 +208,7 @@ async fn replay_retained_live_recording(recording: LlmHttpRecording) -> TestResu
     )
     .await?;
     let database = TempDatabase::new("live-recording-exact-count")?;
-    let config = live_config(database.path())?;
+    let config = live_config(database.path(), &replay.base_url(""))?;
     let primary = run_provider_roundtrip_and_restart(ProviderRoundtripSpec {
         database: database.path().to_owned(),
         config,

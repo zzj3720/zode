@@ -15,9 +15,10 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::domain::{
-    DomainError, EventDraft, EventRecord, GlobalPosition, SessionEvent, SessionOwner,
-    SessionSelection, SessionState, SessionStatus, StreamVersion, EVENT_SCHEMA_VERSION,
-    REDUCER_SCHEMA_VERSION, SESSION_CREATED_SCHEMA_VERSION, STATE_SCHEMA_VERSION,
+    AsyncCallbackBinding, DomainError, EventDraft, EventRecord, GlobalPosition, SessionEvent,
+    SessionOwner, SessionSelection, SessionState, SessionStatus, StreamVersion,
+    EVENT_SCHEMA_VERSION, REDUCER_SCHEMA_VERSION, SESSION_CREATED_SCHEMA_VERSION,
+    STATE_SCHEMA_VERSION,
 };
 
 pub const SNAPSHOT_ENCODING_JSON: &str = "json";
@@ -35,7 +36,7 @@ const SESSION_LIST_CURSOR_ROUTE: &str = "/v1/sessions";
 const SESSION_LIST_CURSOR_SORT_VERSION: u32 = 1;
 const MAX_SESSION_LIST_CURSOR_BYTES: usize = 4 * 1024;
 pub const MAX_OWNED_SESSION_SCAN_LIMIT: usize = 256;
-pub const MAX_SESSION_LIST_LIMIT: usize = 100;
+pub const MAX_SESSION_LIST_LIMIT: usize = 200;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppendResult {
@@ -92,6 +93,14 @@ pub struct SessionCreate {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionCreateResult {
     pub append: AppendResult,
+    pub state: SessionState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalCallbackLookup {
+    pub owner: SessionOwner,
+    pub session_id: String,
+    pub binding: AsyncCallbackBinding,
     pub state: SessionState,
 }
 
@@ -167,19 +176,15 @@ impl SessionListCursor {
         if bytes.is_empty() || bytes.len() > MAX_SESSION_LIST_CURSOR_BYTES {
             return Err(StoreError::InvalidSessionListCursor);
         }
-        let wire: SessionListCursorWire = serde_json::from_slice(&bytes)
-            .map_err(|_| StoreError::InvalidSessionListCursor)?;
+        let wire: SessionListCursorWire =
+            serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidSessionListCursor)?;
         if wire.schema != SESSION_LIST_CURSOR_SCHEMA
             || wire.route != SESSION_LIST_CURSOR_ROUTE
             || wire.sort_version != SESSION_LIST_CURSOR_SORT_VERSION
         {
             return Err(StoreError::InvalidSessionListCursor);
         }
-        Self::new(
-            &wire.owner,
-            wire.creation_global_position,
-            wire.session_id,
-        )
+        Self::new(&wire.owner, wire.creation_global_position, wire.session_id)
     }
 }
 
@@ -303,6 +308,17 @@ pub trait EventStore: Send + Sync {
     ) -> Result<SessionListPage, StoreError>;
 
     fn write_snapshot(&self, snapshot: &SnapshotRecord) -> Result<(), StoreError>;
+
+    /// Resolve an opaque callback ID from the verified append-only stream.
+    ///
+    /// The callback bearer is never accepted here; callers compare a keyed
+    /// fingerprint against the returned non-secret binding before appending a
+    /// terminal callback event.  Implementations may cache this lookup as a
+    /// rebuildable projection, but the event stream remains authoritative.
+    fn lookup_external_callback(
+        &self,
+        callback_id: &str,
+    ) -> Result<Option<ExternalCallbackLookup>, StoreError>;
 }
 
 #[derive(Debug, Error)]
@@ -390,6 +406,8 @@ pub enum StoreError {
     InvalidOwnedSessionScanLimit,
     #[error("session create receipt is inconsistent with its creation event")]
     InvalidSessionCreateReceipt,
+    #[error("external callback {0} is mapped by multiple session streams")]
+    ExternalCallbackConflict(String),
 }
 
 pub struct SqliteEventStore {
@@ -1090,6 +1108,7 @@ fn validate_storage_triggers(
             projection_repair_allowed
                 && table_role(expected.table_name) == Some(SchemaRole::Projection)
                 && projection_table_needs_repair(catalog, expected.table_name)
+                && !triggers.iter().any(|actual| actual.name == expected.name)
         })
         .count();
     if triggers.len() + missing_projection_triggers != STORAGE_TRIGGERS.len() {
@@ -1346,8 +1365,36 @@ fn append_in_transaction(
         }
     }
 
-    let mut stored_events = Vec::with_capacity(events.len());
-    for (index, draft) in events.iter().enumerate() {
+    // Reducer no-ops (stale timers, duplicate terminal completions, and
+    // already-materialized deliveries) retain their command receipt but do
+    // not become a second durable semantic event. Compute this projection
+    // before any authority insert so an invalid batch still appends nothing.
+    let mut effective_drafts = Vec::with_capacity(events.len());
+    let mut candidate_state = rehydrated.state.clone();
+    for draft in events {
+        let next = candidate_state.apply_event(&draft.event)?;
+        if next != candidate_state {
+            effective_drafts.push(draft.clone());
+        }
+        candidate_state = next;
+    }
+
+    if effective_drafts.is_empty() {
+        // Keep a durable, non-semantic idempotency fact so projection repair
+        // can reconstruct this command even though the requested transition
+        // was stale/no-op. The key is a digest of the command identity, never
+        // the caller's raw idempotency value.
+        let command_digest = hex_encode(&digest_bytes(command_id.as_bytes()));
+        effective_drafts.push(EventDraft::new(
+            format!("command-noop:v1:{command_digest}"),
+            SessionEvent::DedupeRecorded {
+                key: format!("command:{command_digest}"),
+            },
+        ));
+    }
+
+    let mut stored_events = Vec::with_capacity(effective_drafts.len());
+    for (index, draft) in effective_drafts.iter().enumerate() {
         let offset = u64::try_from(index + 1).map_err(|_| StoreError::IntegerRange {
             field: "event batch index",
         })?;
@@ -1406,11 +1453,11 @@ fn append_in_transaction(
     }
 
     let stream_version = expected_version
-        .checked_add(
-            u64::try_from(events.len()).map_err(|_| StoreError::IntegerRange {
+        .checked_add(u64::try_from(effective_drafts.len()).map_err(|_| {
+            StoreError::IntegerRange {
                 field: "event batch length",
-            })?,
-        )
+            }
+        })?)
         .ok_or(StoreError::IntegerRange {
             field: "stream_version",
         })?;
@@ -1499,7 +1546,7 @@ fn append_in_transaction(
             request_hash,
             to_sqlite_integer("first_version", first_version)?,
             to_sqlite_integer("last_version", stream_version)?,
-            i64::try_from(events.len()).map_err(|_| StoreError::IntegerRange {
+            i64::try_from(effective_drafts.len()).map_err(|_| StoreError::IntegerRange {
                 field: "event count"
             })?,
         ],
@@ -1690,26 +1737,28 @@ fn lookup_session_create_in_view(
             command_id: command.command_id.clone(),
         });
     }
-    let verified = verified_owned_stream(connection, owner, &stream_id)?;
+    // A create receipt is intentionally replayable from the immutable
+    // version-one creation fact alone. Do not rehydrate the mutable tail here:
+    // a later corruption must not turn an already-admitted fixed `201` replay
+    // into a current-state read.
+    let creation = verified_creation_event(connection, &stream_id)?;
     if from_sqlite_integer("create stream_version", stream_version)? != 1
         || from_sqlite_integer("creation_global_position", creation_position)?
-            != verified.creation.record.global_position
-        || verified.creation.record.command_id != command.command_id
-        || verified.creation.command_fingerprint_version != SESSION_CREATE_COMMAND_VERSION
-        || !digest_matches(
-            &verified.creation.command_fingerprint,
-            &command.request_hash,
-        )
+            != creation.record.global_position
+        || creation.owner != *owner
+        || creation.record.command_id != command.command_id
+        || creation.command_fingerprint_version != SESSION_CREATE_COMMAND_VERSION
+        || !digest_matches(&creation.command_fingerprint, &command.request_hash)
     {
         return Err(StoreError::InvalidSessionCreateReceipt);
     }
-    let state = SessionState::new(&stream_id).apply_record(&verified.creation.record)?;
+    let state = SessionState::new(&stream_id).apply_record(&creation.record)?;
     state.validate()?;
     Ok(Some(SessionCreateResult {
         append: AppendResult {
             stream_id,
             command_id: command.command_id.clone(),
-            events: vec![verified.creation.record],
+            events: vec![creation.record],
             stream_version: 1,
             replayed: true,
         },
@@ -2016,8 +2065,8 @@ impl EventStore for SqliteEventStore {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         require_clean_storage_metadata(&transaction)?;
-        let projection_limit = i64::try_from(limit + 1)
-            .map_err(|_| StoreError::IntegerRange { field: "limit" })?;
+        let projection_limit =
+            i64::try_from(limit + 1).map_err(|_| StoreError::IntegerRange { field: "limit" })?;
         let projections = if let Some(cursor) = cursor {
             let cursor_position = to_sqlite_integer(
                 "session list cursor creation position",
@@ -2100,10 +2149,52 @@ impl EventStore for SqliteEventStore {
             None
         };
         transaction.commit()?;
-        Ok(SessionListPage {
-            items,
-            next_cursor,
-        })
+        Ok(SessionListPage { items, next_cursor })
+    }
+
+    fn lookup_external_callback(
+        &self,
+        callback_id: &str,
+    ) -> Result<Option<ExternalCallbackLookup>, StoreError> {
+        require_text("callback_id", callback_id)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        require_clean_storage_metadata(&transaction)?;
+        let stream_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT DISTINCT stream_id
+                 FROM events
+                 WHERE event_type = 'async_tool_call_callback_planned'
+                 ORDER BY stream_id ASC",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut found = None;
+        for stream_id in stream_ids {
+            let state = rehydrate_from_view(&transaction, &stream_id)
+                .map_err(|error| rehydrate_error_into_store_error(error, &stream_id))?
+                .state;
+            let Some(binding) = state.callback_bindings.get(callback_id).cloned() else {
+                continue;
+            };
+            let owner = state
+                .owner
+                .clone()
+                .ok_or(StoreError::InvalidSessionCreateReceipt)?;
+            let lookup = ExternalCallbackLookup {
+                owner,
+                session_id: state.session_id.clone(),
+                binding,
+                state,
+            };
+            if found.is_some() {
+                return Err(StoreError::ExternalCallbackConflict(callback_id.into()));
+            }
+            found = Some(lookup);
+        }
+        transaction.commit()?;
+        Ok(found)
     }
 
     fn write_snapshot(&self, snapshot: &SnapshotRecord) -> Result<(), StoreError> {
@@ -2195,6 +2286,7 @@ struct CreateReceiptProjection {
 fn rebuild_projections_in_transaction(transaction: &Transaction<'_>) -> Result<(), StoreError> {
     let mut stream_heads = BTreeMap::<String, StreamVersion>::new();
     let mut stream_states = BTreeMap::<String, SessionState>::new();
+    let mut stream_prefixes = BTreeMap::<String, Vec<u8>>::new();
     let mut creation_positions = BTreeMap::<String, GlobalPosition>::new();
     let mut commands = BTreeMap::<(String, String), CommandProjection>::new();
     let mut receipts = BTreeMap::<(String, String, String), CreateReceiptProjection>::new();
@@ -2239,6 +2331,10 @@ fn rebuild_projections_in_transaction(transaction: &Transaction<'_>) -> Result<(
             let state = stream_states
                 .entry(stream_id.clone())
                 .or_insert_with(|| SessionState::new(&stream_id));
+            let prefix = stream_prefixes
+                .entry(stream_id.clone())
+                .or_insert_with(|| prefix_digest_seed(&stream_id));
+            *prefix = extend_prefix_digest(prefix, &event.fingerprint);
             *state = state.apply_record(&event.record)?;
             if version == 1 {
                 let SessionEvent::SessionCreated { owner, .. } = &event.record.event else {
@@ -2386,6 +2482,23 @@ fn rebuild_projections_in_transaction(transaction: &Transaction<'_>) -> Result<(
             return Err(StoreError::RehydrationIntegrity {
                 stream_id,
                 version: verified.version,
+            });
+        }
+        let state = stream_states
+            .get(&stream_id)
+            .ok_or(StoreError::InvalidSessionCreateReceipt)?;
+        let prefix = stream_prefixes
+            .get(&stream_id)
+            .ok_or(StoreError::InvalidIntegrityAnchor {
+                stream_id: stream_id.clone(),
+                version: head,
+            })?;
+        if !digest_matches(prefix, &verified.anchor.prefix_digest)
+            || !digest_matches(&state_digest(state)?, &verified.anchor.state_digest)
+        {
+            return Err(StoreError::RehydrationIntegrity {
+                stream_id,
+                version: head,
             });
         }
     }
@@ -2848,7 +2961,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn hex_decode(encoded: &str) -> Option<Vec<u8>> {
     if encoded.is_empty()
-        || encoded.len() % 2 != 0
+        || !encoded.len().is_multiple_of(2)
         || encoded.len() / 2 > MAX_SESSION_LIST_CURSOR_BYTES
     {
         return None;
@@ -3109,6 +3222,21 @@ fn decode_raw_event(raw: RawEvent) -> Result<EventRecord, StoreError> {
         stored_type,
         payload,
     ) = raw;
+    if global_position <= 0 {
+        return Err(StoreError::CorruptInteger {
+            field: "global_position",
+            value: global_position,
+        });
+    }
+    require_text("stream_id", &stream_id)?;
+    require_text("event_id", &event_id)?;
+    require_text("command_id", &command_id)?;
+    require_text("event_type", &stored_type)?;
+    if payload.len() > 1024 * 1024 {
+        return Err(StoreError::IncompatibleStorageSchema(
+            "stored event payload bound",
+        ));
+    }
     let event_schema_version =
         u32::try_from(event_schema_version).map_err(|_| StoreError::CorruptInteger {
             field: "event_schema_version",

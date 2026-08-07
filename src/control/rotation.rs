@@ -176,7 +176,14 @@ impl RotationStore {
         };
         let bytes = serde_json::to_vec(&fact).map_err(|_| ControlInitError::Invalid)?;
         files::create_private_file(&self.initialization_path(), &bytes)?;
-        self.current_authorities(&fact.authorities)
+        let authorities = self.current_authorities(&fact.authorities)?;
+        let mut consumed_seeds = HashSet::new();
+        for spec in specs {
+            if consumed_seeds.insert(spec.secret_file.clone()) {
+                files::consume_private_file(&spec.secret_file)?;
+            }
+        }
+        Ok(authorities)
     }
 
     pub(crate) fn rotate<Before, After>(
@@ -428,8 +435,13 @@ impl RotationStore {
     }
 
     fn reconcile_intent(&mut self, record: JournalRecord) -> Result<(), ControlInitError> {
-        let staged = self.read_secret(&record.secret_ref)?;
         let current = self.load_pointer(&record.authority_id)?;
+        let initial_revision = self.load_initialization()?.and_then(|fact| {
+            fact.authorities
+                .into_iter()
+                .find(|authority| authority.authority_id == record.authority_id)
+                .map(|authority| authority.revision)
+        });
         if current
             .as_ref()
             .is_some_and(|pointer| same_pointer_record(pointer, &record))
@@ -439,12 +451,20 @@ impl RotationStore {
         if current
             .as_ref()
             .is_some_and(|pointer| pointer.revision >= record.revision)
+            || initial_revision.is_some_and(|revision| revision >= record.revision)
         {
-            self.complete_receipt(&record, 409, Some(&staged))
+            // A stale request may crash after its intent is durable but before
+            // it stages any candidate secret. It is already fenced by the
+            // active higher/equal revision (or the bootstrap revision before
+            // any active manifest exists), so reconcile the safe conflict
+            // receipt without requiring bytes that were never written.
+            self.complete_receipt(&record, 409, None)
                 .map_err(|_| ControlInitError::Invalid)?;
             files::remove_best_effort(&self.root.join(&record.secret_ref));
             return Ok(());
         }
+
+        let staged = self.read_secret(&record.secret_ref)?;
 
         let pointer = ActivePointer {
             schema: POINTER_SCHEMA.to_owned(),

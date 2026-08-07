@@ -345,11 +345,11 @@ fn legacy_hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
-fn config_for_replay(database: &Path) -> TestResult<PathBuf> {
+fn config_for_replay(database: &Path, provider_origin: &str) -> TestResult<PathBuf> {
     let path = write_endpoint_config(database, Vec::new(), 1)?;
     let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
     config["provider_execution"]["adapter_kinds"] = json!(["openai_compatible"]);
-    config["provider_execution"]["allowed_base_url_origins"] = json!(["http://127.0.0.1"]);
+    config["provider_execution"]["allowed_base_url_origins"] = json!([provider_origin]);
     fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
     Ok(path)
 }
@@ -528,7 +528,7 @@ async fn replay_recording_roundtrip_with_environment(
         .and_then(|exchange| exchange.request.path.strip_suffix("/chat/completions"))
         .ok_or_else(|| Error::other("provider recording path was not a chat-completions route"))?;
     let database = TempDatabase::new(label)?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &proxy.base_url(""))?;
     let primary = run_provider_roundtrip_and_restart(ProviderRoundtripSpec {
         database: database.path().to_owned(),
         config,
@@ -591,7 +591,7 @@ async fn replay_legacy_first_occurrence(recording: LegacyRecording) -> TestResul
     let mut replay = LegacyReplayFixture::start(recording).await?;
     let marker_values = replay_markers();
     let database = TempDatabase::new("recorded-v1-first-occurrence")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &replay.base_url(""))?;
     let primary = run_provider_roundtrip_and_restart(ProviderRoundtripSpec {
         database: database.path().to_owned(),
         config,
@@ -702,7 +702,7 @@ async fn capture_pre_stream_retry_with_plan(
     )
     .await?;
     let database = TempDatabase::new("record-pre-stream-retry")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &recorder.base_url(""))?;
     let primary = run_provider_roundtrip_and_restart(ProviderRoundtripSpec {
         database: database.path().to_owned(),
         config,
@@ -750,7 +750,7 @@ async fn e2e_llm_recorder_redacts_authorization_into_named_synthetic_slot() -> T
     )
     .await?;
     let database = TempDatabase::new("recording-authorization-slot")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &provider.origin())?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -885,7 +885,7 @@ async fn e2e_llm_recorder_explicit_authorization_requirement_covers_custom_slot(
     )
     .await?;
     let database = TempDatabase::new("recording-custom-auth-slot")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &provider.origin())?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -976,7 +976,7 @@ async fn e2e_model_replay_rejects_wrong_provider_authorization() -> TestResult<(
             .await?;
     let mut replay = LlmHttpProxy::replay(recording, false).await?;
     let database = TempDatabase::new("model-replay-wrong-provider-authorization")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &replay.base_url(""))?;
     let mut spec = synthetic_spec(
         &database,
         config,
@@ -1097,7 +1097,7 @@ async fn capture_stream_error_recording() -> TestResult<(LlmHttpRecording, PathB
     )
     .await?;
     let database = TempDatabase::new("recording-aborted-terminal-stream")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &provider.origin())?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -1143,7 +1143,7 @@ async fn capture_transport_error_recording() -> TestResult<(LlmHttpRecording, Pa
     )
     .await?;
     let database = TempDatabase::new("recording-transport-terminal-consumption")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &recorder.base_url(""))?;
     run_provider_failure(synthetic_spec(
         &database,
         config,
@@ -1183,7 +1183,7 @@ async fn capture_complete_recording_for(owner: &str) -> TestResult<(LlmHttpRecor
         start_synthetic_recorder(provider.origin(), "synthetic_complete_terminal_hold", owner)
             .await?;
     let database = TempDatabase::new("recording-complete-terminal-hold")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &provider.origin())?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -1224,7 +1224,7 @@ async fn replay_synthetic_failure(recording: LlmHttpRecording, prefix: &str) -> 
         LlmHttpProxy::replay_with_authorization(recording, false, Some(REPLAY_SECRET.to_owned()))
             .await?;
     let database = TempDatabase::new(prefix)?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &replay.base_url(""))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(&database, config, replay.base_url("/v1"), prefix),
@@ -1343,7 +1343,7 @@ async fn e2e_recorded_provider_replay_does_not_count_aborted_terminal_stream() -
     )
     .await?;
     let database = TempDatabase::new("replay-aborted-terminal-stream")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &replay.base_url(""))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -1390,7 +1390,7 @@ async fn e2e_recorded_provider_replay_does_not_count_aborted_complete_before_ter
     let database = TempDatabase::new("replay-aborted-complete-terminal").map_err(|error| {
         Error::other(format!("complete-terminal replay database failed: {error}"))
     })?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &replay.base_url(""))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -1432,7 +1432,7 @@ async fn e2e_recorded_provider_replay_requires_transport_error_terminal_consumpt
     )
     .await?;
     let database = TempDatabase::new("replay-transport-terminal-consumption")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &replay.base_url(""))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -1534,7 +1534,7 @@ async fn e2e_llm_recorder_rejects_ambiguous_attempt_identity() -> TestResult<()>
     .await?;
 
     let database_a = TempDatabase::new("recording-ambiguous-attempt-a")?;
-    let config_a = config_for_replay(database_a.path())?;
+    let config_a = config_for_replay(database_a.path(), &recorder.base_url(""))?;
     let cancel_a = Arc::new(Notify::new());
     let task_a = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -1552,7 +1552,7 @@ async fn e2e_llm_recorder_rejects_ambiguous_attempt_identity() -> TestResult<()>
         .map_err(|error| Error::other(format!("first ambiguous attempt failed: {error}")))??;
 
     let database_b = TempDatabase::new("recording-ambiguous-attempt-b")?;
-    let config_b = config_for_replay(database_b.path())?;
+    let config_b = config_for_replay(database_b.path(), &recorder.base_url(""))?;
     let cancel_b = Arc::new(Notify::new());
     let task_b = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -1613,7 +1613,7 @@ async fn e2e_llm_recorder_rejects_interleaved_attempt_without_explicit_plan() ->
     )
     .await?;
     let database_a = TempDatabase::new("recording-interleaved-attempt-a")?;
-    let config_a = config_for_replay(database_a.path())?;
+    let config_a = config_for_replay(database_a.path(), &recorder.base_url(""))?;
     let cancel_a = Arc::new(Notify::new());
     let task_a = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -1627,7 +1627,7 @@ async fn e2e_llm_recorder_rejects_interleaved_attempt_without_explicit_plan() ->
     first_hold.wait_entered().await?;
 
     let database_b = TempDatabase::new("recording-interleaved-attempt-b")?;
-    let config_b = config_for_replay(database_b.path())?;
+    let config_b = config_for_replay(database_b.path(), &recorder.base_url(""))?;
     let mut spec_b = synthetic_spec(
         &database_b,
         config_b,
@@ -1681,7 +1681,7 @@ async fn e2e_llm_recording_flush_failure_blocks_live_promotion() -> TestResult<(
     }
 
     let database = TempDatabase::new("recording-flush-failure")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &recorder.base_url(""))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -1743,7 +1743,7 @@ async fn e2e_llm_recorder_terminal_flush_failure_fails_live_stream() -> TestResu
         fs::set_permissions(&occupied_exchange, fs::Permissions::from_mode(0o600))?;
     }
     let database = TempDatabase::new("recording-terminal-flush-failure")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &provider.origin())?;
     run_provider_failure(synthetic_spec(
         &database,
         config,
@@ -1789,7 +1789,7 @@ async fn e2e_llm_recorder_stream_capture_bound_fails_closed() -> TestResult<()> 
     )
     .await?;
     let database = TempDatabase::new("recording-stream-capture-bound")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &provider.origin())?;
     run_provider_failure(synthetic_spec(
         &database,
         config,
@@ -1837,7 +1837,7 @@ async fn e2e_llm_recording_promotion_is_private_then_immutable_0444() -> TestRes
     )
     .await?;
     let database = TempDatabase::new("recording-promotion-modes")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &provider.origin())?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -2005,7 +2005,7 @@ async fn e2e_llm_recorder_preserves_failure_outcomes() -> TestResult<()> {
     )
     .await?;
     let database = TempDatabase::new("recording-rate-limit")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &recorder.base_url(""))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -2048,7 +2048,7 @@ async fn e2e_llm_recorder_preserves_failure_outcomes() -> TestResult<()> {
     )
     .await?;
     let database = TempDatabase::new("recording-partial-stream")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &recorder.base_url(""))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -2087,7 +2087,7 @@ async fn e2e_llm_recorder_preserves_failure_outcomes() -> TestResult<()> {
     )
     .await?;
     let database = TempDatabase::new("recording-transport-error")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &recorder.base_url(""))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -2125,7 +2125,7 @@ async fn e2e_llm_recorder_preserves_failure_outcomes() -> TestResult<()> {
     )
     .await?;
     let database = TempDatabase::new("recording-client-disconnect")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &recorder.base_url(""))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -2169,7 +2169,7 @@ async fn e2e_llm_recorder_done_then_transport_disconnect_replays_as_complete() -
     )
     .await?;
     let database = TempDatabase::new("recording-done-then-disconnect")?;
-    let config = config_for_replay(database.path())?;
+    let config = config_for_replay(database.path(), &provider.origin())?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -2243,9 +2243,9 @@ async fn e2e_llm_recorder_concurrent_completions_are_durably_persisted_in_sequen
     .await?;
 
     let database_a = TempDatabase::new("recording-concurrent-a")?;
-    let config_a = config_for_replay(database_a.path())?;
+    let config_a = config_for_replay(database_a.path(), &recorder.base_url(""))?;
     let database_b = TempDatabase::new("recording-concurrent-b")?;
-    let config_b = config_for_replay(database_b.path())?;
+    let config_b = config_for_replay(database_b.path(), &recorder.base_url(""))?;
     let cancel_a = Arc::new(Notify::new());
     let cancel_b = Arc::new(Notify::new());
     let task_a = tokio::spawn(run_provider_attempt_until_cancel(
