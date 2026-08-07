@@ -255,9 +255,11 @@ replication is `docs/auth-replication.md`; ingress identity is
   complete release directory and restart or adopt the matching Server. Do not
   add Server release-control routes or accept browser commands for these
   operations.
-- After each operator switch, a real browser verifies the Access-protected UI,
-  Server, and built-in Endpoint revision together; no request may combine UI
-  and Server revisions.
+- After each operator switch, a real browser exercises the Access-protected UI
+  through the built-in Endpoint while the release harness independently binds
+  the served UI tree and observed process executables to the selected manifest.
+  Do not add component-digest API fields or hidden DOM constants only for this
+  test; no request may combine UI and Server revisions.
 
 ## E2E-only acceptance
 

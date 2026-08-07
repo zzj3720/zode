@@ -520,11 +520,15 @@ Server HTTP API.
 
 The browser is an observer, not the release actuator. After operator promotion
 and rollback, the release E2E enters the Access-protected product through a real
-browser and proves that the UI tree, Server, and built-in Endpoint all report
-the selected revision and bound component digests. Web exposes no release
-buttons, and Server exposes no release-control route. Adding browser-triggered
-release management later requires a separately reviewed supervisor/API design
-and its own red E2Es.
+browser and proves the ordinary UI -> Server -> built-in Endpoint path remains
+usable. In the same black-box scenario, the release harness independently binds
+the selected manifest and `current` pointer to the served UI tree and the
+observed Server/Endpoint process IDs and executable digests. Those observations
+together prove that the complete artifact did not mix revisions; component
+digests do not become a public product API or hidden DOM constants merely for
+the test. Web exposes no release buttons, and Server exposes no release-control
+route. Adding browser-triggered release management later requires a separately
+reviewed supervisor/API design and its own red E2Es.
 
 A Server configuration always names an explicit `ui_mode`: `assets` or
 `api_only`. `assets` requires `ui_assets_directory`, resolved relative to the

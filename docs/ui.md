@@ -329,8 +329,10 @@ UI release.
 The operator release driver/CLI, normally called by continuous test-release
 automation, owns `stage`, `promote`, and `rollback`. The browser does not expose
 or invoke those actions. Release E2Es open the real Access-protected application
-after each operator action and verify that the served UI, Server, and built-in
-Endpoint belong to the same complete revision.
+after each operator action and exercise the ordinary UI -> Server -> built-in
+Endpoint path. The release harness separately binds the served UI tree and
+observed process executables to the selected manifest; Web does not expose
+component digests or hidden release markers solely for the test.
 
 ## 11. E2E-only acceptance
 
