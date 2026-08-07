@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-/* Real-process recovery E2E for a driver crash before role persistence. */
+/* Real-process recovery E2E for a driver crash during role persistence. */
 const {
   existsSync,
   mkdirSync,
@@ -52,7 +52,7 @@ if (!artifact) {
       if (!existsSync(statePath)) continue;
       let state;
       try { state = JSON.parse(readFileSync(statePath, 'utf8')); } catch { continue; }
-      if (!Array.isArray(state.roles) || state.roles.length !== 0) continue;
+      if (!Array.isArray(state.roles)) continue;
       const executable = join(state.artifact.installPath, 'zode-server');
       const config = join(state.directory, 'server.json');
       const pids = exactProcess(executable, config);
@@ -67,8 +67,8 @@ if (!artifact) {
       const found = findEmptyInstance();
       if (found) return found;
       if (child.exitCode !== null) break;
-      // The roles=[] window ends as soon as the detached Server is admitted;
-      // sample it at 1 ms so the crash barrier remains observable on macOS.
+      // Sample the durable state and detached Server together at a short
+      // barrier; either provisional or empty roles must be recoverable.
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
     return null;
