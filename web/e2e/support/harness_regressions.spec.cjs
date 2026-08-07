@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 
@@ -10,10 +11,12 @@ const { test } = require('@playwright/test');
 
 const {
   HarnessFailure,
+  RealProcess,
   RecordingJournal,
   SecretLedger,
   createWebE2EHarness,
   proxyHttp,
+  startAccessFixture,
   startHttpServer,
 } = require('./harness.cjs');
 const {
@@ -106,6 +109,43 @@ async function appendProviderMessage(page, harness, sessionId) {
   assert.equal(result.status, 202, `provider message admission failed: ${result.status}`);
 }
 
+function requestLocalEdge(url, headers) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(new URL(url), { method: 'GET', headers }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+      response.once('end', () => resolve({
+        status: response.statusCode || 0,
+        headers: response.headers,
+        body: Buffer.concat(chunks),
+      }));
+      response.once('error', reject);
+    });
+    request.once('error', (error) => resolve({ status: 0, headers: {}, body: Buffer.alloc(0), error }));
+    request.end();
+  });
+}
+
+function requestLocalEdgeWithBody(url, { method = 'POST', headers = {}, body = Buffer.alloc(0) } = {}) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(new URL(url), {
+      method,
+      headers: { ...headers, 'content-length': String(body.length) },
+    }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+      response.once('end', () => resolve({
+        status: response.statusCode || 0,
+        headers: response.headers,
+        body: Buffer.concat(chunks),
+      }));
+      response.once('error', reject);
+    });
+    request.once('error', (error) => resolve({ status: 0, headers: {}, body: Buffer.alloc(0), error }));
+    request.end(body);
+  });
+}
+
 class RecordingGapRegression extends Error {
   constructor(message, details) {
     super(message);
@@ -116,6 +156,121 @@ class RecordingGapRegression extends Error {
 }
 
 test.describe('Zode web E2E harness regressions', () => {
+  test('e2e_shared_real_process_requires_capture_arm_before_spawn', async ({}, testInfo) => {
+    test.setTimeout(120_000);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-process-arm-'));
+    const markerPath = path.join(root, 'spawned.marker');
+    const ledger = new SecretLedger();
+    let childProcess;
+    let failure;
+    try {
+      try {
+        childProcess = await RealProcess.start({
+          name: 'endpoint',
+          binary: '/bin/sh',
+          args: ['-c', `printf 'ZODE_READY http://127.0.0.1:45679\\n'; printf spawned > '${markerPath}'; sleep 30`],
+          cwd: process.cwd(),
+          env: {},
+          readyPrefix: 'ZODE_READY ',
+          ledger,
+          logDir: path.join(root, 'logs'),
+          e2eName: testInfo.title,
+        });
+      } catch (error) {
+        failure = error;
+      }
+      if (childProcess) {
+        try { await childProcess.stop(); } catch {}
+      }
+      assert.equal(failure?.classification, 'PROCESS_CAPTURE_NOT_ARMED', 'real process spawned without an armed capture');
+      assert.equal(fs.existsSync(markerPath), false, 'the product child ran before capture was armed');
+    } finally {
+      try { await childProcess?.stop(); } catch {}
+    }
+  });
+
+  test('e2e_shared_real_process_capture_is_durable_before_readiness_and_stop', async ({}, testInfo) => {
+    test.setTimeout(120_000);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-process-capture-'));
+    const ledger = new SecretLedger();
+    let childProcess;
+    try {
+      childProcess = await RealProcess.start({
+        name: 'endpoint',
+        binary: '/bin/sh',
+        args: ['-c', 'printf "ZODE_READY http://127.0.0.1:45680\\n"; sleep 30'],
+        cwd: process.cwd(),
+        env: {},
+        readyPrefix: 'ZODE_READY ',
+        ledger,
+        logDir: path.join(root, 'logs'),
+        startupCaptureRoot: path.join(root, 'capture'),
+        startupConfigBytes: Buffer.from('test-only-config\n'),
+        e2eName: testInfo.title,
+      });
+
+      const capture = childProcess.startupCapture;
+      assert.ok(capture?.armed, 'the process did not expose an armed startup capture');
+      assert.ok(fs.existsSync(capture.observationPath), 'readiness returned before durable process observation');
+      const beforeStop = JSON.parse(fs.readFileSync(capture.observationPath, 'utf8'));
+      assert.ok(['spawned', 'ready_probe', 'exit'].includes(beforeStop.phase), 'readiness observation phase was not durable');
+      assert.equal(beforeStop.flush_status, 'ok', 'readiness observation was not durably flushed');
+      assert.match(Buffer.from(beforeStop.stdout_hex, 'hex').toString('utf8'), /ZODE_READY http:\/\/127\.0\.0\.1:45680/u);
+
+      await childProcess.stop();
+      const afterStop = JSON.parse(fs.readFileSync(capture.observationPath, 'utf8'));
+      assert.equal(afterStop.phase, 'stop', 'stop cleanup ran before durable process observation');
+      assert.equal(afterStop.flush_status, 'ok', 'stop observation was not durably flushed');
+      assert.equal(afterStop.stop.flush_status, 'ok', 'stop proof did not retain durable output flush status');
+      assert.equal(afterStop.stop.timed_out, false, 'bounded stop unexpectedly timed out');
+      assert.equal(afterStop.stop.leaked_pids.length, 0, 'bounded stop leaked a child process');
+      assert.equal(afterStop.exit_status.known, true, 'stop observation lost the child exit status');
+    } finally {
+      try { await childProcess?.stop(); } catch {}
+    }
+  });
+
+  test('e2e_shared_real_process_prefers_durable_ready_line_before_exit', async ({}, testInfo) => {
+    test.setTimeout(120_000);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-process-ready-race-'));
+    const ledger = new SecretLedger();
+    const childProcess = await RealProcess.start({
+      name: 'endpoint',
+      binary: '/bin/sh',
+      // Large preceding output keeps the sidecar write and child exit in the
+      // same scheduling window while the readiness marker remains a line.
+      args: ['-c', 'head -c 100000 /dev/zero; printf "\\nZODE_READY http://127.0.0.1:45681\\n"'],
+      cwd: process.cwd(),
+      env: {},
+      readyPrefix: 'ZODE_READY ',
+      ledger,
+      logDir: path.join(root, 'logs'),
+      startupCaptureRoot: path.join(root, 'capture'),
+      startupConfigBytes: Buffer.from('test-only-config\n'),
+      e2eName: testInfo.title,
+    });
+    try {
+      assert.equal(childProcess.baseUrl, 'http://127.0.0.1:45681');
+      await childProcess.exitPromise;
+      const capture = childProcess.startupCapture;
+      const exitObservation = JSON.parse(fs.readFileSync(capture.observationPath, 'utf8'));
+      assert.equal(exitObservation.phase, 'exit', 'child exit was not durably quarantined before recovery');
+      const recovered = capture.recoverProcessObservation({
+        locatorPath: childProcess.locatorPath,
+        locator: childProcess.locator,
+        phase: 'recovered',
+      });
+      assert.equal(recovered.phase, 'recovered');
+      assert.equal(recovered.flush_status, 'ok');
+      assert.match(Buffer.from(recovered.stdout_hex, 'hex').toString('utf8'), /ZODE_READY http:\/\/127\.0\.0\.1:45681/u);
+    } finally {
+      // The shell exits naturally in this scenario; the locator and durable
+      // observation remain available for recovery after an early harness exit.
+      try { await childProcess.exitPromise; } catch {}
+      try { await childProcess.stop(); } catch {}
+    }
+  });
+
   test('e2e_first_failure_cassette_tracks_real_browser_exchange', async ({ page }, testInfo) => {
     test.setTimeout(120_000);
     let harness;
@@ -291,7 +446,7 @@ test.describe('Zode web E2E harness regressions', () => {
         firstObserved: 'real Chromium query callback exchange through the public HTTP edge',
         firstFailureRecordingId: first.recordingId,
         replay: async (envelope) => {
-          replayServer = await journal.startReplayServer(envelope);
+          replayServer = await journal.startReplayEdge(envelope, { canonicalOrigin: upstream.baseUrl });
           try {
             const replayResponse = await page.goto(`${replayServer.baseUrl}${requestPath}`, {
               waitUntil: 'domcontentloaded',
@@ -328,6 +483,589 @@ test.describe('Zode web E2E harness regressions', () => {
       try { await upstream?.close(); } catch {}
       // Keep the quarantine directory for first-occurrence inspection if this
       // test is red; it is test-owned and never printed into the report.
+    }
+  });
+
+  test('e2e_http_capture_set_preserves_canonical_host_and_forwarded_headers_for_replay', async ({}, testInfo) => {
+    test.setTimeout(120_000);
+    const quarantineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-host-surface-'));
+    const ledger = new SecretLedger();
+    const journal = new RecordingJournal({ rootDir: quarantineRoot, ledger });
+    const managementOrigin = 'http://127.0.0.1:48123';
+    const callbackOrigin = 'http://127.0.0.2:48123';
+    const managementForwarded = 'for=203.0.113.10;host=spoof-management.invalid';
+    const callbackForwarded = 'for=203.0.113.11;host=spoof-callback.invalid';
+    const managementXForwardedHost = 'spoof-management.invalid';
+    const callbackXForwardedHost = 'spoof-callback.invalid';
+    let upstream;
+    let managementEdge;
+    let callbackEdge;
+    let replayServer;
+    try {
+      upstream = await startHttpServer((request, response) => {
+        if (request.method !== 'GET' || request.url !== '/host-surface') {
+          response.writeHead(404, { 'content-type': 'text/plain' });
+          response.end('not found');
+          return;
+        }
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({
+          host: request.headers.host,
+          forwarded: request.headers.forwarded,
+          x_forwarded_host: request.headers['x-forwarded-host'],
+        }));
+      });
+      const captureSetId = journal.beginCaptureSet({
+        e2eName: testInfo.title,
+        maxMembers: 2,
+      });
+      managementEdge = await startHttpServer((request, response) => proxyHttp({
+        targetBaseUrl: upstream.baseUrl,
+        request,
+        response,
+        boundary: 'management-host-surface-edge',
+        journal,
+        ledger,
+        captureSetId,
+        canonicalOrigin: managementOrigin,
+      }));
+      callbackEdge = await startHttpServer((request, response) => proxyHttp({
+        targetBaseUrl: upstream.baseUrl,
+        request,
+        response,
+        boundary: 'callback-host-surface-edge',
+        journal,
+        ledger,
+        captureSetId,
+        canonicalOrigin: callbackOrigin,
+      }));
+
+      const managementCapture = await requestLocalEdge(`${managementEdge.baseUrl}/host-surface`, {
+        host: 'management-edge.invalid',
+        forwarded: managementForwarded,
+        'x-forwarded-host': managementXForwardedHost,
+        authorization: 'Bearer synthetic-edge-secret',
+        cookie: 'session=synthetic-edge-cookie',
+        'cf-access-jwt-assertion': 'synthetic-access-assertion',
+      });
+      const callbackCapture = await requestLocalEdge(`${callbackEdge.baseUrl}/host-surface`, {
+        host: 'callback-edge.invalid',
+        forwarded: callbackForwarded,
+        'x-forwarded-host': callbackXForwardedHost,
+        authorization: 'Bearer synthetic-edge-secret',
+        cookie: 'session=synthetic-edge-cookie',
+        'cf-access-jwt-assertion': 'synthetic-access-assertion',
+      });
+      assert.equal(managementCapture.status, 200, 'management local edge did not return the captured exchange');
+      assert.equal(callbackCapture.status, 200, 'callback local edge did not return the captured exchange');
+
+      const first = journal.first({ boundary: 'management-host-surface-edge', responseStatus: 200 });
+      assert.ok(first?.rawPath, 'canonical Host capture was not retained in quarantine');
+      const promoted = await journal.promoteCaptureSet(captureSetId, {
+        e2eName: testInfo.title,
+        classification: 'HARNESS_HOST_SURFACE_FIXTURE_FAILURE',
+        firstObserved: 'real local management/callback edges carried distinct canonical Host and spoofed forwarding headers',
+        firstFailureRecordingId: first.recordingId,
+        replay: async (envelope) => {
+          replayServer = await journal.startReplayServer(envelope);
+          const wrong = await requestLocalEdge(`${replayServer.baseUrl}/host-surface`, {
+            host: 'callback.invalid:48123',
+            forwarded: 'for=198.51.100.99;host=wrong.invalid',
+            'x-forwarded-host': 'wrong.invalid',
+          });
+          assert.equal(wrong.status, 500, 'replay accepted a wrong Host/forwarding authority');
+          assert.equal(
+            replayServer.failures[0]?.classification,
+            'REPLAY_REQUEST_HEADER_MISMATCH',
+            'wrong Host/forwarding headers did not produce a typed replay mismatch',
+          );
+          try {
+            await replayServer.finish();
+          } catch (error) {
+            assert.equal(error.classification, 'REPLAY_REQUEST_HEADER_MISMATCH');
+          }
+          replayServer = undefined;
+
+          replayServer = await journal.startReplayServer(envelope);
+          const managementReplay = await requestLocalEdge(`${replayServer.baseUrl}/host-surface`, {
+            host: new URL(managementOrigin).host,
+            forwarded: managementForwarded,
+            'x-forwarded-host': managementXForwardedHost,
+          });
+          const callbackReplay = await requestLocalEdge(`${replayServer.baseUrl}/host-surface`, {
+            host: new URL(callbackOrigin).host,
+            forwarded: callbackForwarded,
+            'x-forwarded-host': callbackXForwardedHost,
+          });
+          assert.equal(managementReplay.status, 200, 'canonical management Host replay did not match');
+          assert.equal(callbackReplay.status, 200, 'canonical callback Host replay did not match');
+          await replayServer.finish();
+          replayServer = undefined;
+          return { ok: true };
+        },
+      });
+      const exchanges = promoted.envelope.exchanges;
+      assert.equal(exchanges.length, 2, 'both host surfaces were not retained in the capture set');
+      assert.equal(exchanges[0].request_headers.host, new URL(managementOrigin).host);
+      assert.equal(exchanges[0].request_headers.forwarded, managementForwarded);
+      assert.equal(exchanges[0].request_headers['x-forwarded-host'], managementXForwardedHost);
+      assert.equal(exchanges[0].request_headers.authorization, undefined);
+      assert.equal(exchanges[0].request_headers.cookie, undefined);
+      assert.equal(exchanges[0].request_headers['cf-access-jwt-assertion'], undefined);
+      assert.equal(exchanges[1].request_headers.host, new URL(callbackOrigin).host);
+      assert.equal(exchanges[1].request_headers.forwarded, callbackForwarded);
+      assert.equal(exchanges[1].request_headers['x-forwarded-host'], callbackXForwardedHost);
+      assert.equal(exchanges[1].request_headers.authorization, undefined);
+      assert.equal(exchanges[1].request_headers.cookie, undefined);
+      assert.equal(exchanges[1].request_headers['cf-access-jwt-assertion'], undefined);
+      assert.equal(promoted.replay?.ok, true, 'Host surface promotion did not retain replay proof');
+    } finally {
+      try { await replayServer?.finish(); } catch {}
+      try { await managementEdge?.close(); } catch {}
+      try { await callbackEdge?.close(); } catch {}
+      try { await upstream?.close(); } catch {}
+    }
+  });
+
+  test('e2e_capture_set_recovery_promotes_existing_flushed_raw_after_recorder_restart', async ({}, testInfo) => {
+    test.setTimeout(120_000);
+    const quarantineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-capture-recovery-'));
+    const ledger = new SecretLedger();
+    const journal = new RecordingJournal({ rootDir: quarantineRoot, ledger });
+    let upstream;
+    let edge;
+    try {
+      upstream = await startHttpServer((request, response) => {
+        response.writeHead(200, { 'content-type': 'text/plain' });
+        response.end('recovery-edge');
+      });
+      const captureSetId = journal.beginCaptureSet({ e2eName: testInfo.title, maxMembers: 1 });
+      edge = await startHttpServer((request, response) => proxyHttp({
+        targetBaseUrl: upstream.baseUrl,
+        request,
+        response,
+        boundary: 'capture-recovery-edge',
+        journal,
+        ledger,
+        captureSetId,
+        canonicalOrigin: upstream.baseUrl,
+      }));
+      const captured = await requestLocalEdge(`${edge.baseUrl}/recovery`, {});
+      assert.equal(captured.status, 200, 'the real local edge did not produce the recovery source exchange');
+      const firstFailureRecordingId = journal.first({ boundary: 'capture-recovery-edge', responseStatus: 200 }).recordingId;
+      journal.flushCaptureSet(captureSetId, { firstFailureRecordingId });
+      const destinationDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-capture-recovery-promoted-'));
+      const promotedBeforeRecovery = fs.existsSync(path.join(quarantineRoot, 'promoted'));
+      const restartedJournal = RecordingJournal.openFlushedCaptureRoot({ rootDir: quarantineRoot, ledger: new SecretLedger() });
+      const reloaded = restartedJournal.reloadCaptureSet(captureSetId);
+      assert.equal(reloaded.state, 'flushed', 'the recovery source was not durably sealed before recorder exit');
+      assert.equal(fs.existsSync(path.join(quarantineRoot, 'promoted')), promotedBeforeRecovery, 'recovery loader polluted the forensic root before validation');
+      await assert.rejects(
+        () => restartedJournal.promoteFlushedCaptureSet(captureSetId, {
+          destinationDirectory,
+          replayProof: { ok: true },
+        }),
+        (error) => error.classification === 'REPLAY_PROOF_REQUIRED',
+      );
+      assert.equal(fs.readdirSync(destinationDirectory).length, 0, 'unbound recovery proof created a cassette');
+      await assert.rejects(
+        () => restartedJournal.promoteFlushedCaptureSet(captureSetId, {
+          destinationDirectory,
+          replay: async (envelope) => envelope.exchanges.map((exchange) => ({
+            status: exchange.response.status,
+            path: exchange.path,
+            outcome: exchange.response.outcome,
+            chunks: exchange.response.chunks.length,
+          })),
+        }),
+        (error) => error.classification === 'REPLAY_PROOF_INVALID',
+      );
+      assert.equal(fs.readdirSync(destinationDirectory).length, 0, 'fabricated replay results created a cassette');
+      await assert.rejects(
+        () => restartedJournal.promoteFlushedCaptureSet(captureSetId, {
+          destinationDirectory,
+          replay: async (envelope) => {
+            const results = await restartedJournal.replay(envelope, { baseUrl: upstream.baseUrl });
+            envelope.exchanges[0].request_body.raw_base64 = Buffer.from('forged').toString('base64');
+            return results;
+          },
+        }),
+        (error) => error.classification === 'REPLAY_PROOF_INVALID',
+      );
+      assert.equal(fs.readdirSync(destinationDirectory).length, 0, 'mutated replay envelope created a cassette');
+      const symlinkDestination = path.join(quarantineRoot, 'recovery-destination-link');
+      fs.symlinkSync(quarantineRoot, symlinkDestination, 'dir');
+      const forensicCassettesBeforeSymlinkAttempt = fs.readdirSync(quarantineRoot)
+        .filter((entry) => entry.endsWith('.v1.json'))
+        .sort();
+      await assert.rejects(
+        () => restartedJournal.promoteFlushedCaptureSet(captureSetId, {
+          destinationDirectory: symlinkDestination,
+          replay: async (envelope) => restartedJournal.replay(envelope, { baseUrl: upstream.baseUrl }),
+        }),
+        (error) => error.classification === 'RECOVERY_DESTINATION_INVALID',
+      );
+      assert.deepEqual(
+        fs.readdirSync(quarantineRoot).filter((entry) => entry.endsWith('.v1.json')).sort(),
+        forensicCassettesBeforeSymlinkAttempt,
+        'symlink destination promotion polluted the forensic root',
+      );
+      const promoted = await restartedJournal.promoteFlushedCaptureSet(captureSetId, {
+        classification: 'HARNESS_CAPTURE_RECOVERY_FIXTURE_FAILURE',
+        firstObserved: 'recorder exited after flush before immutable promotion',
+        firstFailureRecordingId,
+        destinationDirectory,
+        replay: async (envelope) => restartedJournal.replay(envelope, {
+          baseUrl: upstream.baseUrl,
+        }),
+      });
+      assert.equal(promoted.replay?.ok, true, 'recovered promotion did not retain the replay proof');
+      assert.equal(fs.statSync(promoted.cassettePath).mode & 0o777, 0o444, 'recovered cassette was not immutable');
+      assert.ok(fs.existsSync(reloaded.records[0].rawPath), 'recovery promotion rewrote or removed the first raw member');
+      assert.equal(promoted.replay.source_digest, reloaded.sourceDigest, 'replay proof was not bound to the flushed source digest');
+    } finally {
+      try { await edge?.close(); } catch {}
+      try { await upstream?.close(); } catch {}
+    }
+  });
+
+  test('e2e_recording_promotion_never_deletes_existing_immutable_cassette', async ({}, testInfo) => {
+    test.setTimeout(120_000);
+    const quarantineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-promotion-existing-'));
+    const destinationDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-promotion-existing-destination-'));
+    const ledger = new SecretLedger();
+    const journal = new RecordingJournal({ rootDir: quarantineRoot, ledger });
+    let upstream;
+    let edge;
+    try {
+      upstream = await startHttpServer((request, response) => {
+        response.writeHead(200, { 'content-type': 'text/plain' });
+        response.end('existing-cassette');
+      });
+      edge = await startHttpServer((request, response) => proxyHttp({
+        targetBaseUrl: upstream.baseUrl,
+        request,
+        response,
+        boundary: 'promotion-existing-edge',
+        journal,
+        ledger,
+        canonicalOrigin: upstream.baseUrl,
+      }));
+      const result = await requestLocalEdge(`${edge.baseUrl}/existing`, {});
+      assert.equal(result.status, 200);
+      const record = journal.first({ boundary: 'promotion-existing-edge', responseStatus: 200 });
+      assert.ok(record?.recordingId, 'the real local exchange was not captured');
+      const existingPath = path.join(destinationDirectory, `${record.recordingId}.v1.json`);
+      const existingBytes = Buffer.from(JSON.stringify({ immutable: true, owner: testInfo.title }) + '\n');
+      fs.writeFileSync(existingPath, existingBytes, { mode: 0o600, flag: 'wx' });
+      fs.chmodSync(existingPath, 0o444);
+      const before = fs.statSync(existingPath);
+      await assert.rejects(
+        () => journal.promote(record, {
+          destinationDirectory,
+          replayProof: { ok: true },
+        }),
+        (error) => Boolean(error),
+      );
+      const after = fs.statSync(existingPath);
+      assert.deepEqual(fs.readFileSync(existingPath), existingBytes, 'duplicate promotion changed the immutable cassette bytes');
+      assert.equal(after.mode & 0o777, 0o444, 'duplicate promotion changed immutable cassette permissions');
+      assert.equal(after.ino, before.ino, 'duplicate promotion replaced the immutable cassette inode');
+    } finally {
+      try { await edge?.close(); } catch {}
+      try { await upstream?.close(); } catch {}
+    }
+  });
+
+  test('e2e_http_ingress_is_durably_captured_before_body_bound_failure', async ({}, testInfo) => {
+    test.setTimeout(120_000);
+    const quarantineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-ingress-bound-'));
+    const ledger = new SecretLedger();
+    const journal = new RecordingJournal({ rootDir: quarantineRoot, ledger });
+    let upstream;
+    let edge;
+    try {
+      let upstreamRequests = 0;
+      upstream = await startHttpServer((request, response) => {
+        upstreamRequests += 1;
+        response.writeHead(200, { 'content-type': 'text/plain' });
+        response.end('unexpected upstream request');
+      });
+      edge = await startHttpServer((request, response) => proxyHttp({
+        targetBaseUrl: upstream.baseUrl,
+        request,
+        response,
+        boundary: 'ingress-bound-edge',
+        journal,
+        ledger,
+        canonicalOrigin: upstream.baseUrl,
+      }));
+      const body = Buffer.alloc(4 * 1024 * 1024 + 1, 0x78);
+      const result = await requestLocalEdgeWithBody(`${edge.baseUrl}/oversized-ingress`, { body });
+      assert.equal(upstreamRequests, 0, 'body-bound failure escaped to the upstream edge');
+      assert.ok(
+        journal.records.some((record) => record.boundary === 'ingress-bound-edge'),
+        `request ingress was not durably captured before body parsing failed (status=${result.status})`,
+      );
+    } finally {
+      try { await edge?.close(); } catch {}
+      try { await upstream?.close(); } catch {}
+    }
+  });
+
+  test('e2e_jwks_ingress_is_durably_captured_before_path_assertion', async ({}, testInfo) => {
+    test.setTimeout(120_000);
+    const quarantineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-jwks-ingress-'));
+    const ledger = new SecretLedger();
+    const journal = new RecordingJournal({ rootDir: quarantineRoot, ledger });
+    let jwks;
+    try {
+      jwks = await startAccessFixture({
+        ledger,
+        journal,
+        managementOrigin: 'http://127.0.0.1',
+        callbackOrigin: 'http://127.0.0.2',
+      });
+      const result = await requestLocalEdge(`${jwks.jwksServer.baseUrl}/unexpected`, {});
+      assert.equal(result.status, 404, 'JWKS path guard did not return its typed local 404');
+      assert.ok(
+        journal.records.some((record) => record.boundary === 'access-jwks-fixture'),
+        'JWKS exchange was not durably captured before method/path assertion',
+      );
+    } finally {
+      try { await jwks?.jwksServer?.close(); } catch {}
+    }
+  });
+
+  test('e2e_browser_replay_edge_restores_canonical_host_and_forwarded_headers', async ({ browser }, testInfo) => {
+    test.setTimeout(120_000);
+    const quarantineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-browser-host-surface-'));
+    const ledger = new SecretLedger();
+    const journal = new RecordingJournal({ rootDir: quarantineRoot, ledger });
+    let canonicalOrigin;
+    const forwarded = 'for=203.0.113.12;host=spoof-browser.invalid';
+    const xForwardedHost = 'spoof-browser.invalid';
+    let upstream;
+    let edge;
+    let replayEdge;
+    let replayContext;
+    try {
+      upstream = await startHttpServer((request, response) => {
+        if (request.method !== 'GET' || request.url !== '/browser-host-surface') {
+          response.writeHead(404, { 'content-type': 'text/plain' });
+          response.end('not found');
+          return;
+        }
+        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        response.end('<title>browser host surface</title>');
+      });
+      canonicalOrigin = upstream.baseUrl;
+      const captureSetId = journal.beginCaptureSet({
+        e2eName: testInfo.title,
+        maxMembers: 1,
+      });
+      edge = await startHttpServer((request, response) => proxyHttp({
+        targetBaseUrl: upstream.baseUrl,
+        request,
+        response,
+        boundary: 'browser-host-surface-edge',
+        journal,
+        ledger,
+        captureSetId,
+        canonicalOrigin,
+      }));
+      const captureContext = await browser.newContext({ extraHTTPHeaders: {
+        forwarded,
+        'x-forwarded-host': xForwardedHost,
+      } });
+      const capturePage = await captureContext.newPage();
+      const captured = await capturePage.goto(`${edge.baseUrl}/browser-host-surface`, { waitUntil: 'domcontentloaded' });
+      assert.equal(captured?.status(), 200, 'the browser did not capture the local Host/forwarding edge exchange');
+      await captureContext.close();
+
+      const first = journal.first({ boundary: 'browser-host-surface-edge', responseStatus: 200 });
+      assert.ok(first?.rawPath, 'the browser Host/forwarding exchange was not durably captured');
+      const promoted = await journal.promoteCaptureSet(captureSetId, {
+        e2eName: testInfo.title,
+        classification: 'HARNESS_BROWSER_HOST_SURFACE_FIXTURE_FAILURE',
+        firstObserved: 'real Chromium browser edge exchange required canonical Host and forwarding restoration',
+        firstFailureRecordingId: first.recordingId,
+        replay: async (envelope) => {
+          replayEdge = await journal.startReplayEdge(envelope, { canonicalOrigin: upstream.baseUrl });
+          const wrongContext = await browser.newContext({ extraHTTPHeaders: {
+            forwarded: 'for=198.51.100.24;host=wrong-browser.invalid',
+            'x-forwarded-host': 'wrong-browser.invalid',
+          } });
+          const wrongPage = await wrongContext.newPage();
+          const wrongReplay = await wrongPage.goto(`${replayEdge.baseUrl}/browser-host-surface`, { waitUntil: 'domcontentloaded' });
+          assert.equal(wrongReplay?.status(), 500, 'browser replay silently overwrote an explicitly spoofed forwarding header');
+          try {
+            await replayEdge.finish();
+          } catch (error) {
+            assert.equal(error.classification, 'REPLAY_REQUEST_HEADER_MISMATCH');
+          }
+          assert.equal(
+            replayEdge.server.failures[0]?.classification,
+            'REPLAY_REQUEST_HEADER_MISMATCH',
+            'explicit browser forwarding spoof did not produce a typed replay mismatch',
+          );
+          await wrongContext.close();
+          replayEdge = undefined;
+
+          replayEdge = await journal.startReplayEdge(envelope, { canonicalOrigin: upstream.baseUrl });
+          replayContext = await browser.newContext();
+          const replayPage = await replayContext.newPage();
+          const replayed = await replayPage.goto(`${replayEdge.baseUrl}/browser-host-surface`, { waitUntil: 'domcontentloaded' });
+          assert.equal(replayed?.status(), 200, 'browser replay edge did not restore the captured forwarding headers');
+          await replayContext.close();
+          replayContext = undefined;
+          await replayEdge.finish();
+          replayEdge = undefined;
+          assert.equal(journal.records.length, 1, 'browser replay appended a member to the sealed capture set');
+          return { ok: true };
+        },
+      });
+      assert.equal(promoted.replay?.ok, true, 'browser Host/forwarding replay proof was not retained');
+    } finally {
+      try { await replayContext?.close(); } catch {}
+      try { await replayEdge?.finish(); } catch {}
+      try { await edge?.close(); } catch {}
+      try { await upstream?.close(); } catch {}
+    }
+  });
+
+  test('e2e_browser_replay_edge_preserves_exchange_order_when_body_is_held', async ({ page }, testInfo) => {
+    test.setTimeout(120_000);
+    const quarantineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-replay-held-body-'));
+    const ledger = new SecretLedger();
+    const journal = new RecordingJournal({ rootDir: quarantineRoot, ledger });
+    let upstream;
+    let edge;
+    let replayEdge;
+    let notifyPostArrived;
+    const postArrived = new Promise((resolve) => { notifyPostArrived = resolve; });
+    try {
+      upstream = await startHttpServer(async (request, response) => {
+        if (request.method === 'GET' && request.url === '/bootstrap') {
+          response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+          response.end('bootstrap');
+          return;
+        }
+        if (request.method === 'POST' && request.url === '/slow') {
+          const body = [];
+          for await (const chunk of request) body.push(Buffer.from(chunk));
+          assert.equal(Buffer.concat(body).toString('utf8'), 'held', 'capture fixture received an unexpected held body');
+          response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+          response.end('slow');
+          return;
+        }
+        if (request.method === 'GET' && request.url === '/fast') {
+          response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+          response.end('fast');
+          return;
+        }
+        response.writeHead(404, { 'content-type': 'text/plain' });
+        response.end('not found');
+      });
+      const captureSetId = journal.beginCaptureSet({
+        e2eName: testInfo.title,
+        maxMembers: 3,
+      });
+      edge = await startHttpServer((request, response) => proxyHttp({
+        targetBaseUrl: upstream.baseUrl,
+        request,
+        response,
+        boundary: 'replay-held-body-edge',
+        journal,
+        ledger,
+        captureSetId,
+        canonicalOrigin: upstream.baseUrl,
+      }));
+      const bootstrap = await page.goto(`${edge.baseUrl}/bootstrap`, { waitUntil: 'domcontentloaded' });
+      assert.equal(bootstrap?.status(), 200, 'the browser did not establish the held-body capture edge');
+      const captured = await page.evaluate(async () => {
+        const slow = await fetch('/slow', {
+          method: 'POST',
+          headers: { 'content-type': 'text/plain' },
+          body: 'held',
+        });
+        const fast = await fetch('/fast');
+        return {
+          slow: { status: slow.status, body: await slow.text() },
+          fast: { status: fast.status, body: await fast.text() },
+        };
+      });
+      assert.equal(captured.slow.status, 200);
+      assert.equal(captured.fast.status, 200);
+      const first = journal.first({ boundary: 'replay-held-body-edge', responseStatus: 200 });
+      assert.ok(first?.rawPath, 'the held-body browser exchanges were not retained in quarantine');
+      const prepared = journal.prepareCaptureSetPromotion(captureSetId, {
+        e2eName: testInfo.title,
+        classification: 'HARNESS_REPLAY_HELD_BODY_ORDER_FIXTURE_FAILURE',
+        firstObserved: 'a real public POST body was held at the replay edge while Chromium issued the next public GET',
+        firstFailureRecordingId: first.recordingId,
+      });
+      assert.equal(prepared.captureSet.records.length, 3, 'bootstrap, held POST, and fast GET were not all retained');
+
+      replayEdge = await journal.startReplayEdge(prepared.envelope, {
+        canonicalOrigin: upstream.baseUrl,
+        onDispatch: ({ request }) => {
+          if (request.method === 'POST' && request.url === '/slow') notifyPostArrived();
+        },
+      });
+      const replayBootstrap = await page.goto(`${replayEdge.baseUrl}/bootstrap`, { waitUntil: 'domcontentloaded' });
+      assert.equal(replayBootstrap?.status(), 200, 'the replay edge did not establish the browser origin');
+      const postExchange = prepared.envelope.exchanges.find((exchange) => exchange.method === 'POST' && exchange.path === '/slow');
+      assert.ok(postExchange, 'held POST exchange was not present in the promoted envelope');
+      const postHeaders = Object.fromEntries(
+        Object.entries(postExchange.request_headers || {}).map(([name, value]) => [name, ledger.restore(value)]),
+      );
+      let heldPostRequest;
+      const heldPostResponse = new Promise((resolve, reject) => {
+        heldPostRequest = http.request(new URL('/slow', replayEdge.baseUrl), {
+          method: 'POST',
+          headers: { ...postHeaders, expect: '100-continue', 'content-length': '4' },
+        }, (response) => {
+          const chunks = [];
+          response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+          response.once('error', reject);
+          response.once('end', () => resolve({
+            status: response.statusCode || 0,
+            body: Buffer.concat(chunks).toString('utf8'),
+          }));
+        });
+        heldPostRequest.once('error', reject);
+        heldPostRequest.flushHeaders();
+      });
+      // A real public POST has entered the replay edge and its request body is
+      // intentionally left unterminated.  Chromium drives the next public
+      // GET through the same edge while this request is held.
+      await postArrived;
+      const fastRequest = page.waitForRequest((request) => request.url() === `${replayEdge.baseUrl}/fast`);
+      const fastResponse = page.evaluate(async () => {
+        const response = await fetch('/fast');
+        return { status: response.status, body: await response.text() };
+      });
+      await fastRequest;
+      // The browser has dispatched GET /fast while POST /slow is still held.
+      // Release the POST only after that public request barrier, so the edge
+      // must retain exchange-1 until its body/dispatch fully completes.
+      heldPostRequest.end('held');
+      const replayed = {
+        slow: await heldPostResponse,
+        fast: await fastResponse,
+      };
+      assert.deepEqual(replayed, {
+        slow: { status: 200, body: 'slow' },
+        fast: { status: 200, body: 'fast' },
+      }, `held POST and subsequent GET did not replay in cassette order: ${JSON.stringify(replayEdge.failures.map((failure) => ({ classification: failure.classification, message: failure.message, details: failure.details })))}`);
+      await replayEdge.finish();
+      replayEdge = undefined;
+    } finally {
+      try { await replayEdge?.finish(); } catch {}
+      try { await edge?.close(); } catch {}
+      try { await upstream?.close(); } catch {}
+      // Keep the first raw members in the test-owned quarantine on red.
     }
   });
 
@@ -418,7 +1156,10 @@ test.describe('Zode web E2E harness regressions', () => {
         ...delayedUnsignedEnvelope,
         integrity_sha256: createHash('sha256').update(JSON.stringify(delayedUnsignedEnvelope)).digest('hex'),
       };
-      replayServer = await journal.startReplayServer(delayedCassette, { timingMode: 'captured' });
+      replayServer = await journal.startReplayEdge(delayedCassette, {
+        timingMode: 'captured',
+        canonicalOrigin: upstream.baseUrl,
+      });
       const replayBootstrap = await page.goto(`${replayServer.baseUrl}/bootstrap`, { waitUntil: 'domcontentloaded' });
       assert.equal(replayBootstrap?.status(), 200, 'the replay server did not establish the browser origin');
       const replayed = await page.evaluate(async (targetUrl) => {

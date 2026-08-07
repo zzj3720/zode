@@ -434,7 +434,11 @@ async function validateProcessOwner(locator) {
   const entry = processEntry(locator.pid);
   const groupEntries = processGroupEntries(locator.process_group_id);
   if (!entry || entry.stat.includes('Z')) {
-    if (groupEntries.length === 0 && !processPresent(locator.pid)) return false;
+    // A reaped leader may remain as a zombie until its parent observes the
+    // exit.  Zombies cannot receive a useful signal; only a live member makes
+    // a missing leader an unsafe PGID-reuse ambiguity.
+    const liveGroupEntries = groupEntries.filter((candidate) => !candidate.stat.includes('Z'));
+    if (liveGroupEntries.length === 0 && !processPresent(locator.pid)) return false;
     throw ownerMismatch();
   }
   if (entry.pgid !== locator.process_group_id) throw ownerMismatch();
@@ -559,23 +563,41 @@ function readBoundedFlushedLog(path) {
 }
 
 function flushLogs(locatorPath, markers) {
-  const paths = logPaths(locatorPath);
-  let available = false;
   try {
-    for (const path of [paths.stdout, paths.stderr]) {
-      const target = privateFile(path);
-      if (!existsSync(target)) continue;
-      available = true;
-      const bytes = readBoundedFlushedLog(target);
-      fsyncDirectory(dirname(target));
-      assertMarkerFree(bytes, markers, 'child process output');
-    }
+    return readProcessOutput(locatorPath, { secretMarkers: markers }).flush_status;
   } catch (error) {
     if (error instanceof SecretMarkerError) return 'secret_marker';
     if (error instanceof OutputBoundError) return 'bound_exceeded';
     return 'failed';
   }
-  return available ? 'ok' : 'not_available';
+}
+
+/**
+ * Durably snapshot the child output without changing its lifecycle.  This is
+ * intentionally separate from stopProcess so a harness can seal output
+ * before inspecting readiness, asserting behavior, or attempting cleanup.
+ */
+function readProcessOutput(locatorPath, options = {}) {
+  const markers = configuredMarkers(options);
+  const paths = logPaths(locatorPath);
+  let stdout = Buffer.alloc(0);
+  let stderr = Buffer.alloc(0);
+  let available = 0;
+  for (const [key, path] of [['stdout', paths.stdout], ['stderr', paths.stderr]]) {
+    const target = privateFile(path);
+    if (!existsSync(target)) continue;
+    available += 1;
+    const bytes = readBoundedFlushedLog(target);
+    fsyncDirectory(dirname(target));
+    assertMarkerFree(bytes, markers, 'child process output');
+    if (key === 'stdout') stdout = bytes;
+    else stderr = bytes;
+  }
+  return {
+    stdout,
+    stderr,
+    flush_status: available === 2 ? 'ok' : available === 0 ? 'not_available' : 'failed',
+  };
 }
 
 function exitStatusUnknown() {
@@ -606,6 +628,17 @@ async function reapSpawnFailure(child, pid) {
  */
 async function startProcess(options = {}) {
   const markers = configuredMarkers(options);
+  if (options.requireCapture || options.capture !== undefined) {
+    const capture = options.capture;
+    if (!capture || capture.armed !== true || typeof capture.assertArmed !== 'function') {
+      throw new SeamError('capture_not_armed', 'durable process capture must be armed before spawn');
+    }
+    try {
+      capture.assertArmed();
+    } catch {
+      throw new SeamError('capture_not_armed', 'durable process capture must be armed before spawn');
+    }
+  }
   const executablePath = normalizeExecutable(options.executable ?? options.executablePath, markers);
   const role = validateText(options.role ?? 'supervisor', 'role');
   if (!PROCESS_ROLES.has(role)) {
@@ -941,6 +974,7 @@ module.exports = {
   SecretMarkerError,
   cli,
   readLocator,
+  readProcessOutput,
   startProcess,
   stopProcess,
 };
