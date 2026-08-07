@@ -49,6 +49,10 @@ export ZODE_ENDPOINT_BIN="$ROOT/target/debug/zode"
 export ZODE_SERVER_BIN="$ROOT/server/target/debug/zode-server"
 export ZODE_UI_ASSETS_DIRECTORY="$UI_DIR"
 export ZODE_WEB_E2E_UI_MODE=assets
+# Product E2Es invoke the project-local Vite+ CLI from child processes.  A
+# clean checkout has no globally installed `vp`; expose the locked workspace
+# binary without relying on a developer's shell PATH.
+export PATH="$ROOT/web/node_modules/.bin:$PATH"
 export CI=true
 
 # This is the same command on a checkout and on the developer machine. The
