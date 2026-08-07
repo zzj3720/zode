@@ -911,7 +911,7 @@ function restoreHeaders(headers, ledger) {
   return restored;
 }
 
-async function requestRaw(target, { method, headers, body, timeoutMs = HTTP_TIMEOUT_MS, expectedOutcome }) {
+async function requestRaw(target, { method, headers, body, timeoutMs = HTTP_TIMEOUT_MS }) {
   return withTimeout(new Promise((resolve, reject) => {
     const started = process.hrtime.bigint();
     const request = http.request(target, { method, headers }, (response) => {
@@ -932,14 +932,13 @@ async function requestRaw(target, { method, headers, body, timeoutMs = HTTP_TIME
         data: Buffer.from(chunk),
       }));
       response.once('end', () => finish('completed'));
-      response.once('aborted', () => {
-        finish(expectedOutcome === 'transport_error' || expectedOutcome === 'client_disconnected'
-          ? expectedOutcome
-          : 'disconnected');
-      });
-      response.once('error', () => finish(expectedOutcome || 'transport_error'));
+      // Terminal outcome is an observation of this replay target, never a
+      // hint from the captured cassette.  Otherwise a target that disconnects
+      // or errors differently could be relabeled as the expected outcome.
+      response.once('aborted', () => finish('disconnected'));
+      response.once('error', () => finish('transport_error'));
       response.once('close', () => {
-        if (!settled && !response.complete) finish(expectedOutcome || 'disconnected');
+        if (!settled && !response.complete) finish('disconnected');
       });
     });
     request.once('error', reject);
@@ -2326,7 +2325,6 @@ class RecordingJournal {
       headers: requestHeaders,
       body: requestBody,
       timeoutMs: HTTP_TIMEOUT_MS,
-      expectedOutcome: exchange.response.outcome,
     });
     const expectedResponseHeaders = normalizeHeaders(restoreHeaders(exchange.response.headers, this.ledger));
     const actualResponseHeaders = normalizeHeaders(publicHeaders(response.headers));

@@ -186,8 +186,9 @@ Native HTTP replay uses `RecordingJournal.startReplayServer(cassette)` and
 therefore expects the caller to send the recorded authority headers exactly.
 Same-entry replay through a live product/edge compares the complete ordered
 response bytes and terminal outcome; an HTTP hop may coalesce or split Node
-transport reads. `startReplayServer` remains the exact captured-chunk replay
-primitive.
+transport reads. The target terminal outcome is observed independently rather
+than copied from the cassette; a difference is `REPLAY_TERMINATION_MISMATCH`.
+`startReplayServer` remains the exact captured-chunk replay primitive.
 Browser replay uses `startReplayEdge(cassette, { canonicalOrigin, timingMode })`;
 the local edge restores the canonical `Host` before forwarding to the replay
 server and restores recorded `Forwarded`/`X-Forwarded-Host` only when the

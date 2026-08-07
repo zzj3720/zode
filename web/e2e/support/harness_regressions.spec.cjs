@@ -1360,4 +1360,75 @@ test.describe('Zode web E2E harness regressions', () => {
       try { await upstream?.close(); } catch {}
     }
   });
+
+  test('e2e_browser_replay_rejects_same_bytes_with_terminal_outcome_mismatch', async ({ page }, testInfo) => {
+    test.setTimeout(120_000);
+    const quarantineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-replay-terminal-outcome-'));
+    const destinationDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-replay-terminal-destination-'));
+    const ledger = new SecretLedger();
+    const journal = new RecordingJournal({ rootDir: quarantineRoot, ledger });
+    let unavailable;
+    let edge;
+    let replayTarget;
+    try {
+      unavailable = await startHttpServer(() => {});
+      const unavailableBaseUrl = unavailable.baseUrl;
+      await unavailable.close();
+      unavailable = undefined;
+
+      const captureSetId = journal.beginCaptureSet({ e2eName: testInfo.title, maxMembers: 1 });
+      edge = await startHttpServer((request, response) => proxyHttp({
+        targetBaseUrl: unavailableBaseUrl,
+        request,
+        response,
+        boundary: 'replay-terminal-outcome-edge',
+        journal,
+        ledger,
+        captureSetId,
+        canonicalOrigin: unavailableBaseUrl,
+      }));
+      const captured = await page.goto(`${edge.baseUrl}/terminal-outcome`, { waitUntil: 'load' });
+      assert.equal(captured?.status(), 502, 'the real browser did not observe the captured upstream failure response');
+
+      const first = journal.first({ boundary: 'replay-terminal-outcome-edge', responseStatus: 502 });
+      assert.ok(first?.rawPath, 'the terminal-outcome first occurrence was not durably retained');
+      assert.equal(first.response.outcome, 'transport_error', 'the fixture did not capture a transport terminal outcome');
+      const capturedBody = Buffer.concat(first.response.chunks.map((chunk) => Buffer.from(chunk.data_base64, 'base64')));
+      assert.ok(capturedBody.length > 0, 'the captured failure response had no body bytes');
+
+      replayTarget = await startHttpServer((request, response) => {
+        if (request.method !== 'GET' || request.url !== '/terminal-outcome') {
+          response.writeHead(404, { 'content-type': 'text/plain' });
+          response.end('not found');
+          return;
+        }
+        // Keep status and bytes identical, but terminate by disconnecting the
+        // response.  Same-entry replay must reject this outcome difference.
+        response.writeHead(502, { 'content-type': 'application/json' });
+        response.write(capturedBody);
+        setImmediate(() => response.socket?.destroy());
+      });
+
+      await assert.rejects(
+        journal.promoteCaptureSet(captureSetId, {
+          e2eName: testInfo.title,
+          classification: 'HARNESS_TERMINAL_OUTCOME_MISMATCH',
+          firstObserved: 'real browser observed the same bytes before a replay target changed terminal outcome',
+          firstFailureRecordingId: first.recordingId,
+          destinationDirectory,
+          replay: async (envelope) => ({
+            ok: true,
+            results: await journal.replay(envelope, { baseUrl: replayTarget.baseUrl }),
+          }),
+        }),
+        (error) => error?.classification === 'REPLAY_TERMINATION_MISMATCH',
+        'same status/body with a different terminal outcome was accepted',
+      );
+      assert.deepEqual(fs.readdirSync(destinationDirectory), [], 'terminal-outcome mismatch wrote a cassette');
+    } finally {
+      try { await replayTarget?.close(); } catch {}
+      try { await edge?.close(); } catch {}
+      try { await unavailable?.close(); } catch {}
+    }
+  });
 });
