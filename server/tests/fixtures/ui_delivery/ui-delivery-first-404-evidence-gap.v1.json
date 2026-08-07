@@ -1,0 +1,16 @@
+{
+  "boundary": "management_http",
+  "cassette": "tests/fixtures/ui_delivery/ui-delivery-first-404.v1.json",
+  "cassette_is_freezing": false,
+  "do_not_relabel_later_capture": true,
+  "evidence_status": "non_freezing_diagnostic",
+  "owner": "e2e_server_ui_delivery_serves_access_protected_management_assets_and_isolates_callback_origin",
+  "raw_search_marker": "ui-delivery-management-root-first-404",
+  "raw_search_root": "target/test-recordings/quarantine",
+  "raw_status": "missing",
+  "reason": "The original capture used a temporary quarantine that was deleted with its test directory; no ignored raw exchange remains.",
+  "recording_id": "ui-delivery-management-root-first-404",
+  "schema": "zode.http-incident-evidence.v1",
+  "version": 1,
+  "whole_digest": "sha256:63434b0fa2f99edaf711151a5546454b034219d91df4c09affd32b8c9ce8c87b"
+}

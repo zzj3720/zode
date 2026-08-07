@@ -1,0 +1,36 @@
+{
+  "boundary": "management_http",
+  "canonical_fingerprint": {
+    "algorithm": "sha256",
+    "request": "5db19c72e9c4f78161b123c30c35a2576f99840f3cdf275474d9daaa7f66f48e",
+    "response": "e645c92e50a7dbb77350d157f8ffad2bd4b89ad1b853fa7be4a53a6096c0f455"
+  },
+  "first_failure": {
+    "body": "",
+    "error_code": "missing_management_ui_route",
+    "status": 404
+  },
+  "owner": "e2e_server_ui_delivery_serves_access_protected_management_assets_and_isolates_callback_origin",
+  "recording_id": "ui-delivery-management-root-first-404",
+  "request": {
+    "authority": "management.ui-delivery.test",
+    "body": "",
+    "headers": {
+      "Accept": "text/html",
+      "Cf-Access-Jwt-Assertion": "SLOT_ACCESS_ASSERTION"
+    },
+    "method": "GET",
+    "path": "/"
+  },
+  "response": {
+    "body": "",
+    "headers": {},
+    "status": 404
+  },
+  "schema": "zode.http-incident-recording.v1",
+  "slots": [
+    "SLOT_ACCESS_ASSERTION"
+  ],
+  "version": 1,
+  "whole_digest": "sha256:e4815e4348684ce4938e8925436c925e78eff3e4c702c0df0be1ab390398b3b2"
+}

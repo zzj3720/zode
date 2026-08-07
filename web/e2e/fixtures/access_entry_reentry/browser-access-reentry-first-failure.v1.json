@@ -1,0 +1,46 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "access-reentry-stops-mutations-first-failure-20260807",
+  "purpose": "first real-browser management-origin view entry failure for the Access re-entry mutation-stop contract",
+  "owner": "e2e_browser_access_reentry_stops_mutations_and_uses_management_origin",
+  "boundary": "browser->management-origin",
+  "secret_slots": [
+    "${ACCESS_ASSERTION}"
+  ],
+  "first_observed_outcome": {
+    "sequence": 1,
+    "status": 404,
+    "safe_error": "management_ui_bootstrap_not_found"
+  },
+  "target_contract": {
+    "status": 200,
+    "browser_observable": "management view is visible and can resume its Endpoint session stream"
+  },
+  "exchanges": [
+    {
+      "sequence": 1,
+      "request": {
+        "method": "GET",
+        "path": "/?view=sessions",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "${ACCESS_ASSERTION}"
+          }
+        ],
+        "raw_body_hex": "",
+        "body_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "chunks": [],
+        "completed": true,
+        "termination": "complete",
+        "body_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  ],
+  "whole_digest": "sha256:24d486e36f1feeb09d17663a3a585b577d8a70aa8bd03b97c988ce8a21dc6633"
+}

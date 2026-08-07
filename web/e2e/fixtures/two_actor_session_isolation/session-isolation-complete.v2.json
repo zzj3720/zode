@@ -1,0 +1,255 @@
+{
+  "schema": "zode.web-two-actor-session-isolation-complete.v2",
+  "version": 2,
+  "recording_id": "two-actor-session-isolation-first-404-complete-20260808-v2",
+  "purpose": "Replay the retained first real-browser two-actor session-isolation failure with exact Browser-to-Server-to-Endpoint exchanges and a positive catalog barrier.",
+  "source_recording_id": "two-actor-Wq1Xmr",
+  "owner": "e2e_browser_two_actor_session_isolation",
+  "boundary": "browser_management_http_sse",
+  "secret_slots": [
+    {
+      "name": "SLOT_ENDPOINT_CONTROL_SECRET",
+      "kind": "endpoint_control_secret",
+      "semantic_sha256": "sha256:25a5221af6a50097158c5c5c3240685017b7e8d717c0392fbbd44ef89c022e43"
+    }
+  ],
+  "provenance": {
+    "source_recording_id": "two-actor-Wq1Xmr",
+    "source_digest": "sha256:e5a3d4555dd48d59def4dfcb12126cc7aca06e483be40175ad50f4f6f3c58476",
+    "source_path": "target/test-recordings/quarantine/two-actor-Wq1Xmr/e2e_browser_two_actor_session_isolation.v1.json",
+    "source_verified": true,
+    "promotion": "create_new_from_verified_raw",
+    "redaction": "named_synthetic_slots_and_loopback_port_normalization"
+  },
+  "first_observed": {
+    "actor": "actor-a",
+    "method": "GET",
+    "path": "/",
+    "status": 404,
+    "safeCode": null,
+    "message": "actor-a GET / -> 404 [shallow_non_evidence]",
+    "classification": "shallow_non_evidence",
+    "exchangeSequence": 0
+  },
+  "classification": {
+    "kind": "shallow_non_evidence",
+    "exact_response": {
+      "status": 404,
+      "semantic_headers": {
+        "content-length": "0"
+      },
+      "body_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "response_fingerprint": "sha256:df77fab8dcf2d1208c38e10976b171a613dceab970b2c12dcd158f60783f44f8",
+      "response_code": null,
+      "termination": "complete",
+      "completed": true
+    },
+    "positive_catalog_barrier": {
+      "required": true,
+      "expected_status": 200,
+      "observed": true,
+      "exchange_sequence": 1,
+      "exact_response": {
+        "status": 200,
+        "semantic_headers": {
+          "content-length": "216",
+          "content-type": "application/json"
+        },
+        "body_sha256": "sha256:61a6f624f7e60665c7bbba917b3a4d8568b6c0a833ed29cad197302c31efa888",
+        "response_fingerprint": "sha256:761ce154b76619ef27fb046e7f06eb51e04c8ff6c802fb33441aa2547b79bb51",
+        "response_code": null,
+        "termination": "complete",
+        "completed": true
+      },
+      "reason": null
+    }
+  },
+  "exchanges": [
+    {
+      "sequence": 0,
+      "actor": "actor-a",
+      "method": "GET",
+      "path": "/",
+      "request": {
+        "semanticHeaders": {},
+        "bodyHex": "",
+        "bodySha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonicalJson": null
+      },
+      "response": {
+        "status": 404,
+        "semanticHeaders": {
+          "content-length": "0"
+        },
+        "bodyHex": "",
+        "bodySha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonicalJson": null,
+        "chunks": [],
+        "responseCode": null,
+        "completed": true,
+        "termination": "complete"
+      }
+    },
+    {
+      "sequence": 1,
+      "actor": "actor-a",
+      "method": "GET",
+      "path": "/v1/system",
+      "request": {
+        "semanticHeaders": {
+          "accept": "application/json"
+        },
+        "bodyHex": "",
+        "bodySha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonicalJson": null
+      },
+      "response": {
+        "status": 200,
+        "semanticHeaders": {
+          "content-length": "216",
+          "content-type": "application/json"
+        },
+        "bodyHex": "7b226465706c6f796d656e74223a227365727665725f6f6e6c79222c226665617475726573223a7b2270726f76696465725f61757468223a747275652c2272656d6f74655f656e64706f696e7473223a747275657d2c22696e6772657373223a7b2263616c6c6261636b5f6f726967696e223a227365706172617465222c226d616e6167656d656e745f61757468223a22636c6f7564666c6172655f616363657373227d2c226c6f63616c5f656e64706f696e745f6964223a6e756c6c2c22736368656d61223a227a6f64652e73797374656d2e7631227d",
+        "bodySha256": "sha256:61a6f624f7e60665c7bbba917b3a4d8568b6c0a833ed29cad197302c31efa888",
+        "canonicalJson": {
+          "deployment": "server_only",
+          "features": {
+            "provider_auth": true,
+            "remote_endpoints": true
+          },
+          "ingress": {
+            "callback_origin": "separate",
+            "management_auth": "cloudflare_access"
+          },
+          "local_endpoint_id": null,
+          "schema": "zode.system.v1"
+        },
+        "chunks": [
+          {
+            "sequence": 0,
+            "bodyHex": "7b226465706c6f796d656e74223a227365727665725f6f6e6c79222c226665617475726573223a7b2270726f76696465725f61757468223a747275652c2272656d6f74655f656e64706f696e7473223a747275657d2c22696e6772657373223a7b2263616c6c6261636b5f6f726967696e223a227365706172617465222c226d616e6167656d656e745f61757468223a22636c6f7564666c6172655f616363657373227d2c226c6f63616c5f656e64706f696e745f6964223a6e756c6c2c22736368656d61223a227a6f64652e73797374656d2e7631227d",
+            "bodySha256": "sha256:61a6f624f7e60665c7bbba917b3a4d8568b6c0a833ed29cad197302c31efa888",
+            "offsetMs": 0
+          }
+        ],
+        "responseCode": null,
+        "completed": true,
+        "termination": "complete"
+      }
+    },
+    {
+      "sequence": 2,
+      "actor": "actor-a",
+      "method": "POST",
+      "path": "/v1/endpoints",
+      "request": {
+        "semanticHeaders": {
+          "idempotency-key": "two-actor-endpoint-add",
+          "accept": "application/json",
+          "content-type": "application/json"
+        },
+        "bodyHex": "7b226c6162656c223a2253686172656420456e64706f696e74222c22626173655f75726c223a22687474703a2f2f3132372e302e302e313a7b7b504f52547d7d222c22636f6e74726f6c5f61757468223a7b226b696e64223a22626561726572222c22736563726574223a223c7365637265743a534c4f545f454e44504f494e545f434f4e54524f4c5f5345435245543e227d7d",
+        "bodySha256": "sha256:3ec7d927b900ac546d8d9d2c511b1dd22729e3e56b6a47a07f7f38980c214e99",
+        "canonicalJson": {
+          "label": "Shared Endpoint",
+          "base_url": "http://127.0.0.1:{{PORT}}",
+          "control_auth": {
+            "kind": "bearer",
+            "secret": "<secret:SLOT_ENDPOINT_CONTROL_SECRET>"
+          }
+        }
+      },
+      "response": {
+        "status": 201,
+        "semanticHeaders": {
+          "content-length": "413",
+          "content-type": "application/json"
+        },
+        "bodyHex": "7b22617574685f7265706c6963615f73756d6d617279223a7b2270656e64696e67223a302c227265616479223a302c227374616c65223a307d2c226361706162696c6974696573223a7b2270726f746f636f6c5f76657273696f6e223a227a6f64652e656e64706f696e742e7631222c2270726f766964657273223a5b5d2c22746f6f6c73223a5b5d7d2c22636f6e74726f6c6c65725f617574686f726974795f6964223a2274776f2d6163746f722d7365727665722d617574686f72697479222c22636f6e74726f6c6c65725f63726564656e7469616c5f7265766973696f6e223a312c2264697361626c6564223a66616c73652c22656e64706f696e745f6964223a227b7b53455353494f4e5f49447d7d222c226b696e64223a2272656d6f7465222c226c6162656c223a2253686172656420456e64706f696e74222c226c6173745f6f627365727665645f61745f6d73223a7b7b54494d455354414d505f4d537d7d2c22736368656d61223a227a6f64652e656e64706f696e742e7631222c22737461747573223a226f6e6c696e65227d",
+        "bodySha256": "sha256:3842dda37b9ad9d5c1f2e79315b441ac47ffb3e24e4001dacddb95fdb9ac64b9",
+        "canonicalJson": null,
+        "chunks": [
+          {
+            "sequence": 0,
+            "bodyHex": "7b22617574685f7265706c6963615f73756d6d617279223a7b2270656e64696e67223a302c227265616479223a302c227374616c65223a307d2c226361706162696c6974696573223a7b2270726f746f636f6c5f76657273696f6e223a227a6f64652e656e64706f696e742e7631222c2270726f766964657273223a5b5d2c22746f6f6c73223a5b5d7d2c22636f6e74726f6c6c65725f617574686f726974795f6964223a2274776f2d6163746f722d7365727665722d617574686f72697479222c22636f6e74726f6c6c65725f63726564656e7469616c5f7265766973696f6e223a312c2264697361626c6564223a66616c73652c22656e64706f696e745f6964223a227b7b53455353494f4e5f49447d7d222c226b696e64223a2272656d6f7465222c226c6162656c223a2253686172656420456e64706f696e74222c226c6173745f6f627365727665645f61745f6d73223a7b7b54494d455354414d505f4d537d7d2c22736368656d61223a227a6f64652e656e64706f696e742e7631222c22737461747573223a226f6e6c696e65227d",
+            "bodySha256": "sha256:3842dda37b9ad9d5c1f2e79315b441ac47ffb3e24e4001dacddb95fdb9ac64b9",
+            "offsetMs": 0
+          }
+        ],
+        "responseCode": null,
+        "completed": true,
+        "termination": "complete"
+      }
+    },
+    {
+      "sequence": 3,
+      "actor": "actor-a",
+      "method": "PUT",
+      "path": "/v1/providers/two-actor-fixture-provider",
+      "request": {
+        "semanticHeaders": {
+          "idempotency-key": "two-actor-provider-descriptor",
+          "accept": "application/json",
+          "content-type": "application/json"
+        },
+        "bodyHex": "7b226b696e64223a226f70656e61695f636f6d70617469626c65222c22626173655f75726c223a22687474703a2f2f3132372e302e302e313a7b7b504f52547d7d2f7631222c226d6f64656c73223a5b2274776f2d6163746f722d666978747572652d6d6f64656c225d2c226f7074696f6e73223a7b7d7d",
+        "bodySha256": "sha256:39cde9a79cbec348ad62d8aeacf52b61e87542ce2cb670a0846f81b7bfbd9cad",
+        "canonicalJson": {
+          "kind": "openai_compatible",
+          "base_url": "http://127.0.0.1:{{PORT}}/v1",
+          "models": [
+            "two-actor-fixture-model"
+          ],
+          "options": {}
+        }
+      },
+      "response": {
+        "status": 404,
+        "semanticHeaders": {
+          "content-length": "0"
+        },
+        "bodyHex": "",
+        "bodySha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonicalJson": null,
+        "chunks": [],
+        "responseCode": null,
+        "completed": true,
+        "termination": "complete"
+      }
+    }
+  ],
+  "endpointExchanges": [
+    {
+      "sequence": 0,
+      "method": "GET",
+      "path": "/v1/identity",
+      "subjectSlot": "subject-1",
+      "controllerAuth": "shared",
+      "idempotencyKey": null,
+      "requestHeaders": {
+        "accept": "*/*"
+      },
+      "requestBodyHex": "",
+      "requestBodyDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json",
+        "content-length": "167"
+      },
+      "responseBodyHex": "7b22736368656d61223a227a6f64652e6964656e746974792e7631222c2270726f746f636f6c5f76657273696f6e223a227a6f64652e656e64706f696e742e7631222c22656e64706f696e745f6964223a227b7b53455353494f4e5f49447d7d222c22617574686f726974795f6964223a2274776f2d6163746f722d7365727665722d617574686f72697479222c227265766973696f6e223a317d",
+      "responseBodyDigest": "6716653086945b145200a446ba1579f69d19ab70d6bd08bf25b77e37f0dd995f",
+      "responseChunks": [
+        {
+          "sequence": 0,
+          "bodyHex": "7b22736368656d61223a227a6f64652e6964656e746974792e7631222c2270726f746f636f6c5f76657273696f6e223a227a6f64652e656e64706f696e742e7631222c22656e64706f696e745f6964223a227b7b53455353494f4e5f49447d7d222c22617574686f726974795f6964223a2274776f2d6163746f722d7365727665722d617574686f72697479222c227265766973696f6e223a317d",
+          "bodySha256": "sha256:6716653086945b145200a446ba1579f69d19ab70d6bd08bf25b77e37f0dd995f",
+          "offsetMs": 3
+        }
+      ],
+      "responseCode": null,
+      "completed": true,
+      "termination": "complete"
+    }
+  ],
+  "whole_digest": "sha256:0a958a68f57b4aaba416a525391e9141419b29d9f7a13cb02d66df80b4dda1eb"
+}

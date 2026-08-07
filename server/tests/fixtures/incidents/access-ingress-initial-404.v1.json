@@ -1,0 +1,902 @@
+{
+  "schema": "zode.access-ingress-incident.v1",
+  "source": "test-owned-public-http-harness",
+  "observed_jwks_requests": 0,
+  "exchanges": [
+    {
+      "slot": "human-valid",
+      "expected_status": 200,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "service-valid",
+      "expected_status": 200,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "missing-assertion",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "malformed-assertion",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "forged-signature",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "expired-beyond-skew",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "future-nbf-beyond-skew",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "wrong-issuer",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "wrong-audience",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "unsupported-algorithm",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "missing-kid",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "missing-type",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "missing-subject",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "wrong-type",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "ambiguous-actor",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "empty-actor",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "non-string-subject",
+      "expected_status": 401,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "no-user-route-login",
+      "expected_status": 404,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/login",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "no-user-route-logout",
+      "expected_status": 404,
+      "concurrent_group": null,
+      "request": {
+        "method": "POST",
+        "path": "/v1/logout",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "no-user-route-users",
+      "expected_status": 404,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/users",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "no-user-route-workspaces",
+      "expected_status": 404,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/workspaces",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "no-user-route-roles",
+      "expected_status": 404,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/roles",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "no-user-route-grants",
+      "expected_status": 404,
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/grants",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "unknown-kid-singleflight",
+      "expected_status": 401,
+      "concurrent_group": "unknown-kid-singleflight",
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "unknown-kid-singleflight",
+      "expected_status": 401,
+      "concurrent_group": "unknown-kid-singleflight",
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "unknown-kid-singleflight",
+      "expected_status": 401,
+      "concurrent_group": "unknown-kid-singleflight",
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "unknown-kid-singleflight",
+      "expected_status": 401,
+      "concurrent_group": "unknown-kid-singleflight",
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    },
+    {
+      "slot": "unknown-kid-fail-closed",
+      "expected_status": 401,
+      "concurrent_group": "unknown-kid-fail-closed",
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "header_names": [
+          "host",
+          "connection",
+          "cf-access-jwt-assertion"
+        ]
+      },
+      "observed": {
+        "status": 404,
+        "headers": [
+          {
+            "name": "connection",
+            "value": "close"
+          },
+          {
+            "name": "content-length",
+            "value": "0"
+          },
+          {
+            "name": "date",
+            "value": "Fri, 07 Aug 2026 10:01:59 GMT"
+          }
+        ],
+        "body": ""
+      }
+    }
+  ]
+}

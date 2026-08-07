@@ -1,0 +1,585 @@
+{
+  "schema": "zode.llm-http-recording.v1",
+  "version": 1,
+  "recording_id": "session-reconnect-runtime-states-first-failure",
+  "purpose": "Replay the retained partial model stream while keeping provisional model text outside the durable transcript.",
+  "owning_e2e": "e2e_browser_session_admission_is_separate_from_completion_and_last_event_id_reconnect_replaces_provisional_final",
+  "boundary": "endpoint_model_provider",
+  "provider": "fixture-provider",
+  "model": "fixture-model",
+  "secret_slots": [
+    "SLOT_PROVIDER_AUTHORIZATION"
+  ],
+  "synthetic_request_slots": [
+    "SLOT_KEYBOARD_REQUEST_BODY",
+    "SLOT_RECONNECT_REQUEST_BODY",
+    "SLOT_OFFLINE_REQUEST_BODY",
+    "SLOT_CANCEL_REQUEST_BODY",
+    "SLOT_WAIT_TIMEOUT_REQUEST_BODY",
+    "SLOT_UNKNOWN_OUTCOME_REQUEST_BODY",
+    "SLOT_MOBILE_ACTIVITY_REQUEST_BODY"
+  ],
+  "replay_contract": {
+    "require_all_exchanges_consumed": true,
+    "request": {
+      "headers": "exact-semantic-headers",
+      "body": "exact-canonical-json",
+      "fingerprint": "sha256:canonical-json"
+    },
+    "response": {
+      "headers": "exact-recorded-content-type",
+      "body": "exact-recorded-chunks",
+      "fingerprint": "sha256:canonical-json"
+    }
+  },
+  "request_body_contract": {
+    "model": "fixture-model",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "fixture_async",
+          "description": "Controlled asynchronous HTTP tool for browser lifecycle E2E.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string"
+              }
+            },
+            "required": ["mode"],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "wait_for",
+          "description": "Pause this session until new input or a runtime notification arrives.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "timeout_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 600
+              }
+            },
+            "required": ["reason"],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  },
+  "first_seen_failure": {
+    "boundary": "endpoint_model_provider",
+    "safe_error": "model stream disconnected after provisional token",
+    "status": 200,
+    "exchange_sequence": 1,
+    "termination": "client_disconnect",
+    "provisional_text": "PROVISIONAL_TOKEN",
+    "durable_text": "DURABLE_FINAL"
+  },
+  "contract_response": {
+    "admission_status": 202,
+    "durable_final_assistant_count": 1,
+    "reconnect_header": "Last-Event-ID"
+  },
+  "exchanges": [
+    {
+      "sequence": 0,
+      "scenario": "keyboard-session",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [
+          {
+            "name": "accept",
+            "value": "*/*"
+          },
+          {
+            "name": "authorization",
+            "value": "{{SLOT_PROVIDER_AUTHORIZATION}}"
+          },
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": "{{SLOT_KEYBOARD_REQUEST_BODY}}",
+        "messages": [
+          {
+            "role": "user",
+            "content": "keyboard path keyboard-session"
+          }
+        ],
+        "canonical_body_fingerprint": "sha256:515a5363a019a029950621dc5c9fec51f387590b0e826fe8628a70f743a50a85",
+        "body_match": {
+          "contains": "keyboard-session"
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "headers": [
+          {"name": "cache-control", "value": "no-store"},
+          {"name": "content-type", "value": "text/event-stream"}
+        ],
+        "complete": true,
+        "stream_error": false,
+        "canonical_response_fingerprint": "sha256:8ab8b2797f4b9a3214118422ab39694b73a267cc0cb59e8871e9a2364203296d",
+        "body_sha256": "sha256:56e5d3220ff5b72b001833df113a824be22c0ae351ed540e4f9bd1fd7e3d7e03",
+        "chunks": [
+          {
+            "at_us": 0,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22636f6e74656e74223a224b4559424f4152445f46494e414c227d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a646174613a207b2263686f69636573223a5b7b2264656c7461223a7b7d2c2266696e6973685f726561736f6e223a2273746f70227d5d7d0a0a646174613a205b444f4e455d0a0a"
+          }
+        ]
+      }
+    },
+    {
+      "sequence": 1,
+      "scenario": "reconnect-session",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [
+          {
+            "name": "accept",
+            "value": "*/*"
+          },
+          {
+            "name": "authorization",
+            "value": "{{SLOT_PROVIDER_AUTHORIZATION}}"
+          },
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": "{{SLOT_RECONNECT_REQUEST_BODY}}",
+        "messages": [
+          {
+            "role": "user",
+            "content": "reconnect path reconnect-session"
+          }
+        ],
+        "canonical_body_fingerprint": "sha256:a5c76d191bfb24d5b008c94d53b4453c1f5b5f83a6874cf8e6d7e040510d5649",
+        "body_match": {
+          "contains": "reconnect-session"
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "headers": [
+          {"name": "cache-control", "value": "no-store"},
+          {"name": "content-type", "value": "text/event-stream"}
+        ],
+        "complete": false,
+        "stream_error": "client_disconnect",
+        "canonical_response_fingerprint": "sha256:836c0562a49b44167f12c4e7787c9a6d2b0a385f77ced6249ee3c4bbdf904c00",
+        "body_sha256": "sha256:766c578c433953a446c039fd26fbac3ca3f279e01a4057b9083fbb2da204dae0",
+        "chunks": [
+          {
+            "at_us": 0,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22636f6e74656e74223a2250524f564953494f4e414c5f544f4b454e227d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a"
+          }
+        ]
+      }
+    },
+    {
+      "sequence": 2,
+      "scenario": "reconnect-session",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [
+          {
+            "name": "accept",
+            "value": "*/*"
+          },
+          {
+            "name": "authorization",
+            "value": "{{SLOT_PROVIDER_AUTHORIZATION}}"
+          },
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": "{{SLOT_RECONNECT_REQUEST_BODY}}",
+        "messages": [
+          {
+            "role": "user",
+            "content": "reconnect path reconnect-session"
+          }
+        ],
+        "canonical_body_fingerprint": "sha256:a5c76d191bfb24d5b008c94d53b4453c1f5b5f83a6874cf8e6d7e040510d5649",
+        "body_match": {
+          "contains": "reconnect-session"
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "headers": [
+          {"name": "cache-control", "value": "no-store"},
+          {"name": "content-type", "value": "text/event-stream"}
+        ],
+        "complete": true,
+        "stream_error": false,
+        "canonical_response_fingerprint": "sha256:a4564473c06a660b86c0b1f08f6ae596ca7eb4d8580c623a62a0753af33cb076",
+        "body_sha256": "sha256:f1017d081f8f89da2d5ed0ef0c5eb9be0dfee3b1f3a659d9e28b611e23bc0b7d",
+        "chunks": [
+          {
+            "at_us": 0,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22636f6e74656e74223a2244555241424c455f46494e414c227d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a646174613a207b2263686f69636573223a5b7b2264656c7461223a7b7d2c2266696e6973685f726561736f6e223a2273746f70227d5d7d0a0a646174613a205b444f4e455d0a0a"
+          }
+        ]
+      }
+    },
+    {
+      "sequence": 3,
+      "scenario": "offline-session",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [
+          {
+            "name": "accept",
+            "value": "*/*"
+          },
+          {
+            "name": "authorization",
+            "value": "{{SLOT_PROVIDER_AUTHORIZATION}}"
+          },
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": "{{SLOT_OFFLINE_REQUEST_BODY}}",
+        "messages": [
+          {
+            "role": "user",
+            "content": "offline path offline-session"
+          }
+        ],
+        "canonical_body_fingerprint": "sha256:a1463b9a4e261e6606a2941adbb26ca8fd7d7709588dd6f4f63df59d0e43640d",
+        "body_match": {
+          "contains": "offline-session"
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "headers": [
+          {"name": "cache-control", "value": "no-store"},
+          {"name": "content-type", "value": "text/event-stream"}
+        ],
+        "complete": true,
+        "stream_error": false,
+        "canonical_response_fingerprint": "sha256:5107b5f4d9d8736abfdb6e0e6adcf6f21bf8c433c6571a35b8a4f843b93b8ca9",
+        "body_sha256": "sha256:d4077b2490e2d9328d9b4b960ab0bf6aa583ee6fc9a8bd041c978102acfe172d",
+        "chunks": [
+          {
+            "at_us": 0,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22636f6e74656e74223a224f46464c494e455f46494e414c227d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a646174613a207b2263686f69636573223a5b7b2264656c7461223a7b7d2c2266696e6973685f726561736f6e223a2273746f70227d5d7d0a0a646174613a205b444f4e455d0a0a"
+          }
+        ]
+      }
+    },
+    {
+      "sequence": 4,
+      "scenario": "cancel-session",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [
+          {
+            "name": "accept",
+            "value": "*/*"
+          },
+          {
+            "name": "authorization",
+            "value": "{{SLOT_PROVIDER_AUTHORIZATION}}"
+          },
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": "{{SLOT_CANCEL_REQUEST_BODY}}",
+        "messages": [
+          {
+            "role": "user",
+            "content": "cancel path cancel-session"
+          }
+        ],
+        "canonical_body_fingerprint": "sha256:f38227eb2a56f2935362aa5d29b417410e6a6fd18c62b59486e88854ce42623f",
+        "body_match": {
+          "contains": "cancel-session"
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "headers": [
+          {"name": "cache-control", "value": "no-store"},
+          {"name": "content-type", "value": "text/event-stream"}
+        ],
+        "complete": true,
+        "stream_error": false,
+        "canonical_response_fingerprint": "sha256:8e37b0b5c174d9b691421093a1ef54b37bba6339a419eadbc3bf54cded912c9e",
+        "body_sha256": "sha256:186ede3ada62758d7bdf36633a13b7824a27892c712e3ee0c05339634939345a",
+        "chunks": [
+          {
+            "at_us": 0,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22746f6f6c5f63616c6c73223a5b7b22696e646578223a302c226964223a2263616e63656c2d746f6f6c2d63616c6c222c2274797065223a2266756e6374696f6e222c2266756e6374696f6e223a7b226e616d65223a22666978747572655f6173796e63222c22617267756d656e7473223a227b5c226d6f64655c223a5c2263616e63656c5c227d227d7d5d7d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a646174613a207b2263686f69636573223a5b7b2264656c7461223a7b7d2c2266696e6973685f726561736f6e223a22746f6f6c5f63616c6c73227d5d7d0a0a646174613a205b444f4e455d0a0a"
+          }
+        ]
+      }
+    },
+    {
+      "sequence": 5,
+      "scenario": "wait-timeout-session",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [
+          {
+            "name": "accept",
+            "value": "*/*"
+          },
+          {
+            "name": "authorization",
+            "value": "{{SLOT_PROVIDER_AUTHORIZATION}}"
+          },
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": "{{SLOT_WAIT_TIMEOUT_REQUEST_BODY}}",
+        "messages": [
+          {
+            "role": "user",
+            "content": "wait path wait-timeout-session"
+          }
+        ],
+        "canonical_body_fingerprint": "sha256:6814c1f5b39100091cd1e25ccaaf2e154882a2ab17620907e073fb9de359f5bd",
+        "body_match": {
+          "contains": "wait-timeout-session"
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "headers": [
+          {"name": "cache-control", "value": "no-store"},
+          {"name": "content-type", "value": "text/event-stream"}
+        ],
+        "complete": true,
+        "stream_error": false,
+        "canonical_response_fingerprint": "sha256:6b800ed3203ceeb680e670674b23dce3570b773c075913d38909a9cb40599941",
+        "body_sha256": "sha256:4f691b727ec688a0ea4920a2442c7a74d0bc1a8e7c51ddc48cb3f42d91a2ea8d",
+        "chunks": [
+          {
+            "at_us": 0,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22746f6f6c5f63616c6c73223a5b7b22696e646578223a302c226964223a22776169742d74696d656f75742d746f6f6c2d63616c6c222c2274797065223a2266756e6374696f6e222c2266756e6374696f6e223a7b226e616d65223a22776169745f666f72222c22617267756d656e7473223a227b5c22726561736f6e5c223a5c22646561646c696e655c222c5c2274696d656f75745f7365636f6e64735c223a317d227d7d5d7d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a646174613a207b2263686f69636573223a5b7b2264656c7461223a7b7d2c2266696e6973685f726561736f6e223a22746f6f6c5f63616c6c73227d5d7d0a0a646174613a205b444f4e455d0a0a"
+          }
+        ]
+      }
+    },
+    {
+      "sequence": 6,
+      "scenario": "wait-timeout-session",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [
+          {
+            "name": "accept",
+            "value": "*/*"
+          },
+          {
+            "name": "authorization",
+            "value": "{{SLOT_PROVIDER_AUTHORIZATION}}"
+          },
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": "{{SLOT_WAIT_TIMEOUT_REQUEST_BODY}}",
+        "messages": [
+          {
+            "role": "user",
+            "content": "wait path wait-timeout-session"
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "type": "function",
+                "id": "wait-timeout-tool-call",
+                "function": {
+                  "name": "wait_for",
+                  "arguments": "{\"reason\":\"deadline\",\"timeout_seconds\":1}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "wait_for accepted",
+            "tool_call_id": "wait-timeout-tool-call"
+          }
+        ],
+        "canonical_body_fingerprint": "sha256:ca16dc61011d39bfdc3bfb9832c96747ec5caadb807d33182d80eaaee1abb92e",
+        "body_match": {
+          "contains": "wait-timeout-session"
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "headers": [
+          {"name": "cache-control", "value": "no-store"},
+          {"name": "content-type", "value": "text/event-stream"}
+        ],
+        "complete": true,
+        "stream_error": false,
+        "canonical_response_fingerprint": "sha256:32213622dd3e835d74b0812a29d33f1bdd65ddda19574d1e0b01ef8f01b708b0",
+        "body_sha256": "sha256:caf963d7c1aa535a9d340f577f0ffff4aa979edc577c216bac68fe4c82b453f1",
+        "chunks": [
+          {
+            "at_us": 0,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22636f6e74656e74223a22574149545f54494d454f55545f46494e414c227d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a646174613a207b2263686f69636573223a5b7b2264656c7461223a7b7d2c2266696e6973685f726561736f6e223a2273746f70227d5d7d0a0a646174613a205b444f4e455d0a0a"
+          }
+        ]
+      }
+    },
+    {
+      "sequence": 7,
+      "scenario": "unknown-outcome-session",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [
+          {
+            "name": "accept",
+            "value": "*/*"
+          },
+          {
+            "name": "authorization",
+            "value": "{{SLOT_PROVIDER_AUTHORIZATION}}"
+          },
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": "{{SLOT_UNKNOWN_OUTCOME_REQUEST_BODY}}",
+        "messages": [
+          {
+            "role": "user",
+            "content": "unknown path unknown-outcome-session"
+          }
+        ],
+        "canonical_body_fingerprint": "sha256:5143fbe706bba9ef5966361d1c020b16f37903094888c2629141a1f47932cf4e",
+        "body_match": {
+          "contains": "unknown-outcome-session"
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "headers": [
+          {"name": "cache-control", "value": "no-store"},
+          {"name": "content-type", "value": "text/event-stream"}
+        ],
+        "complete": true,
+        "stream_error": false,
+        "canonical_response_fingerprint": "sha256:a9eae4867014dc2a166e53c69dc8c0e5da9d6d534a46e0db66ba17c0a6b7b0b0",
+        "body_sha256": "sha256:77ceb0ea76a81dcc40a07d1e008dc59e3cc4e5dd64f9e5f30461df7c82013bfe",
+        "chunks": [
+          {
+            "at_us": 0,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22746f6f6c5f63616c6c73223a5b7b22696e646578223a302c226964223a22756e6b6e6f776e2d746f6f6c2d63616c6c222c2274797065223a2266756e6374696f6e222c2266756e6374696f6e223a7b226e616d65223a22666978747572655f6173796e63222c22617267756d656e7473223a227b5c226d6f64655c223a5c22756e6b6e6f776e5c227d227d7d5d7d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a646174613a207b2263686f69636573223a5b7b2264656c7461223a7b7d2c2266696e6973685f726561736f6e223a22746f6f6c5f63616c6c73227d5d7d0a0a646174613a205b444f4e455d0a0a"
+          }
+        ]
+      }
+    },
+    {
+      "sequence": 8,
+      "scenario": "mobile-activity-session",
+      "request": {
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [
+          {
+            "name": "accept",
+            "value": "*/*"
+          },
+          {
+            "name": "authorization",
+            "value": "{{SLOT_PROVIDER_AUTHORIZATION}}"
+          },
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": "{{SLOT_MOBILE_ACTIVITY_REQUEST_BODY}}",
+        "messages": [
+          {
+            "role": "user",
+            "content": "mobile path mobile-activity-session"
+          }
+        ],
+        "canonical_body_fingerprint": "sha256:e0813e16be4b8e6f1adeaec03b4a42a5b11994ddc91bc82c80d1c045f401c00f",
+        "body_match": {
+          "contains": "mobile-activity-session"
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/event-stream",
+        "headers": [
+          {"name": "cache-control", "value": "no-store"},
+          {"name": "content-type", "value": "text/event-stream"}
+        ],
+        "complete": true,
+        "stream_error": false,
+        "canonical_response_fingerprint": "sha256:72e912d97e97121580ea06f6918e9030446a5c36e1aabf62d0af7fa53618139c",
+        "body_sha256": "sha256:3cd6d6322c0cb542a5662e6cad55cfebb09243fd96f6474d8e3fd1ee22065b9b",
+        "chunks": [
+          {
+            "at_us": 0,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22746f6f6c5f63616c6c73223a5b7b22696e646578223a302c226964223a22756e6b6e6f776e2d746f6f6c2d63616c6c222c2274797065223a2266756e6374696f6e222c2266756e6374696f6e223a7b226e616d65223a22666978747572655f6173796e63222c22617267756d656e7473223a227b5c226d6f64655c223a5c22756e6b6e6f776e5c227d227d7d2c7b22696e646578223a312c226964223a226d6f62696c652d776169742d63616c6c222c2274797065223a2266756e6374696f6e222c2266756e6374696f6e223a7b226e616d65223a22776169745f666f72222c22617267756d656e7473223a227b5c22726561736f6e5c223a5c226d6f62696c6520646561646c696e655c222c5c2274696d656f75745f7365636f6e64735c223a3630307d227d7d5d7d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a646174613a207b2263686f69636573223a5b7b2264656c7461223a7b7d2c2266696e6973685f726561736f6e223a22746f6f6c5f63616c6c73227d5d7d0a0a646174613a205b444f4e455d0a0a"
+          }
+        ]
+      }
+    }
+  ],
+  "canonical_fingerprint": {
+    "algorithm": "sha256",
+    "request": "canonical-json-body-and-exact-semantic-headers",
+    "response": "canonical-json-envelope-and-exact-recorded-chunks",
+    "note": "Every exchange carries a secret-free canonical request fingerprint and an exact response fingerprint; the live replay server rejects any mismatch before consuming the exchange."
+  },
+  "whole_digest": "sha256:3f9f13637500de9e45fa912cf173aac573f8df2ea86b9ce4db0b4d0234305f2b"
+}

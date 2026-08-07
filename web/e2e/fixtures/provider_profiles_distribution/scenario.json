@@ -1,0 +1,95 @@
+{
+  "schema": "zode.ui-e2e.provider-profiles-distribution.v1",
+  "provider": "fixture-provider",
+  "model": "fixture-model",
+  "firstFailureOwner": "e2e_browser_first_run_freezes_profile_descriptor_and_waits_for_replica_ready",
+  "actors": {
+    "primary": "provider-ui-human",
+    "secondary": "provider-ui-actor-b"
+  },
+  "actorAssertions": {
+    "sameProvider": true,
+    "profileCount": 2,
+    "replicaReadStatus": 200,
+    "selectedSharing": "declared_endpoint_only"
+  },
+  "seamMatrix": {
+    "firstFailure": {
+      "method": "GET",
+      "path": "/v1/providers",
+      "status": 200,
+      "recordedStatus": 404,
+      "classification": "shallow_non_evidence"
+    },
+    "bootstrap": {
+      "system": { "method": "GET", "path": "/v1/system", "status": 200 },
+      "endpoints": { "method": "GET", "path": "/v1/endpoints", "status": 200 },
+      "providers": { "method": "GET", "path": "/v1/providers", "status": 200 }
+    },
+    "endpointCatalog": {
+      "create": { "method": "POST", "path": "/v1/endpoints", "status": 201 },
+      "read": { "method": "GET", "path": "/v1/endpoints", "status": 200 },
+      "identity": { "method": "GET", "path": "/v1/identity", "status": 200 },
+      "capabilities": { "method": "GET", "path": "/v1/capabilities", "status": 200 },
+      "probe": {
+        "method": "POST",
+        "path": "/v1/endpoints/{endpoint_id}/probe",
+        "onlineStatus": 200,
+        "offlineStatus": 503
+      }
+    },
+    "providerDescriptor": { "method": "PUT", "path": "/v1/providers/{provider}", "status": 200 },
+    "profileList": { "method": "GET", "path": "/v1/providers/{provider}/auth-profiles", "status": 200 },
+    "profileCreate": { "method": "POST", "path": "/v1/providers/{provider}/auth-profiles", "status": 201 },
+    "defaultProfile": { "method": "PUT", "path": "/v1/providers/{provider}/default-auth-profile", "status": 200 },
+    "sharing": { "method": "PUT", "path": "/v1/auth-profiles/{profile_id}/sharing", "status": 202 },
+    "replicas": { "method": "GET", "path": "/v1/auth-profiles/{profile_id}/replicas", "status": 200 },
+    "replicaInstall": { "method": "PUT", "path": "/v1/auth-replicas/{profile_id}", "status": 201 },
+    "replicaTombstone": { "method": "PUT", "path": "/v1/auth-replicas/{profile_id}", "status": 200 },
+    "sessionCreate": { "method": "POST", "path": "/v1/endpoints/{endpoint_id}/sessions", "status": 201 }
+  },
+  "profiles": [
+    {
+      "label": "Primary API key",
+      "kind": "api_key",
+      "endpointLabel": "Endpoint A",
+      "notSharedEndpointLabel": "Endpoint B",
+      "sharing": "selected",
+      "default": true
+    },
+    {
+      "label": "Secondary OAuth",
+      "kind": "oauth",
+      "endpointLabel": "Endpoint B",
+      "notSharedEndpointLabel": "Endpoint A",
+      "sharing": "selected",
+      "default": false
+    }
+  ],
+  "uiSemantics": {
+    "deploymentSharedText": "deployment[ -]shared|shared deployment",
+    "forbiddenOwnershipTerms": ["personal", "owner", "workspace", "role", "grant"]
+  },
+  "distributionStatuses": [
+    "pending",
+    "stale",
+    "unreachable",
+    "ready",
+    "removing",
+    "removed"
+  ],
+  "securityAssertions": [
+    "dom",
+    "accessibility",
+    "storage",
+    "url",
+    "console",
+    "download"
+  ],
+  "llm": {
+    "requestsExpected": 0,
+    "recorderSchema": "zode.llm-http-recording.v1",
+    "quarantineRoot": "target/test-recordings/quarantine",
+    "firstFailureRule": "flush every unexpected wire exchange before failing; promote only an immutable redacted cassette"
+  }
+}

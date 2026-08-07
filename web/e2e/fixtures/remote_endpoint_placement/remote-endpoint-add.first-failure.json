@@ -1,0 +1,96 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "remote-endpoint-placement-first-404",
+  "purpose": "Retain the first real-browser remote Endpoint add exchange before the public route and probe path are implemented.",
+  "owner": "e2e_remote_endpoint_add_probe_and_endpoint_scoped_session_placement",
+  "boundary": "browser->management-origin",
+  "secret_slots": [
+    "SLOT_ACCESS_ASSERTION",
+    "SLOT_ENDPOINT_BASE_URL",
+    "SLOT_ENDPOINT_CONTROL_SECRET"
+  ],
+  "first_failure": {
+    "exchange_sequence": 0,
+    "status": 404,
+    "safe_error": "missing_public_endpoint_route"
+  },
+  "target_contract": {
+    "success_status": 201,
+    "endpoint_id_source": "remote_endpoint_identity_probe",
+    "session_url": "/endpoints/{endpoint_id}/sessions/{session_id}",
+    "session_id_source": "endpoint_generated_ulid"
+  },
+  "expected_after_fix": {
+    "status": 201,
+    "browser_assertions": [
+      "probe_progress_is_visible",
+      "response_omits_control_secret",
+      "session_url_contains_endpoint_id_and_endpoint_generated_ulid"
+    ]
+  },
+  "replay_policy": {
+    "same_first_failure_is_red": true,
+    "different_status_continues_to_behavioral_assertions": true,
+    "no_shallow_404_pass": true
+  },
+  "placement_contract": {
+    "session_create_and_list_path": "/v1/endpoints/{endpoint_id}/sessions",
+    "id_only_session_lookup": {
+      "path": "/v1/sessions/{session_id}",
+      "status": 404
+    },
+    "server_session_state": "absent",
+    "server_store": {
+      "session_ids": "absent",
+      "events": "absent",
+      "resume_cursors": "absent"
+    },
+    "unreachable": {
+      "status": "unreachable",
+      "authoritative": false,
+      "automatic_migration": false
+    },
+    "server_only_local_endpoint_id": null
+  },
+  "exchanges": [
+    {
+      "sequence": 0,
+      "request": {
+        "method": "POST",
+        "path": "/v1/endpoints",
+        "semantic_headers": {
+          "cf-access-jwt-assertion": "${SLOT_ACCESS_ASSERTION}",
+          "content-type": "application/json",
+          "idempotency-key": "remote-endpoint-add"
+        },
+        "raw_body": "{\"label\":\"Remote fixture endpoint\",\"base_url\":\"${SLOT_ENDPOINT_BASE_URL}\",\"control_auth\":{\"kind\":\"bearer\",\"secret\":\"${SLOT_ENDPOINT_CONTROL_SECRET}\"}}",
+        "canonical_json": {
+          "label": "Remote fixture endpoint",
+          "base_url": "${SLOT_ENDPOINT_BASE_URL}",
+          "control_auth": {
+            "kind": "bearer",
+            "secret": "${SLOT_ENDPOINT_CONTROL_SECRET}"
+          }
+        },
+        "body_sha256": "sha256:dbbb0c71e8e5dcb0fd516a8c0fb3a6ac861c8d90f56b1d7cb3098ffd4d70b20b",
+        "fingerprint": "sha256:aa77fee4e7148057d4e7cfeb220c6fa0f5d84f70b022b7c4bdc832ebe9a8dfe5"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": {},
+        "chunks": [
+          {
+            "offset_us": 0,
+            "body_hex": ""
+          }
+        ],
+        "completed": true,
+        "termination": "complete",
+        "body_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "sha256:7e6e0f246ea725216270957f07c13fcfbe5108f29314a5ea08eda80dabda5fd7"
+      }
+    }
+  ],
+  "whole_digest": "sha256:95bbff4c150b1dfc0b5682718d0d11133c603415a621e0ebf71697365a2ae63a"
+}

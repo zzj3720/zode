@@ -1,0 +1,1460 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "recording_id": "access-ingress-auth-boundary-first-404-20260807",
+  "purpose": "Preserve the first public HTTP 404 before Access ingress existed and replay the reviewed admission contract",
+  "owner": "e2e_access_human_service_and_jwks_rotation_gate_management",
+  "boundary": "zode-server-management-http",
+  "secret_slots": [
+    "SLOT_ACCESS_ASSERTION_AMBIGUOUS_ACTOR",
+    "SLOT_ACCESS_ASSERTION_DUPLICATE_A",
+    "SLOT_ACCESS_ASSERTION_DUPLICATE_B",
+    "SLOT_ACCESS_ASSERTION_EMPTY_ACTOR",
+    "SLOT_ACCESS_ASSERTION_EXPIRED_BEYOND_SKEW",
+    "SLOT_ACCESS_ASSERTION_FORGED_SIGNATURE",
+    "SLOT_ACCESS_ASSERTION_FUTURE_NBF_BEYOND_SKEW",
+    "SLOT_ACCESS_ASSERTION_HUMAN_VALID",
+    "SLOT_ACCESS_ASSERTION_MALFORMED_ASSERTION",
+    "SLOT_ACCESS_ASSERTION_MISSING_AUDIENCE",
+    "SLOT_ACCESS_ASSERTION_MISSING_EXP",
+    "SLOT_ACCESS_ASSERTION_MISSING_ISSUER",
+    "SLOT_ACCESS_ASSERTION_MISSING_KID",
+    "SLOT_ACCESS_ASSERTION_MISSING_SUBJECT",
+    "SLOT_ACCESS_ASSERTION_MISSING_TYPE",
+    "SLOT_ACCESS_ASSERTION_NON_NUMERIC_EXP",
+    "SLOT_ACCESS_ASSERTION_NON_NUMERIC_NBF",
+    "SLOT_ACCESS_ASSERTION_NON_STRING_AUDIENCE",
+    "SLOT_ACCESS_ASSERTION_NON_STRING_ISSUER",
+    "SLOT_ACCESS_ASSERTION_NON_STRING_SUBJECT",
+    "SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_ACCOUNT",
+    "SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_CURRENT_USER",
+    "SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_GRANTS",
+    "SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_INVITE",
+    "SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_LOGIN",
+    "SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_LOGOUT",
+    "SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_PRINCIPAL",
+    "SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_ROLES",
+    "SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_USERS",
+    "SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_WORKSPACES",
+    "SLOT_ACCESS_ASSERTION_SERVICE_VALID",
+    "SLOT_ACCESS_ASSERTION_UNKNOWN_KID_FAIL_CLOSED",
+    "SLOT_ACCESS_ASSERTION_UNKNOWN_KID_SINGLEFLIGHT",
+    "SLOT_ACCESS_ASSERTION_UNSUPPORTED_ALGORITHM",
+    "SLOT_ACCESS_ASSERTION_WRONG_AUDIENCE",
+    "SLOT_ACCESS_ASSERTION_WRONG_ISSUER",
+    "SLOT_ACCESS_ASSERTION_WRONG_TYPE",
+    "SLOT_CUSTOM_ACCESS_EMAIL",
+    "SLOT_CUSTOM_CF_AUTHORIZATION",
+    "SLOT_CUSTOM_ZODE_SUBJECT"
+  ],
+  "first_observed_outcome": {
+    "sequence": 0,
+    "status": 404,
+    "safe_error": "empty_router_http_404",
+    "response_fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe",
+    "observed_jwks_requests": 0
+  },
+  "exchanges": [
+    {
+      "sequence": 0,
+      "slot": "human-valid",
+      "phase": "management_admission",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_HUMAN_VALID}}"
+          }
+        ],
+        "semantic_headers_sha256": "3f116f20045111adaba564861aaba8d4ae5ca20bb1f1d125a2d543a454c6aa9c",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "ea5576b339ae0d879440c41732d3768873faccd818b3d23bae17424d275f1162"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 200,
+        "kind": "system"
+      }
+    },
+    {
+      "sequence": 1,
+      "slot": "service-valid",
+      "phase": "management_admission",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_SERVICE_VALID}}"
+          }
+        ],
+        "semantic_headers_sha256": "d316b9b9c2c3a57d3dc1dc3df1796c55fd0cb7962cc206b839830d3f8fa5d241",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "829b1c6bbed69230f67da0f3b9a8d39c3d841727f20827835ef295328fc11f2a"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 200,
+        "kind": "system"
+      }
+    },
+    {
+      "sequence": 2,
+      "slot": "missing-assertion",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "57c3ab089c0d06a629591b71303dd779d5300afb57780803c48e6515438a9757"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 3,
+      "slot": "duplicate-assertion",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_DUPLICATE_A}}"
+          },
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_DUPLICATE_B}}"
+          }
+        ],
+        "semantic_headers_sha256": "a681edfc24f8d10196d2b3dc3fc9a578c8c822e3924aedc0857c368b8f37f234",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "437b159eaa171b75a5543cb29326dfa52efcdefbb9483b6a1051814cda30a462"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 4,
+      "slot": "malformed-assertion",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_MALFORMED_ASSERTION}}"
+          }
+        ],
+        "semantic_headers_sha256": "515b69a78f8f3927be1b1b7b6afd93894185823764ad920f4b3a52b6e9a9fef2",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "c73cb46489f2cc668fd2ebf88c7b098374a8c69daf723347d535c5bcb13f8f79"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 5,
+      "slot": "forged-signature",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_FORGED_SIGNATURE}}"
+          }
+        ],
+        "semantic_headers_sha256": "f4ba34e163ba6cdc91a45555c01af909cb540df4c1233849e70697ee68061b4c",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "bc92a3a65501ce9f0778daf35d9e7424938afbb3c3ebdf8277d93975217506f4"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 6,
+      "slot": "expired-beyond-skew",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_EXPIRED_BEYOND_SKEW}}"
+          }
+        ],
+        "semantic_headers_sha256": "5f2e76e1c537ad2f6dfb39ca5d30346cdb5cc2be06d1c13c6f8f5940e65d2dda",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "853ccbadf21e83a987be5617964f9377b5d5697d652464e6c0c36b72db293502"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 7,
+      "slot": "future-nbf-beyond-skew",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_FUTURE_NBF_BEYOND_SKEW}}"
+          }
+        ],
+        "semantic_headers_sha256": "2433593ab5c5c940a2011f4527c4934442733915407e7d38230d150515c95921",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "3c1ea78fc50ae42245d2fb36357ce43bd9b0f157e6a32174d661329ba60a5925"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 8,
+      "slot": "wrong-issuer",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_WRONG_ISSUER}}"
+          }
+        ],
+        "semantic_headers_sha256": "7f902fc9ffa715aba81e4dbc2b1d0257984045697845742da0b95e0a9ed5310c",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "8bcfdbaaca2b520b85dfbfc52690ba8d5994541fc250cf542e96f6a688f5e68e"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 9,
+      "slot": "missing-issuer",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_MISSING_ISSUER}}"
+          }
+        ],
+        "semantic_headers_sha256": "612a3cb483908785d920757c2740a96fa87041c52e5e4fbb4598406e4fa2877a",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "25be79b62d5c7bb366b418e8957a3e004902b8dc427c977a7335f3e6a9e2cc2b"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 10,
+      "slot": "non-string-issuer",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NON_STRING_ISSUER}}"
+          }
+        ],
+        "semantic_headers_sha256": "768e5fe1243be17fa64b81ce7cc9b4b01555525c190f10b659f508c3db91b1a0",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "75ab5dda993230a4b71f3976d9713b54dd8a6653d5186a8811280ac0e61bdafc"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 11,
+      "slot": "wrong-audience",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_WRONG_AUDIENCE}}"
+          }
+        ],
+        "semantic_headers_sha256": "fdf39e61d4e598b169ea7aad73a8ff97b170b3ec97356ea42587b9ce87f257e8",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "f979e8e850db0f90d0f3f6ed84f665534dead26755e4c09b67591856ddc9c0b0"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 12,
+      "slot": "missing-audience",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_MISSING_AUDIENCE}}"
+          }
+        ],
+        "semantic_headers_sha256": "867fe12bf32b3e23706cb30c969a8b9c318fe5657bc1fae7d7f4d7c8ff7a95d5",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "e339517f7bf8282335f89687c6133af274e4b0490041e6456f9ffe3362f9b734"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 13,
+      "slot": "non-string-audience",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NON_STRING_AUDIENCE}}"
+          }
+        ],
+        "semantic_headers_sha256": "29d87ef04138710c4d541a1ba658fb1d3fb60ceb9884de4e46f272762b0d0ecd",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "eda127c8e77ae2319c9ef6c4d439e32132e2ff7c06689dc30a209916d0ec571b"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 14,
+      "slot": "unsupported-algorithm",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_UNSUPPORTED_ALGORITHM}}"
+          }
+        ],
+        "semantic_headers_sha256": "a0ce680a8d2ab4ea849f38b4c119550769df4d46110433829776bda3b3e91db2",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "51533144bb7c6c19261258fb021971539727dd106979f9b353d2b29d9326f7e0"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 15,
+      "slot": "missing-kid",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_MISSING_KID}}"
+          }
+        ],
+        "semantic_headers_sha256": "39e348c756c673dffe2a70ed1ebbf599e63c30e2694b1eca10517352d7c445c2",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "7120e1fbf194ba6e7fc2f4bf5338cf598105bb272933cc6b14a867e12c0c5809"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 16,
+      "slot": "missing-type",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_MISSING_TYPE}}"
+          }
+        ],
+        "semantic_headers_sha256": "f16f2638bbe2dafd648a6d1bb1987ecae02913191f42499385cc66d28c8645d7",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "c3f5a932686cd291ba87ee9ea212ec4047873362945c9819ff56f7dcea64345f"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 17,
+      "slot": "wrong-type",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_WRONG_TYPE}}"
+          }
+        ],
+        "semantic_headers_sha256": "0ae4b20149d3c79b82688763f40d7ba98ed8bf2f36379a07abddd98ce9637ad2",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "216bf6138cfbeb3d049ae26af1b38d84af7675f609c327ec86661d5c5bb705d5"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 18,
+      "slot": "missing-exp",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_MISSING_EXP}}"
+          }
+        ],
+        "semantic_headers_sha256": "86a7f915c36ebdb435bae761b32f02d69a33769bc1d8f64013ee82d7dadb7745",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "22cbea99a72bc62a24baca20356c5f18eabca30ba2619807021483a6236afa47"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 19,
+      "slot": "non-numeric-exp",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NON_NUMERIC_EXP}}"
+          }
+        ],
+        "semantic_headers_sha256": "0a26424af070c922522f382e7d15a5c971570cdad983995d84d37de6acef0d17",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "8f60756e893d0c81d5a6f77a9eb7c850fc25c3ccc908c39c07a1e54ab6c75d7c"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 20,
+      "slot": "non-numeric-nbf",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NON_NUMERIC_NBF}}"
+          }
+        ],
+        "semantic_headers_sha256": "e6f6c5aec6237aeaf374b5e521861d6699a6bc066a1f9950c4b21776578a53c2",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "a60e5fb974f3a3b8fd3af76093d2268bb6fa12d7dfb381eeb51d3b6e131f3fe3"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 21,
+      "slot": "missing-subject",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_MISSING_SUBJECT}}"
+          }
+        ],
+        "semantic_headers_sha256": "8cc5431a8f5df34c6dc00b346527345926740fc919863375c7eaf93839d0f096",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "ec535d33848b68e1f2e6b4117bc1cca529773e802140474f3e2d81bf638e1e12"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 22,
+      "slot": "ambiguous-actor",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_AMBIGUOUS_ACTOR}}"
+          }
+        ],
+        "semantic_headers_sha256": "7f509b5b7ded286f4624c669843ee0ba1bf315ee3d91b43a96408e86500d295d",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "4846f7858251545eea62cfde5f45b2af1848fbc1664e6f59af9d4e3c691e463c"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 23,
+      "slot": "empty-actor",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_EMPTY_ACTOR}}"
+          }
+        ],
+        "semantic_headers_sha256": "47f5a623c087ac6f94f53a245bde63cced65eb6821e34a980e679703c64bbd6e",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "fadb752f67133af75918955815fec4a65d8bfba69f29f4cfabb3ed88396edbc7"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 24,
+      "slot": "non-string-subject",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NON_STRING_SUBJECT}}"
+          }
+        ],
+        "semantic_headers_sha256": "59eb33fd8a86a2312612f6615d8963cd294107c997e43b44a9b08fe6ed759a68",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "5eb9b3c82ad94f1567c1ba9e7ff6ceb68f2760366cc9d5151b82732e7f4a3549"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 25,
+      "slot": "custom-identity-headers",
+      "phase": "ingress_rejection",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-authorization",
+            "value": "{{SLOT_CUSTOM_CF_AUTHORIZATION}}"
+          },
+          {
+            "name": "cf-access-authenticated-user-email",
+            "value": "{{SLOT_CUSTOM_ACCESS_EMAIL}}"
+          },
+          {
+            "name": "x-zode-subject",
+            "value": "{{SLOT_CUSTOM_ZODE_SUBJECT}}"
+          }
+        ],
+        "semantic_headers_sha256": "acfa6e5e1ce4df0edbd3e9174cb806092bf88c85b595d2ff6a65ee8f00361408",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "bc9c50ecf3071124b53e2d7dabc53baf9acc81bf0fa533405a1bf13be5918ef4"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 26,
+      "slot": "unknown-kid-singleflight",
+      "phase": "jwks_rotation_singleflight",
+      "concurrent_group": "unknown-kid-singleflight",
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_UNKNOWN_KID_SINGLEFLIGHT}}"
+          }
+        ],
+        "semantic_headers_sha256": "5fbce8b2728c638fa994b841a3a04d9b787b6777132c308783c512e22e215550",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "53685a99fc1873ce83cdb38ea84534058180b2f1cab35f8d4b2f7cee3ba7b3c6"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 200,
+        "kind": "system"
+      }
+    },
+    {
+      "sequence": 27,
+      "slot": "unknown-kid-singleflight",
+      "phase": "jwks_rotation_singleflight",
+      "concurrent_group": "unknown-kid-singleflight",
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_UNKNOWN_KID_SINGLEFLIGHT}}"
+          }
+        ],
+        "semantic_headers_sha256": "5fbce8b2728c638fa994b841a3a04d9b787b6777132c308783c512e22e215550",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "53685a99fc1873ce83cdb38ea84534058180b2f1cab35f8d4b2f7cee3ba7b3c6"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 200,
+        "kind": "system"
+      }
+    },
+    {
+      "sequence": 28,
+      "slot": "unknown-kid-singleflight",
+      "phase": "jwks_rotation_singleflight",
+      "concurrent_group": "unknown-kid-singleflight",
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_UNKNOWN_KID_SINGLEFLIGHT}}"
+          }
+        ],
+        "semantic_headers_sha256": "5fbce8b2728c638fa994b841a3a04d9b787b6777132c308783c512e22e215550",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "53685a99fc1873ce83cdb38ea84534058180b2f1cab35f8d4b2f7cee3ba7b3c6"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 200,
+        "kind": "system"
+      }
+    },
+    {
+      "sequence": 29,
+      "slot": "unknown-kid-singleflight",
+      "phase": "jwks_rotation_singleflight",
+      "concurrent_group": "unknown-kid-singleflight",
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_UNKNOWN_KID_SINGLEFLIGHT}}"
+          }
+        ],
+        "semantic_headers_sha256": "5fbce8b2728c638fa994b841a3a04d9b787b6777132c308783c512e22e215550",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "53685a99fc1873ce83cdb38ea84534058180b2f1cab35f8d4b2f7cee3ba7b3c6"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 200,
+        "kind": "system"
+      }
+    },
+    {
+      "sequence": 30,
+      "slot": "unknown-kid-fail-closed",
+      "phase": "jwks_refresh_fail_closed",
+      "concurrent_group": "unknown-kid-fail-closed",
+      "request": {
+        "method": "GET",
+        "path": "/v1/system",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_UNKNOWN_KID_FAIL_CLOSED}}"
+          }
+        ],
+        "semantic_headers_sha256": "8a4a939d9295ff4ebde0401c3fb950b23c44b5d13772824489cededc993cfecf",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "66f2e1ece76761b5d5cca29165244e890f7cc53b6b91ffe4c81fed738b8587af"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 401,
+        "kind": "safe_unauthorized"
+      }
+    },
+    {
+      "sequence": 31,
+      "slot": "no-user-route-login",
+      "phase": "absence_of_local_identity_routes",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/login",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_LOGIN}}"
+          }
+        ],
+        "semantic_headers_sha256": "3a85a703a9ef666e9e3be48ab7b2d9d0841f4afe0eb3055d78cba7b29cd02a7c",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "cc5f2f96c106652ed1aa65ad53eac7ea2b3e16c6c588f2797adff134ae199bb0"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 404,
+        "kind": "not_found"
+      }
+    },
+    {
+      "sequence": 32,
+      "slot": "no-user-route-logout",
+      "phase": "absence_of_local_identity_routes",
+      "concurrent_group": null,
+      "request": {
+        "method": "POST",
+        "path": "/v1/logout",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_LOGOUT}}"
+          }
+        ],
+        "semantic_headers_sha256": "92cd32ff7ce3be3bea810d8cd0e8b3647b462fbace3aa3abe80e1d011758ccb9",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "69b1e8eb55616f3dc36cea2cae08c030e9b9e5c95cee3b0c5e3c2a23e6d50d1c"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 404,
+        "kind": "not_found"
+      }
+    },
+    {
+      "sequence": 33,
+      "slot": "no-user-route-users",
+      "phase": "absence_of_local_identity_routes",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/users",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_USERS}}"
+          }
+        ],
+        "semantic_headers_sha256": "4743b592cf9c9e7ff2d705f8b01f81e6160447a3f36a58a0be4fc751e06552cb",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "27344c579de21dac2686deb267c3e589f3f660ded65b62d591b4f4cc4bc05616"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 404,
+        "kind": "not_found"
+      }
+    },
+    {
+      "sequence": 34,
+      "slot": "no-user-route-workspaces",
+      "phase": "absence_of_local_identity_routes",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/workspaces",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_WORKSPACES}}"
+          }
+        ],
+        "semantic_headers_sha256": "cefc79a0ebd585cf9d793df9599eb38d2b1213738533ff131a04a79554bee83e",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "00d44033565010308d499e64fba1ee0b20c6522798e99243f8098075e4c76265"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 404,
+        "kind": "not_found"
+      }
+    },
+    {
+      "sequence": 35,
+      "slot": "no-user-route-roles",
+      "phase": "absence_of_local_identity_routes",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/roles",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_ROLES}}"
+          }
+        ],
+        "semantic_headers_sha256": "9b1681091e2cf92b7e766d36a1d787195b3880c672facb4a995fb69ba8178881",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "fd162882c53276573e7940e560ea9034032f398218b577560ad5e55f3fb96ed4"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 404,
+        "kind": "not_found"
+      }
+    },
+    {
+      "sequence": 36,
+      "slot": "no-user-route-grants",
+      "phase": "absence_of_local_identity_routes",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/grants",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_GRANTS}}"
+          }
+        ],
+        "semantic_headers_sha256": "cefe8e668be6c889720bf619d238adbaa6bba90f190877c962002adec5cf8bd3",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "c5be27e7b0b5c87585eddd35cd8890bacf09fc6c14ff2929d787bd13b9cd407f"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 404,
+        "kind": "not_found"
+      }
+    },
+    {
+      "sequence": 37,
+      "slot": "no-user-route-current-user",
+      "phase": "absence_of_local_identity_routes",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/current-user",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_CURRENT_USER}}"
+          }
+        ],
+        "semantic_headers_sha256": "b465f7f7b338b023cf963ba3bb562522b4e3bf4534dee7f9bf5233e0db28d18a",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "f8753b4e2f7c4b55415948818c151b9affdb5349c1d8318c66770677cde4f35a"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 404,
+        "kind": "not_found"
+      }
+    },
+    {
+      "sequence": 38,
+      "slot": "no-user-route-principal",
+      "phase": "absence_of_local_identity_routes",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/principal",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_PRINCIPAL}}"
+          }
+        ],
+        "semantic_headers_sha256": "20b91c1e4f06bad2209f166471afa877758716db3df3c91ac72a538726299c4a",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "79a65073e84e23baebd2880e7e1507b9a8039663df3627ed47f6f75560061a15"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 404,
+        "kind": "not_found"
+      }
+    },
+    {
+      "sequence": 39,
+      "slot": "no-user-route-invite",
+      "phase": "absence_of_local_identity_routes",
+      "concurrent_group": null,
+      "request": {
+        "method": "POST",
+        "path": "/v1/invite",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_INVITE}}"
+          }
+        ],
+        "semantic_headers_sha256": "6eb1648239a972ca551f6002f0931b5a0a4c215d6fc48bd1c0f32a0192353a97",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "35c8bc22866c8480b95a98eb502da90f2e6678e3004b5bc3e464bf772de836cb"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 404,
+        "kind": "not_found"
+      }
+    },
+    {
+      "sequence": 40,
+      "slot": "no-user-route-account",
+      "phase": "absence_of_local_identity_routes",
+      "concurrent_group": null,
+      "request": {
+        "method": "GET",
+        "path": "/v1/account",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "{{SLOT_ACCESS_ASSERTION_NO_USER_ROUTE_ACCOUNT}}"
+          }
+        ],
+        "semantic_headers_sha256": "550aac6b9f047da69f1f1dbde0f0109e8dc50dfa0938a4b24ea07999737d7a48",
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "b58b8119e106396b2b6529671623ca55f537564d25bb8a593b8b5c50566a8517"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "semantic_headers_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "body_hex": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "600e25a77449ee87e4e510d835c67b2e962e9b21a8bd8f265f19e26252a22abe"
+      },
+      "contract": {
+        "status": 404,
+        "kind": "not_found"
+      }
+    }
+  ],
+  "envelope_sha256": "795c9d4cc070ec450eb8027ef396a11a07b7dc468b9e9024c599946902ed41bc"
+}

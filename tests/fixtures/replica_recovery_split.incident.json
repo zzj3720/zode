@@ -1,0 +1,47 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "replica-recovery-split-first-200",
+  "owner": "e2e_auth_replica_recovery_does_not_split_active_and_receipt_metadata",
+  "boundary": "endpoint_http",
+  "first_failure": {
+    "status": 200,
+    "error_code": "stale_active_replica_after_receipt_loss",
+    "response_fingerprint": "5d3f2f0e596c15c9db07c9e2459715eedc479e2c12782f965dcfee3fe1b2aa98"
+  },
+  "slots": [
+    "SLOT_CONTROLLER_AUTHORIZATION",
+    "SLOT_CONTROLLER_SUBJECT"
+  ],
+  "request": {
+    "method": "GET",
+    "path": "/v1/auth-replicas/control-profile",
+    "headers": [
+      {
+        "name": "authorization",
+        "value": "SLOT_CONTROLLER_AUTHORIZATION"
+      },
+      {
+        "name": "zode-subject",
+        "value": "SLOT_CONTROLLER_SUBJECT"
+      }
+    ],
+    "body": ""
+  },
+  "response": {
+    "status": 200,
+    "headers": [
+      {
+        "name": "content-type",
+        "value": "application/json"
+      }
+    ],
+    "body": "{\"schema\":\"zode.auth-replica.v1\",\"authority_id\":\"controller-e2e\",\"auth_profile_id\":\"control-profile\",\"provider\":\"fixture-provider\",\"revision\":1,\"expires_at_ms\":null,\"status\":\"ready\"}"
+  },
+  "canonical_fingerprint": {
+    "algorithm": "sha256",
+    "request": "3d198c7dea135e8aef96b6d30abd65e8d2c260956313504a790bc99b498b7312",
+    "response": "5d3f2f0e596c15c9db07c9e2459715eedc479e2c12782f965dcfee3fe1b2aa98"
+  },
+  "whole_digest": "sha256:99c856fa040e320cf97850e5a45d5af9670ed8c0c6a5be91f35b6aebecd63a13"
+}

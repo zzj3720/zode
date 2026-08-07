@@ -1,0 +1,42 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "provider-profiles-browser-first-404",
+  "purpose": "retain the first real-browser provider bootstrap failure before profile distribution is implemented",
+  "owner": "e2e_browser_first_run_freezes_profile_descriptor_and_waits_for_replica_ready",
+  "boundary": "management_http_browser",
+  "secret_slots": [],
+  "first_observed_outcome": {
+    "sequence": 0,
+    "status": 404,
+    "safe_error": "missing_public_provider_route",
+    "response_fingerprint": "sha256:60adbc991fbf8cb5d3c149b36c01cc20971a7cb820c171009be64a5ae09cc9c1"
+  },
+  "exchanges": [
+    {
+      "sequence": 0,
+      "request": {
+        "method": "GET",
+        "path": "/v1/providers",
+        "semantic_headers": [],
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "sha256:bb8207b9016400b9b92de3621428b95a5f5d65fc639f1f0ed63e27ec35b79c7f"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "body_hex": "",
+        "body_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "sha256:60adbc991fbf8cb5d3c149b36c01cc20971a7cb820c171009be64a5ae09cc9c1"
+      },
+      "contract_response": {
+        "status": 200,
+        "kind": "providers_list"
+      }
+    }
+  ],
+  "whole_digest": "sha256:77d0fb6db2d8a08090243c40cfa90c97da219df934e937f05b95e97047ff9068"
+}

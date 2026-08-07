@@ -1,0 +1,41 @@
+{
+  "schema": "zode.web-two-actor-session-isolation-incident.v1",
+  "owner": "e2e_browser_provider_profiles_are_shared_deployment_resources",
+  "boundary": "browser_management_http_sse",
+  "firstObserved": {
+    "status": 404,
+    "safeCode": null,
+    "message": "actor-a GET /providers -> 404 [shallow_non_evidence]",
+    "classification": "shallow_non_evidence",
+    "exchangeSequence": 0
+  },
+  "exchanges": [
+    {
+      "sequence": 0,
+      "actor": "actor-a",
+      "method": "GET",
+      "path": "/providers",
+      "request": {
+        "semanticHeaders": {},
+        "bodyHex": "",
+        "bodySha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonicalJson": null
+      },
+      "response": {
+        "status": 404,
+        "semanticHeaders": {
+          "content-length": "0"
+        },
+        "bodyHex": "",
+        "bodySha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonicalJson": null,
+        "chunks": [],
+        "responseCode": null,
+        "completed": true,
+        "termination": "complete"
+      }
+    }
+  ],
+  "endpointExchanges": [],
+  "wholeDigest": "sha256:8b0b570920dceced492289755e34b014bdd55a8b540250c9a401da0cd25e87b4"
+}

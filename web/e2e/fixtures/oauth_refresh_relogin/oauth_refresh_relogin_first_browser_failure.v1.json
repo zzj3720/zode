@@ -1,0 +1,52 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "oauth-refresh-relogin-browser-first-404-20260807",
+  "purpose": "retain the first real-browser management bootstrap failure before OAuth ticket repair",
+  "owner": "e2e_browser_write_only_secrets_and_oauth_ticket_non_disclosure",
+  "boundary": "management_http_browser",
+  "secret_slots": [],
+  "first_observed_outcome": {
+    "sequence": 1,
+    "status": 404,
+    "safe_error": "missing_public_provider_route",
+    "response_fingerprint": "sha256:60adbc991fbf8cb5d3c149b36c01cc20971a7cb820c171009be64a5ae09cc9c1",
+    "classification": "PRODUCT_ROUTE_MISSING_SHALLOW_404",
+    "non_evidence": true
+  },
+  "exchanges": [
+    {
+      "sequence": 1,
+      "request": {
+        "method": "GET",
+        "path": "/v1/providers",
+        "semantic_headers": [],
+        "raw_body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "sha256:bb8207b9016400b9b92de3621428b95a5f5d65fc639f1f0ed63e27ec35b79c7f"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "body_hex": "",
+        "body_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "complete",
+        "fingerprint": "sha256:60adbc991fbf8cb5d3c149b36c01cc20971a7cb820c171009be64a5ae09cc9c1"
+      },
+      "contract": {
+        "status": 404,
+        "kind": "missing_public_provider_route"
+      }
+    }
+  ],
+  "expected_after_fix": {
+    "status": 200,
+    "safe_outcome": "management_ui_bootstrapped"
+  },
+  "replay_policy": {
+    "shallow_404_is_non_evidence": true,
+    "continue_only_after_status": 200
+  },
+  "whole_digest": "sha256:f45f65f6753440587d460b1ab61ee91a0133f4e7087b1f90d260897be588a454"
+}

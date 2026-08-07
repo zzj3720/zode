@@ -1,0 +1,27 @@
+{
+  "schema": "zode.llm-http-recording-legacy-sidecar.v1",
+  "source_file": "opencode_go_deepseek_v4_flash.v1.json",
+  "source_bytes": 36462,
+  "source_sha256": "3f0f7b69fac0620b0b24d774972840c0b9ee99897c2e16a63466309248b160ab",
+  "owner": "e2e_opencode_v1_first_occurrence_remains_replayable",
+  "boundary": "endpoint_aimux_provider_http",
+  "request_match": "canonical_json",
+  "exchanges": [
+    {
+      "sequence": 0,
+      "request_body_sha256": "e88fcac9bf170207b4d6db22e5414e98910d5403e8afc18fb9a08c52fc028f97",
+      "response_body_sha256": "71f6d0bf968adec9bda376e4dcfe85a87fe3d6ec81a10bdb75e726019c72472d",
+      "response_chunk_count": 47,
+      "legacy_outcome": "client_disconnect_after_done",
+      "replay_outcome": "complete_after_done"
+    },
+    {
+      "sequence": 1,
+      "request_body_sha256": "201e4d191074aa4b315c02807c110b673d076fdfb50ff4a6e8ed5f70dac44bc6",
+      "response_body_sha256": "5085650852c1f4b035a754363c90dad9510a4870cd3667f6dc85809981251c69",
+      "response_chunk_count": 58,
+      "legacy_outcome": "client_disconnect_after_done",
+      "replay_outcome": "complete_after_done"
+    }
+  ]
+}

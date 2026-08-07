@@ -1,0 +1,91 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "model-stop-after-partial-tool-input-first-occurrence",
+  "owner": "e2e_model_stop_after_partial_tool_input_has_no_assistant_or_tool_effect",
+  "boundary": "endpoint_model_provider",
+  "first_failure": {
+    "status": 200,
+    "boundary": "provider_model_stream",
+    "error_code": "partial_tool_input_finish_stop"
+  },
+  "slots": [
+    "SLOT_PROVIDER_MODEL_AUTHORIZATION"
+  ],
+  "provider": "fixture-provider",
+  "model": "fixture-model",
+  "exchanges": [
+    {
+      "body": "{\"model\":\"fixture-model\",\"messages\":[{\"role\":\"user\",\"content\":\"first input before partial stop\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"fixture_tool\",\"parameters\":{\"type\":\"object\"},\"description\":\"controlled HTTP tool\"}},{\"type\":\"function\",\"function\":{\"name\":\"wait_for\",\"parameters\":{\"type\":\"object\",\"properties\":{\"reason\":{\"type\":\"string\"},\"timeout_seconds\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":600}},\"required\":[\"reason\"],\"additionalProperties\":false},\"description\":\"Pause this session until new input or a runtime notification arrives.\"}}],\"tool_choice\":\"auto\"}",
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "response": {
+        "chunks": [
+          {
+            "at_us": 6,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22746f6f6c5f63616c6c73223a5b7b22696e646578223a302c226964223a227061727469616c2d73746f702d63616c6c222c2274797065223a2266756e6374696f6e222c2266756e6374696f6e223a7b226e616d65223a22666978747572655f746f6f6c222c22617267756d656e7473223a22227d7d5d7d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a"
+          },
+          {
+            "at_us": 53,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22746f6f6c5f63616c6c73223a5b7b22696e646578223a302c2266756e6374696f6e223a7b22617267756d656e7473223a227b5c2276616c75655c223a5c22706172227d7d5d7d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a"
+          },
+          {
+            "at_us": 69,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22746f6f6c5f63616c6c73223a5b7b22696e646578223a302c2266756e6374696f6e223a7b22617267756d656e7473223a227469616c5c227d227d7d5d7d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a"
+          },
+          {
+            "at_us": 102,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b7d2c2266696e6973685f726561736f6e223a2273746f70227d5d7d0a0a"
+          },
+          {
+            "at_us": 4777,
+            "bytes_hex": "646174613a205b444f4e455d0a0a"
+          }
+        ],
+        "complete": true,
+        "content_type": "text/event-stream",
+        "status": 200,
+        "stream_error": false
+      }
+    },
+    {
+      "body": "{\"model\":\"fixture-model\",\"messages\":[{\"role\":\"user\",\"content\":\"first input before partial stop\"},{\"role\":\"assistant\",\"content\":\"\"},{\"role\":\"user\",\"content\":\"queued input after partial stop\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true},\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"fixture_tool\",\"parameters\":{\"type\":\"object\"},\"description\":\"controlled HTTP tool\"}},{\"type\":\"function\",\"function\":{\"name\":\"wait_for\",\"parameters\":{\"type\":\"object\",\"properties\":{\"reason\":{\"type\":\"string\"},\"timeout_seconds\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":600}},\"required\":[\"reason\"],\"additionalProperties\":false},\"description\":\"Pause this session until new input or a runtime notification arrives.\"}}],\"tool_choice\":\"auto\"}",
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "response": {
+        "chunks": [
+          {
+            "at_us": 4,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22636f6e74656e74223a2271756575656420696e707574207265636f7665726564227d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a"
+          },
+          {
+            "at_us": 33,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b7d2c2266696e6973685f726561736f6e223a2273746f70227d5d7d0a0a"
+          },
+          {
+            "at_us": 46,
+            "bytes_hex": "646174613a205b444f4e455d0a0a"
+          }
+        ],
+        "complete": true,
+        "content_type": "text/event-stream",
+        "status": 200,
+        "stream_error": false
+      }
+    }
+  ],
+  "canonical_fingerprint": {
+    "algorithm": "sha256",
+    "exchanges": [
+      {
+        "request": "091388c650fa830a673aaeadf5b67481760ce54c8fa42d6ce0d7f223ec2deab7",
+        "response": "1d5ff146224c19e0d87db7ad5ee682f906b121cb494de75ea2f51925ad346951"
+      },
+      {
+        "request": "84fb9e627c0a0b16054d21dd06f401caf215bee942f744ba7ccd841652e16f76",
+        "response": "3d2de698ee6894c6788960d59a06cfd566bfec2cd774aa400cf65abe4d50e331"
+      }
+    ]
+  },
+  "whole_digest": "sha256:2af0f26b4d8c3cd554b784251bf303e666c6edb1f04512bceb22b733823b3152"
+}

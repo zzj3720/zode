@@ -1,0 +1,48 @@
+{
+  "schema": "zode.access-entry-shallow-non-evidence.v1",
+  "version": 1,
+  "classification": "PRODUCT_ROUTE_MISSING_SHALLOW_404",
+  "evidence_status": "shallow_non_evidence",
+  "non_evidence": true,
+  "replay_policy": {
+    "boundary": "browser->management-origin",
+    "shallow_404_is_non_evidence": true,
+    "readiness_is_non_evidence": true,
+    "continue_only_after_status": 200
+  },
+  "sources": [
+    {
+      "cassette": "management-entry-first-failure.v1.json",
+      "owner": "e2e_access_entry_reentry_through_real_access_edge",
+      "path": "/",
+      "first_observed_outcome": {
+        "sequence": 1,
+        "status": 404,
+        "safe_error": "management_ui_bootstrap_not_found"
+      },
+      "recorded_response": {
+        "status": 404,
+        "body_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "target_status": 200,
+      "cassette_digest": "sha256:31b9d43c4d650a23f7090088a47900aa19e560dfd478962ede0235c9e5921f3f"
+    },
+    {
+      "cassette": "browser-access-reentry-first-failure.v1.json",
+      "owner": "e2e_browser_access_reentry_stops_mutations_and_uses_management_origin",
+      "path": "/?view=sessions",
+      "first_observed_outcome": {
+        "sequence": 1,
+        "status": 404,
+        "safe_error": "management_ui_bootstrap_not_found"
+      },
+      "recorded_response": {
+        "status": 404,
+        "body_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "target_status": 200,
+      "cassette_digest": "sha256:24d486e36f1feeb09d17663a3a585b577d8a70aa8bd03b97c988ce8a21dc6633"
+    }
+  ],
+  "whole_digest": "sha256:9e1c9e774168dbfd347e7d7336cb8712881324af5ded206214e0e3b51679f82c"
+}

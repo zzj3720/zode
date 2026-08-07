@@ -1,0 +1,68 @@
+{
+  "schema": "zode.browser-visual-contract.v1",
+  "viewport": {
+    "width": 1920,
+    "height": 1080,
+    "device_scale_factor": 1
+  },
+  "geometry": {
+    "sidebar_width": 274,
+    "main_header_height": 56,
+    "thread_column_width": 736,
+    "composer_width": 736,
+    "composer_bottom_inset": 16,
+    "composer_radius": 24,
+    "navigation_row_height": 32,
+    "navigation_row_radius": 8,
+    "icon_size": 16,
+    "body_font_size": 15,
+    "body_line_height": 24,
+    "maximum_deviation_css_px": 1
+  },
+  "palette": {
+    "sidebar": "#27363b",
+    "selected_row": "#38464b",
+    "main": "#181818",
+    "secondary_surface": "#242424",
+    "composer": "#2a2a2a",
+    "primary_text": "#f5f6f6",
+    "secondary_text": "#dfe1e1",
+    "attention": "#f39c12"
+  },
+  "selectors": {
+    "shell": "[data-zode-shell]",
+    "sidebar": "[data-zode-shell-sidebar]",
+    "main_surface": "[data-zode-shell-main]",
+    "header": "[data-zode-shell-header]",
+    "thread_column": "[data-zode-thread-column]",
+    "composer": "[data-zode-composer]",
+    "secondary_surface": "[data-zode-secondary-surface]",
+    "navigation_row": "[data-zode-nav-row]",
+    "selected_row": "[data-zode-nav-row][data-zode-selected=\"true\"]",
+    "sidebar_icon": "[data-zode-nav-row] [data-zode-nav-icon]",
+    "primary_text": "[data-zode-primary-text]",
+    "secondary_text": "[data-zode-secondary-text]",
+    "attention": "[data-zode-attention]",
+    "dynamic": [
+      "[data-zode-visual-dynamic]",
+      "[data-zode-visual-id]",
+      "[data-zode-visual-timestamp]",
+      "[data-zode-visual-token]",
+      "[data-zode-visual-caret]"
+    ]
+  },
+  "visual_diff": {
+    "maximum_changed_pixel_ratio": 0.002,
+    "maximum_masked_pixel_ratio": 0.05,
+    "maximum_channel_deviation": 1,
+    "mask_color": [255, 0, 255, 255]
+  },
+  "session_states": {
+    "stream": "[data-zode-session-state=\"streaming\"]",
+    "wait": "[data-zode-session-state=\"waiting\"]",
+    "tool": "[data-zode-session-state=\"tool\"]",
+    "error": "[data-zode-session-state=\"error\"]",
+    "reconnect": "[data-zode-session-state=\"reconnecting\"]",
+    "focus": "[data-zode-composer]:focus-within"
+  }
+}

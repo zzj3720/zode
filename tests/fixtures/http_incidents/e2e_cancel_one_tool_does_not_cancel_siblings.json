@@ -1,0 +1,420 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "recording_id": "http-incident:e2e_cancel_one_tool_does_not_cancel_siblings:v1",
+  "purpose": "retain the first public cancellation failure and both concurrent tool exchanges",
+  "owner": "tests/async_wait_e2e.rs",
+  "boundary": "Endpoint public HTTP and provider/tool network adapters",
+  "owning_e2e": "e2e_cancel_one_tool_does_not_cancel_siblings",
+  "secret_slots": [
+    "{{PROVIDER_MODEL_AUTHORIZATION_HEADER}}",
+    "{{PUBLIC_TOOL_CALL_CANCEL_AUTHORIZATION_HEADER}}"
+  ],
+  "first_seen_failure": {
+    "boundary": "public.tool_call_cancel",
+    "safe_error": "tool cancellation route returned 404 Not Found before sibling isolation could be observed",
+    "status": 404,
+    "response_sha256": "8ae95de560314aafee066c34d60ebb7dca33adb1b5dee22ef32ae5162952a7fc",
+    "response_fingerprint": "71fe4723929ea899edebef74daa09ac164d6467606959c48058d5ff7f14c85d2"
+  },
+  "exchanges": [
+    {
+      "sequence": 0,
+      "boundary": "provider.model",
+      "request": {
+        "method": "POST",
+        "path": "/chat/completions",
+        "semantic_headers": [
+          {
+            "name": "authorization",
+            "value": "{{PROVIDER_MODEL_AUTHORIZATION_HEADER}}"
+          },
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "raw_body_hex": "7b226d6f64656c223a22666978747572652d6d6f64656c222c226d65737361676573223a5b7b22726f6c65223a2275736572222c22636f6e74656e74223a2263616e63656c206f6e6520746f6f6c20627574206b65657020697473207369626c696e67227d5d2c2273747265616d223a747275652c2273747265616d5f6f7074696f6e73223a7b22696e636c7564655f7573616765223a747275657d2c22746f6f6c73223a5b7b2274797065223a2266756e6374696f6e222c2266756e6374696f6e223a7b226e616d65223a2263616e63656c5f746f6f6c222c22706172616d6574657273223a7b2274797065223a226f626a656374227d2c226465736372697074696f6e223a22636f6e74726f6c6c65642064657669636520746f6f6c227d7d2c7b2274797065223a2266756e6374696f6e222c2266756e6374696f6e223a7b226e616d65223a227369626c696e675f746f6f6c222c22706172616d6574657273223a7b2274797065223a226f626a656374227d2c226465736372697074696f6e223a22636f6e74726f6c6c65642064657669636520746f6f6c227d7d2c7b2274797065223a2266756e6374696f6e222c2266756e6374696f6e223a7b226e616d65223a22776169745f666f72222c22706172616d6574657273223a7b2274797065223a226f626a656374222c2270726f70657274696573223a7b22726561736f6e223a7b2274797065223a22737472696e67227d2c2274696d656f75745f7365636f6e6473223a7b2274797065223a22696e7465676572222c226d696e696d756d223a312c226d6178696d756d223a3630307d7d2c227265717569726564223a5b22726561736f6e225d2c226164646974696f6e616c50726f70657274696573223a66616c73657d2c226465736372697074696f6e223a22506175736520746869732073657373696f6e20756e74696c206e657720696e707574206f7220612072756e74696d65206e6f74696669636174696f6e20617272697665732e227d7d5d2c22746f6f6c5f63686f696365223a226175746f227d",
+        "canonical_json": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "cancel one tool but keep its sibling"
+            }
+          ],
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "cancel_tool",
+                "parameters": {
+                  "type": "object"
+                },
+                "description": "controlled device tool"
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "sibling_tool",
+                "parameters": {
+                  "type": "object"
+                },
+                "description": "controlled device tool"
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "wait_for",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "reason": {
+                      "type": "string"
+                    },
+                    "timeout_seconds": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 600
+                    }
+                  },
+                  "required": [
+                    "reason"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Pause this session until new input or a runtime notification arrives."
+              }
+            }
+          ],
+          "tool_choice": "auto"
+        },
+        "body_sha256": "9b904d86b46c4fb1945d145ea2166c57567d05e05902caac03892edab47d38be",
+        "tool_call_id": null,
+        "fingerprint": "e0f421ab921c82c9c1163407ef9ce8014ce879f3309191795ca6fb8c4a32cd50"
+      },
+      "response": {
+        "status": 200,
+        "semantic_headers": [
+          {
+            "name": "content-type",
+            "value": "text/event-stream"
+          }
+        ],
+        "chunks": [
+          {
+            "at_us": 10,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22746f6f6c5f63616c6c73223a5b7b22696e646578223a302c226964223a2263616e63656c2d63616c6c222c2274797065223a2266756e6374696f6e222c2266756e6374696f6e223a7b226e616d65223a2263616e63656c5f746f6f6c222c22617267756d656e7473223a227b5c2276616c75655c223a5c2263616e63656c5c227d227d7d2c7b22696e646578223a312c226964223a227369626c696e672d63616c6c222c2274797065223a2266756e6374696f6e222c2266756e6374696f6e223a7b226e616d65223a227369626c696e675f746f6f6c222c22617267756d656e7473223a227b5c2276616c75655c223a5c227369626c696e675c227d227d7d5d7d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a",
+            "sha256": "7406c0c4f1ed83c8ac9f8f730e993bede7c26c6f21b521ce19b7892213363261"
+          },
+          {
+            "at_us": 576,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b7d2c2266696e6973685f726561736f6e223a22746f6f6c5f63616c6c73227d5d7d0a0a",
+            "sha256": "ca3899cd31f69e1a4a27eec62dde8874b35f89b95217c3e12bd0c22c9a752fc8"
+          },
+          {
+            "at_us": 966,
+            "bytes_hex": "646174613a205b444f4e455d0a0a",
+            "sha256": "d8d37da081f11203f2af42092a92cb35508f27db75eba643058a0a580454517d"
+          }
+        ],
+        "complete": true,
+        "partial": false,
+        "disconnected": false,
+        "error": null,
+        "body_sha256": "e05a16455168372b61bcaebb35fee97cfa37c3d520286e8204f32ea2136458a8",
+        "fingerprint": "d40c5b02c9af63e165858c9ee134775f521677e4fc5bef7d967779d531a96c79"
+      }
+    },
+    {
+      "sequence": 1,
+      "boundary": "tool.cancel",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "semantic_headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "raw_body_hex": "7b22746f6f6c5f63616c6c5f6964223a2263616e63656c2d63616c6c222c22746f6f6c5f6e616d65223a2263616e63656c5f746f6f6c222c22696e707574223a7b2276616c7565223a2263616e63656c227d7d",
+        "canonical_json": {
+          "tool_call_id": "cancel-call",
+          "tool_name": "cancel_tool",
+          "input": {
+            "value": "cancel"
+          }
+        },
+        "body_sha256": "dda6cb6e6c3c2edc0261df7fea541f4aeaa7bc1b4c27caf5ea5e189b8d12613d",
+        "tool_call_id": "cancel-call",
+        "fingerprint": "1bdbdef7415dcb20c6b8008e506814747728d7199175512425dfa084cc29aff6"
+      },
+      "response": {
+        "status": 200,
+        "semantic_headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "chunks": [
+          {
+            "at_us": 2,
+            "bytes_hex": "7b22737461747573223a22636f6d706c65746564222c22726573756c74223a7b22636f6e74656e74223a2263616e63656c6c656420746f6f6c206576656e7475616c6c792072657475726e6564227d7d",
+            "sha256": "3d56045ee614ea885c313fff3e5be31a683afe01bc6dd1805f2f74da4b1262f8"
+          }
+        ],
+        "complete": true,
+        "partial": false,
+        "disconnected": false,
+        "error": null,
+        "body_sha256": "3d56045ee614ea885c313fff3e5be31a683afe01bc6dd1805f2f74da4b1262f8",
+        "fingerprint": "c53f05e72c3fd25c2a54f32496e8b1a48255406ca9fdf6b500ae95e8abac8ab0"
+      }
+    },
+    {
+      "sequence": 2,
+      "boundary": "tool.sibling",
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "semantic_headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "raw_body_hex": "7b22746f6f6c5f63616c6c5f6964223a227369626c696e672d63616c6c222c22746f6f6c5f6e616d65223a227369626c696e675f746f6f6c222c22696e707574223a7b2276616c7565223a227369626c696e67227d7d",
+        "canonical_json": {
+          "tool_call_id": "sibling-call",
+          "tool_name": "sibling_tool",
+          "input": {
+            "value": "sibling"
+          }
+        },
+        "body_sha256": "c4839e0ac59b61e4cc35ce8e6180487ba2a82cd38333cab48f5d17997cc044cb",
+        "tool_call_id": "sibling-call",
+        "fingerprint": "4c0961e405d9c91fdb867319866b025199c9ab5722c109ef000df8bbb2261c6f"
+      },
+      "response": {
+        "status": 200,
+        "semantic_headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "chunks": [
+          {
+            "at_us": 4,
+            "bytes_hex": "7b22737461747573223a22636f6d706c65746564222c22726573756c74223a7b22636f6e74656e74223a227369626c696e6720636f6d706c65746564227d7d",
+            "sha256": "c0b48c48c8169731f7536288eb318bf9f3d5963d9b4f274be1befa1884f8ebb7"
+          }
+        ],
+        "complete": true,
+        "partial": false,
+        "disconnected": false,
+        "error": null,
+        "body_sha256": "c0b48c48c8169731f7536288eb318bf9f3d5963d9b4f274be1befa1884f8ebb7",
+        "fingerprint": "6ae48b435ac9e89f5aaffcff066c339ab3839f351ec5d0d5f2bbc5f4b00671a6"
+      }
+    },
+    {
+      "sequence": 3,
+      "boundary": "public.tool_call_cancel",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sessions/01KZEKV5P5B2T2DWW3T4JTVHZP/tool-calls/cancel-call/cancel",
+        "semantic_headers": [
+          {
+            "name": "authorization",
+            "value": "{{PUBLIC_TOOL_CALL_CANCEL_AUTHORIZATION_HEADER}}"
+          },
+          {
+            "name": "content-type",
+            "value": "application/json"
+          },
+          {
+            "name": "idempotency-key",
+            "value": "cancel-one-call"
+          },
+          {
+            "name": "zode-subject",
+            "value": "subject-e2e"
+          }
+        ],
+        "raw_body_hex": "7b22726561736f6e223a2263616e63656c206f6e6c7920746869732063616c6c227d",
+        "canonical_json": {
+          "reason": "cancel only this call"
+        },
+        "body_sha256": "247b7af0d233dc0dad4211ed0857a6a1dc13600652301b0f843af30cd7129107",
+        "tool_call_id": "cancel-call/cancel",
+        "fingerprint": "723c543274c69cae1e1b927bde867cf72ccfb9c066e777ef6ed099b9e31d9de8"
+      },
+      "response": {
+        "status": 404,
+        "semantic_headers": [],
+        "chunks": [],
+        "complete": true,
+        "partial": false,
+        "disconnected": false,
+        "error": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "71fe4723929ea899edebef74daa09ac164d6467606959c48058d5ff7f14c85d2"
+      }
+    },
+    {
+      "sequence": 4,
+      "boundary": "provider.model",
+      "request": {
+        "method": "POST",
+        "path": "/chat/completions",
+        "semantic_headers": [
+          {
+            "name": "authorization",
+            "value": "{{PROVIDER_MODEL_AUTHORIZATION_HEADER}}"
+          },
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "raw_body_hex": "7b226d6f64656c223a22666978747572652d6d6f64656c222c226d65737361676573223a5b7b22726f6c65223a2275736572222c22636f6e74656e74223a2263616e63656c206f6e6520746f6f6c20627574206b65657020697473207369626c696e67227d2c7b22726f6c65223a22617373697374616e74222c22636f6e74656e74223a6e756c6c2c22746f6f6c5f63616c6c73223a5b7b2274797065223a2266756e6374696f6e222c226964223a2263616e63656c2d63616c6c222c2266756e6374696f6e223a7b226e616d65223a2263616e63656c5f746f6f6c222c22617267756d656e7473223a227b5c2276616c75655c223a5c2263616e63656c5c227d227d7d2c7b2274797065223a2266756e6374696f6e222c226964223a227369626c696e672d63616c6c222c2266756e6374696f6e223a7b226e616d65223a227369626c696e675f746f6f6c222c22617267756d656e7473223a227b5c2276616c75655c223a5c227369626c696e675c227d227d7d5d7d2c7b22726f6c65223a22746f6f6c222c22636f6e74656e74223a2263616e63656c6c656420746f6f6c206576656e7475616c6c792072657475726e6564222c22746f6f6c5f63616c6c5f6964223a2263616e63656c2d63616c6c227d2c7b22726f6c65223a22746f6f6c222c22636f6e74656e74223a227369626c696e6720636f6d706c65746564222c22746f6f6c5f63616c6c5f6964223a227369626c696e672d63616c6c227d5d2c2273747265616d223a747275652c2273747265616d5f6f7074696f6e73223a7b22696e636c7564655f7573616765223a747275657d2c22746f6f6c73223a5b7b2274797065223a2266756e6374696f6e222c2266756e6374696f6e223a7b226e616d65223a2263616e63656c5f746f6f6c222c22706172616d6574657273223a7b2274797065223a226f626a656374227d2c226465736372697074696f6e223a22636f6e74726f6c6c65642064657669636520746f6f6c227d7d2c7b2274797065223a2266756e6374696f6e222c2266756e6374696f6e223a7b226e616d65223a227369626c696e675f746f6f6c222c22706172616d6574657273223a7b2274797065223a226f626a656374227d2c226465736372697074696f6e223a22636f6e74726f6c6c65642064657669636520746f6f6c227d7d2c7b2274797065223a2266756e6374696f6e222c2266756e6374696f6e223a7b226e616d65223a22776169745f666f72222c22706172616d6574657273223a7b2274797065223a226f626a656374222c2270726f70657274696573223a7b22726561736f6e223a7b2274797065223a22737472696e67227d2c2274696d656f75745f7365636f6e6473223a7b2274797065223a22696e7465676572222c226d696e696d756d223a312c226d6178696d756d223a3630307d7d2c227265717569726564223a5b22726561736f6e225d2c226164646974696f6e616c50726f70657274696573223a66616c73657d2c226465736372697074696f6e223a22506175736520746869732073657373696f6e20756e74696c206e657720696e707574206f7220612072756e74696d65206e6f74696669636174696f6e20617272697665732e227d7d5d2c22746f6f6c5f63686f696365223a226175746f227d",
+        "canonical_json": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "cancel one tool but keep its sibling"
+            },
+            {
+              "role": "assistant",
+              "content": null,
+              "tool_calls": [
+                {
+                  "type": "function",
+                  "id": "cancel-call",
+                  "function": {
+                    "name": "cancel_tool",
+                    "arguments": "{\"value\":\"cancel\"}"
+                  }
+                },
+                {
+                  "type": "function",
+                  "id": "sibling-call",
+                  "function": {
+                    "name": "sibling_tool",
+                    "arguments": "{\"value\":\"sibling\"}"
+                  }
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "content": "cancelled tool eventually returned",
+              "tool_call_id": "cancel-call"
+            },
+            {
+              "role": "tool",
+              "content": "sibling completed",
+              "tool_call_id": "sibling-call"
+            }
+          ],
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          },
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "cancel_tool",
+                "parameters": {
+                  "type": "object"
+                },
+                "description": "controlled device tool"
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "sibling_tool",
+                "parameters": {
+                  "type": "object"
+                },
+                "description": "controlled device tool"
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "wait_for",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "reason": {
+                      "type": "string"
+                    },
+                    "timeout_seconds": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 600
+                    }
+                  },
+                  "required": [
+                    "reason"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Pause this session until new input or a runtime notification arrives."
+              }
+            }
+          ],
+          "tool_choice": "auto"
+        },
+        "body_sha256": "c018df3220090269b3c9a0bd459766c9f40b54afd575f1308c0f0ed37070df16",
+        "tool_call_id": null,
+        "fingerprint": "887a7948af510a97cfb2a2a10022cd8bf85436545cb56f3be3ab33e00652f313"
+      },
+      "response": {
+        "status": 200,
+        "semantic_headers": [
+          {
+            "name": "content-type",
+            "value": "text/event-stream"
+          }
+        ],
+        "chunks": [
+          {
+            "at_us": 31,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b22636f6e74656e74223a2263616e63656c207369626c696e672066696e616c227d2c2266696e6973685f726561736f6e223a6e756c6c7d5d7d0a0a",
+            "sha256": "cf5c99c7c96490194a17271f6beb253a6137dc50f5f50e3ba90e7ef3d227b125"
+          },
+          {
+            "at_us": 210,
+            "bytes_hex": "646174613a207b2263686f69636573223a5b7b2264656c7461223a7b7d2c2266696e6973685f726561736f6e223a2273746f70227d5d7d0a0a",
+            "sha256": "5a576a8b521637100d6d079726446e8b02be5f6ddad226a406aa1a20ba9bde46"
+          },
+          {
+            "at_us": 296,
+            "bytes_hex": "646174613a205b444f4e455d0a0a",
+            "sha256": "d8d37da081f11203f2af42092a92cb35508f27db75eba643058a0a580454517d"
+          }
+        ],
+        "complete": true,
+        "partial": false,
+        "disconnected": false,
+        "error": null,
+        "body_sha256": "8e3a16ddb1c07712fbf03a92ffe4b7603c8a4184b7318d5d2bb2796144a6dec0",
+        "fingerprint": "6ea9aeed733a2cec85d3cd22efaebb035545cbe4913dab20dd94238dc54f5812"
+      }
+    }
+  ],
+  "whole_sha256": "9f32d0d6c4ead8225e20d36fcdcd7a703af6f5f2f477afe33dbde5030999bf0b"
+}

@@ -1,0 +1,79 @@
+{
+  "schema": "zode.web-two-actor-session-isolation-complete.v2",
+  "version": 2,
+  "recording_id": "two-actor-provider-profile-sharing-first-404-complete-20260808-v2",
+  "purpose": "Replay the retained first real-browser deployment-shared profile failure and preserve the missing positive catalog barrier as an evidence gap.",
+  "source_recording_id": "two-actor-KtNFae",
+  "owner": "e2e_browser_provider_profiles_are_shared_deployment_resources",
+  "boundary": "browser_management_http_sse",
+  "secret_slots": [],
+  "provenance": {
+    "source_recording_id": "two-actor-KtNFae",
+    "source_digest": "sha256:7d753abda003f646616da8e9e0147cba4cae181f89dea62a62b018af25e18590",
+    "source_path": "target/test-recordings/quarantine/two-actor-KtNFae/e2e_browser_provider_profiles_are_shared_deployment_resources.v1.json",
+    "source_verified": true,
+    "promotion": "create_new_from_verified_raw",
+    "redaction": "named_synthetic_slots_and_loopback_port_normalization"
+  },
+  "first_observed": {
+    "actor": "actor-a",
+    "method": "GET",
+    "path": "/providers",
+    "status": 404,
+    "safeCode": null,
+    "message": "actor-a GET /providers -> 404 [evidence_gap_no_positive_catalog_barrier]",
+    "classification": "evidence_gap_no_positive_catalog_barrier",
+    "exchangeSequence": 0
+  },
+  "classification": {
+    "kind": "evidence_gap_no_positive_catalog_barrier",
+    "exact_response": {
+      "status": 404,
+      "semantic_headers": {
+        "content-length": "0"
+      },
+      "body_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "response_fingerprint": "sha256:df77fab8dcf2d1208c38e10976b171a613dceab970b2c12dcd158f60783f44f8",
+      "response_code": null,
+      "termination": "complete",
+      "completed": true
+    },
+    "positive_catalog_barrier": {
+      "required": true,
+      "expected_status": 200,
+      "observed": false,
+      "exchange_sequence": null,
+      "exact_response": null,
+      "reason": "first safe raw ended before a positive catalog response was observed"
+    }
+  },
+  "exchanges": [
+    {
+      "sequence": 0,
+      "actor": "actor-a",
+      "method": "GET",
+      "path": "/providers",
+      "request": {
+        "semanticHeaders": {},
+        "bodyHex": "",
+        "bodySha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonicalJson": null
+      },
+      "response": {
+        "status": 404,
+        "semanticHeaders": {
+          "content-length": "0"
+        },
+        "bodyHex": "",
+        "bodySha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonicalJson": null,
+        "chunks": [],
+        "responseCode": null,
+        "completed": true,
+        "termination": "complete"
+      }
+    }
+  ],
+  "endpointExchanges": [],
+  "whole_digest": "sha256:fa37bf65165218473456c8a80438982234f15813135adfae89f55aea8593028e"
+}

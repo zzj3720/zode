@@ -1,0 +1,17 @@
+/codex-reference/
+**/target/
+**/node_modules/
+**/dist/
+**/test-results/
+**/playwright-report/
+/.idea/
+/.vscode/
+.DS_Store
+.env
+.env.*
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

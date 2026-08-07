@@ -1,0 +1,40 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "remote-vertical-endpoint-create-first-404",
+  "owner": "e2e_remote_server_configure_once_distributes_and_runs_session_without_session_storage",
+  "boundary": "management_http",
+  "first_failure": {
+    "status": 404,
+    "error_code": "missing_public_endpoint_route",
+    "body": ""
+  },
+  "slots": ["SLOT_ACCESS_ASSERTION", "SLOT_ENDPOINT_BASE_URL", "SLOT_ENDPOINT_CONTROL_SECRET"],
+  "request": {
+    "method": "POST",
+    "path": "/v1/endpoints",
+    "headers": {
+      "Idempotency-Key": "remote-endpoint-add",
+      "Cf-Access-Jwt-Assertion": "SLOT_ACCESS_ASSERTION"
+    },
+    "body": {
+      "label": "Remote fixture endpoint",
+      "base_url": "SLOT_ENDPOINT_BASE_URL",
+      "control_auth": {
+        "kind": "bearer",
+        "secret": "SLOT_ENDPOINT_CONTROL_SECRET"
+      }
+    }
+  },
+  "response": {
+    "status": 404,
+    "headers": {},
+    "body": ""
+  },
+  "canonical_fingerprint": {
+    "algorithm": "sha256",
+    "request": "8b6a60f2cca94b8f06e8893b48d2eb85d160b6c35d59485ffa1db39bbdaf349d",
+    "response": "1bbf1252fa0fff9ec6de376b3aa38ea1abd9419e7ca4b27fad3276cc774c2557"
+  },
+  "whole_digest": "sha256:9a8b252ae79576ced67f8ec79efd7c8dce761dc0455c862158aede96710dff07"
+}

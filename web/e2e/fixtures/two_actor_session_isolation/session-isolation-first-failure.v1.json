@@ -1,0 +1,200 @@
+{
+  "schema": "zode.web-two-actor-session-isolation-incident.v1",
+  "owner": "e2e_browser_two_actor_session_isolation",
+  "boundary": "browser_management_http_sse",
+  "firstObserved": {
+    "status": 404,
+    "safeCode": null,
+    "message": "actor-a GET / -> 404 [shallow_non_evidence]",
+    "classification": "shallow_non_evidence",
+    "exchangeSequence": 0
+  },
+  "exchanges": [
+    {
+      "sequence": 0,
+      "actor": "actor-a",
+      "method": "GET",
+      "path": "/",
+      "request": {
+        "semanticHeaders": {},
+        "bodyHex": "",
+        "bodySha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonicalJson": null
+      },
+      "response": {
+        "status": 404,
+        "semanticHeaders": {
+          "content-length": "0"
+        },
+        "bodyHex": "",
+        "bodySha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonicalJson": null,
+        "chunks": [],
+        "responseCode": null,
+        "completed": true,
+        "termination": "complete"
+      }
+    },
+    {
+      "sequence": 1,
+      "actor": "actor-a",
+      "method": "GET",
+      "path": "/v1/system",
+      "request": {
+        "semanticHeaders": {
+          "accept": "application/json"
+        },
+        "bodyHex": "",
+        "bodySha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonicalJson": null
+      },
+      "response": {
+        "status": 200,
+        "semanticHeaders": {
+          "content-length": "216",
+          "content-type": "application/json"
+        },
+        "bodyHex": "7b226465706c6f796d656e74223a227365727665725f6f6e6c79222c226665617475726573223a7b2270726f76696465725f61757468223a747275652c2272656d6f74655f656e64706f696e7473223a747275657d2c22696e6772657373223a7b2263616c6c6261636b5f6f726967696e223a227365706172617465222c226d616e6167656d656e745f61757468223a22636c6f7564666c6172655f616363657373227d2c226c6f63616c5f656e64706f696e745f6964223a6e756c6c2c22736368656d61223a227a6f64652e73797374656d2e7631227d",
+        "bodySha256": "sha256:61a6f624f7e60665c7bbba917b3a4d8568b6c0a833ed29cad197302c31efa888",
+        "canonicalJson": {
+          "deployment": "server_only",
+          "features": {
+            "provider_auth": true,
+            "remote_endpoints": true
+          },
+          "ingress": {
+            "callback_origin": "separate",
+            "management_auth": "cloudflare_access"
+          },
+          "local_endpoint_id": null,
+          "schema": "zode.system.v1"
+        },
+        "chunks": [
+          {
+            "sequence": 0,
+            "bodyHex": "7b226465706c6f796d656e74223a227365727665725f6f6e6c79222c226665617475726573223a7b2270726f76696465725f61757468223a747275652c2272656d6f74655f656e64706f696e7473223a747275657d2c22696e6772657373223a7b2263616c6c6261636b5f6f726967696e223a227365706172617465222c226d616e6167656d656e745f61757468223a22636c6f7564666c6172655f616363657373227d2c226c6f63616c5f656e64706f696e745f6964223a6e756c6c2c22736368656d61223a227a6f64652e73797374656d2e7631227d",
+            "bodySha256": "sha256:61a6f624f7e60665c7bbba917b3a4d8568b6c0a833ed29cad197302c31efa888",
+            "offsetMs": 0
+          }
+        ],
+        "responseCode": null,
+        "completed": true,
+        "termination": "complete"
+      }
+    },
+    {
+      "sequence": 2,
+      "actor": "actor-a",
+      "method": "POST",
+      "path": "/v1/endpoints",
+      "request": {
+        "semanticHeaders": {
+          "idempotency-key": "two-actor-endpoint-add",
+          "accept": "application/json",
+          "content-type": "application/json"
+        },
+        "bodyHex": "7b226c6162656c223a2253686172656420456e64706f696e74222c22626173655f75726c223a22687474703a2f2f3132372e302e302e313a7b7b504f52547d7d222c22636f6e74726f6c5f61757468223a7b226b696e64223a22626561726572222c22736563726574223a225b73796e7468657469633a3235613532323161663661355d227d7d",
+        "bodySha256": "sha256:1dd77803a23f9f0a4e56e41ee19c42d56b0ba35d4eeeb4472ab258ec5fa5dcb2",
+        "canonicalJson": {
+          "label": "Shared Endpoint",
+          "base_url": "http://127.0.0.1:{{PORT}}",
+          "control_auth": {
+            "kind": "bearer",
+            "secret": "[synthetic:25a5221af6a5]"
+          }
+        }
+      },
+      "response": {
+        "status": 201,
+        "semanticHeaders": {
+          "content-length": "413",
+          "content-type": "application/json"
+        },
+        "bodyHex": "7b22617574685f7265706c6963615f73756d6d617279223a7b2270656e64696e67223a302c227265616479223a302c227374616c65223a307d2c226361706162696c6974696573223a7b2270726f746f636f6c5f76657273696f6e223a227a6f64652e656e64706f696e742e7631222c2270726f766964657273223a5b5d2c22746f6f6c73223a5b5d7d2c22636f6e74726f6c6c65725f617574686f726974795f6964223a2274776f2d6163746f722d7365727665722d617574686f72697479222c22636f6e74726f6c6c65725f63726564656e7469616c5f7265766973696f6e223a312c2264697361626c6564223a66616c73652c22656e64706f696e745f6964223a227b7b53455353494f4e5f49447d7d222c226b696e64223a2272656d6f7465222c226c6162656c223a2253686172656420456e64706f696e74222c226c6173745f6f627365727665645f61745f6d73223a7b7b54494d455354414d505f4d537d7d2c22736368656d61223a227a6f64652e656e64706f696e742e7631222c22737461747573223a226f6e6c696e65227d",
+        "bodySha256": "sha256:3842dda37b9ad9d5c1f2e79315b441ac47ffb3e24e4001dacddb95fdb9ac64b9",
+        "canonicalJson": null,
+        "chunks": [
+          {
+            "sequence": 0,
+            "bodyHex": "7b22617574685f7265706c6963615f73756d6d617279223a7b2270656e64696e67223a302c227265616479223a302c227374616c65223a307d2c226361706162696c6974696573223a7b2270726f746f636f6c5f76657273696f6e223a227a6f64652e656e64706f696e742e7631222c2270726f766964657273223a5b5d2c22746f6f6c73223a5b5d7d2c22636f6e74726f6c6c65725f617574686f726974795f6964223a2274776f2d6163746f722d7365727665722d617574686f72697479222c22636f6e74726f6c6c65725f63726564656e7469616c5f7265766973696f6e223a312c2264697361626c6564223a66616c73652c22656e64706f696e745f6964223a227b7b53455353494f4e5f49447d7d222c226b696e64223a2272656d6f7465222c226c6162656c223a2253686172656420456e64706f696e74222c226c6173745f6f627365727665645f61745f6d73223a7b7b54494d455354414d505f4d537d7d2c22736368656d61223a227a6f64652e656e64706f696e742e7631222c22737461747573223a226f6e6c696e65227d",
+            "bodySha256": "sha256:3842dda37b9ad9d5c1f2e79315b441ac47ffb3e24e4001dacddb95fdb9ac64b9",
+            "offsetMs": 0
+          }
+        ],
+        "responseCode": null,
+        "completed": true,
+        "termination": "complete"
+      }
+    },
+    {
+      "sequence": 3,
+      "actor": "actor-a",
+      "method": "PUT",
+      "path": "/v1/providers/two-actor-fixture-provider",
+      "request": {
+        "semanticHeaders": {
+          "idempotency-key": "two-actor-provider-descriptor",
+          "accept": "application/json",
+          "content-type": "application/json"
+        },
+        "bodyHex": "7b226b696e64223a226f70656e61695f636f6d70617469626c65222c22626173655f75726c223a22687474703a2f2f3132372e302e302e313a7b7b504f52547d7d2f7631222c226d6f64656c73223a5b2274776f2d6163746f722d666978747572652d6d6f64656c225d2c226f7074696f6e73223a7b7d7d",
+        "bodySha256": "sha256:39cde9a79cbec348ad62d8aeacf52b61e87542ce2cb670a0846f81b7bfbd9cad",
+        "canonicalJson": {
+          "kind": "openai_compatible",
+          "base_url": "http://127.0.0.1:{{PORT}}/v1",
+          "models": [
+            "two-actor-fixture-model"
+          ],
+          "options": {}
+        }
+      },
+      "response": {
+        "status": 404,
+        "semanticHeaders": {
+          "content-length": "0"
+        },
+        "bodyHex": "",
+        "bodySha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "canonicalJson": null,
+        "chunks": [],
+        "responseCode": null,
+        "completed": true,
+        "termination": "complete"
+      }
+    }
+  ],
+  "endpointExchanges": [
+    {
+      "sequence": 0,
+      "method": "GET",
+      "path": "/v1/identity",
+      "subjectSlot": "subject-1",
+      "controllerAuth": "shared",
+      "idempotencyKey": null,
+      "requestHeaders": {
+        "accept": "*/*"
+      },
+      "requestBodyHex": "",
+      "requestBodyDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "application/json",
+        "content-length": "167"
+      },
+      "responseBodyHex": "7b22736368656d61223a227a6f64652e6964656e746974792e7631222c2270726f746f636f6c5f76657273696f6e223a227a6f64652e656e64706f696e742e7631222c22656e64706f696e745f6964223a227b7b53455353494f4e5f49447d7d222c22617574686f726974795f6964223a2274776f2d6163746f722d7365727665722d617574686f72697479222c227265766973696f6e223a317d",
+      "responseBodyDigest": "6716653086945b145200a446ba1579f69d19ab70d6bd08bf25b77e37f0dd995f",
+      "responseChunks": [
+        {
+          "sequence": 0,
+          "bodyHex": "7b22736368656d61223a227a6f64652e6964656e746974792e7631222c2270726f746f636f6c5f76657273696f6e223a227a6f64652e656e64706f696e742e7631222c22656e64706f696e745f6964223a227b7b53455353494f4e5f49447d7d222c22617574686f726974795f6964223a2274776f2d6163746f722d7365727665722d617574686f72697479222c227265766973696f6e223a317d",
+          "bodySha256": "sha256:6716653086945b145200a446ba1579f69d19ab70d6bd08bf25b77e37f0dd995f",
+          "offsetMs": 3
+        }
+      ],
+      "responseCode": null,
+      "completed": true,
+      "termination": "complete"
+    }
+  ],
+  "wholeDigest": "sha256:6844337008ca0b7206952258b5d153b69ad5ab012f31e88e41ca778096fd3508"
+}

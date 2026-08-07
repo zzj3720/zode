@@ -1,0 +1,18 @@
+{
+  "name": "zode",
+  "version": "1.0.0",
+  "description": "一个由管理 Server、设备 Endpoint 和 Web UI 组成的持久化 agent 系统。",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "packageManager": "pnpm@11.20.0"
+}

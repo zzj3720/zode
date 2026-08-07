@@ -1,0 +1,46 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "access-entry-reentry-first-failure-20260807",
+  "purpose": "first real management-origin UI bootstrap failure before Access re-entry repair",
+  "owner": "e2e_access_entry_reentry_through_real_access_edge",
+  "boundary": "browser->management-origin",
+  "secret_slots": [
+    "${ACCESS_ASSERTION}"
+  ],
+  "first_observed_outcome": {
+    "sequence": 1,
+    "status": 404,
+    "safe_error": "management_ui_bootstrap_not_found"
+  },
+  "target_contract": {
+    "status": 200,
+    "browser_observable": "management UI landmark is visible"
+  },
+  "exchanges": [
+    {
+      "sequence": 1,
+      "request": {
+        "method": "GET",
+        "path": "/",
+        "semantic_headers": [
+          {
+            "name": "cf-access-jwt-assertion",
+            "value": "${ACCESS_ASSERTION}"
+          }
+        ],
+        "raw_body_hex": "",
+        "body_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "recorded_response": {
+        "status": 404,
+        "semantic_headers": [],
+        "chunks": [],
+        "completed": true,
+        "termination": "complete",
+        "body_sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  ],
+  "whole_digest": "sha256:31b9d43c4d650a23f7090088a47900aa19e560dfd478962ede0235c9e5921f3f"
+}

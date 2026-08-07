@@ -1,0 +1,50 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "recording_id": "all-in-one-first-run-initial-404-v1",
+  "purpose": "Preserve the first post-rule real-browser management-entry failure after canonical all-in-one startup stopped before HTTP.",
+  "owner_e2e": "e2e_ui_all_in_one_first_run_creates_profile_and_chats",
+  "boundary": "browser_access_edge_management_http",
+  "first_observed": {
+    "safe_error": "management UI entry returned 404 before bootstrap",
+    "status": 404
+  },
+  "capture_context": {
+    "deployment": "server_only_scaffold",
+    "endpoint_process": "real standalone Endpoint",
+    "reason": "canonical all_in_one exited before readiness and produced no HTTP exchange",
+    "access_admission": "not implemented in the source capture; current replay separately requires JWKS contact"
+  },
+  "secret_slots": {
+    "ACCESS_ASSERTION_RS256": {
+      "placeholder": "<ACCESS_ASSERTION_RS256>",
+      "kind": "test-owned Cloudflare Access RS256 assertion"
+    }
+  },
+  "timing_mode": "immediate",
+  "exchanges": [
+    {
+      "sequence": 1,
+      "request": {
+        "method": "GET",
+        "path": "/",
+        "headers": {
+          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "cf-access-jwt-assertion": "<ACCESS_ASSERTION_RS256>"
+        },
+        "body_base64": "",
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 404,
+        "headers": {},
+        "chunks": [],
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "outcome": "completed"
+      }
+    }
+  ],
+  "envelope_digest": "sha256:b800fff6ce36b50b2a5ac6140e690eb63918f1b93f3c9588eea5aaf5b79cff5b"
+}

@@ -1,0 +1,228 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "recording_id": "e2e_model_create_rejects_below_minimum_replica_before_receipt-41004-1786099124307510000",
+  "purpose": "preserve the first normal-miss session-create admission before auth-replica availability repair",
+  "owning_e2e": "e2e_model_create_rejects_below_minimum_replica_before_receipt",
+  "boundary": "endpoint_http",
+  "secret_slots": [
+    "SLOT_CONTROLLER_AUTHORIZATION",
+    "SLOT_FIRST_FAILURE_SESSION_ID",
+    "SLOT_OWNER_SUBJECT",
+    "SLOT_REPLICA_SECRET_A"
+  ],
+  "first_seen_failure": {
+    "boundary": "public.session_create",
+    "safe_error": "session create returned 201 without a usable auth replica",
+    "status": 201,
+    "response_fingerprint": "796fdfee003ea3a0f5805c2d58e46a63a7e16ae08a209b31d80991eb0212830b"
+  },
+  "contract_response": {
+    "status": 503,
+    "error_code": "auth_replica_unavailable"
+  },
+  "exchanges": [
+    {
+      "sequence": 0,
+      "phase": "setup.replica_install",
+      "request": {
+        "method": "PUT",
+        "path": "/v1/auth-replicas/control-profile",
+        "headers": [
+          {
+            "name": "authorization",
+            "value": "{{SLOT_CONTROLLER_AUTHORIZATION}}"
+          },
+          {
+            "name": "content-type",
+            "value": "application/json"
+          },
+          {
+            "name": "idempotency-key",
+            "value": "control-create-low-revision-replica-initial"
+          },
+          {
+            "name": "zode-subject",
+            "value": "{{SLOT_OWNER_SUBJECT}}"
+          }
+        ],
+        "body_hex": "7b22736368656d61223a227a6f64652e617574682d7265706c6963612e696e7374616c6c2e7631222c22617574686f726974795f6964223a22636f6e74726f6c6c65722d653265222c2270726f7669646572223a22666978747572652d70726f7669646572222c226b696e64223a226170695f6b6579222c227265766973696f6e223a312c2263726564656e7469616c5f736368656d61223a226f70656e61692d636f6d70617469626c652e6170692d6b65792e7631222c22657870697265735f61745f6d73223a6e756c6c2c22736563726574223a7b22656e636f64696e67223a226170706c69636174696f6e2f7a6f64652d7365637265742d656e76656c6f7065222c227061796c6f6164223a227b7b534c4f545f5245504c4943415f5345435245545f417d7d227d7d",
+        "canonical_json": {
+          "schema": "zode.auth-replica.install.v1",
+          "authority_id": "controller-e2e",
+          "provider": "fixture-provider",
+          "kind": "api_key",
+          "revision": 1,
+          "credential_schema": "openai-compatible.api-key.v1",
+          "expires_at_ms": null,
+          "secret": {
+            "encoding": "application/zode-secret-envelope",
+            "payload": "{{SLOT_REPLICA_SECRET_A}}"
+          }
+        },
+        "body_sha256": "e44a835ca8aa775fbec72e17f9dcbd1ccbaf4f3fb250ebb93a1663d6011f291c",
+        "fingerprint": "adb34b9b097d24b7a9b18209d132d7b58c7ba1007805ad9fe2e187735336d17c"
+      },
+      "response": {
+        "status": 201,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "chunks": [
+          {
+            "at_us": 87,
+            "bytes_hex": "7b22736368656d61223a227a6f64652e617574682d7265706c6963612e7631222c22617574686f726974795f6964223a22636f6e74726f6c6c65722d653265222c22617574685f70726f66696c655f6964223a22636f6e74726f6c2d70726f66696c65222c2270726f7669646572223a22666978747572652d70726f7669646572222c227265766973696f6e223a312c22657870697265735f61745f6d73223a6e756c6c2c22737461747573223a227265616479227d"
+          }
+        ],
+        "outcome": "complete",
+        "body_sha256": "fa9b2fb5f507221a480c64b777dbc2c6e29217c12fe9e27f1baaeeaa74c1ce6c",
+        "fingerprint": "40e12de94a9364c238ac2acf8250640da5fc4bb31671d86613150eb8d7f774c8"
+      }
+    },
+    {
+      "sequence": 1,
+      "phase": "setup.replica_get_ready",
+      "request": {
+        "method": "GET",
+        "path": "/v1/auth-replicas/control-profile",
+        "headers": [
+          {
+            "name": "authorization",
+            "value": "{{SLOT_CONTROLLER_AUTHORIZATION}}"
+          },
+          {
+            "name": "zode-subject",
+            "value": "{{SLOT_OWNER_SUBJECT}}"
+          }
+        ],
+        "body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "f9a75c55be28d633e954792423a63668f56f2d53054c08c7149812c6f055c8f5"
+      },
+      "response": {
+        "status": 200,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "chunks": [
+          {
+            "at_us": 30,
+            "bytes_hex": "7b22736368656d61223a227a6f64652e617574682d7265706c6963612e7631222c22617574686f726974795f6964223a22636f6e74726f6c6c65722d653265222c22617574685f70726f66696c655f6964223a22636f6e74726f6c2d70726f66696c65222c2270726f7669646572223a22666978747572652d70726f7669646572222c227265766973696f6e223a312c22657870697265735f61745f6d73223a6e756c6c2c22737461747573223a227265616479227d"
+          }
+        ],
+        "outcome": "complete",
+        "body_sha256": "fa9b2fb5f507221a480c64b777dbc2c6e29217c12fe9e27f1baaeeaa74c1ce6c",
+        "fingerprint": "e71a448a235e3f4068131b8793c9d800ca3f8ef78eb17aea5f5b5fd1d8e11e43"
+      }
+    },
+    {
+      "sequence": 2,
+      "phase": "setup.replica_list_ready",
+      "request": {
+        "method": "GET",
+        "path": "/v1/auth-replicas",
+        "headers": [
+          {
+            "name": "authorization",
+            "value": "{{SLOT_CONTROLLER_AUTHORIZATION}}"
+          },
+          {
+            "name": "zode-subject",
+            "value": "{{SLOT_OWNER_SUBJECT}}"
+          }
+        ],
+        "body_hex": "",
+        "canonical_json": null,
+        "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "fingerprint": "adab7180664cc0e5b88a284158e4de857f53fa40c9ebb121bfd7dbe57a02a82f"
+      },
+      "response": {
+        "status": 200,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "chunks": [
+          {
+            "at_us": 35,
+            "bytes_hex": "7b22736368656d61223a227a6f64652e617574682d7265706c6963612d6c6973742e7631222c226974656d73223a5b7b22736368656d61223a227a6f64652e617574682d7265706c6963612e7631222c22617574686f726974795f6964223a22636f6e74726f6c6c65722d653265222c22617574685f70726f66696c655f6964223a22636f6e74726f6c2d70726f66696c65222c2270726f7669646572223a22666978747572652d70726f7669646572222c227265766973696f6e223a312c22657870697265735f61745f6d73223a6e756c6c2c22737461747573223a227265616479227d5d7d"
+          }
+        ],
+        "outcome": "complete",
+        "body_sha256": "4f948fffb12ee0fb9cf9768855cf63c4f83d392467ec3b15a8caad36898814df",
+        "fingerprint": "c8657b4a0deb33d16d9464f930b4ea88e2e606f6201fca1b28a123e480251d08"
+      }
+    },
+    {
+      "sequence": 3,
+      "phase": "create",
+      "request": {
+        "method": "POST",
+        "path": "/v1/sessions",
+        "headers": [
+          {
+            "name": "authorization",
+            "value": "{{SLOT_CONTROLLER_AUTHORIZATION}}"
+          },
+          {
+            "name": "content-type",
+            "value": "application/json"
+          },
+          {
+            "name": "idempotency-key",
+            "value": "control-create-low-revision-replica-create"
+          },
+          {
+            "name": "zode-subject",
+            "value": "{{SLOT_OWNER_SUBJECT}}"
+          }
+        ],
+        "body_hex": "7b226d6f64656c223a7b2270726f7669646572223a22666978747572652d70726f7669646572222c2270726f76696465725f657865637574696f6e223a7b22736368656d61223a227a6f64652e70726f76696465722d657865637574696f6e2e7631222c227265766973696f6e223a312c226b696e64223a226f70656e61695f636f6d70617469626c65222c22626173655f75726c223a22687474703a2f2f3132372e302e302e313a34313030302f7631227d2c226d6f64656c223a22666978747572652d6d6f64656c222c22617574685f617574686f726974795f6964223a22636f6e74726f6c6c65722d653265222c22617574685f70726f66696c655f6964223a22636f6e74726f6c2d70726f66696c65222c226d696e696d756d5f617574685f7265766973696f6e223a327d7d",
+        "canonical_json": {
+          "model": {
+            "provider": "fixture-provider",
+            "provider_execution": {
+              "schema": "zode.provider-execution.v1",
+              "revision": 1,
+              "kind": "openai_compatible",
+              "base_url": "http://127.0.0.1:41000/v1"
+            },
+            "model": "fixture-model",
+            "auth_authority_id": "controller-e2e",
+            "auth_profile_id": "control-profile",
+            "minimum_auth_revision": 2
+          }
+        },
+        "body_sha256": "e8bd792214e2dc8c26c484b9e7616c6a1ceb02399177d05b0c8532c7a16b0611",
+        "fingerprint": "40a5afbcf97747b1bde9c7e3c0a8bfe1b5ca4d3b5af390032eaa80ec3d4acbf7"
+      },
+      "response": {
+        "status": 201,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "chunks": [
+          {
+            "at_us": 20,
+            "bytes_hex": "7b22736368656d61223a227a6f64652e636f6d6d616e642e7631222c2273657373696f6e5f6964223a227b7b534c4f545f46495253545f4641494c5552455f53455353494f4e5f49447d7d222c226163636570746564223a747275652c2276657273696f6e223a317d"
+          }
+        ],
+        "outcome": "complete",
+        "body_sha256": "99ce648e9d31591d12ca16c8e62511d6440cf5df1ec8ecac80d0b5efd1038dcc",
+        "fingerprint": "796fdfee003ea3a0f5805c2d58e46a63a7e16ae08a209b31d80991eb0212830b"
+      }
+    }
+  ],
+  "whole_sha256": "47251eb85eb3ea2f6de3e70532d1beff8220138228df6cfe712a4e02792033c2"
+}
