@@ -2,7 +2,7 @@
 'use strict';
 
 /* Real-process red/green test for artifact-driver admission ordering. */
-const { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } = require('node:fs');
+const { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } = require('node:fs');
 const { createHash } = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const { join } = require('node:path');
@@ -31,6 +31,32 @@ if (!artifact) {
     maxBuffer: 8 * 1024 * 1024,
   });
   const passed = result.status !== 0 && !existsSync(marker);
+  const resignedWorkspace = mkdtempSync(join(tmpdir(), 'zode-channel-resigned-driver-e2e-'));
+  const resignedArtifact = join(resignedWorkspace, 'artifact');
+  cpSync(artifact, resignedArtifact, { recursive: true, force: false, errorOnExist: true });
+  const resignedMarker = join(resignedWorkspace, 'driver-ran');
+  const resignedDriver = join(resignedArtifact, 'release-driver');
+  chmodSync(resignedDriver, 0o700);
+  writeFileSync(resignedDriver, `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(${JSON.stringify(resignedMarker)}, 'unexpected');\nprocess.exit(1);\n`, { mode: 0o555 });
+  chmodSync(resignedDriver, 0o555);
+  const resignedManifestPath = join(resignedArtifact, 'manifest.json');
+  const resignedManifest = JSON.parse(readFileSync(resignedManifestPath, 'utf8'));
+  const resignedDriverSha = createHash('sha256').update(readFileSync(resignedDriver)).digest('hex');
+  const resignedUnsigned = {
+    ...resignedManifest,
+    driver: { ...resignedManifest.driver, binary_sha256: resignedDriverSha },
+    binding: { ...resignedManifest.binding, driver_binary_sha256: resignedDriverSha },
+  };
+  delete resignedUnsigned.manifest_sha256;
+  chmodSync(resignedManifestPath, 0o644);
+  writeFileSync(resignedManifestPath, `${JSON.stringify({ ...resignedUnsigned, manifest_sha256: createHash('sha256').update(Buffer.from(`${JSON.stringify(resignedUnsigned, null, 2)}\n`, 'utf8')).digest('hex') }, null, 2)}\n`, { mode: 0o444 });
+  chmodSync(resignedManifestPath, 0o444);
+  const resignedRoot = join(resignedWorkspace, 'channel-root');
+  mkdirSync(resignedRoot, { mode: 0o700 });
+  const resignedResult = spawnSync(process.execPath, [channel, 'install', '--artifact', resignedArtifact, '--release-root', resignedRoot], {
+    cwd: join(__dirname, '..', '..'), encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
+  });
+  const resignedSafe = resignedResult.status !== 0 && !existsSync(resignedMarker);
   const currentWorkspace = mkdtempSync(join(tmpdir(), 'zode-channel-current-admission-e2e-'));
   const currentRoot = join(currentWorkspace, 'channel-root');
   mkdirSync(currentRoot, { mode: 0o700 });
@@ -76,7 +102,7 @@ if (!artifact) {
     cwd: join(__dirname, '..', '..'), encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
   });
   const fakeSafe = fakeResult.status !== 0 && !existsSync(fakeMarker);
-  const passedAll = passed && currentSafe && fakeSafe;
-  process.stdout.write(JSON.stringify({ status: passedAll ? 'PASS' : 'RED', marker, currentMarker, fakeMarker, stdout: result.stdout, stderr: result.stderr, current_stdout: currentResult?.stdout ?? null, current_stderr: currentResult?.stderr ?? null, fake_stdout: fakeResult.stdout, fake_stderr: fakeResult.stderr }) + '\n');
+  const passedAll = passed && resignedSafe && currentSafe && fakeSafe;
+  process.stdout.write(JSON.stringify({ status: passedAll ? 'PASS' : 'RED', marker, resignedMarker, currentMarker, fakeMarker, stdout: result.stdout, stderr: result.stderr, resigned_stdout: resignedResult.stdout, resigned_stderr: resignedResult.stderr, current_stdout: currentResult?.stdout ?? null, current_stderr: currentResult?.stderr ?? null, fake_stdout: fakeResult.stdout, fake_stderr: fakeResult.stderr }) + '\n');
   process.exitCode = passedAll ? 0 : 1;
 }

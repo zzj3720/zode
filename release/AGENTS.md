@@ -33,6 +33,10 @@ recorder、locator 或未认证 health 参数。
 的脚本。安装成功后，`promote`、`health` 和 `teardown` 才从 `current` 读取
 已安装且 digest 绑定的 driver。
 
+本机通道要求 artifact 的 `release-driver` digest 与执行 admission 的同一
+干净 checkout `release/driver` 相等；这样即使攻击者重新签出一份自洽
+manifest，也不能把未知脚本带进通道。
+
 `health`/`teardown` 执行前还会由 checkout 中的受信 driver 对 `current` 的
 完整 artifact 重新做一次 admission，并要求它精确落在本通道的
 `releases/` 安装树；仅有自洽 envelope 或 driver 字段的伪造目录不可执行。

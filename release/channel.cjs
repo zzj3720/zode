@@ -125,6 +125,18 @@ function jsonBytes(value) {
   return Buffer.from(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
 }
 
+function assertTrustedDriverBinding(manifest, path) {
+  const expected = manifest?.driver;
+  const sourceDigest = sha256(readFileSync(SOURCE_DRIVER));
+  if (!expected || expected.path !== 'release-driver' || expected.binary_sha256 !== sourceDigest) {
+    fail('channel_artifact_invalid', 'artifact driver is not the digest-bound driver from this clean checkout', {
+      path,
+      expected_sha256: expected?.binary_sha256 ?? null,
+      source_sha256: sourceDigest,
+    });
+  }
+}
+
 function parseLastJson(stdout) {
   const lines = String(stdout ?? '').trim().split(/\r?\n/).filter(Boolean);
   for (let index = lines.length - 1; index >= 0; index -= 1) {
@@ -182,6 +194,7 @@ function driverForCurrent(root) {
   if (typeof envelopeDigest !== 'string' || sha256(jsonBytes(withoutDigest)) !== envelopeDigest) {
     fail('channel_current_invalid', 'current manifest envelope digest does not match', { path: manifestPath });
   }
+  assertTrustedDriverBinding(manifest, current);
 
   // Re-run the complete trusted checkout admission before executing any
   // installed script.  A self-consistent envelope containing only a driver
@@ -221,6 +234,14 @@ function invokeDriver(operation, root, artifact = null) {
   // install/bootstrap/stage admission; those operations may copy or start
   // files. Once installed, promote/health/teardown use the digest-bound copy
   // under current.
+  if (artifact && ['install', 'bootstrap', 'stage'].includes(operation)) {
+    const manifestPath = join(artifact, 'manifest.json');
+    let manifest;
+    try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch (error) {
+      fail('channel_artifact_invalid', 'artifact manifest could not be read before driver admission', { path: manifestPath, error: String(error) });
+    }
+    assertTrustedDriverBinding(manifest, artifact);
+  }
   const driver = artifact && ['install', 'bootstrap', 'stage'].includes(operation)
     ? SOURCE_DRIVER
     : artifact ? driverForArtifact(artifact) : driverForCurrent(root);

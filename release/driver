@@ -870,6 +870,52 @@ function processCommandLine(pid) {
   return commandOutput("ps", ["-p", String(pid), "-o", "command="]).trim();
 }
 
+function processesWithExactCommand(executablePath, args) {
+  const expectedExecutable = realpathSync(executablePath);
+  const expectedCommand = `${expectedExecutable} ${args.join(" ")}`;
+  const output = commandOutput("ps", ["-axo", "pid=,command="]);
+  return output.split(/\r?\n/).flatMap((line) => {
+    const match = line.trim().match(/^(\d+)\s+(.+)$/);
+    if (!match || match[2] !== expectedCommand) return [];
+    const pid = Number(match[1]);
+    return Number.isSafeInteger(pid) && pid > 0 ? [pid] : [];
+  });
+}
+
+async function recoverInstanceRoles(instance) {
+  // A driver crash can happen after the instance state is durably created but
+  // before the first role is appended.  Recover only commands carrying this
+  // run's exact, private config paths; this is not a machine-wide basename
+  // scan and cannot adopt an unrelated zode process.
+  const artifactRoot = realpathSync(instance.artifact.installPath);
+  const serverExecutable = join(artifactRoot, "zode-server");
+  const endpointExecutable = join(artifactRoot, "zode");
+  const serverConfig = join(instance.directory, "server.json");
+  const endpointConfig = join(instance.directory, "endpoint.json");
+  const roles = [];
+  const candidates = [
+    { role: "server", executablePath: serverExecutable, args: ["--config", serverConfig] },
+  ];
+  try {
+    const endpoint = JSON.parse(readFileSync(endpointConfig, "utf8"));
+    if (typeof endpoint.listen === "string" && endpoint.listen) {
+      candidates.push({ role: "endpoint", executablePath: endpointExecutable, args: ["--config", endpointConfig, "--listen", endpoint.listen] });
+    }
+  } catch { /* a partial instance may not have reached endpoint config creation */ }
+  for (const candidate of candidates) {
+    const executable = realpathSync(candidate.executablePath);
+    const pids = processesWithExactCommand(executable, candidate.args);
+    if (pids.length > 1) {
+      fail("release_recovery_ambiguous", "more than one exact release-instance process was found during recovery", { role: candidate.role, pids });
+    }
+    if (!pids.length) continue;
+    const identity = await processIdentity(pids[0]);
+    if (!identity) fail("release_recovery_identity_missing", "release-instance process identity could not be recovered", { role: candidate.role, pid: pids[0] });
+    roles.push({ role: candidate.role, pid: pids[0], process_group_id: identity.process_group_id, session_id: identity.session_id, executablePath: executable });
+  }
+  return roles;
+}
+
 function listenerOwnedBy(pid, port) {
   try {
     const output = commandOutput("lsof", ["-nP", "-a", "-p", String(pid), `-iTCP:${port}`, "-sTCP:LISTEN", "-Fn"]);
@@ -1468,7 +1514,23 @@ async function teardown(root) {
   const seen = new Set();
   for (const instance of allStates(root)) {
     if (!instance.roles.length) {
+      const recoveredRoles = await recoverInstanceRoles(instance);
+      if (recoveredRoles.length) {
+        instance.roles = recoveredRoles;
+        persistState(root, instance);
+        const report = await stopInstance(instance);
+        reports.push(report);
+        seen.add(report.instance_id);
+        continue;
+      }
+      // No exact process remains.  Remove the durable empty instance as one
+      // recovery transaction; leaving its directory behind would make the
+      // next teardown treat a state-less entry as corruption.
       removeIfExists(statePath(root, instance.instance_id));
+      const directory = statOrNull(instance.directory);
+      if (directory?.isDirectory() && !directory.isSymbolicLink()) {
+        rmSync(instance.directory, { recursive: true, force: true });
+      }
       continue;
     }
     const report = await stopInstance(instance);
