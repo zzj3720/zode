@@ -1,0 +1,55 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "0002-82884989-3395-4b11-b7ca-be86bc4a8f26-665e9002-a57c-4492-b042-3dbeacd6a9cc",
+  "e2e_name": "e2e_browser_provider_profile_default_action_updates_server_pointer",
+  "boundary": "browser-capture-set",
+  "first_observed": "a non-default provider profile had no Set as default action, so the browser could not move the Server-owned provider default pointer",
+  "classification": "PROVIDER_PROFILE_DEFAULT_ACTION_MISSING",
+  "source_digest": "e00d76e4422291195a53889e27984babe88702a15ee0edd9cc189330498005fc",
+  "first_failure_recording_id": "000021-600b27ac-fa83-44fc-b9a6-6bbdd7d0b379",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000021-600b27ac-fa83-44fc-b9a6-6bbdd7d0b379",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/providers",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 4367.167,
+            "data_base64": "eyJwcm92aWRlcnMiOlt7ImF1dGhfcHJvZmlsZV9jb3VudCI6MiwiYXV0aF9zdGF0dXMiOiJyZWFkeSIsImRlZmF1bHRfcHJvZmlsZV9pZCI6InByb2ZpbGUtZGQ3NDk0YjU4NzJhZWU2NTBmYjRhOWNiMjc3ZTgxYTEiLCJkZXNjcmlwdG9yIjp7ImJhc2VfdXJsIjoiaHR0cDovLzEyNy4wLjAuMTo2MDM4NC92MSIsImtpbmQiOiJvcGVuYWlfY29tcGF0aWJsZSIsIm1vZGVscyI6WyJwcm9maWxlLWRlZmF1bHQtYWN0aW9uLW1vZGVsIl0sIm9wdGlvbnMiOnt9LCJyZXZpc2lvbiI6MX0sInByb3ZpZGVyIjoicHJvZmlsZS1kZWZhdWx0LWFjdGlvbi1maXh0dXJlIn1dLCJzY2hlbWEiOiJ6b2RlLnByb3ZpZGVycy52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>",
+    "<secret:access_assertion_8>",
+    "<secret:profile_primary_profile>",
+    "<secret:profile_secondary_profile>",
+    "<secret:access_assertion_20>"
+  ],
+  "integrity_sha256": "eead08e83b0765dd451a6deaff27fb2def77119cdfc4dfd05c7b627974f0e8ec"
+}

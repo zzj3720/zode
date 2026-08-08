@@ -222,6 +222,13 @@ export async function listProfiles(provider: string): Promise<AuthProfile[]> {
   return response.items;
 }
 
+export function setDefaultProfile(provider: string, profileId: string): Promise<AuthProfile> {
+  return requestJson<AuthProfile>(
+    `/v1/providers/${encodeURIComponent(provider)}/default-auth-profile`,
+    idempotent("PUT", { profile_id: profileId }),
+  );
+}
+
 export function createApiKeyProfile(
   provider: string,
   body: {

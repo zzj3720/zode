@@ -14,6 +14,7 @@ import {
   listSessions,
   putProvider,
   probeEndpoint,
+  setDefaultProfile,
   sendMessage,
   ServerClientError,
   type AuthProfile,
@@ -443,11 +444,24 @@ function profileRow(profile: AuthProfile): HTMLElement {
   const targets = profile.sharing.endpoint_ids
     .map((id) => state.endpoints.find((endpoint) => endpoint.endpoint_id === id)?.label ?? id)
     .join(", ");
+  const controls = node("div", "profile-actions");
+  if (!profile.is_default) {
+    const makeDefault = action("Set as default", "star", async () => {
+      await withBusy(async () => {
+        await setDefaultProfile(profile.provider, profile.profile_id);
+        state.notice = `${profile.label} is now the default profile.`;
+        await refreshProviders();
+      });
+    });
+    makeDefault.disabled = state.busy;
+    controls.append(makeDefault);
+  }
   row.append(
     copy,
     node("span", "profile-default", profile.is_default ? "Default profile" : "Not default"),
     node("span", "profile-targets", targets || "Not shared"),
     statusBadge(profile.status),
+    controls,
   );
   return row;
 }

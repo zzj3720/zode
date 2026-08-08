@@ -14,7 +14,8 @@ use crate::{
     catalog::{Catalog, CatalogError},
     store::{
         hex, AuthProfileRecord, AuthReplicaRecord, ControlStore, ProfileCreatePhase,
-        ProfileCreateWrite, ProviderDescriptorRecord, ProviderDescriptorWrite, StoreError,
+        ProfileCreateWrite, ProviderDefaultProfileWrite, ProviderDescriptorRecord,
+        ProviderDescriptorWrite, StoreError,
     },
 };
 
@@ -31,6 +32,8 @@ const MAX_ENDPOINTS_PER_SHARING: usize = 100;
 pub(crate) enum ProviderError {
     #[error("provider request is invalid")]
     Invalid,
+    #[error("provider profile was not found")]
+    NotFound,
     #[error("provider request is too large")]
     PayloadTooLarge,
     #[error("provider command conflicts with an existing operation")]
@@ -57,6 +60,12 @@ pub(crate) struct CreateAuthProfileRequest {
     #[serde(default)]
     make_default: bool,
     sharing: SharingRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetDefaultAuthProfileRequest {
+    pub(crate) profile_id: String,
 }
 
 #[derive(Deserialize)]
@@ -298,6 +307,49 @@ impl ProviderAuthority {
             "schema": "zode.auth-profiles.v1",
             "items": items,
         }))
+    }
+
+    pub(crate) async fn set_default_profile(
+        &self,
+        actor: &ActorContext,
+        idempotency_key: &str,
+        provider: &str,
+        request: SetDefaultAuthProfileRequest,
+    ) -> Result<Value, ProviderError> {
+        if !valid_identifier(provider, MAX_PROVIDER_BYTES)
+            || !valid_text(idempotency_key, MAX_IDEMPOTENCY_KEY_BYTES)
+            || !valid_identifier(&request.profile_id, 128)
+        {
+            return Err(ProviderError::Invalid);
+        }
+        let keys = self.store.keys();
+        let command_key = keys.digest(
+            b"auth-profile-default-command-v1",
+            &[provider.as_bytes(), idempotency_key.as_bytes()],
+        );
+        let request_fingerprint = keys.digest(
+            b"auth-profile-default-request-v1",
+            &[provider.as_bytes(), request.profile_id.as_bytes()],
+        );
+        let write = ProviderDefaultProfileWrite {
+            actor_key: *actor.actor_key(),
+            provider: provider.to_owned(),
+            command_key,
+            request_fingerprint,
+            profile_id: request.profile_id,
+            created_at_ms: unix_millis()?,
+        };
+        let store = Arc::clone(&self.store);
+        let (profile, replayed) =
+            tokio::task::spawn_blocking(move || store.set_provider_default_profile(write))
+                .await
+                .map_err(|_| ProviderError::Internal)?
+                .map_err(map_store_error)?;
+        let mut response = self.profile_response(&profile).await?;
+        if replayed {
+            response["is_default"] = Value::Bool(true);
+        }
+        Ok(response)
     }
 
     pub(crate) async fn list_replicas(&self, profile_id: &str) -> Result<Value, ProviderError> {
@@ -567,6 +619,7 @@ fn unix_millis() -> Result<i64, ProviderError> {
 fn map_store_error(error: StoreError) -> ProviderError {
     match error {
         StoreError::Conflict => ProviderError::Conflict,
+        StoreError::NotFound => ProviderError::NotFound,
         StoreError::Integrity | StoreError::Internal => ProviderError::Internal,
     }
 }

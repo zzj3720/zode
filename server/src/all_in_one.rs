@@ -429,10 +429,6 @@ fn unix_millis() -> Result<i64, LocalEndpointError> {
     i64::try_from(millis).map_err(|_| LocalEndpointError::Catalog)
 }
 
-fn map_store_authority(error: StoreError) -> LocalEndpointError {
-    match error {
-        StoreError::Conflict | StoreError::Integrity | StoreError::Internal => {
-            LocalEndpointError::Authority
-        }
-    }
+fn map_store_authority(_error: StoreError) -> LocalEndpointError {
+    LocalEndpointError::Authority
 }

@@ -19,6 +19,7 @@ use crate::{
     config::Deployment,
     provider_authority::{
         CreateAuthProfileRequest, ProviderAuthority, ProviderError, PutProviderDescriptorRequest,
+        SetDefaultAuthProfileRequest,
     },
     session_proxy::{CreateSessionRequest, ProxyJson, SessionProxy, SessionProxyError},
     ui_assets::UiAssets,
@@ -103,6 +104,10 @@ pub(crate) fn router(
         .route(
             "/v1/providers/{provider}/auth-profiles",
             get(list_auth_profiles).post(create_auth_profile),
+        )
+        .route(
+            "/v1/providers/{provider}/default-auth-profile",
+            put(set_default_auth_profile),
         )
         .route(
             "/v1/auth-profiles/{profile_id}/replicas",
@@ -372,6 +377,26 @@ async fn create_auth_profile(
     Ok((StatusCode::CREATED, Json(profile)).into_response())
 }
 
+async fn set_default_auth_profile(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Extension(actor): Extension<ActorContext>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    let idempotency_key = one_header(request.headers(), "idempotency-key")?;
+    let body = to_bytes(request.into_body(), MAX_PROFILE_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::payload_too_large())?;
+    let request: SetDefaultAuthProfileRequest =
+        serde_json::from_slice(&body).map_err(|_| ApiError::invalid())?;
+    state
+        .providers
+        .set_default_profile(&actor, &idempotency_key, &provider, request)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_provider)
+}
+
 async fn list_auth_profile_replicas(
     State(state): State<AppState>,
     Path(profile_id): Path<String>,
@@ -628,6 +653,7 @@ impl ApiError {
     fn from_provider(error: ProviderError) -> Self {
         match error {
             ProviderError::Invalid => Self::invalid(),
+            ProviderError::NotFound => Self::not_found(),
             ProviderError::PayloadTooLarge => Self::payload_too_large(),
             ProviderError::Conflict => Self {
                 status: StatusCode::CONFLICT,
