@@ -2385,6 +2385,9 @@ async fn e2e_invalid_model_tool_arguments_are_rejected_before_side_effect() -> T
         2,
     )?;
     let mut config_value: Value = serde_json::from_slice(&fs::read(&config)?)?;
+    // This anchor covers only a configured ordinary adapter tool. The
+    // runtime-owned wait_for contract has separate explicit-wait E2Es and is
+    // intentionally not changed or asserted by this schema boundary.
     config_value["tools"][0]["input_schema"] = json!({
         "type": "object",
         "properties": {"value": {"type": "string"}},
@@ -2424,7 +2427,7 @@ async fn e2e_invalid_model_tool_arguments_are_rejected_before_side_effect() -> T
         result = tool.wait_for_invocations(1) => {
             result?;
             return Err(Error::other(
-                "invalid model tool arguments reached the tool adapter",
+                "invalid ordinary adapter arguments reached the tool adapter",
             ).into());
         }
     }

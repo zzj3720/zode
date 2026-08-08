@@ -65,7 +65,10 @@ SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
   out of prepared envelopes/events.
 - Do not commit an assistant outcome or execute any tool until the complete
   stream ends normally with a valid finish and all completed tool calls pass
-  validation. Incremental tool-input parts are never executable.
+  validation for configured ordinary adapter tools. The runtime-owned
+  `wait_for` call keeps its existing session-control/result contract and is
+  outside this adapter-schema validation boundary. Incremental tool-input parts
+  are never executable.
 
 - An ordinary tool batch may create at most one automatic wait. If a model
   batch also contains explicit `wait_for`, ordinary tools still execute and

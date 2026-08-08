@@ -406,12 +406,15 @@ and other non-retryable failures end the activation without retry.
 
 Text, reasoning, tool-input fragments, and usage from an incomplete attempt are
 transient candidates. A model attempt succeeds only after the complete stream
-ends normally with a valid finish and all tool calls validate. Only then may
-zode atomically commit the assistant outcome and tool-call batch. It never
-dispatches a tool from `ToolInputStart`/`ToolInputDelta` or from a completed
-`ToolCall` followed by a failed stream. Retrying can produce different model
-output; the runtime promises durable causality and bounded effects, not model
-determinism.
+ends normally with a valid finish and all completed calls for configured
+ordinary adapter tools validate. Only then may zode atomically commit the
+assistant outcome and tool-call batch. It never dispatches a tool from
+`ToolInputStart`/`ToolInputDelta` or from a completed `ToolCall` followed by a
+failed stream. The runtime-owned `wait_for` call follows its separate
+session-control contract and is intentionally outside this adapter-schema
+validation boundary; this rule does not change its ordinary tool-result path.
+Retrying can produce different model output; the runtime promises durable
+causality and bounded effects, not model determinism.
 
 Only continuation fields required for a later native request are normalized
 into the bounded durable envelope. Debug/raw stream parts remain transient and
@@ -419,9 +422,10 @@ secret-safe; they are neither durable session state nor public events.
 
 For one assistant tool-call batch:
 
-1. validate every call and durably commit the assistant message, tool calls,
-   stable invocation keys, and invocation intent before starting any side
-   effect;
+1. validate each call for a configured ordinary adapter tool and durably commit
+   the assistant message, tool calls, stable invocation keys, and invocation
+   intent before starting any side effect; the runtime-owned `wait_for` call
+   remains governed by its existing wait contract;
 2. start all ordinary calls concurrently only after that commit;
 3. give the entire batch one shared foreground window, initially three
    seconds;
@@ -695,7 +699,7 @@ The main scenario groups are:
 | Snapshot/recovery | bounded snapshot-plus-tail restore, every configured runtime/API snapshot cadence point, corrupt fallback, dirty-index repair, healthy read-only startup | `sqlite_storage_e2e::e2e_sqlite_snapshot_cursor_follows_public_commits`; `sqlite_storage_e2e::e2e_snapshot_cannot_override_event_stream`; `sqlite_storage_e2e::e2e_corrupt_latest_snapshot_falls_back`; `e2e_runtime_commits_honor_snapshot_cadence_and_restart`; `sqlite_storage_e2e::e2e_sqlite_restart_rebuilds_derived_indexes_and_allows_harmless_extra_index`; storage-corruption cases in `reviewer_findings_e2e` |
 | Model activation | real aimux fake provider, final assistant event, input/completion arriving mid-request steers the next round when one exists, otherwise wakes the next activation; active model change remains deferred to the next activation; configured round budget stops feedback loops while allowing a queued user to wake a fresh activation; every accepted input and assistant round remains durably ordered online and after restart without a new client command | `e2e_golden_assembled_model_tool_loop_survives_restart`; `e2e_round_boundary_steering_waits_for_the_next_model_round`; `e2e_round_boundary_final_defers_steering_to_next_activation`; `e2e_max_rounds_per_activation_stops_tool_feedback_loop`; `e2e_concurrent_inputs_preserve_both_assistant_rounds`; `e2e_restart_recovers_queued_input_without_another_command` |
 | Model retry | aimux bounded pre-stream retry remains one logical runtime request; after stream establishment zode owns bounded step retry; no partial assistant/tool effect; hard-crash interrupted-attempt recovery | `e2e_model_pre_stream_rate_limit_is_one_logical_request`; `e2e_model_partial_stream_retry_has_no_partial_tool_effect`; `e2e_hard_crash_recovery_exhausts_one_model_attempt_and_keeps_delivery_runnable`; `e2e_hard_crash_after_retry_fact_claims_one_scheduled_attempt` |
-| Tool batch | schema-valid model arguments, invalid arguments fail before side effects, fast/slow/failing concurrent calls, provider-order results, one shared foreground window | `e2e_invalid_model_tool_arguments_are_rejected_before_side_effect`; `e2e_mixed_tool_batch_is_concurrent_ordered_and_waits_once` |
+| Tool batch | configured ordinary adapter arguments are schema-valid and invalid ones fail before side effects; the runtime-owned `wait_for` contract is unchanged; fast/slow/failing concurrent calls, provider-order results, one shared foreground window | `e2e_invalid_model_tool_arguments_are_rejected_before_side_effect`; `e2e_mixed_tool_batch_is_concurrent_ordered_and_waits_once`; existing `e2e_explicit_wait_*` anchors |
 | Async/wait | early result, auto wait, explicit-wait precedence, user/timer race, completion wake, timeout without cancel, maximum 600 seconds | `e2e_explicit_wait_last_wins_without_skipping_ordinary_tool`; `e2e_explicit_wait_zero_is_rejected`; `e2e_explicit_wait_above_maximum_is_rejected`; `e2e_explicit_wait_legacy_high_value_is_rejected`; `e2e_auto_wait_timeout_does_not_cancel_running_tool`; `e2e_two_session_waits_do_not_cross` |
 | Terminal races | cancel/complete/callback first-wins, duplicate semantic callback, unknown-outcome cancel/unsupported mark-failed rejected, no second wake/event | `e2e_external_completion_first_wins_and_wakes_one_next_activation`; `e2e_restart_remote_response_becomes_unknown_and_cancel_cannot_rewrite_it`; `e2e_restart_unknown_response_rejects_unsupported_mark_failed` |
 | Restart | unclaimed plan dispatches once; process-bound call fails without retry; external callback survives; ambiguous remote dispatch becomes reconcilable `unknown_outcome` | `e2e_http_response_tool_rejects_runtime_restarted_recovery`; `e2e_external_callback_tool_stays_running_and_completes_after_restart`; the model hard-crash anchors above |

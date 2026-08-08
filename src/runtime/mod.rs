@@ -997,6 +997,9 @@ impl Runtime {
                 .complete(request.clone())
                 .await
                 .and_then(|value| {
+                    // Configured ordinary adapter tools use JSON Schema
+                    // validation here. The runtime-owned wait_for call is
+                    // intentionally handled by its existing wait contract.
                     if validate_tool_calls(&value.tool_calls, &tools).is_ok() {
                         Ok(value)
                     } else {
