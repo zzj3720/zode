@@ -76,6 +76,11 @@ replication is `docs/auth-replication.md`; ingress identity is
   forward it in the concrete session model selection. Endpoint reports adapter
   support and outbound policy; do not require users to duplicate provider base
   URL/model configuration on every device.
+- `e2e_remote_server_configure_once_distributes_and_runs_session_without_session_storage`
+  exercises the public Server→Endpoint model-selection route with a real
+  model-less session, same-key replay, durable projection, Server restart, and
+  replay after the current profile is deleted; it uses only a test-owned local
+  provider fixture and remains in the ordinary CI gate.
 - Health is a bounded Server observation from Server-initiated reads. Endpoint
   never supplies a reverse heartbeat.
 - V0 Endpoint removal is reversible disablement, not row deletion. Never reuse

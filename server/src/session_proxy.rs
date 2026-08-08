@@ -45,20 +45,24 @@ pub(crate) enum SessionProxyError {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateSessionRequest {
     #[serde(default)]
-    model: Option<CreateModelSelection>,
+    model: Option<ModelSelectionRequest>,
     #[serde(default)]
     tools: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CreateModelSelection {
+pub(crate) struct ModelSelectionRequest {
     provider: String,
     model: String,
     provider_execution: ProviderExecution,
+    #[serde(default, rename = "auth_authority_id")]
+    _auth_authority_id: Option<String>,
     auth_profile_id: String,
     minimum_auth_revision: u64,
 }
+
+type CreateModelSelection = ModelSelectionRequest;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -276,6 +280,71 @@ impl SessionProxy {
         .and_then(public_only)
     }
 
+    pub(crate) async fn select_model(
+        &self,
+        actor: &ActorContext,
+        endpoint_id: &str,
+        session_id: &str,
+        idempotency_key: &str,
+        request: ModelSelectionRequest,
+    ) -> Result<ProxyJson, SessionProxyError> {
+        validate_path_identifier(session_id)?;
+        validate_idempotency_key(idempotency_key)?;
+        let target = self.endpoint_target(endpoint_id).await?;
+        let body = self.model_body(&request);
+        let path = format!("/v1/sessions/{session_id}/model");
+        match self
+            .send_json(
+                &target,
+                actor,
+                reqwest::Method::PUT,
+                &path,
+                JsonRequest {
+                    idempotency_key: Some(idempotency_key),
+                    body: Some(&body),
+                    replay_only: true,
+                },
+            )
+            .await?
+        {
+            EndpointJson::Public(response) => return Ok(response),
+            EndpointJson::ReceiptMiss => {}
+        }
+
+        let policy = self
+            .validate_create_policy(
+                &target.record,
+                endpoint_id,
+                &CreateSessionRequest {
+                    model: Some(request),
+                    tools: Vec::new(),
+                },
+            )
+            .await?;
+        let model = policy
+            .forwarded
+            .get("model")
+            .cloned()
+            .ok_or(SessionProxyError::Internal)?;
+        match self
+            .send_json(
+                &target,
+                actor,
+                reqwest::Method::PUT,
+                &path,
+                JsonRequest {
+                    idempotency_key: Some(idempotency_key),
+                    body: Some(&model),
+                    replay_only: false,
+                },
+            )
+            .await?
+        {
+            EndpointJson::Public(response) => Ok(response),
+            EndpointJson::ReceiptMiss => Err(SessionProxyError::Internal),
+        }
+    }
+
     pub(crate) async fn stream_events(
         &self,
         actor: &ActorContext,
@@ -452,22 +521,7 @@ impl SessionProxy {
         endpoint_id: &str,
         request: &CreateSessionRequest,
     ) -> Result<Value, SessionProxyError> {
-        let model = request.model.as_ref().map(|model| {
-            json!({
-                "provider": model.provider,
-                "provider_execution": {
-                    "schema": model.provider_execution.schema,
-                    "revision": model.provider_execution.revision,
-                    "kind": model.provider_execution.kind,
-                    "base_url": model.provider_execution.base_url,
-                    "options": model.provider_execution.options,
-                },
-                "model": model.model,
-                "auth_authority_id": self.store.authority_id(),
-                "auth_profile_id": model.auth_profile_id,
-                "minimum_auth_revision": model.minimum_auth_revision,
-            })
-        });
+        let model = request.model.as_ref().map(|model| self.model_body(model));
         Ok(json!({
             "model": model,
             "tools": request.tools,
@@ -476,6 +530,23 @@ impl SessionProxy {
                 self.callback_origin
             ),
         }))
+    }
+
+    fn model_body(&self, model: &ModelSelectionRequest) -> Value {
+        json!({
+            "provider": model.provider,
+            "provider_execution": {
+                "schema": model.provider_execution.schema,
+                "revision": model.provider_execution.revision,
+                "kind": model.provider_execution.kind,
+                "base_url": model.provider_execution.base_url,
+                "options": model.provider_execution.options,
+            },
+            "model": model.model,
+            "auth_authority_id": self.store.authority_id(),
+            "auth_profile_id": model.auth_profile_id,
+            "minimum_auth_revision": model.minimum_auth_revision,
+        })
     }
 
     async fn endpoint_target(

@@ -272,10 +272,23 @@ async fn wait_for_jwks_requests(
 }
 
 async fn stop_child(child: &mut Child) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // Let SQLite flush its WAL and release the ownership lock before the
+        // restart assertion.  Escalate only when the real process ignores the
+        // ordinary shutdown signal.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
     let _ = child.start_kill();
-    timeout(Duration::from_secs(5), child.wait())
-        .await
-        .map_err(|_| Error::new(ErrorKind::TimedOut, "child reap timed out"))??;
+    if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
+        let _ = child.start_kill();
+        timeout(Duration::from_secs(5), child.wait())
+            .await
+            .map_err(|_| Error::new(ErrorKind::TimedOut, "child reap timed out"))??;
+    }
     Ok(())
 }
 
@@ -469,6 +482,12 @@ fn write_server_config(
     issuer: &str,
     jwks_url: &str,
 ) -> Result<(PathBuf, PathBuf, PathBuf), Box<dyn std::error::Error + Send + Sync>> {
+    let management_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let management_port = management_listener.local_addr()?.port();
+    drop(management_listener);
+    let callback_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let callback_port = callback_listener.local_addr()?.port();
+    drop(callback_listener);
     let database = root.join("server.sqlite3");
     let secrets = root.join("server-secrets");
     let subject_key = root.join("subject.key");
@@ -483,9 +502,9 @@ fn write_server_config(
     }
     let config = json!({
         "schema": "zode.server-config.v1",
-        "listen": "127.0.0.1:0",
-        "management_origin": "http://127.0.0.1:41001",
-        "callback_origin": "http://127.0.0.1:41002",
+        "listen": format!("127.0.0.1:{management_port}"),
+        "management_origin": format!("http://127.0.0.1:{management_port}"),
+        "callback_origin": format!("http://127.0.0.1:{callback_port}"),
         "server_authority_id": SERVER_AUTHORITY,
         "deployment": "server_only",
         "ui_mode": "api_only",
@@ -548,8 +567,11 @@ async fn read_response(
     }
     let status = response.status();
     let body = timeout(HTTP_TIMEOUT, response.text()).await??;
-    if markers.iter().any(|marker| body.contains(marker)) {
-        return Err(Error::other("public response body contained a secret marker").into());
+    if let Some(marker_index) = markers.iter().position(|marker| body.contains(marker)) {
+        return Err(Error::other(format!(
+            "public response body contained forbidden marker index {marker_index}"
+        ))
+        .into());
     }
     Ok((status, body))
 }
@@ -818,7 +840,9 @@ async fn public_json(
     label: &str,
 ) -> Result<(StatusCode, String, Value), Box<dyn std::error::Error + Send + Sync>> {
     let response = timeout(HTTP_TIMEOUT, request.send()).await??;
-    let (status, body) = read_response(response, markers).await?;
+    let (status, body) = read_response(response, markers)
+        .await
+        .map_err(|error| Error::other(format!("{label}: {error}")))?;
     let value = parse_json(&body, label)?;
     Ok((status, body, value))
 }
@@ -993,10 +1017,14 @@ async fn scan_tree_for_markers(
                 }
             } else if path.is_file() {
                 let bytes = fs::read(path)?;
-                if markers.iter().any(|marker| scan_bytes(&bytes, marker)) {
-                    return Err(Error::other(
-                        "server-owned file contained a forbidden marker",
-                    ));
+                if let Some(marker_index) = markers
+                    .iter()
+                    .position(|marker| scan_bytes(&bytes, marker))
+                {
+                    return Err(Error::other(format!(
+                        "server-owned file contained forbidden marker index {marker_index}: {}",
+                        path.display()
+                    )));
                 }
             }
             Ok(())
@@ -1013,12 +1041,20 @@ async fn scan_tree_for_markers(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_session_storage(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let endpoint_binary = env::var_os("ZODE_ENDPOINT_BIN").ok_or_else(|| {
-        Error::other("set ZODE_ENDPOINT_BIN to the real zode Endpoint binary for this E2E")
-    })?;
-    let endpoint_binary = PathBuf::from(endpoint_binary);
+    let endpoint_binary = env::var_os("ZODE_ENDPOINT_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
+                .join("target/debug/zode")
+        });
     if !endpoint_binary.is_file() {
-        return Err(Error::other("ZODE_ENDPOINT_BIN did not point to a file").into());
+        return Err(Error::other(format!(
+            "real zode Endpoint binary is missing: {}",
+            endpoint_binary.display()
+        ))
+        .into());
     }
     let server_binary = env::var_os("CARGO_BIN_EXE_zode-server")
         .or_else(|| env::var_os("CARGO_BIN_EXE_zode_server"))
@@ -1046,7 +1082,8 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         ],
         "ZODE_READY ",
     )
-    .await?;
+    .await
+    .map_err(|error| Error::other(format!("Endpoint process failed to start: {error}")))?;
     let jwks_url = jwks.url("/jwks");
     let issuer = format!("{}/", jwks.base_url);
     let (server_config, server_database, server_secrets) =
@@ -1059,12 +1096,13 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         ],
         "ZODE_SERVER_READY ",
     )
-    .await?;
+    .await
+    .map_err(|error| Error::other(format!("Server process failed to start: {error}")))?;
     let assertion = access_assertion(&issuer)?;
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .build()?;
-    let mut marker_values = vec![
+    let marker_values = vec![
         PROVIDER_KEY.to_owned(),
         ENDPOINT_CONTROL_SECRET.to_owned(),
         assertion.clone(),
@@ -1072,10 +1110,12 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         "remote-endpoint-add".to_owned(),
         "remote-provider-descriptor".to_owned(),
         "remote-profile-create".to_owned(),
-        "remote-profile-sharing".to_owned(),
         "remote-session-create".to_owned(),
+        "remote-session-model-selection".to_owned(),
+        "remote-session-model-selection-replay".to_owned(),
         "remote-session-message".to_owned(),
         "remote-session-follow-up".to_owned(),
+        "remote-profile-delete".to_owned(),
     ];
     let cassette = load_endpoint_create_cassette()?;
     let request_path = cassette["request"]["path"]
@@ -1136,7 +1176,6 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         .as_str()
         .ok_or_else(|| Error::other("Server endpoint response omitted Endpoint-owned ID"))?
         .to_owned();
-    marker_values.push(endpoint_id.clone());
     if body.contains(ENDPOINT_CONTROL_SECRET) {
         return Err(Error::other("Server endpoint response leaked control secret").into());
     }
@@ -1221,26 +1260,10 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         .as_str()
         .ok_or_else(|| Error::other("provider profile omitted profile ID"))?
         .to_owned();
-    marker_values.push(profile_id.clone());
     let profile_revision = profile_value["revision"]
         .as_u64()
         .ok_or_else(|| Error::other("provider profile omitted revision"))?;
 
-    let sharing = authenticated(
-        client
-            .put(format!(
-                "{}/v1/auth-profiles/{profile_id}/sharing",
-                server.base_url
-            ))
-            .header("Idempotency-Key", "remote-profile-sharing"),
-        &assertion,
-    )
-    .json(&json!({"mode": "selected", "endpoint_ids": [endpoint_id]}));
-    let (status, _body, _sharing_value) =
-        public_json(sharing, &marker_refs(&marker_values), "profile sharing").await?;
-    if !status.is_success() {
-        return Err(Error::other("profile sharing did not return a success status").into());
-    }
     let _replica_state = wait_for_replica_ready(
         &client,
         &server.base_url,
@@ -1277,7 +1300,7 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
             .header("Idempotency-Key", "remote-session-create"),
         &assertion,
     )
-    .json(&json!({"model": model}));
+    .json(&json!({}));
     let (status, _create_body, create_value) = public_json(
         create,
         &marker_refs(&marker_values),
@@ -1295,7 +1318,82 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
     if !is_crockford_ulid(&session_id) {
         return Err(Error::other("Endpoint session ID was not an uppercase Crockford ULID").into());
     }
-    marker_values.push(session_id.clone());
+    let model_selection = authenticated(
+        client
+            .put(format!(
+                "{}/v1/endpoints/{endpoint_id}/sessions/{session_id}/model",
+                server.base_url
+            ))
+            .header("Idempotency-Key", "remote-session-model-selection"),
+        &assertion,
+    )
+    .json(&model);
+    let (status, model_selection_body, model_selection_value) = public_json(
+        model_selection,
+        &marker_refs(&marker_values),
+        "remote session model selection",
+    )
+    .await?;
+    require_status(
+        status,
+        StatusCode::ACCEPTED,
+        "remote session model selection",
+    )?;
+    if model_selection_value["schema"] != "zode.command.v1"
+        || model_selection_value["session_id"] != session_id
+        || model_selection_value["accepted"] != true
+    {
+        return Err(Error::other("remote session model selection response was not exact").into());
+    }
+
+    let model_selection_replay = authenticated(
+        client
+            .put(format!(
+                "{}/v1/endpoints/{endpoint_id}/sessions/{session_id}/model",
+                server.base_url
+            ))
+            .header("Idempotency-Key", "remote-session-model-selection"),
+        &assertion,
+    )
+    .json(&model);
+    let (replay_status, replay_body) = read_response(
+        timeout(HTTP_TIMEOUT, model_selection_replay.send()).await??,
+        &marker_refs(&marker_values),
+    )
+    .await?;
+    require_status(
+        replay_status,
+        StatusCode::ACCEPTED,
+        "remote session model selection replay",
+    )?;
+    if replay_body != model_selection_body {
+        return Err(Error::other(
+            "remote session model selection replay changed its body",
+        )
+        .into());
+    }
+
+    let (status, _body, selected_session) = public_json(
+        authenticated(
+            client.get(format!(
+                "{}/v1/endpoints/{endpoint_id}/sessions/{session_id}",
+                server.base_url
+            )),
+            &assertion,
+        ),
+        &marker_refs(&marker_values),
+        "selected remote session read",
+    )
+    .await?;
+    require_status(status, StatusCode::OK, "selected remote session read")?;
+    if selected_session["model"]["provider"] != PROVIDER_NAME
+        || selected_session["model"]["model"] != MODEL_NAME
+        || selected_session["model"]["provider_execution_revision"] != descriptor_revision
+        || selected_session["model"]["auth_profile_id"] != profile_id
+    {
+        return Err(Error::other("remote session model selection was not durable").into());
+    }
+
     let message = authenticated(
         client
             .post(format!(
@@ -1388,7 +1486,8 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         ],
         "ZODE_SERVER_READY ",
     )
-    .await?;
+    .await
+    .map_err(|error| Error::other(format!("restarted Server process failed to start: {error}")))?;
     let (status, _body, restarted_session) = public_json(
         authenticated(
             client.get(format!(
@@ -1496,9 +1595,13 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         .ok_or_else(|| Error::other("second provider request omitted prior assistant context"))?;
     let second_user = second_messages
         .iter()
-        .position(|message| {
-            message["role"] == "user" && message["content"] == "Reply with exactly REMOTE_OK"
+        .enumerate()
+        .find(|(position, message)| {
+            *position > first_assistant
+                && message["role"] == "user"
+                && message["content"] == "Reply with exactly REMOTE_OK"
         })
+        .map(|(position, _)| position)
         .ok_or_else(|| Error::other("second provider request omitted follow-up input"))?;
     if first_assistant >= second_user {
         return Err(Error::other("second provider request had the wrong transcript order").into());
@@ -1518,14 +1621,67 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
             Error::other("fake provider did not receive the credential on both requests").into(),
         );
     }
+
+    let delete_profile = authenticated(
+        client
+            .delete(format!(
+                "{}/v1/providers/{PROVIDER_NAME}/auth-profiles/{profile_id}",
+                restarted_server.base_url
+            ))
+            .header("Idempotency-Key", "remote-profile-delete"),
+        &assertion,
+    );
+    let (status, _body, deleted_profile) = public_json(
+        delete_profile,
+        &marker_refs(&marker_values),
+        "remote profile delete",
+    )
+    .await?;
+    require_status(status, StatusCode::OK, "remote profile delete")?;
+    if deleted_profile["provider"] != PROVIDER_NAME
+        || deleted_profile["auth_profile_id"] != profile_id
+        || !matches!(
+            deleted_profile["status"].as_str(),
+            Some("deleted") | Some("removal_pending")
+        )
+    {
+        return Err(Error::other("remote profile delete response was not exact").into());
+    }
+
+    let model_selection_after_delete = authenticated(
+        client
+            .put(format!(
+                "{}/v1/endpoints/{endpoint_id}/sessions/{session_id}/model",
+                restarted_server.base_url
+            ))
+            .header("Idempotency-Key", "remote-session-model-selection"),
+        &assertion,
+    )
+    .json(&model);
+    let (replayed_after_delete_status, replayed_after_delete_body) = read_response(
+        timeout(HTTP_TIMEOUT, model_selection_after_delete.send()).await??,
+        &marker_refs(&marker_values),
+    )
+    .await?;
+    require_status(
+        replayed_after_delete_status,
+        StatusCode::ACCEPTED,
+        "remote session model selection replay after profile delete",
+    )?;
+    if replayed_after_delete_body != model_selection_body {
+        return Err(Error::other(
+            "remote session model replay after profile delete changed its body",
+        )
+        .into());
+    }
+
     restarted_server.stop().await?;
     let server_logs_after_restart = restarted_server.logs();
     endpoint.stop().await?;
     provider.stop().await?;
     jwks.stop().await?;
     let mut persisted_markers = marker_values;
-    persisted_markers.push(first_event_id);
-    persisted_markers.push(second_event_id);
+    persisted_markers.push(session_id);
     scan_tree_for_markers(server_database.clone(), persisted_markers.clone()).await?;
     scan_tree_for_markers(
         server_database.with_extension("sqlite3-wal"),

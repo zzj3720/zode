@@ -62,6 +62,12 @@ export ZODE_WEB_E2E_UI_MODE=assets
 export PATH="$ROOT/web/node_modules/.bin:$PATH"
 export CI=true
 
+printf '%s\n' '== Server--Endpoint session model selection/replay E2E =='
+cargo test --locked --manifest-path "$ROOT/server/Cargo.toml" \
+  --test remote_vertical_e2e \
+  e2e_remote_server_configure_once_distributes_and_runs_session_without_session_storage \
+  -- --exact --nocapture
+
 # This is the same command on a checkout and on the developer machine. The
 # gate selects the shared deterministic browser/process/replay scenarios; the
 # Management product suites have their own owner and currently contain known
