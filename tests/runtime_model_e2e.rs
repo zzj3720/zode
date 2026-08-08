@@ -2358,6 +2358,106 @@ async fn e2e_model_partial_stream_retry_has_no_partial_tool_effect() -> TestResu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_invalid_model_tool_arguments_are_rejected_before_side_effect() -> TestResult<()> {
+    let database = TempDatabase::new("runtime-invalid-tool-arguments")?;
+    let mut model = ModelFixture::start(vec![
+        ModelScript::tool_call(
+            "call-invalid-arguments-1",
+            "fixture_tool",
+            r#"{"value":42}"#,
+        ),
+        ModelScript::tool_call(
+            "call-invalid-arguments-2",
+            "fixture_tool",
+            r#"{"value":42}"#,
+        ),
+    ])
+    .await?;
+    let mut tool = ToolFixture::start(vec![ToolScript::Response(json!({
+        "status": "completed",
+        "result": {"content": "side effect must not run"}
+    }))])
+    .await?;
+    let config = config_file(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        2,
+    )?;
+    let mut config_value: Value = serde_json::from_slice(&fs::read(&config)?)?;
+    config_value["tools"][0]["input_schema"] = json!({
+        "type": "object",
+        "properties": {"value": {"type": "string"}},
+        "required": ["value"],
+        "additionalProperties": false
+    });
+    fs::write(&config, serde_json::to_vec_pretty(&config_value)?)?;
+
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-invalid-tool-arguments",
+    )
+    .await?;
+    let mut events = open_events(&client, &server, &session_id).await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "invalid-tool-arguments-message",
+        "invoke the fixture tool",
+    )
+    .await?;
+    model.wait_for_requests(2).await?;
+
+    tokio::select! {
+        result = next_event_with_kind(&mut events, "model_attempt_failed") => {
+            let frame = result?;
+            assert_eq!(
+                frame.data["data"]["error"]["class"],
+                "invalid_tool_arguments"
+            );
+        }
+        result = tool.wait_for_invocations(1) => {
+            result?;
+            return Err(Error::other(
+                "invalid model tool arguments reached the tool adapter",
+            ).into());
+        }
+    }
+    assert_eq!(tool.invocation_count(), 0);
+    let state = timeout(Duration::from_secs(5), async {
+        loop {
+            let state = get_session(&client, &server, &session_id).await?;
+            if state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "invalid tool terminal barrier timed out",
+        )
+    })??;
+    assert_no_model_effect(&state, "invalid model tool arguments")?;
+    assert_eq!(state["status"], "idle");
+    assert!(state["active_activation"].is_null());
+    assert!(state["active_model_round"].is_null());
+    assert_eq!(model.request_count(), 2);
+    server.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_hard_crash_recovery_exhausts_one_model_attempt_and_keeps_delivery_runnable(
 ) -> TestResult<()> {
     let database = TempDatabase::new("runtime-crash-exhausted")?;

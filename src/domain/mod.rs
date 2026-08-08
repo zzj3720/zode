@@ -542,6 +542,7 @@ pub struct ToolError {
 #[serde(rename_all = "snake_case")]
 pub enum ModelAttemptErrorClass {
     AuthReplicaUnavailable,
+    InvalidToolArguments,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
