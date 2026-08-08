@@ -818,6 +818,11 @@ impl Runtime {
         let Some(attempt) = round.attempt.clone() else {
             return Ok(state);
         };
+        if attempt.outcome == crate::domain::ModelAttemptOutcome::Failed {
+            return self
+                .recover_failed_model_round(owner, session_id, state, attempt)
+                .await;
+        }
         if attempt.outcome != crate::domain::ModelAttemptOutcome::Running {
             return Ok(state);
         }
@@ -912,6 +917,123 @@ impl Runtime {
             not_before_ms: current_time_ms().saturating_add(delay_ms as i64),
             maximum_attempts: request.maximum_attempts,
             error_class: "model_attempt_interrupted".to_owned(),
+        };
+        let scheduled = append_runtime_event(
+            self.store.clone(),
+            owner,
+            session_id,
+            format!(
+                "model-retry:{}:{}",
+                schedule.request_id, schedule.next_attempt_number
+            ),
+            format!(
+                "model-retry-event:{}:{}",
+                schedule.request_id, schedule.next_attempt_number
+            ),
+            SessionEvent::ModelStepRetryScheduled { schedule },
+        )
+        .await?;
+        self.observe_commit(&scheduled.0, &scheduled.1).await;
+        Ok(scheduled.1)
+    }
+
+    async fn recover_failed_model_round(
+        self: &Arc<Self>,
+        owner: SessionOwner,
+        session_id: String,
+        mut state: SessionState,
+        attempt: crate::domain::ModelAttemptRecord,
+    ) -> Result<SessionState, &'static str> {
+        let Some(request) = state
+            .active_model_round
+            .as_ref()
+            .and_then(|round| round.request.clone())
+        else {
+            return Ok(state);
+        };
+        let failure = read_model_failure_fact(
+            self.store.clone(),
+            owner.clone(),
+            session_id.clone(),
+            &attempt,
+        )
+        .await?
+        .unwrap_or_else(|| RecoveredModelFailure {
+            error_class: "model_attempt_failed".to_owned(),
+            retryable: attempt.attempt_number < request.maximum_attempts,
+        });
+        let terminal = !failure.retryable || attempt.attempt_number >= request.maximum_attempts;
+        if terminal {
+            if attempt.attempt_number >= request.maximum_attempts {
+                let identity = PreparedRequestIdentity {
+                    activation_id: attempt.activation_id.clone(),
+                    round_id: attempt.round_id.clone(),
+                    request_id: attempt.request_id.clone(),
+                    maximum_attempts: request.maximum_attempts,
+                    attempt_id: attempt.attempt_id.clone(),
+                    attempt_number: attempt.attempt_number,
+                };
+                let exhausted = append_model_attempts_exhausted(
+                    self.store.clone(),
+                    owner.clone(),
+                    session_id.clone(),
+                    &identity,
+                    &attempt.attempt_id,
+                    attempt.attempt_number,
+                )
+                .await?;
+                self.observe_commit(&exhausted.0, &exhausted.1).await;
+                state = exhausted.1;
+            }
+            if state
+                .transcript
+                .last()
+                .is_some_and(|message| message.role == TranscriptRole::User)
+            {
+                let (error_class, error_message) = terminal_model_error_class(&failure.error_class);
+                let terminal = append_model_attempt_failure_with_error(
+                    self.store.clone(),
+                    owner.clone(),
+                    session_id.clone(),
+                    state
+                        .transcript
+                        .last()
+                        .map(|message| message.message_id.clone())
+                        .unwrap_or_default(),
+                    error_class,
+                    error_message,
+                )
+                .await?;
+                self.observe_commit(&terminal.0, &terminal.1).await;
+                state = terminal.1;
+            }
+            return self
+                .finish_model_failure_activation(&owner, &session_id, state)
+                .await;
+        }
+
+        let next_attempt_number = attempt.attempt_number.saturating_add(1);
+        let next_attempt_id = stable_digest(
+            "model-attempt",
+            &format!("{}:{next_attempt_number}", attempt.request_id),
+        );
+        let delay_ms = retry_delay_ms(
+            self.options.model_retry_base,
+            self.options.model_retry_max,
+            next_attempt_number,
+        );
+        let schedule = ModelRetrySchedule {
+            activation_id: attempt.activation_id,
+            round_id: attempt.round_id,
+            request_id: attempt.request_id,
+            failed_attempt_id: attempt.attempt_id,
+            next_attempt_id,
+            failed_attempt_number: attempt.attempt_number,
+            next_attempt_number,
+            delay_ms,
+            not_before_ms: current_time_ms().saturating_add(delay_ms as i64),
+            maximum_attempts: request.maximum_attempts,
+            error_class: failure.error_class,
         };
         let scheduled = append_runtime_event(
             self.store.clone(),
@@ -1894,6 +2016,60 @@ async fn rehydrate(
 }
 
 #[derive(Clone, Debug)]
+struct RecoveredModelFailure {
+    error_class: String,
+    retryable: bool,
+}
+
+async fn read_model_failure_fact(
+    store: Arc<dyn EventStore>,
+    owner: SessionOwner,
+    session_id: String,
+    attempt: &crate::domain::ModelAttemptRecord,
+) -> Result<Option<RecoveredModelFailure>, &'static str> {
+    // This path is only reached for a failed attempt that has no retry or
+    // terminal boundary. Read the append-only fact directly so snapshots made
+    // before this recovery rule was shipped remain recoverable as well.
+    let activation_id = attempt.activation_id.clone();
+    let round_id = attempt.round_id.clone();
+    let request_id = attempt.request_id.clone();
+    let attempt_id = attempt.attempt_id.clone();
+    let attempt_number = attempt.attempt_number;
+    tokio::task::spawn_blocking(move || {
+        let events = store
+            .read_stream_owned(&owner, &session_id, 0)
+            .map_err(|_| "model_failure_history")?;
+        Ok(events
+            .into_iter()
+            .rev()
+            .find_map(|record| match record.event {
+                SessionEvent::ModelAttemptFailedFact {
+                    activation_id: event_activation_id,
+                    round_id: event_round_id,
+                    request_id: event_request_id,
+                    attempt_id: event_attempt_id,
+                    attempt_number: event_attempt_number,
+                    error_class,
+                    retryable,
+                } if event_activation_id == activation_id
+                    && event_round_id == round_id
+                    && event_request_id == request_id
+                    && event_attempt_id == attempt_id
+                    && event_attempt_number == attempt_number =>
+                {
+                    Some(RecoveredModelFailure {
+                        error_class,
+                        retryable,
+                    })
+                }
+                _ => None,
+            }))
+    })
+    .await
+    .map_err(|_| "model_failure_history_join")?
+}
+
+#[derive(Clone, Debug)]
 struct PreparedRequestIdentity {
     activation_id: String,
     round_id: String,
@@ -2397,6 +2573,19 @@ fn model_error_class(error: &ModelError) -> &'static str {
 fn terminal_model_error(error: &ModelError) -> (ModelAttemptErrorClass, &'static str) {
     match error {
         ModelError::InvalidToolArguments => (
+            ModelAttemptErrorClass::InvalidToolArguments,
+            "model supplied invalid tool arguments",
+        ),
+        _ => (
+            ModelAttemptErrorClass::AuthReplicaUnavailable,
+            "credential replica unavailable",
+        ),
+    }
+}
+
+fn terminal_model_error_class(error_class: &str) -> (ModelAttemptErrorClass, &'static str) {
+    match error_class {
+        "invalid_tool_arguments" => (
             ModelAttemptErrorClass::InvalidToolArguments,
             "model supplied invalid tool arguments",
         ),

@@ -98,6 +98,10 @@ SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
   name or transport.
 - Recovery derives runnable work, waits, and async status from durable facts;
   an orphaned in-memory handle is never evidence that work is still running.
+- A persisted `ModelAttemptFailedFact` is itself an unfinished recovery
+  boundary: after restart, finish its exhaustion/terminal/activation batch (or
+  schedule its recorded retry) before claiming the session is reconciled. Do
+  not treat a failed attempt with no retry/exhaustion fact as already done.
 - Recovery marks an unterminated model attempt interrupted and schedules the
   same prepared request as a new zode attempt only while its bounded step
   budget remains. `ModelStepRetryScheduled` preallocates the stable next
@@ -133,6 +137,7 @@ Stable executable anchors are:
   `e2e_model_pre_stream_rate_limit_is_one_logical_request`,
   `e2e_model_partial_stream_retry_has_no_partial_tool_effect`,
   `e2e_provider_process_exit_finishes_activation_without_stuck_working`,
+  `e2e_restart_reconciles_failed_model_attempt_before_terminal_finish`,
   `e2e_tombstoned_replica_never_reaches_provider_before_or_after_restart`,
   `e2e_hard_crash_recovery_exhausts_one_model_attempt_and_keeps_delivery_runnable`,
   and `e2e_hard_crash_after_retry_fact_claims_one_scheduled_attempt`;
