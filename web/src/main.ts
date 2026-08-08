@@ -367,6 +367,12 @@ function profileForm(provider: Provider): HTMLFormElement {
   form.append(node("h3", undefined, "Add API key profile"));
   const labelInput = textInput("Profile label", { placeholder: "Production key" });
   const apiKey = textInput("API key", { type: "password" });
+  const defaultRow = node("label", "checkbox-row");
+  const defaultCheckbox = node("input") as HTMLInputElement;
+  defaultCheckbox.type = "checkbox";
+  defaultCheckbox.checked = true;
+  defaultCheckbox.setAttribute("aria-label", "Make this the default profile");
+  defaultRow.append(defaultCheckbox, node("span", undefined, "Make this the default profile"));
   const targets = node("fieldset", "endpoint-choices");
   const legend = node("legend", undefined, "Share with Endpoints");
   targets.append(legend);
@@ -399,7 +405,7 @@ function profileForm(provider: Provider): HTMLFormElement {
   );
   const grid = form.querySelector(".form-grid")!;
   grid.append(field("API key", apiKey));
-  form.append(targets, actions);
+  form.append(defaultRow, targets, actions);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const endpointIds = Array.from(
@@ -412,9 +418,13 @@ function profileForm(provider: Provider): HTMLFormElement {
         label: labelInput.value.trim(),
         apiKey: secret,
         endpointIds,
+        makeDefault: defaultCheckbox.checked,
       });
       state.panel = null;
-      state.notice = "Profile installed on the selected Endpoint.";
+      state.notice =
+        endpointIds.length > 0
+          ? "Profile installed on the selected Endpoint."
+          : "Profile saved without Endpoint sharing.";
       await refreshProviders();
     });
   });
@@ -433,6 +443,7 @@ function profileRow(profile: AuthProfile): HTMLElement {
     .join(", ");
   row.append(
     copy,
+    node("span", "profile-default", profile.is_default ? "Default profile" : "Not default"),
     node("span", "profile-targets", targets || "Not shared"),
     statusBadge(profile.status),
   );
@@ -660,6 +671,9 @@ function sessionForm(): HTMLFormElement {
   );
   const model = selectInput("Model", []);
   const profile = selectInput("Auth profile", []);
+  const profileHint = node("p", "inline-empty");
+  profileHint.hidden = true;
+  let submit: HTMLButtonElement | undefined;
   const updateChoices = (): void => {
     const current = state.providers.find((item) => item.provider === provider.value);
     model.replaceChildren(
@@ -669,18 +683,27 @@ function sessionForm(): HTMLFormElement {
         return option;
       }),
     );
-    profile.replaceChildren(
-      ...(state.profiles.get(provider.value) ?? [])
-        .filter((item) => item.status === "ready")
-        .map((item) => {
-          const option = node("option", undefined, item.label);
-          option.value = item.profile_id;
-          return option;
-        }),
+    const availableProfiles = (state.profiles.get(provider.value) ?? []).filter(
+      (item) =>
+        item.status === "ready" &&
+        item.sharing.mode === "selected" &&
+        item.sharing.endpoint_ids.includes(endpoint.value),
     );
+    profile.replaceChildren(
+      ...availableProfiles.map((item) => {
+        const option = node("option", undefined, item.label);
+        option.value = item.profile_id;
+        option.selected = item.is_default;
+        return option;
+      }),
+    );
+    profileHint.hidden = availableProfiles.length > 0;
+    profileHint.textContent =
+      availableProfiles.length > 0 ? "" : "No shared profile is available for this Endpoint.";
+    if (submit) submit.disabled = state.busy || availableProfiles.length === 0;
   };
   provider.addEventListener("change", updateChoices);
-  updateChoices();
+  endpoint.addEventListener("change", updateChoices);
   const grid = node("div", "form-grid");
   grid.append(
     field("Endpoint", endpoint),
@@ -689,14 +712,17 @@ function sessionForm(): HTMLFormElement {
     field("Auth profile", profile),
   );
   const actions = node("div", "panel-actions");
+  submit = submitButton("Start session");
   actions.append(
     action("Cancel", "x", () => {
       state.panel = null;
       render();
     }),
-    submitButton("Start session"),
+    submit,
   );
   form.append(title, grid, actions);
+  form.insertBefore(profileHint, actions);
+  updateChoices();
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     await withBusy(async () => {

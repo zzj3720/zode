@@ -228,6 +228,7 @@ export function createApiKeyProfile(
     label: string;
     apiKey: string;
     endpointIds: string[];
+    makeDefault: boolean;
   },
 ): Promise<AuthProfile> {
   return requestJson<AuthProfile>(
@@ -236,8 +237,11 @@ export function createApiKeyProfile(
       kind: "api_key",
       label: body.label,
       api_key: body.apiKey,
-      make_default: true,
-      sharing: { mode: "selected", endpoint_ids: body.endpointIds },
+      make_default: body.makeDefault,
+      sharing:
+        body.endpointIds.length > 0
+          ? { mode: "selected", endpoint_ids: body.endpointIds }
+          : { mode: "none", endpoint_ids: [] },
     }),
   );
 }

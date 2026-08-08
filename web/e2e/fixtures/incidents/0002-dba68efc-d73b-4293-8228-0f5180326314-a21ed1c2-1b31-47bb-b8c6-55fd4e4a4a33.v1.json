@@ -1,0 +1,85 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "0002-dba68efc-d73b-4293-8228-0f5180326314-a21ed1c2-1b31-47bb-b8c6-55fd4e4a4a33",
+  "e2e_name": "e2e_browser_provider_default_profile_is_preselected_for_new_session",
+  "boundary": "browser-capture-set",
+  "first_observed": "the New session form selected the first ready shared profile even though the provider API declared a different explicit default profile",
+  "classification": "PROVIDER_DEFAULT_PROFILE_NOT_PRESELECTED",
+  "source_digest": "a30b3af1f45916dc97b1b37215090623c0ade5306f517328389e41e0bee8d00b",
+  "first_failure_recording_id": "000027-854ae778-23dd-49bb-9552-adafc266d9f1",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000027-854ae778-23dd-49bb-9552-adafc266d9f1",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/providers",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 3753.583,
+            "data_base64": "eyJwcm92aWRlcnMiOlt7ImF1dGhfcHJvZmlsZV9jb3VudCI6MiwiYXV0aF9zdGF0dXMiOiJyZWFkeSIsImRlZmF1bHRfcHJvZmlsZV9pZCI6InByb2ZpbGUtOTJhNTQ1MzFkYzI0YWQwN2FiNzdiM2U5MTlhNmNmYjAiLCJkZXNjcmlwdG9yIjp7ImJhc2VfdXJsIjoiaHR0cDovLzEyNy4wLjAuMTo2NTA0Ny92MSIsImtpbmQiOiJvcGVuYWlfY29tcGF0aWJsZSIsIm1vZGVscyI6WyJwcm92aWRlci1kZWZhdWx0LXNlc3Npb24tbW9kZWwiXSwib3B0aW9ucyI6e30sInJldmlzaW9uIjoxfSwicHJvdmlkZXIiOiJwcm92aWRlci1kZWZhdWx0LXNlc3Npb24tZml4dHVyZSJ9XSwic2NoZW1hIjoiem9kZS5wcm92aWRlcnMudjEifQ=="
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000002",
+      "recording_id": "000028-d5fb2c14-ad00-4d95-a9c9-45449a80533c",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/endpoints/01KZGHHD6PHTECZ6TB6C0BVKHA/sessions",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 4479,
+            "data_base64": "eyJpdGVtcyI6W10sIm5leHRfY3Vyc29yIjpudWxsLCJzY2hlbWEiOiJ6b2RlLnNlc3Npb24tbGlzdC52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>",
+    "<secret:access_assertion_4>",
+    "<secret:access_assertion_16>",
+    "<secret:default_first_profile>",
+    "<secret:default_second_default_profile>",
+    "<secret:access_assertion_26>"
+  ],
+  "integrity_sha256": "7d9d206126aebc94be39755c1a6a5f51117039e33ffcddcb49517b8c49c15dd3"
+}
