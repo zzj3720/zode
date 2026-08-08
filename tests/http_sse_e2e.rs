@@ -1246,6 +1246,112 @@ async fn e2e_get_exposes_explicit_durable_model_selection(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_session_list_reflects_current_model_selection_after_update(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let database_path = test_database("list-current-model-selection")?;
+    let mut server = TestServer::start(&database_path).await?;
+    let client = http_client()?;
+    let subject = "list-current-model-selection-subject";
+    install_test_replica(
+        &client,
+        &server.base_url,
+        "list-current-model-selection-replica",
+    )
+    .await?;
+    let initial_model = json!({
+        "provider": "fixture-provider",
+        "provider_execution": {
+            "schema": "zode.provider-execution.v1",
+            "revision": 1,
+            "kind": "openai_compatible",
+            "base_url": "http://127.0.0.1/v1"
+        },
+        "model": "fixture-model-v1",
+        "auth_authority_id": support::TEST_CONTROLLER_AUTHORITY,
+        "auth_profile_id": support::TEST_AUTH_PROFILE,
+        "minimum_auth_revision": 1
+    });
+    let create = authenticated_as(client.post(server.url("/v1/sessions")), subject)
+        .header("Idempotency-Key", "list-current-model-selection-create")
+        .json(&json!({"model": initial_model}))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let create_body = response_json(create).await?;
+    let session_id = create_body["session_id"]
+        .as_str()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "model create omitted session_id"))?;
+
+    let sse_response = authenticated_as(
+        client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
+        subject,
+    )
+    .header("Last-Event-ID", "1")
+    .send_with_timeout()
+    .await?;
+    assert_eq!(sse_response.status(), StatusCode::OK);
+
+    let updated_model = json!({
+        "provider": "fixture-provider",
+        "provider_execution": {
+            "schema": "zode.provider-execution.v1",
+            "revision": 1,
+            "kind": "openai_compatible",
+            "base_url": "http://127.0.0.1/v1"
+        },
+        "model": "fixture-model-v2",
+        "auth_authority_id": support::TEST_CONTROLLER_AUTHORITY,
+        "auth_profile_id": support::TEST_AUTH_PROFILE,
+        "minimum_auth_revision": 1
+    });
+    let update = authenticated_as(
+        client.put(server.url(&format!("/v1/sessions/{session_id}/model"))),
+        subject,
+    )
+    .header("Idempotency-Key", "list-current-model-selection-update")
+    .json(&updated_model)
+    .send_with_timeout()
+    .await?;
+    assert_eq!(update.status(), StatusCode::ACCEPTED);
+    let update_body = response_json(update).await?;
+    assert_eq!(update_body["version"], 2);
+
+    let events = read_sse_events(sse_response, 1).await?;
+    assert_eq!(events[0].event, "model_selection_changed");
+    assert_eq!(events[0].data["version"], 2);
+    assert_eq!(events[0].data["data"]["model"]["model"], "fixture-model-v2");
+
+    let current = authenticated_as(
+        client.get(server.url(&format!("/v1/sessions/{session_id}"))),
+        subject,
+    )
+    .send_with_timeout()
+    .await?;
+    assert_eq!(current.status(), StatusCode::OK);
+    let current_body = response_json(current).await?;
+    assert_eq!(current_body["model"]["model"], "fixture-model-v2");
+
+    let list = authenticated_as(client.get(server.url("/v1/sessions?limit=100")), subject)
+        .send_with_timeout()
+        .await?;
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = response_json(list).await?;
+    let item = list_body["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["session_id"] == session_id))
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "updated session omitted from list"))?;
+    assert!(
+        item["version"].as_u64().is_some_and(|version| version >= 2),
+        "list did not advance after model selection: {item}"
+    );
+    assert_eq!(item["model"], current_body["model"]);
+    assert_eq!(item["model"]["model"], "fixture-model-v2");
+
+    server.stop().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_concurrent_create_receipt_and_event_are_atomic(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

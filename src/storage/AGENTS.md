@@ -41,7 +41,10 @@ or rebuildable operational projections.
   digest to multiple streams. Owned read, append, SSE catch-up, and list paths
   share one verified owner gate so missing and cross-owner resources have the
   same public result; list order uses durable creation position, never ULID
-  lexical order.
+  lexical order. Each listed session's current model selection comes from the
+  verified event-replayed state, not the immutable creation projection; a
+  `model_selection_changed` event must be visible consistently in session GET,
+  SSE, and list responses.
 - Initialize the storage schema only when the SQLite catalog is genuinely
   empty. Once any zode fact exists, missing or non-canonical metadata and
   authority tables fail closed; startup may transactionally rebuild only the
