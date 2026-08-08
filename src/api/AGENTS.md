@@ -93,7 +93,10 @@ errors, durable admission before acceptance, concurrent commit-order SSE,
 `Last-Event-ID` replay/live handoff without gaps or duplicates, lag recovery,
 disconnect without runtime cancellation, bounded identity/health/capabilities,
 credential-replica revision/tombstone idempotency without secrets, and
-duplicate tool callback commands producing one public terminal event.
+duplicate tool callback commands producing one public terminal event. The
+`e2e_session_list_reflects_current_model_selection_after_update` anchor also
+keeps the list's current selection consistent with session GET and the
+`model_selection_changed` SSE event.
 
 The identity/health/capability anchors are
 `e2e_identity_is_endpoint_owned_and_restart_stable`,

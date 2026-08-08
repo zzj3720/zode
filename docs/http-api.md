@@ -258,7 +258,9 @@ collision before committing the first event/receipt.
 of non-secret session summaries owned by the authenticated controller subject.
 Ordering uses durable creation position, not ULID lexical order; `cursor` is
 opaque. The list is derived from Endpoint events and a rebuildable index, never
-a second mutable session authority.
+a second mutable session authority. The `model` summary is the current
+event-replayed selection: after a committed `model_selection_changed` event,
+session GET, its SSE frame, and the list item expose the same selection.
 
 ```json
 {

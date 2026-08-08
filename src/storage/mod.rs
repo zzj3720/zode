@@ -1586,7 +1586,6 @@ struct SessionCreation {
     record: EventRecord,
     owner: SessionOwner,
     created_at_ms: i64,
-    selection: SessionSelection,
     command_fingerprint_version: i64,
     command_fingerprint: Vec<u8>,
 }
@@ -1621,13 +1620,12 @@ fn verified_creation_event(
         .optional()?
         .ok_or(StoreError::InvalidSessionCreateReceipt)?;
     let event = decode_persisted_event(raw.0)?;
-    let (owner, created_at_ms, selection) = match &event.record.event {
+    let (owner, created_at_ms) = match &event.record.event {
         SessionEvent::SessionCreated {
             owner,
             created_at_ms,
-            selection,
             ..
-        } => (owner.clone(), *created_at_ms, selection.clone()),
+        } => (owner.clone(), *created_at_ms),
         _ => return Err(StoreError::InvalidSessionCreateReceipt),
     };
     if raw.1 != COMMAND_FINGERPRINT_VERSION
@@ -1640,7 +1638,6 @@ fn verified_creation_event(
         record: event.record,
         owner,
         created_at_ms,
-        selection,
         command_fingerprint_version: raw.1,
         command_fingerprint: raw.2,
     })
@@ -2135,7 +2132,7 @@ impl EventStore for SqliteEventStore {
                 status,
                 created_at_ms,
                 creation_global_position: creation_position,
-                selection: verified.creation.selection,
+                selection: verified.rehydrated.state.selection,
             });
         }
         let next_cursor = if has_more {
