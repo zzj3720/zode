@@ -9,7 +9,7 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use support::{
     authenticated, authenticated_as, http_client, install_test_replica, require_ulid,
-    response_json, response_text, HttpRequestExt,
+    response_json, response_text, write_endpoint_config, ConfiguredServer, HttpRequestExt,
 };
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_create_message_sse_reconnect_get_restart(
@@ -470,6 +470,123 @@ async fn e2e_message_replay_only_replays_receipt_without_new_event(
     assert_eq!(records[1].event, "message_appended");
 
     server.stop().await?;
+    Ok(())
+}
+
+fn receipt_admission_tool(adapter_url: &str) -> Value {
+    json!({
+        "name": "fixture_tool",
+        "description": "receipt admission fixture",
+        "input_schema": {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "additionalProperties": false
+        },
+        "completion_mode": "response",
+        "auto_wait_timeout_seconds": 20,
+        "recovery": {
+            "on_running_restart": "unknown_outcome",
+            "retry_dispatch": "never"
+        },
+        "adapter": {"kind": "http", "url": adapter_url}
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_create_receipt_lookup_precedes_current_admission(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let database = test_database("create-receipt-admission")?;
+    let configured_tool = receipt_admission_tool("http://127.0.0.1:1/invoke");
+    let config = write_endpoint_config(&database, vec![configured_tool], 1)?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = http_client()?;
+    let create_body = json!({"tools": ["fixture_tool"]});
+
+    let first = authenticated(client.post(server.url("/v1/sessions")))
+        .header("Idempotency-Key", "create-receipt-admission-key")
+        .json(&create_body)
+        .send_with_timeout()
+        .await?;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = response_text(first).await?;
+    let first_json: Value = serde_json::from_str(&first_body)?;
+    let session_id = require_ulid(&first_json)?;
+    assert_eq!(first_json["version"], 1);
+
+    let events = authenticated(
+        client
+            .get(server.url(&format!("/v1/sessions/{session_id}/events")))
+            .header("Last-Event-ID", "0"),
+    )
+    .send_with_timeout()
+    .await?;
+    assert_eq!(events.status(), StatusCode::OK);
+    let events = read_sse_events(events, 1).await?;
+    assert_eq!(events[0].event, "session_created");
+
+    server.stop().await?;
+    let config = write_endpoint_config(&database, Vec::new(), 1)?;
+    let mut restarted = ConfiguredServer::start(&database, &config).await?;
+
+    let replay = authenticated(client.post(restarted.url("/v1/sessions")))
+        .header("Idempotency-Key", "create-receipt-admission-key")
+        .json(&create_body)
+        .send_with_timeout()
+        .await?;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(response_text(replay).await?, first_body);
+
+    let replay_only = authenticated(client.post(restarted.url("/v1/sessions")))
+        .header("Idempotency-Key", "create-receipt-admission-key")
+        .header("Zode-Idempotency-Mode", "replay-only")
+        .json(&create_body)
+        .send_with_timeout()
+        .await?;
+    assert_eq!(replay_only.status(), StatusCode::CREATED);
+    assert_eq!(response_text(replay_only).await?, first_body);
+
+    let conflict = authenticated(client.post(restarted.url("/v1/sessions")))
+        .header("Idempotency-Key", "create-receipt-admission-key")
+        .json(&json!({"tools": ["missing_tool"]}))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(response_json(conflict).await?["error"]["code"], "conflict");
+
+    let replay_miss = authenticated(client.post(restarted.url("/v1/sessions")))
+        .header("Idempotency-Key", "create-receipt-admission-miss")
+        .header("Zode-Idempotency-Mode", "replay-only")
+        .json(&json!({"tools": ["missing_tool"]}))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(replay_miss.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response_json(replay_miss).await?["error"]["code"],
+        "idempotency_receipt_not_found"
+    );
+
+    // A new key must consult the restarted, current tool catalog only after
+    // receipt lookup; the removed fixture tool is no longer admissible.
+    let new_admission = authenticated(client.post(restarted.url("/v1/sessions")))
+        .header("Idempotency-Key", "create-receipt-admission-new")
+        .json(&create_body)
+        .send_with_timeout()
+        .await?;
+    assert_eq!(new_admission.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        response_json(new_admission).await?["error"]["code"],
+        "invalid_request"
+    );
+
+    let session = authenticated(client.get(restarted.url(&format!("/v1/sessions/{session_id}"))))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(session.status(), StatusCode::OK);
+    let session = response_json(session).await?;
+    assert_eq!(session["version"], 1);
+    assert_eq!(session["transcript"], json!([]));
+
+    restarted.stop().await?;
     Ok(())
 }
 

@@ -280,6 +280,17 @@ impl Runtime {
         self.publisher.clone()
     }
 
+    /// Validate a session's configured adapter-tool selection against the
+    /// current runtime catalog.  The HTTP adapter calls this only after a
+    /// create receipt miss; receipt replay therefore never consults the
+    /// current catalog.
+    pub fn validate_tool_selection(&self, selected: &[String]) -> Result<(), RuntimeCommandError> {
+        self.tools
+            .definitions(selected)
+            .map(|_| ())
+            .map_err(|_| RuntimeCommandError::Invalid("tool_selection"))
+    }
+
     /// Complete an external callback through the durable stream.  The
     /// callback ID is the only routing identity; bearer verification and
     /// first-terminal semantics remain inside the runtime so the HTTP adapter

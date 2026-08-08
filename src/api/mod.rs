@@ -740,6 +740,7 @@ async fn create_session(
     let store = state.store.clone();
     let replicas = state.replicas.clone();
     let provider_policy = state.provider_policy.clone();
+    let runtime = state.runtime.clone();
     let operation = run_blocking(move || {
         let replay = store
             .lookup_session_create(&owner, &command)
@@ -750,6 +751,9 @@ async fn create_session(
         if let Some(replay) = replay {
             return Ok(replay);
         }
+        runtime
+            .validate_tool_selection(&selection.tools)
+            .map_err(|_| ServiceError::Invalid("invalid tool selection".into()))?;
         if let Some(model) = selection.model.as_ref() {
             provider_policy
                 .validate(&model.provider_execution)

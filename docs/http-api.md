@@ -240,8 +240,8 @@ authority/subject-scoped collection receipt lookup:
 
 This lets a stateless controller recover an unknown create outcome before
 applying mutable current policy. The normal create path still validates current
-model/profile/replica state on a receipt miss. Other mutation routes use the
-same ordering for their own command scopes.
+tool-catalog and model/profile/replica state on a receipt miss. Other mutation
+routes use the same ordering for their own command scopes.
 
 The ULID is unique only within this Endpoint's resource namespace. Controllers
 must treat it as opaque and pair it with their own Endpoint identity; they must
@@ -734,6 +734,7 @@ without consulting current credential/readiness state or issuing a mutation.
 
 Executable anchors are
 `e2e_create_generates_ulid_and_binds_idempotency_payload`,
+`e2e_create_receipt_lookup_precedes_current_admission`,
 `e2e_concurrent_create_receipt_and_event_are_atomic`, and
 `e2e_session_ownership_safe_not_found_and_ordered_sse`, with the independent
 single-page list assertion in `e2e_session_list_is_subject_scoped`. Authority-

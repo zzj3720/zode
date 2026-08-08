@@ -25,6 +25,10 @@ contract.
   original response, changed fingerprint conflicts, and miss is typed and
   mutation-free. It cannot allocate, append, wake, issue an effect, or bypass
   normal admission for a new key.
+- Session-create receipt lookup also precedes current tool-catalog and
+  provider/profile admission on the normal path: an equivalent replay is
+  returned unchanged, while a receipt miss validates the current selection
+  before allocating a new session.
 - Persist only a versioned one-way fingerprint. Secret-bearing control
   commands use a restart-stable Endpoint-keyed HMAC; never persist their raw
   canonical request bytes.
