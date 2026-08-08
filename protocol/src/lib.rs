@@ -37,6 +37,7 @@ pub const TOOL_HTTP_CAPABILITY: &str = "tool_http";
 pub const EXTERNAL_CALLBACK_CAPABILITY: &str = "external_callback";
 pub const WAIT_FOR_TOOL: &str = "wait_for";
 pub const AUTH_REPLICA_CREDENTIAL_SCHEMA_V1: &str = "openai-compatible.api-key.v1";
+pub const AUTH_REPLICA_CREDENTIAL_SCHEMA_ANTHROPIC_V1: &str = "anthropic.api-key.v1";
 
 /// The authenticated Endpoint identity returned by `/v1/identity`.
 ///

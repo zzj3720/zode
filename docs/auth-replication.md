@@ -123,6 +123,12 @@ encrypted to the Endpoint identity key is recommended when traffic may
 cross a terminating relay. The raw request body is never logged or retained as
 an idempotency receipt.
 
+The credential schema is adapter-specific. The shipped OpenAI-compatible
+adapter accepts `openai-compatible.api-key.v1`; the native Anthropic Messages
+adapter accepts `anthropic.api-key.v1`. Endpoint rejects a session before
+provider admission when the selected adapter and installed replica schema do
+not match, and never substitutes an ambient environment credential.
+
 The authenticated authority plus `profile-opaque` path identifies one replica
 resource. Its first accepted install binds the profile to the request's
 provider type. A later request cannot rebind that profile by changing

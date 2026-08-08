@@ -17,7 +17,10 @@ use aimux_core::{
     tool::{FunctionTool, Tool},
     types::FinishReasonUnified,
 };
-use aimux_providers::openai::{OpenAIConfig, OpenAIProvider};
+use aimux_providers::{
+    anthropic::{AnthropicConfig, AnthropicProvider},
+    openai::{OpenAIConfig, OpenAIProvider},
+};
 use futures_util::StreamExt;
 use getrandom::fill as fill_random;
 use hmac::{Hmac, Mac};
@@ -42,7 +45,8 @@ const RECEIPT_SCHEMA: &str = "zode.auth-replica.receipt.v1";
 const INSTALL_SCHEMA: &str = "zode.auth-replica.install.v1";
 const TOMBSTONE_SCHEMA: &str = "zode.auth-replica.tombstone.v1";
 const SECRET_ENCODING: &str = "application/zode-secret-envelope";
-const CREDENTIAL_SCHEMA: &str = "openai-compatible.api-key.v1";
+const CREDENTIAL_SCHEMA_OPENAI: &str = "openai-compatible.api-key.v1";
+const CREDENTIAL_SCHEMA_ANTHROPIC: &str = "anthropic.api-key.v1";
 const MAX_SECRET_BYTES: usize = 64 * 1024;
 pub const MAX_REPLICA_REQUEST_BYTES: usize = 128 * 1024;
 const MAX_NAME_BYTES: usize = 256;
@@ -127,6 +131,7 @@ pub struct ReplicaMetadata {
 #[derive(Clone, Debug)]
 pub struct ResolvedCredential {
     pub revision: u64,
+    pub credential_schema: String,
     pub secret: String,
 }
 
@@ -310,6 +315,9 @@ impl ReplicaStore {
         }
         Ok(ResolvedCredential {
             revision: record.revision,
+            credential_schema: record
+                .credential_schema
+                .ok_or(ReplicaError::SecretUnavailable)?,
             secret: record.secret.ok_or(ReplicaError::SecretUnavailable)?,
         })
     }
@@ -416,6 +424,14 @@ pub struct ProviderExecutionPolicy {
     allowed_origins: Vec<String>,
 }
 
+pub fn credential_schema_for_adapter(kind: &str) -> Option<&'static str> {
+    match kind {
+        "openai_compatible" => Some(CREDENTIAL_SCHEMA_OPENAI),
+        "anthropic" => Some(CREDENTIAL_SCHEMA_ANTHROPIC),
+        _ => None,
+    }
+}
+
 impl ProviderExecutionPolicy {
     pub fn new(adapter_kinds: Vec<String>, allowed_origins: Vec<String>) -> Self {
         Self {
@@ -455,11 +471,11 @@ pub fn validate_provider_execution_descriptor(
     {
         return Err(ProviderExecutionValidationError::Invalid);
     }
-    if descriptor.kind != "openai_compatible"
-        || !policy
-            .adapter_kinds
-            .iter()
-            .any(|kind| kind == "openai_compatible")
+    if !policy
+        .adapter_kinds
+        .iter()
+        .any(|kind| kind == &descriptor.kind)
+        || credential_schema_for_adapter(&descriptor.kind).is_none()
     {
         return Err(ProviderExecutionValidationError::AdapterDisabled);
     }
@@ -507,7 +523,17 @@ impl AimuxProvider {
             | ReplicaError::Record(_) => ModelError::Unavailable,
         })?;
 
-        let prompt = prompt_from_transcript(&request.transcript)?;
+        let expected_credential_schema =
+            credential_schema_for_adapter(&selection.provider_execution.kind)
+                .ok_or(ModelError::InvalidSelection)?;
+        if credential.credential_schema != expected_credential_schema {
+            return Err(ModelError::AuthReplicaUnavailable);
+        }
+
+        let prompt = prompt_from_transcript(
+            &request.transcript,
+            selection.provider_execution.kind == "openai_compatible",
+        )?;
         let tools = request
             .tools
             .iter()
@@ -532,15 +558,28 @@ impl AimuxProvider {
             provider_options,
             ..CallOptions::new(prompt)
         };
-        let config = OpenAIConfig::new(credential.secret)
-            .with_base_url(selection.provider_execution.base_url)
-            .with_provider(selection.provider);
-        let model = OpenAIProvider::new(config).model(&selection.model);
-        let mut stream = model
-            .do_stream(&options)
-            .await
-            .map_err(|_| ModelError::ProviderFailed)?
-            .stream;
+        let mut stream = match selection.provider_execution.kind.as_str() {
+            "openai_compatible" => {
+                let config = OpenAIConfig::new(credential.secret.clone())
+                    .with_base_url(selection.provider_execution.base_url.clone())
+                    .with_provider(selection.provider.clone());
+                OpenAIProvider::new(config)
+                    .model(&selection.model)
+                    .do_stream(&options)
+                    .await
+            }
+            "anthropic" => {
+                let config = AnthropicConfig::new(credential.secret.clone())
+                    .with_base_url(selection.provider_execution.base_url.clone());
+                AnthropicProvider::new(config)
+                    .model(&selection.model)
+                    .do_stream(&options)
+                    .await
+            }
+            _ => return Err(ModelError::InvalidSelection),
+        }
+        .map_err(|_| ModelError::ProviderFailed)?
+        .stream;
         let mut text = String::new();
         let mut tool_calls = Vec::<(String, String, String, Option<Value>)>::new();
         let mut finish = None;
@@ -657,6 +696,7 @@ impl ModelExecutor for AimuxProvider {
 
 fn prompt_from_transcript(
     transcript: &[TranscriptMessage],
+    suppress_assistant_tool_preamble: bool,
 ) -> Result<LanguageModelPrompt, ModelError> {
     transcript
         .iter()
@@ -675,8 +715,9 @@ fn prompt_from_transcript(
             // back into the next request changes the provider conversation
             // (and breaks replay) even though the text remains observable in
             // Endpoint history.
-            let assistant_tool_turn =
-                message.role == TranscriptRole::Assistant && !message.tool_calls.is_empty();
+            let assistant_tool_turn = suppress_assistant_tool_preamble
+                && message.role == TranscriptRole::Assistant
+                && !message.tool_calls.is_empty();
             if message.role != TranscriptRole::Tool
                 && !message.content.is_empty()
                 && !assistant_tool_turn
@@ -792,7 +833,7 @@ fn validate_mutation(
             if request.schema != INSTALL_SCHEMA
                 || request.authority_id != authority_id
                 || request.kind != "api_key"
-                || request.credential_schema != CREDENTIAL_SCHEMA
+                || !supported_credential_schema(&request.credential_schema)
                 || request.secret.encoding != SECRET_ENCODING
                 || request.secret.payload.is_empty()
                 || request.secret.payload.len() > MAX_SECRET_BYTES
@@ -903,7 +944,10 @@ fn validate_record(
     match record.status.as_str() {
         "ready"
             if record.kind.as_deref() == Some("api_key")
-                && record.credential_schema.as_deref() == Some(CREDENTIAL_SCHEMA)
+                && record
+                    .credential_schema
+                    .as_deref()
+                    .is_some_and(supported_credential_schema)
                 && record.secret.as_ref().is_some_and(|secret| {
                     !secret.is_empty() && secret.len() <= MAX_SECRET_BYTES
                 }) => {}
@@ -911,6 +955,13 @@ fn validate_record(
         _ => return Err(ReplicaError::SecretUnavailable),
     }
     Ok(())
+}
+
+fn supported_credential_schema(schema: &str) -> bool {
+    matches!(
+        schema,
+        CREDENTIAL_SCHEMA_OPENAI | CREDENTIAL_SCHEMA_ANTHROPIC
+    )
 }
 
 fn metadata_from_record(record: &ReplicaRecord) -> ReplicaMetadata {

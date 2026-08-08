@@ -30,6 +30,7 @@ const MAX_DESCRIPTION_BYTES: usize = 8 * 1024;
 const MAX_INPUT_SCHEMA_BYTES: usize = 64 * 1024;
 const MAX_LIST_ITEMS: usize = 1_024;
 const PROVIDER_ADAPTER_OPENAI_COMPATIBLE: &str = "openai_compatible";
+const PROVIDER_ADAPTER_ANTHROPIC: &str = "anthropic";
 
 pub(crate) const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:3000";
 pub(crate) const DEFAULT_RUNTIME_STORE: &str = "zode.sqlite3";
@@ -647,11 +648,9 @@ fn validate_runtime(runtime: &RuntimeConfig) -> Result<(), ConfigError> {
 
 fn validate_provider_execution(config: &mut ProviderExecutionConfig) -> Result<(), ConfigError> {
     parse_unique_names(&config.adapter_kinds)?;
-    if config
-        .adapter_kinds
-        .iter()
-        .any(|kind| kind != PROVIDER_ADAPTER_OPENAI_COMPATIBLE)
-    {
+    if config.adapter_kinds.iter().any(|kind| {
+        kind != PROVIDER_ADAPTER_OPENAI_COMPATIBLE && kind != PROVIDER_ADAPTER_ANTHROPIC
+    }) {
         return Err(ConfigError::Invalid(
             "provider_execution contains an unsupported adapter kind",
         ));
