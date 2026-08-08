@@ -2473,6 +2473,124 @@ async fn e2e_provider_process_exit_finishes_activation_without_stuck_working() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_restart_reconciles_failed_model_attempt_before_terminal_finish() -> TestResult<()> {
+    let database = TempDatabase::new("runtime-failed-attempt-recovery")?;
+    let hold = ModelHold::new();
+    let mut model =
+        ModelFixture::start(vec![ModelScript::stream_failure_hold(hold.clone())]).await?;
+    let mut tool = ToolFixture::start(Vec::new()).await?;
+    let config = config_file(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-failed-attempt-recovery",
+    )
+    .await?;
+    let mut events = open_events(&client, &server, &session_id).await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "failed-attempt-recovery-message",
+        "recover terminal failure after restart",
+    )
+    .await?;
+    hold.wait_entered().await?;
+    hold.release();
+
+    let failure = next_event_with_kind(&mut events, "model_attempt_failed").await?;
+    assert_eq!(failure.data["session_id"], session_id);
+    server.stop().await?;
+    model.stop().await?;
+
+    let mut restarted = ConfiguredServer::start(&database, &config).await?;
+    let mut recovery_events =
+        open_events_with_cursor(&client, &restarted, &session_id, Some(&failure.id)).await?;
+    next_event_with_kind(&mut recovery_events, "model_attempts_exhausted").await?;
+    next_event_with_kind(&mut recovery_events, "model_attempt_failed").await?;
+    next_event_with_kind(&mut recovery_events, "activation_finished").await?;
+    let state = get_session(&client, &restarted, &session_id).await?;
+    assert_eq!(state["active_activation"], Value::Null);
+    assert_eq!(state["active_model_round"], Value::Null);
+    assert_eq!(state["status"], "idle");
+
+    restarted.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_restart_reconciles_failed_model_attempt_before_retry_schedule() -> TestResult<()> {
+    let database = TempDatabase::new("runtime-failed-attempt-retry-recovery")?;
+    let hold = ModelHold::new();
+    let mut model = ModelFixture::start(vec![
+        ModelScript::stream_failure_hold(hold.clone()),
+        ModelScript::final_text("retry recovered after restart"),
+    ])
+    .await?;
+    let mut tool = ToolFixture::start(Vec::new()).await?;
+    let config = config_file(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        2,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-failed-attempt-retry-recovery",
+    )
+    .await?;
+    let mut events = open_events(&client, &server, &session_id).await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "failed-attempt-retry-recovery-message",
+        "recover scheduled retry after restart",
+    )
+    .await?;
+    hold.wait_entered().await?;
+    hold.release();
+
+    let failure = next_event_with_kind(&mut events, "model_attempt_failed").await?;
+    assert_eq!(failure.data["session_id"], session_id);
+    // Stop immediately after the public failure fact.  The retry boundary is
+    // intentionally absent from this crash window; restart must schedule the
+    // same prepared request rather than leave the failed round active.
+    server.stop().await?;
+
+    let mut restarted = ConfiguredServer::start(&database, &config).await?;
+    let mut recovery_events =
+        open_events_with_cursor(&client, &restarted, &session_id, Some(&failure.id)).await?;
+    next_event_with_kind(&mut recovery_events, "model_step_retrying").await?;
+    model.wait_for_requests(2).await?;
+    let assistant =
+        next_assistant_with_content(&mut recovery_events, "retry recovered after restart").await?;
+    assert_eq!(assistant.data["session_id"], session_id);
+    let state = get_session(&client, &restarted, &session_id).await?;
+    assert_eq!(state["active_activation"], Value::Null);
+    assert_eq!(state["active_model_round"], Value::Null);
+    assert_eq!(state["status"], "idle");
+
+    restarted.stop().await?;
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_invalid_model_tool_arguments_are_rejected_before_side_effect() -> TestResult<()> {
     let database = TempDatabase::new("runtime-invalid-tool-arguments")?;
     let mut model = ModelFixture::start(vec![
