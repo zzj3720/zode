@@ -301,9 +301,9 @@ impl SessionProxy {
         if let Some(last_event_id) = last_event_id {
             request = request.header("last-event-id", last_event_id);
         }
-        let response = request
-            .send()
+        let response = tokio::time::timeout_at(actor.assertion_expiry_deadline(), request.send())
             .await
+            .map_err(|_| SessionProxyError::EndpointUnavailable)?
             .map_err(|_| SessionProxyError::EndpointUnavailable)?;
         if !response.status().is_success() {
             return Err(map_endpoint_error(response).await);
@@ -320,9 +320,21 @@ impl SessionProxy {
         {
             return Err(SessionProxyError::EndpointUnavailable);
         }
-        let stream = response
-            .bytes_stream()
-            .map(|chunk| chunk.map_err(|_| std::io::Error::other("Endpoint event stream closed")));
+        let source = Box::pin(response.bytes_stream());
+        let expiry = actor.assertion_expiry_deadline();
+        let stream = futures_util::stream::unfold(
+            (source, expiry),
+            |(mut source, expiry)| async move {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(expiry) => None,
+                    item = source.next() => item.map(|chunk| {
+                        let result = chunk.map_err(|_| std::io::Error::other("Endpoint event stream closed"));
+                        (result, (source, expiry))
+                    }),
+                }
+            },
+        );
         let mut public = Response::new(Body::from_stream(stream));
         *public.status_mut() = StatusCode::OK;
         public.headers_mut().insert(

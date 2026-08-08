@@ -2,15 +2,23 @@ import { test, expect, type BrowserContext, type Page, type TestInfo } from "@pl
 import { createHash, createSign, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { execFile, spawn, type ChildProcessByStdio } from "node:child_process";
+import { execFile } from "node:child_process";
 import { dirname, join, relative, resolve } from "node:path";
-import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const SPEC_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = process.env.ZODE_REPO_ROOT ?? resolve(SPEC_DIR, "../../..");
+const require = createRequire(import.meta.url);
+const { RealProcess: CapturedRealProcess, RecordingJournal, SecretLedger } = require("../support/harness.cjs") as {
+  RealProcess: {
+    start: (options: Record<string, unknown>) => Promise<CapturedProcess>;
+  };
+  RecordingJournal: new (options: { rootDir: string; ledger: SecretLedgerContract }) => RecordingJournalContract;
+  SecretLedger: new () => SecretLedgerContract;
+};
 const FIXTURE_ROOT = resolve(REPO_ROOT, "web/e2e/fixtures/access_entry_reentry");
 const ENTRY_CASSETTE_PATH = join(FIXTURE_ROOT, "management-entry-first-failure.v1.json");
 const REENTRY_CASSETTE_PATH = join(FIXTURE_ROOT, "browser-access-reentry-first-failure.v1.json");
@@ -21,16 +29,52 @@ const ACCESS_SUBJECT = "synthetic-human-access-entry-e2e";
 const ACCESS_EMAIL = "synthetic-access-entry@example.invalid";
 const VIEW_STATE_PATH = process.env.ZODE_ACCESS_VIEW_PATH ?? "/?view=sessions";
 const MUTATION_TEXT = "non-secret-access-entry-view-state";
+const EXPIRY_E2E_NAME = "e2e_browser_access_reentry_stops_mutations_and_uses_management_origin";
+const EXPIRY_LATER_RELATION = "later_test_reproduction_of_gap";
+const EXPIRY_ORIGINAL_GAP = "access-assertion-expiry-sse-first-occurrence-gap";
 const execFileAsync = promisify(execFile);
 
 type AccessMode = "valid" | "expired" | "invalid" | "expiring";
 type SemanticHeader = { name: string; value: string };
 type ResponseChunk = { offset_us: number; body_hex: string };
-type AccessChild = ChildProcessByStdio<null, Readable, Readable>;
-
 type SignedAssertion = {
   token: string;
   expiresAtMs: number;
+};
+
+type CapturedProcess = {
+  baseUrl?: string;
+  stop: () => Promise<unknown>;
+};
+
+type SecretLedgerContract = {
+  add: (label: string, value: string) => void;
+};
+
+type RecordingJournalContract = {
+  beginCaptureSet: (options: { e2eName: string; maxMembers?: number }) => string;
+  beginIngress: (options: {
+    boundary: string;
+    method: string;
+    requestPath: string;
+    requestHeaders: Record<string, unknown>;
+    captureSetId: string;
+  }) => unknown;
+  ingressChunk: (context: unknown, data: Buffer) => void;
+  endIngress: (context: unknown) => Buffer;
+  updateIngressHeaders: (context: unknown, requestHeaders: Record<string, unknown>) => void;
+  responseStarted: (context: unknown, response: { status: number; headers: Record<string, string> }) => void;
+  chunk: (context: unknown, data: Buffer, offsetUs: number) => void;
+  finish: (context: unknown, outcome: string) => unknown;
+  first: (options: {
+    boundary?: string;
+    requestPath?: string;
+    responseStatus?: number;
+  }) => { recordingId: string } | undefined;
+  flushCaptureSet: (
+    captureSetId: string,
+    options?: { firstFailureRecordingId?: string },
+  ) => { records?: Array<{ recordingId: string; rawPath?: string }>; sourceDigest?: string };
 };
 
 type Cassette = {
@@ -586,6 +630,11 @@ class AccessEdgeFixture {
   readonly exchanges: WireExchange[] = [];
   readonly mutationExchanges: WireExchange[] = [];
   readonly sseExchanges: SseExchange[] = [];
+  private captureJournal: RecordingJournalContract | undefined;
+  private captureSetId: string | undefined;
+  private captureError: unknown;
+  private readonly ingressByRequest = new WeakMap<IncomingMessage, unknown>();
+  private readonly ingressByExchange = new WeakMap<WireExchange, unknown>();
   private forwardedAssertionCountValue = 0;
   private readonly server = createServer((request: IncomingMessage, response: ServerResponse) => {
     void this.handle(request, response).catch(() => {
@@ -604,9 +653,20 @@ class AccessEdgeFixture {
   private sseOpened: Promise<void> | undefined;
   private sseClosedResolve: (() => void) | undefined;
   private sseClosed: Promise<void> | undefined;
+  private sseOpenedCountValue = 0;
+  private expireNextMutation = false;
   private autoCompleteReentry = false;
   private reentryCountValue = 0;
   origin = "";
+
+  setCapture(journal: RecordingJournalContract, captureSetId: string): void {
+    this.captureJournal = journal;
+    this.captureSetId = captureSetId;
+  }
+
+  assertCaptureHealthy(): void {
+    if (this.captureError) throw this.captureError;
+  }
 
   async start(): Promise<this> {
     this.origin = await listen(this.server);
@@ -628,6 +688,7 @@ class AccessEdgeFixture {
 
   async setMode(mode: AccessMode): Promise<void> {
     this.mode = mode;
+    this.expireNextMutation = false;
   }
 
   enableAutoCompleteReentry(): void {
@@ -650,7 +711,25 @@ class AccessEdgeFixture {
 
   async waitForSseClosed(): Promise<void> {
     if (!this.sseClosed) throw new Error("SSE lifecycle was not armed");
-    await this.sseClosed;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        this.sseClosed,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("ACCESS_ASSERTION_EXPIRY_SSE_NOT_CLOSED")), 8_000);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async waitForSseOpenedCount(count: number, timeoutMs = 8_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.sseOpenedCountValue < count) {
+      if (Date.now() >= deadline) throw new Error(`ACCESS_SSE_RECONNECT_NOT_OPEN count=${count}`);
+      await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+    }
   }
 
   reentryCount(): number {
@@ -702,6 +781,8 @@ class AccessEdgeFixture {
     this.sseOpened = undefined;
     this.sseClosedResolve = undefined;
     this.sseClosed = undefined;
+    this.sseOpenedCountValue = 0;
+    this.expireNextMutation = false;
     this.autoCompleteReentry = false;
     this.reentryCountValue = 0;
     this.exchanges.length = 0;
@@ -714,38 +795,135 @@ class AccessEdgeFixture {
     await closeServer(this.server);
   }
 
+  private beginIngress(request: IncomingMessage): unknown {
+    if (!this.captureJournal || !this.captureSetId) return undefined;
+    try {
+      const context = this.captureJournal.beginIngress({
+        boundary: request.url?.startsWith("/cdn-cgi/access/certs")
+          ? "access-jwks-fixture"
+          : "management-access-edge",
+        method: request.method ?? "GET",
+        requestPath: request.url ?? "/",
+        requestHeaders: request.headers,
+        captureSetId: this.captureSetId,
+      });
+      this.ingressByRequest.set(request, context);
+      return context;
+    } catch (error) {
+      this.captureError ||= error;
+      throw error;
+    }
+  }
+
+  private async readIngressBody(request: IncomingMessage, context: unknown): Promise<Buffer> {
+    if (!context || !this.captureJournal) return readRequestBody(request);
+    const chunks: Buffer[] = [];
+    let length = 0;
+    try {
+      for await (const chunk of request) {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        length += bytes.length;
+        if (length > 2 * 1024 * 1024) throw new Error("fixture request body exceeds bound");
+        this.captureJournal.ingressChunk(context, bytes);
+        chunks.push(bytes);
+      }
+      return this.captureJournal.endIngress(context);
+    } catch (error) {
+      this.captureError ||= error;
+      throw error;
+    }
+  }
+
+  private finishIngress(
+    request: IncomingMessage,
+    status: number,
+    headers: Record<string, string>,
+    chunks: Array<{ data: Buffer; offsetUs: number }>,
+    outcome: string,
+  ): void {
+    const context = this.ingressByRequest.get(request);
+    if (!context || !this.captureJournal) return;
+    this.ingressByRequest.delete(request);
+    try {
+      this.captureJournal.responseStarted(context, { status, headers });
+      for (const chunk of chunks) this.captureJournal.chunk(context, chunk.data, chunk.offsetUs);
+      this.captureJournal.finish(context, outcome);
+    } catch (error) {
+      this.captureError ||= error;
+    }
+  }
+
+  private captureExchange(
+    exchange: WireExchange,
+    requestHeaders: Record<string, unknown>,
+  ): void {
+    const context = this.ingressByExchange.get(exchange);
+    if (!context || !this.captureJournal) return;
+    this.ingressByExchange.delete(exchange);
+    try {
+      this.captureJournal.updateIngressHeaders(context, requestHeaders);
+      this.captureJournal.responseStarted(context, {
+        status: exchange.responseStatus || 502,
+        headers: exchange.responseHeaders,
+      });
+      for (const chunk of exchange.responseChunks) {
+        this.captureJournal.chunk(context, Buffer.from(chunk.body_hex, "hex"), chunk.offset_us);
+      }
+      const outcome = exchange.responseCompleted
+        ? "completed"
+        : exchange.responseTermination === "client_closed"
+          ? "client_disconnected"
+          : exchange.responseTermination === "upstream_error"
+            ? "transport_error"
+            : exchange.responseTermination === "upstream_aborted"
+              ? "disconnected"
+              : "timed_out";
+      this.captureJournal.finish(context, outcome);
+    } catch (error) {
+      this.captureError ||= error;
+    }
+  }
+
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const path = request.url ?? "/";
+    const ingress = this.beginIngress(request);
+    const body = await this.readIngressBody(request, ingress);
     if (path === "/__fixture/access/state" && request.method === "POST") {
-      const body = JSON.parse((await readRequestBody(request)).toString("utf8")) as { mode: AccessMode };
-      await this.setMode(body.mode);
-      response.writeHead(204);
+      const state = JSON.parse(body.toString("utf8")) as { mode: AccessMode };
+      await this.setMode(state.mode);
+      const headers: Record<string, string> = {};
+      response.writeHead(204, headers);
       response.end();
+      this.finishIngress(request, 204, headers, [], "completed");
       return;
     }
     if (path.startsWith("/__fixture/access/reentry") && request.method === "GET") {
       const returnPath = new URL(path, `${this.origin}/`).searchParams.get("return") ?? "/";
       this.mode = "valid";
-      response.writeHead(302, { location: returnPath, "cache-control": "no-store" });
+      const headers = { location: returnPath, "cache-control": "no-store" };
+      response.writeHead(302, headers);
       response.end();
+      this.finishIngress(request, 302, headers, [], "completed");
       return;
     }
     if (path === "/cdn-cgi/access/certs" && request.method === "GET") {
       const publicJwk = this.initialKeys.publicKey.export({ format: "jwk" }) as { n: string; e: string };
       const body = JSON.stringify({ keys: [{ kty: "RSA", kid: ACCESS_KID, use: "sig", alg: "RS256", n: publicJwk.n, e: publicJwk.e }] });
-      response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      const bytes = Buffer.from(body);
+      const headers = { "content-type": "application/json", "cache-control": "no-store" };
+      response.writeHead(200, headers);
       response.end(body);
+      this.finishIngress(request, 200, headers, [{ data: bytes, offsetUs: 0 }], "completed");
       return;
     }
 
-    const body = await readRequestBody(request);
     const exchange: WireExchange = {
       sequence: this.exchanges.length + 1,
       method: request.method ?? "GET",
       path,
       requestSemanticHeaders: [],
       headerNames: Object.keys(request.headers).map((name) => name.toLowerCase()).sort(),
-      bodySha256: sha256(body),
+      bodySha256: `sha256:${sha256(body)}`,
       responseStatus: 0,
       responseHeaders: {},
       responseChunks: [],
@@ -754,6 +932,7 @@ class AccessEdgeFixture {
       responseBodySha256: "",
     };
     this.exchanges.push(exchange);
+    if (ingress) this.ingressByExchange.set(exchange, ingress);
     if (isMutation(request)) this.mutationExchanges.push(exchange);
 
     if (isMutation(request) && this.holdNextMutation) {
@@ -775,6 +954,7 @@ class AccessEdgeFixture {
         exchange.responseCompleted = true;
         exchange.responseTermination = "complete";
         exchange.responseBodySha256 = `sha256:${sha256(Buffer.alloc(0))}`;
+        this.captureExchange(exchange, { ...request.headers, "cf-access-jwt-assertion": "${ACCESS_ASSERTION}" });
         return;
       }
       const html = "<!doctype html><html><head><title>Access re-entry</title></head><body><main data-access-reentry><h1>Access re-entry required</h1><p>Return through the management origin.</p></main></body></html>";
@@ -789,11 +969,15 @@ class AccessEdgeFixture {
       exchange.responseCompleted = true;
       exchange.responseTermination = "complete";
       exchange.responseBodySha256 = `sha256:${sha256(Buffer.from(html))}`;
+      this.captureExchange(exchange, { ...request.headers, "cf-access-jwt-assertion": "${ACCESS_ASSERTION}" });
       return;
     }
 
-    const signingKeys = this.mode === "invalid" ? this.forgedKeys : this.initialKeys;
-    const signedAssertion = signAccessJwt(signingKeys, this.mode);
+    const signingMode: AccessMode = isMutation(request) && this.expireNextMutation
+      ? "expired"
+      : this.mode;
+    const signingKeys = signingMode === "invalid" ? this.forgedKeys : this.initialKeys;
+    const signedAssertion = signAccessJwt(signingKeys, signingMode);
     const assertion = signedAssertion.token;
     const forwardedRequest = {
       method: request.method,
@@ -815,37 +999,47 @@ class AccessEdgeFixture {
       this.sseExchanges.push(sseExchange);
       this.forwardedAssertionCountValue += 1;
       let opened = false;
-      await forwardStreamingRequest(
-        forwardedRequest,
-        response,
-        this.targetOrigin,
-        { "cf-access-jwt-assertion": assertion },
-        body,
-        (status, headers) => {
-          opened = true;
-          sseExchange.openedAtMs = Date.now();
-          sseExchange.responseStatus = status;
-          sseExchange.responseHeaders = headers;
-          this.sseOpenedResolve?.();
-          this.sseOpenedResolve = undefined;
-        },
-        (chunk, offsetUs) => {
-          sseExchange.responseChunks.push({ offset_us: offsetUs, body_hex: chunk.toString("hex") });
-          for (const match of chunk.toString("utf8").matchAll(/(?:^|\n)id:\s*([^\r\n]+)/g)) {
-            const eventId = match[1];
-            if (eventId !== undefined) sseExchange.eventIds.push(eventId);
-          }
-        },
-        (completed, termination) => {
-          sseExchange.closedAtMs = Date.now();
-          sseExchange.responseCompleted = completed;
-          sseExchange.responseTermination = termination;
-          sseExchange.responseBodySha256 = `sha256:${sha256(responseBodyFromChunks(sseExchange.responseChunks))}`;
-          if (this.mode === "expiring" && opened) this.mode = "expired";
-          this.sseClosedResolve?.();
-          this.sseClosedResolve = undefined;
-        },
-      );
+      try {
+        await forwardStreamingRequest(
+          forwardedRequest,
+          response,
+          this.targetOrigin,
+          { "cf-access-jwt-assertion": assertion },
+          body,
+          (status, headers) => {
+            opened = true;
+            this.sseOpenedCountValue += 1;
+            sseExchange.openedAtMs = Date.now();
+            sseExchange.responseStatus = status;
+            sseExchange.responseHeaders = headers;
+            this.sseOpenedResolve?.();
+            this.sseOpenedResolve = undefined;
+          },
+          (chunk, offsetUs) => {
+            sseExchange.responseChunks.push({ offset_us: offsetUs, body_hex: chunk.toString("hex") });
+            for (const match of chunk.toString("utf8").matchAll(/(?:^|\n)id:\s*([^\r\n]+)/g)) {
+              const eventId = match[1];
+              if (eventId !== undefined) sseExchange.eventIds.push(eventId);
+            }
+          },
+          (completed, termination) => {
+            sseExchange.closedAtMs = Date.now();
+            sseExchange.responseCompleted = completed;
+            sseExchange.responseTermination = termination;
+            sseExchange.responseBodySha256 = `sha256:${sha256(responseBodyFromChunks(sseExchange.responseChunks))}`;
+            if (this.mode === "expiring" && opened) this.expireNextMutation = true;
+            this.sseClosedResolve?.();
+            this.sseClosedResolve = undefined;
+          },
+        );
+      } catch (error) {
+        sseExchange.responseStatus ||= 502;
+        sseExchange.responseTermination = "upstream_error";
+        sseExchange.responseBodySha256 = `sha256:${sha256(responseBodyFromChunks(sseExchange.responseChunks))}`;
+        this.captureExchange(sseExchange, { ...request.headers, "cf-access-jwt-assertion": assertion });
+        throw error;
+      }
+      this.captureExchange(sseExchange, { ...request.headers, "cf-access-jwt-assertion": assertion });
       return;
     }
     this.forwardedAssertionCountValue += 1;
@@ -862,6 +1056,8 @@ class AccessEdgeFixture {
     exchange.responseCompleted = result.completed;
     exchange.responseTermination = result.termination;
     exchange.responseBodySha256 = `sha256:${sha256(result.body)}`;
+    if (isMutation(request) && signingMode === "expired") this.mode = "expired";
+    this.captureExchange(exchange, { ...request.headers, "cf-access-jwt-assertion": assertion });
   }
 }
 
@@ -898,78 +1094,6 @@ class CallbackOriginFixture {
   }
 }
 
-class RealProcess {
-  private constructor(
-    private readonly child: AccessChild,
-    readonly origin: string,
-    private readonly output: { stdout: string; stderr: string },
-  ) {}
-
-  static async start(binary: string, args: string[], readyPrefix: string, cwd = REPO_ROOT): Promise<RealProcess> {
-    try {
-      await access(binary);
-    } catch {
-      throw new ReadinessNonEvidence();
-    }
-    const child = spawn(binary, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-    const output = { stdout: "", stderr: "" };
-    let ready: string | undefined;
-    let readyResolve: ((value: string) => void) | undefined;
-    let readyReject: ((reason: Error) => void) | undefined;
-    const readyPromise = new Promise<string>((resolveReady, rejectReady) => {
-      readyResolve = resolveReady;
-      readyReject = rejectReady;
-    });
-    const append = (key: "stdout" | "stderr", chunk: Buffer): void => {
-      output[key] = `${output[key]}${chunk.toString("utf8")}`.slice(-256 * 1024);
-      if (key === "stdout" && !ready) {
-        const line = output.stdout.split(/\r?\n/).find((candidate) => candidate.startsWith(readyPrefix));
-        if (line) {
-          ready = line.slice(readyPrefix.length).trim();
-          readyResolve?.(ready);
-        }
-      }
-    };
-    child.stdout.on("data", (chunk: Buffer) => append("stdout", chunk));
-    child.stderr.on("data", (chunk: Buffer) => append("stderr", chunk));
-    child.once("error", (error: Error) => readyReject?.(error));
-    child.once("exit", (code: number | null, signal: string | null) => {
-      if (!ready) readyReject?.(new Error(`real process exited before readiness (${code ?? "signal"})`));
-      void signal;
-    });
-    const timeout = setTimeout(() => readyReject?.(new Error(`real process readiness timeout for ${readyPrefix}`)), 15_000);
-    try {
-      const origin = await readyPromise;
-      return new RealProcess(child, origin, output);
-    } catch (error) {
-      child.kill("SIGKILL");
-      if (error instanceof ReadinessNonEvidence) throw error;
-      throw new ReadinessNonEvidence();
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-
-  async stop(): Promise<void> {
-    if (this.child.exitCode !== null || this.child.signalCode !== null) return;
-    this.child.kill("SIGTERM");
-    await new Promise<void>((resolveStop) => {
-      const timer = setTimeout(() => {
-        this.child.kill("SIGKILL");
-        resolveStop();
-      }, 2_000);
-      this.child.once("exit", () => {
-        clearTimeout(timer);
-        resolveStop();
-      });
-    });
-  }
-
-  safeOutput(): string {
-    return `${this.output.stdout}\n${this.output.stderr}`.replace(/\b[A-Za-z0-9_-]{80,}\b/g, "<redacted>");
-  }
-}
-
 function binaryPath(name: "zode" | "zode-server"): string {
   const configured = name === "zode" ? process.env.ZODE_ENDPOINT_BIN : process.env.ZODE_SERVER_BIN;
   if (configured) return resolve(configured);
@@ -994,19 +1118,30 @@ async function buildTestOwnedUiDist(directory: string): Promise<void> {
   await access(join(directory, "index.html"));
 }
 
-async function writeProcessConfigs(root: string, edge: AccessEdgeFixture): Promise<{ endpoint: string; server: string }> {
+async function writeProcessConfigs(root: string, edge: AccessEdgeFixture): Promise<{
+  endpoint: string;
+  server: string;
+  controllerSecret: string;
+}> {
   const endpointDir = join(root, "endpoint-secrets");
   const serverDir = join(root, "server-secrets");
   const replicaDir = join(root, "endpoint-replicas");
   const uiAssetsDirectory = join(root, "ui-dist");
   const serverConfigPath = join(root, "server.json");
   const uiAssetsDirectoryFromConfig = relative(dirname(serverConfigPath), uiAssetsDirectory);
+  const portReservation = createServer();
+  const reservedOrigin = await listen(portReservation);
+  await closeServer(portReservation);
+  const serverPort = new URL(reservedOrigin).port;
+  const managementOrigin = `http://127.0.0.1:${serverPort}`;
+  const callbackOrigin = `http://127.0.0.2:${serverPort}`;
   await mkdir(endpointDir, { recursive: true, mode: 0o700 });
   await mkdir(serverDir, { recursive: true, mode: 0o700 });
   await mkdir(replicaDir, { recursive: true, mode: 0o700 });
   await buildTestOwnedUiDist(uiAssetsDirectory);
-  const controllerSecret = join(endpointDir, "controller.secret");
-  await writeFile(controllerSecret, `synthetic-controller-${randomUUID()}`, { mode: 0o600 });
+  const controllerSecretPath = join(endpointDir, "controller.secret");
+  const controllerSecret = `synthetic-controller-${randomUUID()}`;
+  await writeFile(controllerSecretPath, controllerSecret, { mode: 0o600 });
   const subjectKey = join(root, "subject.key");
   await writeFile(subjectKey, randomBytes(32), { mode: 0o600 });
 
@@ -1020,7 +1155,7 @@ async function writeProcessConfigs(root: string, edge: AccessEdgeFixture): Promi
       authority_id: "access-entry-e2e-server",
       revision: 1,
       kind: "bearer_secret_file",
-      secret_file: controllerSecret,
+      secret_file: controllerSecretPath,
     }],
   };
   await writeJson(endpointConfigPath, endpointConfig);
@@ -1041,7 +1176,9 @@ async function writeProcessConfigs(root: string, edge: AccessEdgeFixture): Promi
   } else {
     await writeJson(serverConfigPath, {
       schema: "zode.server-config.v1",
-      listen: "127.0.0.1:0",
+      listen: `127.0.0.1:${serverPort}`,
+      management_origin: managementOrigin,
+      callback_origin: callbackOrigin,
       server_authority_id: "access-entry-e2e-server",
       deployment: "server_only",
       ui_mode: "assets",
@@ -1057,7 +1194,7 @@ async function writeProcessConfigs(root: string, edge: AccessEdgeFixture): Promi
       },
     });
   }
-  return { endpoint: endpointConfigPath, server: serverConfigPath };
+  return { endpoint: endpointConfigPath, server: serverConfigPath, controllerSecret };
 }
 
 async function isAllInOneConfig(path: string): Promise<boolean> {
@@ -1069,39 +1206,149 @@ async function isAllInOneConfig(path: string): Promise<boolean> {
   }
 }
 
+async function seedAccessSession(
+  accessEdge: AccessEdgeFixture,
+  endpointOrigin: string,
+  controllerSecret: string,
+): Promise<string> {
+  const endpointResponse = await fetch(`${accessEdge.origin}/v1/endpoints`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      "idempotency-key": `access-expiry-endpoint-${randomUUID()}`,
+    },
+    body: JSON.stringify({
+      label: "Access expiry Endpoint",
+      base_url: endpointOrigin,
+      control_auth: { kind: "bearer", secret: controllerSecret },
+    }),
+  });
+  if (!endpointResponse.ok) {
+    throw new ReadinessNonEvidence();
+  }
+  const endpoint = (await endpointResponse.json()) as { endpoint_id?: string };
+  if (!endpoint.endpoint_id) throw new ReadinessNonEvidence();
+  const sessionResponse = await fetch(
+    `${accessEdge.origin}/v1/endpoints/${encodeURIComponent(endpoint.endpoint_id)}/sessions`,
+    {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "idempotency-key": `access-expiry-session-${randomUUID()}`,
+      },
+      body: JSON.stringify({ tools: [] }),
+    },
+  );
+  if (!sessionResponse.ok) throw new ReadinessNonEvidence();
+  const session = (await sessionResponse.json()) as { session_id?: string };
+  if (!session.session_id) throw new ReadinessNonEvidence();
+  return `/endpoints/${encodeURIComponent(endpoint.endpoint_id)}/sessions/${encodeURIComponent(session.session_id)}`;
+}
+
 class TestStack {
+  private expiryRedObserved = false;
+
   private constructor(
     readonly root: string,
     readonly access: AccessEdgeFixture,
     readonly callback: CallbackOriginFixture,
-    readonly server: RealProcess,
-    readonly endpoint: RealProcess | undefined,
+    readonly server: CapturedProcess,
+    readonly endpoint: CapturedProcess | undefined,
+    readonly journal: RecordingJournalContract,
+    readonly captureSetId: string,
+    readonly captureRoot: string,
+    readonly sessionPath: string,
   ) {}
 
   static async start(): Promise<TestStack> {
     const root = await mkdtemp(join(tmpdir(), "zode-access-entry-"));
+    const captureRoot = resolve(
+      REPO_ROOT,
+      "target/test-recordings/quarantine",
+      `access-entry-expiry-${Date.now()}-${randomUUID()}`,
+    );
+    const ledger = new SecretLedger();
+    ledger.add("access_subject", ACCESS_SUBJECT);
+    ledger.add("access_email", ACCESS_EMAIL);
+    const journal = new RecordingJournal({ rootDir: captureRoot, ledger });
+    const captureSetId = journal.beginCaptureSet({ e2eName: EXPIRY_E2E_NAME, maxMembers: 256 });
     const accessEdge = await new AccessEdgeFixture().start();
-    let endpoint: RealProcess | undefined;
+    accessEdge.setCapture(journal, captureSetId);
+    let endpoint: CapturedProcess | undefined;
     try {
       const configs = await writeProcessConfigs(root, accessEdge);
+      ledger.add("controller_secret", configs.controllerSecret);
       const allInOne = await isAllInOneConfig(configs.server);
+      const environment = { ...process.env };
+      const startupCaptureRoot = join(captureRoot, "startup");
+      const e2eName = EXPIRY_E2E_NAME;
       if (!allInOne) {
-        endpoint = await RealProcess.start(binaryPath("zode"), ["--config", configs.endpoint], "ZODE_READY ");
+        endpoint = await CapturedRealProcess.start({
+          name: "endpoint",
+          binary: binaryPath("zode"),
+          args: ["--config", configs.endpoint],
+          cwd: REPO_ROOT,
+          env: environment,
+          readyPrefix: "ZODE_READY ",
+          ledger,
+          logDir: join(root, "logs"),
+          startupCaptureRoot,
+          startupConfigBytes: await readFile(configs.endpoint),
+          e2eName,
+        });
       }
       const serverCwd = join(root, "server-cwd");
       await mkdir(serverCwd, { recursive: true, mode: 0o700 });
-      const server = await RealProcess.start(
-        binaryPath("zode-server"),
-        ["--config", configs.server],
-        "ZODE_SERVER_READY ",
-        serverCwd,
-      );
-      accessEdge.setTarget(server.origin);
-      const callback = await new CallbackOriginFixture().start(server.origin);
-      return new TestStack(root, accessEdge, callback, server, endpoint);
+      const server = await CapturedRealProcess.start({
+        name: "server",
+        binary: binaryPath("zode-server"),
+        args: ["--config", configs.server],
+        cwd: serverCwd,
+        env: environment,
+        readyPrefix: "ZODE_SERVER_READY ",
+        ledger,
+        logDir: join(root, "logs"),
+        startupCaptureRoot,
+        startupConfigBytes: await readFile(configs.server),
+        e2eName,
+      });
+      const serverOrigin = server.baseUrl;
+      if (!serverOrigin) throw new ReadinessNonEvidence();
+      accessEdge.setTarget(serverOrigin);
+      const callback = await new CallbackOriginFixture().start(serverOrigin);
+      const endpointOrigin = endpoint?.baseUrl;
+      if (!endpointOrigin) throw new ReadinessNonEvidence();
+      const sessionPath = await seedAccessSession(accessEdge, endpointOrigin, configs.controllerSecret);
+      return new TestStack(root, accessEdge, callback, server, endpoint, journal, captureSetId, captureRoot, sessionPath);
     } catch (error) {
       await endpoint?.stop().catch(() => undefined);
       await accessEdge.stop().catch(() => undefined);
+      try {
+        accessEdge.assertCaptureHealthy();
+        const flushed = journal.flushCaptureSet(captureSetId);
+        await writeFile(
+          join(captureRoot, "later-gap-metadata.json"),
+          `${JSON.stringify({
+            schema: "zode.access-entry-later-gap.v1",
+            version: 1,
+            owning_e2e: EXPIRY_E2E_NAME,
+            relation: EXPIRY_LATER_RELATION,
+            original_gap: EXPIRY_ORIGINAL_GAP,
+            recording_id: null,
+            capture_set_id: captureSetId,
+            first_observed: "real-process or test setup did not reach the assertion-expiry path",
+            raw_exchange_retained: Boolean(flushed.records?.length),
+            source_digest: flushed.sourceDigest ?? null,
+          }, null, 2)}\n`,
+          { mode: 0o600 },
+        );
+      } catch {
+        // The shared journal retains its open raw members for diagnosis when
+        // a setup failure prevents a complete flush; never replace them with
+        // a fabricated expiry observation.
+      }
       await rm(root, { recursive: true, force: true });
       throw error;
     }
@@ -1111,16 +1358,54 @@ class TestStack {
     return new URL(path, `${this.access.origin}/`).toString();
   }
 
+  markExpiryRed(): void {
+    this.expiryRedObserved = true;
+  }
+
   callbackUrl(path = "/"): string {
     return new URL(path, `${this.callback.origin}/`).toString();
   }
 
   async stop(): Promise<void> {
-    await this.callback.stop().catch(() => undefined);
-    await this.access.stop().catch(() => undefined);
-    await this.server.stop().catch(() => undefined);
-    await this.endpoint?.stop().catch(() => undefined);
+    let firstError: unknown;
+    try { await this.callback.stop(); } catch (error) { firstError ||= error; }
+    try { await this.access.stop(); } catch (error) { firstError ||= error; }
+    try { await this.server.stop(); } catch (error) { firstError ||= error; }
+    try { await this.endpoint?.stop(); } catch (error) { firstError ||= error; }
+    try { this.access.assertCaptureHealthy(); } catch (error) { firstError ||= error; }
+    const firstSse = this.access.sseExchanges[0];
+    const firstFailure = this.expiryRedObserved && firstSse
+      ? this.journal.first({
+          boundary: "management-access-edge",
+          requestPath: firstSse.path,
+          responseStatus: firstSse.responseStatus,
+        })
+      : undefined;
+    try {
+      const flushed = this.journal.flushCaptureSet(this.captureSetId, {
+        firstFailureRecordingId: firstFailure?.recordingId,
+      });
+      await writeFile(
+        join(this.captureRoot, "later-gap-metadata.json"),
+        `${JSON.stringify({
+          schema: "zode.access-entry-later-gap.v1",
+          version: 1,
+          owning_e2e: EXPIRY_E2E_NAME,
+          relation: EXPIRY_LATER_RELATION,
+          original_gap: EXPIRY_ORIGINAL_GAP,
+          recording_id: firstFailure?.recordingId ?? null,
+          capture_set_id: this.captureSetId,
+          first_observed: firstFailure ? "management SSE remained open beyond Access assertion exp" : "no typed red observed",
+          raw_exchange_retained: Boolean(firstFailure),
+          source_digest: flushed.sourceDigest ?? null,
+        }, null, 2)}\n`,
+        { mode: 0o600 },
+      );
+    } catch (error) {
+      firstError ||= error;
+    }
     await rm(this.root, { recursive: true, force: true });
+    if (firstError) throw firstError;
   }
 }
 
@@ -1228,9 +1513,15 @@ function assertSseCursorRecovery(stack: TestStack): void {
   const cursor = first.eventIds.at(-1) ?? first.lastEventId;
   expect(cursor).toBeTruthy();
   expect(recovered.lastEventId).toBe(cursor);
-  const deliveredIds = stack.access.sseExchanges.flatMap((exchange) => exchange.eventIds);
-  expect(deliveredIds.length).toBeGreaterThan(0);
-  expect(new Set(deliveredIds).size).toBe(deliveredIds.length);
+  const firstIds = new Set(first.eventIds);
+  const recoveredIds = new Set(recovered.eventIds);
+  expect(firstIds.size).toBe(first.eventIds.length);
+  expect(recoveredIds.size).toBe(recovered.eventIds.length);
+  // The reconnect pair is the stream continuity contract.  A later full
+  // document re-entry intentionally opens a fresh stream without a cursor
+  // and may replay the initial session frame; it is not a Last-Event-ID
+  // reconnect and must not be mistaken for a duplicate in that pair.
+  expect([...firstIds].some((id) => recoveredIds.has(id))).toBe(false);
 }
 
 test.describe("Access entry and re-entry", () => {
@@ -1368,7 +1659,10 @@ test.describe("Access entry and re-entry", () => {
     await stack.access.setMode("expiring");
     const reentryExchange = reentryCassette.exchanges[0];
     if (!reentryExchange) throw new Error("re-entry cassette has no retained exchange");
-    const viewPath = reentryExchange.request.path;
+    // The retained pre-adoption cassette remains immutable historical evidence;
+    // this later reproduction uses a real Endpoint-owned session route so the
+    // browser exercises the production SSE proxy rather than an empty shell.
+    const viewPath = stack.sessionPath;
     const viewUrl = stack.managementUrl(viewPath);
     const navigationUrls: string[] = [];
     page.on("framenavigated", (frame) => {
@@ -1391,12 +1685,21 @@ test.describe("Access entry and re-entry", () => {
 
     // The real Server proxy must close this response no later than the signed
     // assertion deadline; no wall-clock sleep is used as the test barrier.
-    await stack.access.waitForSseClosed();
+    try {
+      await stack.access.waitForSseClosed();
+    } catch (error) {
+      stack.markExpiryRed();
+      throw error;
+    }
     const initialSse = stack.access.sseExchanges[0];
     if (!initialSse) throw new Error("initial SSE exchange was not retained");
     expect(initialSse.openedAtMs).toBeGreaterThan(0);
     expect(initialSse.closedAtMs).toBeGreaterThanOrEqual(initialSse.openedAtMs);
     expect(initialSse.closedAtMs).toBeLessThanOrEqual(initialSse.assertionExpiresAtMs);
+    // Allow the browser's native EventSource to perform one Access-admitted
+    // reconnect while the page is still alive; only then force the held
+    // mutation through the expired assertion and exercise re-entry.
+    await stack.access.waitForSseOpenedCount(2);
     await stack.access.releaseHeldMutation();
     await click;
 
