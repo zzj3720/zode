@@ -154,7 +154,12 @@ fn main() {
             local_endpoint_id: composition.local_endpoint_id,
         },
     );
-    if let Err(error) = runtime.block_on(serve(listen_addr, router, composition.supervisor)) {
+    if let Err(error) = runtime.block_on(serve(
+        listen_addr,
+        router,
+        composition.supervisor,
+        Arc::clone(&store),
+    )) {
         eprintln!("server stopped: {error}");
         std::process::exit(1);
     }
@@ -182,12 +187,20 @@ async fn serve(
     listen_addr: SocketAddr,
     router: Router,
     supervisor: Option<LocalEndpointSupervisor>,
+    store: Arc<ControlStore>,
 ) -> Result<(), std::io::Error> {
     let result = serve_until_shutdown(listen_addr, router).await;
     if let Some(supervisor) = supervisor {
         supervisor.shutdown().await.map_err(std::io::Error::other)?;
     }
-    result
+    let checkpoint = store
+        .checkpoint_for_shutdown()
+        .map_err(|_| std::io::Error::other("control store checkpoint failed"))
+        .map(|_| ());
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => checkpoint,
+    }
 }
 
 async fn serve_until_shutdown(
