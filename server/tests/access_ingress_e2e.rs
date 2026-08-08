@@ -514,6 +514,131 @@ fn e2e_system_and_endpoint_catalog_bootstrap_through_access() -> TestResult {
     scenario_result
 }
 
+#[cfg(unix)]
+#[test]
+fn e2e_server_control_database_path_swap_cannot_cross_catalog_ownership() -> TestResult {
+    use std::os::unix::fs::symlink;
+
+    let jwks = JwksFixture::start()?;
+    let temp = tempfile::tempdir()?;
+    let endpoint_root = temp.path().join("endpoint");
+    let endpoint_config = write_catalog_endpoint_config(&endpoint_root)?;
+    let mut endpoint = ServerProcess::start_endpoint(&endpoint_config)?;
+    let endpoint_identity = catalog_endpoint_identity(&endpoint.base_url)?;
+    let endpoint_id = endpoint_identity["endpoint_id"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("path-swap Endpoint identity omitted endpoint_id"))?
+        .to_owned();
+    let mut endpoint_proxy = CountingProxy::start(&endpoint.base_url)?;
+
+    let server_root = temp.path().join("server-a");
+    fs::create_dir(&server_root)?;
+    let server_config = write_server_config(&server_root, &jwks)?;
+    let mut server = ServerProcess::start(&server_config)?;
+    let now = unix_seconds();
+    let assertion = signed_token(
+        INITIAL_PRIVATE_KEY,
+        JWKS_INITIAL_KID,
+        actor_claims(
+            &jwks.issuer(),
+            HUMAN_SUB,
+            None,
+            HUMAN_EMAIL,
+            "app",
+            now + 300,
+        ),
+    )?;
+    let create_body = serde_json::to_vec(&json!({
+        "label": CATALOG_ENDPOINT_LABEL,
+        "base_url": endpoint_proxy.base_url,
+        "control_auth": {
+            "kind": "bearer",
+            "secret": CATALOG_CONTROLLER_SECRET
+        }
+    }))?;
+    let forbidden = [
+        assertion.as_str(),
+        CATALOG_CONTROLLER_SECRET,
+        CATALOG_DIRECT_SUBJECT,
+        HUMAN_SUB,
+        HUMAN_EMAIL,
+    ];
+    let create = catalog_request(
+        &server.base_url,
+        "POST",
+        "/v1/endpoints",
+        &assertion,
+        Some("path-swap-endpoint-create"),
+        Some(&create_body),
+        &forbidden,
+    )?;
+    if create.status != 201 {
+        return Err(io::Error::other(format!(
+            "path-swap catalog create expected HTTP 201, got {}",
+            create.status
+        ))
+        .into());
+    }
+    assert_endpoint_record(
+        "path-swap created Endpoint",
+        &serde_json::from_slice(&create.body)?,
+        &endpoint_id,
+    )?;
+
+    let server_b_root = temp.path().join("server-b");
+    fs::create_dir(&server_b_root)?;
+    let server_b_config = write_server_config(&server_b_root, &jwks)?;
+    let mut server_b = ServerProcess::start(&server_b_config)?;
+    server_b.stop()?;
+    let database_a = server_root.join("control.sqlite");
+    let database_b = server_b_root.join("control.sqlite");
+    let database_b_before = fs::read(&database_b)?;
+    let database_a_backup = server_root.join("control.sqlite.original");
+    fs::rename(&database_a, &database_a_backup)?;
+    symlink(&database_b, &database_a)?;
+
+    let swapped = catalog_request(
+        &server.base_url,
+        "GET",
+        "/v1/endpoints",
+        &assertion,
+        None,
+        None,
+        &forbidden,
+    )?;
+    let still_owned = if swapped.status == 200 {
+        assert_endpoint_list("path-swap catalog", &swapped, Some(&endpoint_id)).is_ok()
+    } else {
+        swapped.status == 500 || swapped.status == 503
+    };
+    if !still_owned {
+        return Err(io::Error::other(format!(
+            "path swap crossed Server catalog ownership: HTTP {} body {}",
+            swapped.status,
+            String::from_utf8_lossy(&swapped.body)
+        ))
+        .into());
+    }
+    if fs::read(&database_b)? != database_b_before {
+        return Err(
+            io::Error::other("path swap caused the replacement Server database to change").into(),
+        );
+    }
+
+    let server_capture = server.stop()?;
+    let endpoint_capture = endpoint.stop()?;
+    endpoint_proxy.finish()?;
+    let capture_assertions = vec![assertion.clone()];
+    assert_catalog_capture_safe(
+        &server_capture,
+        &endpoint_capture,
+        &server_root,
+        &endpoint_root,
+        &capture_assertions,
+    )?;
+    Ok(())
+}
+
 #[test]
 fn e2e_server_endpoint_protocol_compatibility_matrix() -> TestResult {
     let jwks = JwksFixture::start()?;

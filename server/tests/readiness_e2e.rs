@@ -100,6 +100,325 @@ fn e2e_server_missing_subject_key_never_becomes_ready() -> TestResult {
 }
 
 #[test]
+fn e2e_server_corrupt_existing_control_store_failure_removes_new_ownership_sidecars() -> TestResult
+{
+    let temp = tempfile::tempdir()?;
+    let config = ConfigFixture::new(temp.path())?;
+    let corrupt = Connection::open(&config.control_database)?;
+    corrupt.execute_batch(
+        "PRAGMA journal_mode=DELETE;
+         CREATE TABLE unrelated_corruption(value INTEGER);
+         INSERT INTO unrelated_corruption(value) VALUES (1);",
+    )?;
+    drop(corrupt);
+    restrict_file(&config.control_database)?;
+    let before = config.live_store_snapshot()?;
+    let mut server = ServerChild::spawn(&config.config_path)?;
+    let observation = server.observe(READY_TIMEOUT)?;
+    let stopped = server.stop()?;
+    let after = config.live_store_snapshot()?;
+    let forbidden = config.forbidden_markers();
+    assert_safe_output("corrupt existing control store", &stopped, &forbidden)?;
+    let capture = capture_first_readiness_failure(
+        "server-readiness-corrupt-existing-v1",
+        "e2e_server_corrupt_existing_control_store_failure_removes_new_ownership_sidecars",
+        "corrupt existing control store must not leave ownership sidecars",
+        config.listen_addr,
+        CONTROL_STORE_INTEGRITY_FAILURE,
+        &observation,
+        false,
+        &stopped,
+        &before,
+        &after,
+        &forbidden,
+    );
+    let startup = assert_startup_failure(
+        "corrupt existing control store",
+        &observation,
+        &stopped,
+        CONTROL_STORE_INTEGRITY_FAILURE,
+        &forbidden,
+    );
+    assert_listen_released(config.listen_addr)?;
+    if before != after {
+        return Err(io::Error::other(
+            "corrupt-store startup changed the persistent store file set/content/mode",
+        )
+        .into());
+    }
+    let file_name = config
+        .control_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("control database had no usable filename"))?;
+    let [wal, shm] = sqlite_sidecars(&config.control_database)?;
+    for path in [
+        config
+            .control_database
+            .with_file_name(format!("{file_name}.server.lock")),
+        config
+            .control_database
+            .with_file_name(format!("{file_name}.server.lock.anchor")),
+        config
+            .control_database
+            .with_file_name(format!("{file_name}.server-owner")),
+        wal,
+        shm,
+    ] {
+        if path.exists() {
+            return Err(io::Error::other(format!(
+                "corrupt-store startup left ownership/SQLite sidecar {}",
+                path.display()
+            ))
+            .into());
+        }
+    }
+    config.assert_persistent_secret_free()?;
+    capture?;
+    startup
+}
+
+#[test]
+fn e2e_server_zero_byte_existing_control_store_failure_removes_new_ownership_sidecars() -> TestResult
+{
+    let temp = tempfile::tempdir()?;
+    let config = ConfigFixture::new(temp.path())?;
+    let empty = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&config.control_database)?;
+    empty.sync_all()?;
+    drop(empty);
+    restrict_file(&config.control_database)?;
+    let before = config.live_store_snapshot()?;
+    let mut server = ServerChild::spawn(&config.config_path)?;
+    let observation = server.observe(READY_TIMEOUT)?;
+    let stopped = server.stop()?;
+    let after = config.live_store_snapshot()?;
+    let forbidden = config.forbidden_markers();
+    assert_safe_output("zero-byte existing control store", &stopped, &forbidden)?;
+    let capture = capture_first_readiness_failure(
+        "server-readiness-zero-byte-existing-v1",
+        "e2e_server_zero_byte_existing_control_store_failure_removes_new_ownership_sidecars",
+        "zero-byte existing control store must not leave ownership sidecars",
+        config.listen_addr,
+        CONTROL_STORE_INTEGRITY_FAILURE,
+        &observation,
+        false,
+        &stopped,
+        &before,
+        &after,
+        &forbidden,
+    );
+    let startup = assert_startup_failure(
+        "zero-byte existing control store",
+        &observation,
+        &stopped,
+        CONTROL_STORE_INTEGRITY_FAILURE,
+        &forbidden,
+    );
+    assert_listen_released(config.listen_addr)?;
+    if before != after {
+        return Err(io::Error::other(
+            "zero-byte-store startup changed the persistent store file set/content/mode",
+        )
+        .into());
+    }
+    let file_name = config
+        .control_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("control database had no usable filename"))?;
+    let [wal, shm] = sqlite_sidecars(&config.control_database)?;
+    for path in [
+        config
+            .control_database
+            .with_file_name(format!("{file_name}.server.lock")),
+        config
+            .control_database
+            .with_file_name(format!("{file_name}.server.lock.anchor")),
+        config
+            .control_database
+            .with_file_name(format!("{file_name}.server-owner")),
+        wal,
+        shm,
+    ] {
+        if path.exists() {
+            return Err(io::Error::other(format!(
+                "zero-byte-store startup left ownership/SQLite sidecar {}",
+                path.display()
+            ))
+            .into());
+        }
+    }
+    config.assert_persistent_secret_free()?;
+    capture?;
+    startup
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_server_existing_control_store_owner_marker_identity_mismatch_failure_removes_new_ownership_sidecars(
+) -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let config = ConfigFixture::new(temp.path())?;
+    establish_ready_baseline(&config, "owner marker identity mismatch")?;
+    let file_name = config
+        .control_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("control database had no usable filename"))?;
+    let lock_path = config.root.join(format!("{file_name}.server.lock"));
+    let anchor_path = config.root.join(format!("{file_name}.server.lock.anchor"));
+    let owner_marker = config.root.join(format!("{file_name}.server-owner"));
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&owner_marker)?;
+    marker.write_all(&[b'X'; 32])?;
+    marker.sync_all()?;
+    drop(marker);
+    restrict_file(&owner_marker)?;
+    fs::rename(&lock_path, config.root.join("control-marker-lock.original"))?;
+    fs::rename(
+        &anchor_path,
+        config.root.join("control-marker-anchor.original"),
+    )?;
+    let before = config.live_store_snapshot()?;
+    let mut server = ServerChild::spawn(&config.config_path)?;
+    let observation = server.observe(READY_TIMEOUT)?;
+    let stopped = server.stop()?;
+    let after = config.live_store_snapshot()?;
+    let forbidden = config.forbidden_markers();
+    assert_safe_output("owner marker identity mismatch", &stopped, &forbidden)?;
+    let capture = capture_first_readiness_failure(
+        "server-readiness-owner-marker-identity-v1",
+        "e2e_server_existing_control_store_owner_marker_identity_mismatch_failure_removes_new_ownership_sidecars",
+        "owner marker identity mismatch must not create replacement sidecars",
+        config.listen_addr,
+        SERVER_ALREADY_OWNED_FAILURE,
+        &observation,
+        false,
+        &stopped,
+        &before,
+        &after,
+        &forbidden,
+    );
+    let startup = assert_startup_failure(
+        "owner marker identity mismatch",
+        &observation,
+        &stopped,
+        SERVER_ALREADY_OWNED_FAILURE,
+        &forbidden,
+    );
+    assert_listen_released(config.listen_addr)?;
+    if before != after {
+        return Err(io::Error::other(
+            "owner marker identity mismatch changed the persistent store file set/content/mode",
+        )
+        .into());
+    }
+    let [wal, shm] = sqlite_sidecars(&config.control_database)?;
+    for path in [lock_path, anchor_path, wal, shm] {
+        if path.exists() {
+            return Err(io::Error::other(format!(
+                "owner marker identity mismatch left replacement sidecar {}",
+                path.display()
+            ))
+            .into());
+        }
+    }
+    config.assert_persistent_secret_free()?;
+    capture?;
+    startup
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_server_existing_control_store_lock_marker_identity_mismatch_failure_removes_new_ownership_sidecars(
+) -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let config = ConfigFixture::new(temp.path())?;
+    establish_ready_baseline(&config, "lock marker identity mismatch")?;
+    let file_name = config
+        .control_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("control database had no usable filename"))?;
+    let lock_path = config.root.join(format!("{file_name}.server.lock"));
+    let anchor_path = config.root.join(format!("{file_name}.server.lock.anchor"));
+    let owner_marker = config.root.join(format!("{file_name}.server-owner"));
+    let secret_owner_marker = config.secret_directory.join(".server-owner");
+    for path in [&owner_marker, &secret_owner_marker] {
+        let mut identity = fs::read(path)?;
+        if identity.len() != 32 {
+            return Err(io::Error::other("owner marker had an unexpected identity length").into());
+        }
+        identity[16..].fill(b'Y');
+        let mut marker = OpenOptions::new().write(true).truncate(true).open(path)?;
+        marker.write_all(&identity)?;
+        marker.sync_all()?;
+        drop(marker);
+        restrict_file(path)?;
+    }
+    fs::rename(
+        &lock_path,
+        config.root.join("control-lock-marker-lock.original"),
+    )?;
+    fs::rename(
+        &anchor_path,
+        config.root.join("control-lock-marker-anchor.original"),
+    )?;
+    let before = config.live_store_snapshot()?;
+    let mut server = ServerChild::spawn(&config.config_path)?;
+    let observation = server.observe(READY_TIMEOUT)?;
+    let stopped = server.stop()?;
+    let after = config.live_store_snapshot()?;
+    let forbidden = config.forbidden_markers();
+    assert_safe_output("lock marker identity mismatch", &stopped, &forbidden)?;
+    let capture = capture_first_readiness_failure(
+        "server-readiness-lock-marker-identity-v1",
+        "e2e_server_existing_control_store_lock_marker_identity_mismatch_failure_removes_new_ownership_sidecars",
+        "lock marker identity mismatch must not create replacement sidecars",
+        config.listen_addr,
+        SERVER_ALREADY_OWNED_FAILURE,
+        &observation,
+        false,
+        &stopped,
+        &before,
+        &after,
+        &forbidden,
+    );
+    let startup = assert_startup_failure(
+        "lock marker identity mismatch",
+        &observation,
+        &stopped,
+        SERVER_ALREADY_OWNED_FAILURE,
+        &forbidden,
+    );
+    assert_listen_released(config.listen_addr)?;
+    if before != after {
+        return Err(io::Error::other(
+            "lock marker identity mismatch changed the persistent store file set/content/mode",
+        )
+        .into());
+    }
+    let [wal, shm] = sqlite_sidecars(&config.control_database)?;
+    for path in [lock_path, anchor_path, wal, shm] {
+        if path.exists() {
+            return Err(io::Error::other(format!(
+                "lock marker identity mismatch left replacement sidecar {}",
+                path.display()
+            ))
+            .into());
+        }
+    }
+    config.assert_persistent_secret_free()?;
+    capture?;
+    startup
+}
+
+#[test]
 fn e2e_second_server_on_same_stores_never_becomes_ready() -> TestResult {
     let temp = tempfile::tempdir()?;
     let config = ConfigFixture::new(temp.path())?;
@@ -216,6 +535,393 @@ fn e2e_second_server_on_same_stores_never_becomes_ready() -> TestResult {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn e2e_server_control_lock_sidecar_replacement_cannot_allow_second_owner() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let config = ConfigFixture::new(temp.path())?;
+    let mut first = ServerChild::spawn(&config.config_path)?;
+    let first_observation = first.observe(READY_TIMEOUT)?;
+    if !matches!(first_observation, Observation::Ready) || !first.is_running()? {
+        let stopped = first.stop()?;
+        assert_safe_output(
+            "first lock-sidecar owner",
+            &stopped,
+            &config.forbidden_markers(),
+        )?;
+        return Err(io::Error::other(
+            "first Server did not establish the lock-sidecar ownership baseline",
+        )
+        .into());
+    }
+
+    let lock_path = config
+        .control_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| config.root.join(format!("{name}.server.lock")))
+        .ok_or_else(|| io::Error::other("control database had no usable filename"))?;
+    let lock_backup = config.root.join("control-readiness-lock.original");
+    fs::rename(&lock_path, &lock_backup)?;
+    let replacement = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)?;
+    replacement.sync_all()?;
+    drop(replacement);
+    restrict_file(&lock_path)?;
+
+    let peer_secret_directory = config.root.join("peer-lock-secret");
+    fs::create_dir(&peer_secret_directory)?;
+    let (peer_config, peer_listen_addr) = config.write_peer_config(
+        "peer-lock-replacement.json",
+        &config.control_database,
+        &peer_secret_directory,
+    )?;
+    let mut second = ServerChild::spawn(&peer_config)?;
+    let second_observation = second.observe(READY_TIMEOUT)?;
+    let second_stopped = second.stop()?;
+    let first_stopped = first.graceful_stop()?;
+    let forbidden =
+        config.forbidden_markers_for(&[peer_secret_directory.as_path(), peer_config.as_path()]);
+    assert_safe_output(
+        "lock-sidecar replacement second Server",
+        &second_stopped,
+        &forbidden,
+    )?;
+    assert_safe_output(
+        "lock-sidecar replacement first Server",
+        &first_stopped,
+        &forbidden,
+    )?;
+    assert_listen_released(peer_listen_addr)?;
+    assert_startup_failure(
+        "lock-sidecar replacement second Server",
+        &second_observation,
+        &second_stopped,
+        CONTROL_STORE_INTEGRITY_FAILURE,
+        &forbidden,
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_server_control_lock_sidecar_hardlink_is_rejected_before_ready() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let config = ConfigFixture::new(temp.path())?;
+    let lock_path = config
+        .control_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| config.root.join(format!("{name}.server.lock")))
+        .ok_or_else(|| io::Error::other("control database had no usable filename"))?;
+    let hardlink_path = config.root.join("control-readiness-lock-peer");
+    let lock = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)?;
+    lock.sync_all()?;
+    drop(lock);
+    restrict_file(&lock_path)?;
+    fs::hard_link(&lock_path, &hardlink_path)?;
+
+    let mut server = ServerChild::spawn(&config.config_path)?;
+    let observation = server.observe(READY_TIMEOUT)?;
+    let stopped = server.stop()?;
+    let forbidden = config.forbidden_markers_for(&[hardlink_path.as_path()]);
+    assert_safe_output("multiply-linked lock sidecar", &stopped, &forbidden)?;
+    assert_listen_released(config.listen_addr)?;
+    assert_startup_failure(
+        "multiply-linked lock sidecar",
+        &observation,
+        &stopped,
+        SERVER_ALREADY_OWNED_FAILURE,
+        &forbidden,
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_server_control_lock_pair_replacement_cannot_allow_second_owner() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let config = ConfigFixture::new(temp.path())?;
+    let mut first = ServerChild::spawn(&config.config_path)?;
+    let first_observation = first.observe(READY_TIMEOUT)?;
+    if !matches!(first_observation, Observation::Ready) || !first.is_running()? {
+        let stopped = first.stop()?;
+        assert_safe_output(
+            "first lock-pair owner",
+            &stopped,
+            &config.forbidden_markers(),
+        )?;
+        return Err(io::Error::other(
+            "first Server did not establish the lock-pair ownership baseline",
+        )
+        .into());
+    }
+
+    let lock_path = config
+        .control_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| config.root.join(format!("{name}.server.lock")))
+        .ok_or_else(|| io::Error::other("control database had no usable filename"))?;
+    let anchor_path = config
+        .control_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| config.root.join(format!("{name}.server.lock.anchor")))
+        .ok_or_else(|| io::Error::other("control database had no usable filename"))?;
+    fs::rename(
+        &lock_path,
+        config.root.join("control-readiness-lock.original"),
+    )?;
+    fs::rename(
+        &anchor_path,
+        config.root.join("control-readiness-anchor.original"),
+    )?;
+    let replacement = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)?;
+    replacement.sync_all()?;
+    drop(replacement);
+    restrict_file(&lock_path)?;
+    fs::hard_link(&lock_path, &anchor_path)?;
+
+    let peer_secret_directory = config.root.join("peer-lock-pair-secret");
+    fs::create_dir(&peer_secret_directory)?;
+    let (peer_config, peer_listen_addr) = config.write_peer_config(
+        "peer-lock-pair-replacement.json",
+        &config.control_database,
+        &peer_secret_directory,
+    )?;
+    let mut second = ServerChild::spawn(&peer_config)?;
+    let second_observation = second.observe(READY_TIMEOUT)?;
+    let second_stopped = second.stop()?;
+    let first_stopped = first.graceful_stop()?;
+    let forbidden =
+        config.forbidden_markers_for(&[peer_secret_directory.as_path(), peer_config.as_path()]);
+    assert_safe_output(
+        "lock-pair replacement second Server",
+        &second_stopped,
+        &forbidden,
+    )?;
+    assert_safe_output(
+        "lock-pair replacement first Server",
+        &first_stopped,
+        &forbidden,
+    )?;
+    assert_listen_released(peer_listen_addr)?;
+    assert_startup_failure(
+        "lock-pair replacement second Server",
+        &second_observation,
+        &second_stopped,
+        CONTROL_STORE_INTEGRITY_FAILURE,
+        &forbidden,
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_server_control_owner_markers_removal_and_lock_pair_replacement_cannot_allow_second_owner(
+) -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let config = ConfigFixture::new(temp.path())?;
+    let mut first = ServerChild::spawn(&config.config_path)?;
+    let first_observation = first.observe(READY_TIMEOUT)?;
+    if !matches!(first_observation, Observation::Ready) || !first.is_running()? {
+        let stopped = first.stop()?;
+        assert_safe_output(
+            "first owner-marker owner",
+            &stopped,
+            &config.forbidden_markers(),
+        )?;
+        return Err(
+            io::Error::other("first Server did not establish the owner-marker baseline").into(),
+        );
+    }
+
+    let file_name = config
+        .control_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("control database had no usable filename"))?;
+    let lock_path = config.root.join(format!("{file_name}.server.lock"));
+    let anchor_path = config.root.join(format!("{file_name}.server.lock.anchor"));
+    let owner_marker = config.root.join(format!("{file_name}.server-owner"));
+    let secret_owner_marker = config.secret_directory.join(".server-owner");
+    fs::rename(&lock_path, config.root.join("control-owner-lock.original"))?;
+    fs::rename(
+        &anchor_path,
+        config.root.join("control-owner-anchor.original"),
+    )?;
+    fs::remove_file(&owner_marker)?;
+    fs::remove_file(&secret_owner_marker)?;
+    let replacement = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)?;
+    replacement.sync_all()?;
+    drop(replacement);
+    restrict_file(&lock_path)?;
+    fs::hard_link(&lock_path, &anchor_path)?;
+
+    let (peer_config, peer_listen_addr) = config.write_peer_config(
+        "peer-owner-marker-removal.json",
+        &config.control_database,
+        &config.secret_directory,
+    )?;
+    let mut second = ServerChild::spawn(&peer_config)?;
+    let second_observation = second.observe(READY_TIMEOUT)?;
+    let second_stopped = second.stop()?;
+    let first_stopped = first.graceful_stop()?;
+    let forbidden = config.forbidden_markers_for(&[peer_config.as_path()]);
+    assert_safe_output(
+        "owner-marker replacement second Server",
+        &second_stopped,
+        &forbidden,
+    )?;
+    assert_safe_output(
+        "owner-marker replacement first Server",
+        &first_stopped,
+        &forbidden,
+    )?;
+    assert_listen_released(peer_listen_addr)?;
+    assert_startup_failure(
+        "owner-marker replacement second Server",
+        &second_observation,
+        &second_stopped,
+        SERVER_ALREADY_OWNED_FAILURE,
+        &forbidden,
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_server_control_database_and_lock_pair_replacement_cannot_allow_second_owner() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let config = ConfigFixture::new(temp.path())?;
+    let mut first = ServerChild::spawn(&config.config_path)?;
+    let first_observation = first.observe(READY_TIMEOUT)?;
+    if !matches!(first_observation, Observation::Ready) || !first.is_running()? {
+        let stopped = first.stop()?;
+        assert_safe_output(
+            "first database-pair owner",
+            &stopped,
+            &config.forbidden_markers(),
+        )?;
+        return Err(io::Error::other(
+            "first Server did not establish the database-pair ownership baseline",
+        )
+        .into());
+    }
+
+    let file_name = config
+        .control_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("control database had no usable filename"))?;
+    let lock_path = config.root.join(format!("{file_name}.server.lock"));
+    let anchor_path = config.root.join(format!("{file_name}.server.lock.anchor"));
+    fs::rename(
+        &config.control_database,
+        config.root.join("control-readiness-database.original"),
+    )?;
+    fs::rename(
+        &lock_path,
+        config.root.join("control-readiness-database-lock.original"),
+    )?;
+    fs::rename(
+        &anchor_path,
+        config
+            .root
+            .join("control-readiness-database-anchor.original"),
+    )?;
+    let replacement_database = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&config.control_database)?;
+    replacement_database.sync_all()?;
+    drop(replacement_database);
+    restrict_file(&config.control_database)?;
+    let replacement_lock = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)?;
+    replacement_lock.sync_all()?;
+    drop(replacement_lock);
+    restrict_file(&lock_path)?;
+    fs::hard_link(&lock_path, &anchor_path)?;
+
+    let (peer_config, peer_listen_addr) = config.write_peer_config(
+        "peer-database-pair-replacement.json",
+        &config.control_database,
+        &config.secret_directory,
+    )?;
+    let mut second = ServerChild::spawn(&peer_config)?;
+    let second_observation = second.observe(READY_TIMEOUT)?;
+    let second_stopped = second.stop()?;
+    let first_stopped = first.graceful_stop()?;
+    let forbidden = config.forbidden_markers_for(&[peer_config.as_path()]);
+    assert_safe_output(
+        "database-pair replacement second Server",
+        &second_stopped,
+        &forbidden,
+    )?;
+    assert_safe_output(
+        "database-pair replacement first Server",
+        &first_stopped,
+        &forbidden,
+    )?;
+    assert_listen_released(peer_listen_addr)?;
+    assert_startup_failure(
+        "database-pair replacement second Server",
+        &second_observation,
+        &second_stopped,
+        SERVER_ALREADY_OWNED_FAILURE,
+        &forbidden,
+    )
+}
+
+#[test]
+fn e2e_server_control_database_path_with_uri_delimiter_restarts_ready() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("uri?root#fixture");
+    fs::create_dir(&root)?;
+    let config = ConfigFixture::new(&root)?;
+    let mut first = ServerChild::spawn(&config.config_path)?;
+    let first_observation = first.observe(READY_TIMEOUT)?;
+    let first_stopped = first.graceful_stop()?;
+    assert_safe_output(
+        "URI-delimiter first Server",
+        &first_stopped,
+        &config.forbidden_markers(),
+    )?;
+    if !matches!(first_observation, Observation::Ready) {
+        return Err(io::Error::other(
+            first_observation.failure_summary("URI-delimiter first Server"),
+        )
+        .into());
+    }
+
+    let mut second = ServerChild::spawn(&config.config_path)?;
+    let second_observation = second.observe(READY_TIMEOUT)?;
+    let second_stopped = second.graceful_stop()?;
+    assert_safe_output(
+        "URI-delimiter restarted Server",
+        &second_stopped,
+        &config.forbidden_markers(),
+    )?;
+    if !matches!(second_observation, Observation::Ready) {
+        return Err(io::Error::other(
+            second_observation.failure_summary("URI-delimiter restarted Server"),
+        )
+        .into());
+    }
+    assert_listen_released(config.listen_addr)
+}
+
 #[test]
 fn e2e_initialized_server_missing_metadata_never_reinitializes() -> TestResult {
     if let Some(raw) = env::var_os(METADATA_RECOVER_ENV) {
@@ -261,6 +967,165 @@ fn run_metadata_cases_without_capture() -> TestResult {
         }
     }
     finish_cases("missing metadata authority", failures)
+}
+
+#[test]
+fn e2e_initialized_server_missing_metadata_with_wal_without_shm_never_creates_sqlite_sidecars(
+) -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let config = ConfigFixture::new(temp.path())?;
+    establish_ready_baseline(&config, "missing metadata with WAL without SHM")?;
+    let sidecars = sqlite_sidecars(&config.control_database)?;
+    let holder = Connection::open(&config.control_database)?;
+    holder.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA wal_autocheckpoint = 0;
+         DELETE FROM server_metadata;
+         CREATE TABLE IF NOT EXISTS readiness_wal_holder(value INTEGER);
+         INSERT INTO readiness_wal_holder(value) VALUES (42);",
+    )?;
+    let deadline = Instant::now() + READY_TIMEOUT;
+    while (!sidecars[0].is_file()
+        || fs::metadata(&sidecars[0])?.len() == 0
+        || !sidecars[1].is_file())
+        && Instant::now() < deadline
+    {
+        thread::sleep(POLL_INTERVAL);
+    }
+    if !sidecars[0].is_file() || fs::metadata(&sidecars[0])?.len() == 0 || !sidecars[1].is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "SQLite holder did not establish a non-empty WAL and SHM pair",
+        )
+        .into());
+    }
+    holder.execute_batch("BEGIN; SELECT COUNT(*) FROM readiness_wal_holder;")?;
+    fs::remove_file(&sidecars[1])?;
+    let before = config.live_store_snapshot()?;
+    let held_listen = hold_public_listen(config.listen_addr)?;
+    let mut restarted = ServerChild::spawn(&config.config_path)?;
+    let observation = restarted.observe(READY_TIMEOUT)?;
+    let stopped = restarted.stop()?;
+    drop(held_listen);
+    let after = config.live_store_snapshot()?;
+    let forbidden = config.forbidden_markers();
+    assert_safe_output(
+        "missing metadata with WAL without SHM",
+        &stopped,
+        &forbidden,
+    )?;
+    let capture = capture_first_readiness_failure(
+        "server-readiness-metadata-with-wal-without-shm-v1",
+        "e2e_initialized_server_missing_metadata_with_wal_without_shm_never_creates_sqlite_sidecars",
+        "missing metadata with WAL without SHM",
+        config.listen_addr,
+        CONTROL_STORE_INTEGRITY_FAILURE,
+        &observation,
+        false,
+        &stopped,
+        &before,
+        &after,
+        &forbidden,
+    );
+    let port_released = assert_listen_released(config.listen_addr);
+    let startup = assert_startup_failure(
+        "missing metadata with WAL without SHM",
+        &observation,
+        &stopped,
+        CONTROL_STORE_INTEGRITY_FAILURE,
+        &forbidden,
+    );
+    let recreated_shm = sidecars[1].exists();
+    holder.execute_batch("ROLLBACK;")?;
+    drop(holder);
+    config.assert_persistent_secret_free()?;
+    capture?;
+    port_released?;
+    if before != after {
+        return Err(
+            io::Error::other("missing metadata preflight changed the SQLite sidecars").into(),
+        );
+    }
+    if recreated_shm {
+        return Err(io::Error::other(
+            "missing metadata preflight recreated the removed SQLite SHM sidecar",
+        )
+        .into());
+    }
+    startup
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_initialized_server_wal_shm_hardlink_is_rejected_before_ready() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let config = ConfigFixture::new(temp.path())?;
+    establish_ready_baseline(&config, "WAL SHM hardlink")?;
+    let sidecars = sqlite_sidecars(&config.control_database)?;
+    let holder = Connection::open(&config.control_database)?;
+    holder.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA wal_autocheckpoint = 0;
+         CREATE TABLE IF NOT EXISTS readiness_wal_link(value INTEGER);
+         INSERT INTO readiness_wal_link(value) VALUES (42);",
+    )?;
+    let deadline = Instant::now() + READY_TIMEOUT;
+    while (!sidecars[0].is_file()
+        || fs::metadata(&sidecars[0])?.len() == 0
+        || !sidecars[1].is_file())
+        && Instant::now() < deadline
+    {
+        thread::sleep(POLL_INTERVAL);
+    }
+    if !sidecars[0].is_file() || fs::metadata(&sidecars[0])?.len() == 0 || !sidecars[1].is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "SQLite holder did not establish a non-empty WAL and SHM pair",
+        )
+        .into());
+    }
+    holder.execute_batch("BEGIN; SELECT COUNT(*) FROM readiness_wal_link;")?;
+    let unrelated = config.root.join("unrelated-shm");
+    fs::rename(&sidecars[1], &unrelated)?;
+    fs::hard_link(&unrelated, &sidecars[1])?;
+    let before = config.live_store_snapshot()?;
+    let held_listen = hold_public_listen(config.listen_addr)?;
+    let mut restarted = ServerChild::spawn(&config.config_path)?;
+    let observation = restarted.observe(READY_TIMEOUT)?;
+    let stopped = restarted.stop()?;
+    drop(held_listen);
+    let after = config.live_store_snapshot()?;
+    let forbidden = config.forbidden_markers_for(&[unrelated.as_path()]);
+    assert_safe_output("WAL SHM hardlink", &stopped, &forbidden)?;
+    let capture = capture_first_readiness_failure(
+        "server-readiness-wal-shm-hardlink-v1",
+        "e2e_initialized_server_wal_shm_hardlink_is_rejected_before_ready",
+        "WAL SHM hardlink must fail closed without mutating the peer file",
+        config.listen_addr,
+        CONTROL_STORE_INTEGRITY_FAILURE,
+        &observation,
+        false,
+        &stopped,
+        &before,
+        &after,
+        &forbidden,
+    );
+    let startup = assert_startup_failure(
+        "WAL SHM hardlink",
+        &observation,
+        &stopped,
+        CONTROL_STORE_INTEGRITY_FAILURE,
+        &forbidden,
+    );
+    holder.execute_batch("ROLLBACK;")?;
+    drop(holder);
+    config.assert_persistent_secret_free()?;
+    capture?;
+    assert_listen_released(config.listen_addr)?;
+    if before != after {
+        return Err(io::Error::other("WAL SHM hardlink preflight changed SQLite sidecars").into());
+    }
+    startup
 }
 
 #[test]
@@ -374,6 +1239,17 @@ impl MetadataDamage {
             Self::Table => !metadata_table,
         })
     }
+}
+
+fn sqlite_sidecars(database: &Path) -> TestResult<[PathBuf; 2]> {
+    let file_name = database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("control database had no usable filename"))?;
+    Ok([
+        database.with_file_name(format!("{file_name}-wal")),
+        database.with_file_name(format!("{file_name}-shm")),
+    ])
 }
 
 #[derive(Clone, Copy)]
