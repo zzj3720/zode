@@ -314,6 +314,9 @@ Maintain positive E2Es for:
 - `e2e_browser_provider_profile_delete_replays_original_result_after_response_loss`
   drops the first browser response after deletion commit and proves the same
   command key replays its stored safe result while the UI confirmation closes;
+- `e2e_browser_provider_profile_delete_tombstone_status_is_monotonic_under_late_failure`
+  races one successful and one later failed dispatch of the same tombstone and
+  proves the public `removed` projection cannot regress to `unreachable`;
 - Endpoint-generated ULID create and stable forwarding across Server crash;
 - Endpoint identity/capability mismatch;
 - same Endpoint added twice cannot create a second device ID/catalog row;

@@ -378,6 +378,10 @@ Endpoint aimux.
   proves a committed profile tombstone keeps a safe response receipt: a lost
   browser response can be retried with the same idempotency key and cannot turn
   into a new-key `not_found` after the UI confirmation remains open;
+- `e2e_browser_provider_profile_delete_tombstone_status_is_monotonic_under_late_failure`
+  races the same tombstone operation through one successful and one later
+  failed Endpoint dispatch, proving a confirmed `removed` projection cannot
+  regress to `unreachable` before or after Server restart;
 - corrupt only a stopped test-owned replica secret, restart, and expose a safe
   typed unavailable state rather than credential content;
 - verify Server UI/API lists every Endpoint holding a profile and accurately

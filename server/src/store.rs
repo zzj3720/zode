@@ -1745,7 +1745,35 @@ impl ControlStore {
         let changed = connection
             .execute(
                 "UPDATE auth_replica_operations
-                 SET status = ?4, observed_revision = ?5
+                 SET status = CASE
+                         WHEN CASE status
+                                  WHEN 'pending' THEN 0
+                                  WHEN 'unreachable' THEN 1
+                                  WHEN 'ready' THEN 2
+                              END
+                              <= CASE ?4
+                                  WHEN 'pending' THEN 0
+                                  WHEN 'unreachable' THEN 1
+                                  WHEN 'ready' THEN 2
+                              END
+                         THEN ?4 ELSE status END,
+                     observed_revision = CASE
+                         WHEN CASE status
+                                  WHEN 'pending' THEN 0
+                                  WHEN 'unreachable' THEN 1
+                                  WHEN 'ready' THEN 2
+                              END
+                              <= CASE ?4
+                                  WHEN 'pending' THEN 0
+                                  WHEN 'unreachable' THEN 1
+                                  WHEN 'ready' THEN 2
+                              END
+                         THEN CASE
+                                  WHEN observed_revision IS NULL THEN ?5
+                                  WHEN ?5 IS NULL OR observed_revision >= ?5 THEN observed_revision
+                                  ELSE ?5
+                              END
+                         ELSE observed_revision END
                  WHERE profile_id = ?1 AND endpoint_id = ?2 AND revision = ?3
                    AND kind = 'tombstone'",
                 params![

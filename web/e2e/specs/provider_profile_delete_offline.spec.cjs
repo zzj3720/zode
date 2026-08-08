@@ -19,6 +19,50 @@ const PROVIDER = "delete-offline-fixture";
 const MODEL = "delete-offline-model";
 const ENDPOINT_LABEL = "Offline delete Endpoint";
 const INCIDENT_DIRECTORY = path.resolve(__dirname, "../fixtures/incidents");
+
+const CONCURRENT_E2E_NAME =
+  "e2e_browser_provider_profile_delete_tombstone_status_is_monotonic_under_late_failure";
+const CONCURRENT_CLASSIFICATION =
+  "AUTH_PROFILE_DELETE_TOMBSTONE_STATUS_REGRESSED_AFTER_LATE_FAILURE";
+const CONCURRENT_FIRST_OBSERVED =
+  "the same tombstone operation was acknowledged by the Endpoint and then a later failed dispatch downgraded the Server replica projection from removed to unreachable";
+
+function concurrentCassettes() {
+  if (!fs.existsSync(INCIDENT_DIRECTORY)) return [];
+  return fs.readdirSync(INCIDENT_DIRECTORY)
+    .filter((name) => name.endsWith(".v1.json"))
+    .map((name) => path.join(INCIDENT_DIRECTORY, name))
+    .filter((candidate) => {
+      try {
+        const value = JSON.parse(fs.readFileSync(candidate, "utf8"));
+        return value.e2e_name === CONCURRENT_E2E_NAME &&
+          value.classification === CONCURRENT_CLASSIFICATION;
+      } catch {
+        return false;
+      }
+    });
+}
+
+function assertConcurrentCassetteIdentity() {
+  const matches = concurrentCassettes();
+  expect(matches).toHaveLength(1);
+  const cassette = JSON.parse(fs.readFileSync(matches[0], "utf8"));
+  expect(cassette.schema).toBe("zode.http-incident-recording.v1");
+  expect(cassette.version).toBe(1);
+  expect(cassette.e2e_name).toBe(CONCURRENT_E2E_NAME);
+  expect(cassette.classification).toBe(CONCURRENT_CLASSIFICATION);
+  expect(cassette.first_observed).toBe(CONCURRENT_FIRST_OBSERVED);
+  expect(cassette.source_digest).toMatch(/^[0-9a-f]{64}$/u);
+  expect(cassette.integrity_sha256).toMatch(/^[0-9a-f]{64}$/u);
+  const exchanges = cassette.exchanges.filter((exchange) =>
+    exchange.boundary === "server-endpoint-control" &&
+    exchange.method === "PUT" &&
+    exchange.path.includes("/v1/auth-replicas/"),
+  );
+  expect(exchanges.length).toBeGreaterThanOrEqual(2);
+  expect(exchanges.some((exchange) => exchange.response.status === 200)).toBe(true);
+  expect(exchanges.some((exchange) => exchange.response.status === 502)).toBe(true);
+}
 function matchingCassettes() {
   if (!fs.existsSync(INCIDENT_DIRECTORY)) return [];
   return fs.readdirSync(INCIDENT_DIRECTORY)
@@ -131,6 +175,88 @@ async function mutableEndpointProxy(harness) {
     proxy,
     setTarget(next) { target = next; },
     async close() { await proxy.close(); },
+  };
+}
+
+async function concurrentTombstoneProxy(harness) {
+  let target = harness.endpoint;
+  let armed = false;
+  let requests = 0;
+  let resolveSecond;
+  let resolveFirst;
+  const firstFinished = new Promise((resolve) => { resolveFirst = resolve; });
+  const twoDispatches = new Promise((resolve) => { resolveSecond = resolve; });
+  const failure = await startHttpServer((_request, response) => {
+    response.writeHead(502, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: { code: "endpoint_unavailable", retryable: true } }));
+  });
+  const proxy = await startHttpServer(async (request, response) => {
+    const isTombstone = armed && request.method === "PUT" &&
+      request.url.includes("/v1/auth-replicas/");
+    const destination = isTombstone && requests > 0 ? failure.baseUrl : target.baseUrl;
+    const canonicalOrigin = destination;
+    if (!isTombstone) {
+      return proxyHttp({
+        targetBaseUrl: destination,
+        request,
+        response,
+        extraHeaders: { authorization: `Bearer ${harness.controllerSecret}` },
+        boundary: "server-endpoint-control",
+        journal: harness.journal,
+        ledger: harness.ledger,
+        captureSetId: harness.journal.currentCaptureSetId,
+        canonicalOrigin,
+      });
+    }
+    requests += 1;
+    if (requests === 1) {
+      try {
+        return await proxyHttp({
+          targetBaseUrl: target.baseUrl,
+          request,
+          response,
+          extraHeaders: { authorization: `Bearer ${harness.controllerSecret}` },
+          boundary: "server-endpoint-control",
+          journal: harness.journal,
+          ledger: harness.ledger,
+          captureSetId: harness.journal.currentCaptureSetId,
+          canonicalOrigin: target.baseUrl,
+        });
+      } finally {
+        resolveFirst();
+      }
+    }
+    await firstFinished;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    try {
+      return await proxyHttp({
+        targetBaseUrl: failure.baseUrl,
+        request,
+        response,
+        extraHeaders: {},
+        boundary: "server-endpoint-control",
+        journal: harness.journal,
+        ledger: harness.ledger,
+        captureSetId: harness.journal.currentCaptureSetId,
+        canonicalOrigin: failure.baseUrl,
+      });
+    } finally {
+      resolveSecond();
+    }
+  });
+  return {
+    proxy,
+    arm() { armed = true; },
+    async waitForTwo() {
+      await Promise.race([
+        twoDispatches,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("tombstone dispatch race timed out")), 15_000)),
+      ]);
+    },
+    async close() {
+      await proxy.close();
+      await failure.close();
+    },
   };
 }
 
@@ -363,6 +489,151 @@ test(E2E_NAME, async ({ page }) => {
       primaryError = captureError;
     }
     try { await endpointProxy.close(); } catch (error) { primaryError ||= error; }
+    try { await harness.close(); } catch (error) { primaryError ||= error; }
+  }
+  if (primaryError) throw primaryError;
+});
+
+test(CONCURRENT_E2E_NAME, async ({ page }) => {
+  test.setTimeout(180_000);
+  const captureRequested = process.env.ZODE_CAPTURE_PROFILE_DELETE_CONCURRENT === "1";
+  if (!captureRequested) assertConcurrentCassetteIdentity();
+  const harness = await createWebE2EHarness({
+    e2eName: CONCURRENT_E2E_NAME,
+    uiMode: "assets",
+    includeServerOrigins: true,
+    authorityId: "web-e2e-server",
+  });
+  const race = await concurrentTombstoneProxy(harness);
+  let captureSetId;
+  let primaryError;
+  try {
+    await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
+    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+    await addRemoteEndpoint(page, race.proxy.baseUrl, harness);
+    await configureProvider(page, harness);
+    await createSharedProfile(page, harness);
+    await page.getByRole("link", { name: "Providers", exact: true }).click();
+    const card = page.locator("article.resource-card").filter({ hasText: PROVIDER }).first();
+    const profile = card.locator(".profile-row").filter({ hasText: "Offline delete profile" });
+    const id = await profileId(page);
+    captureSetId = harness.beginCaptureSet({ e2eName: CONCURRENT_E2E_NAME, maxMembers: 64 });
+    race.arm();
+    await profile.getByRole("button", { name: "Delete profile", exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: "Delete profile" });
+    await dialog.getByRole("checkbox", { name: /understand|acknowledge/i }).check();
+    const deleteResponse = page.waitForResponse((response) =>
+      response.request().method() === "DELETE" &&
+      new URL(response.url()).pathname === `/v1/providers/${PROVIDER}/auth-profiles/${id}`,
+    );
+    await dialog.getByRole("button", { name: "Delete profile permanently", exact: true }).click();
+    expect((await deleteResponse).status()).toBe(200);
+    await race.waitForTwo();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const projection = await page.evaluate(async (profileIdValue) => {
+      const response = await fetch(`/v1/auth-profiles/${encodeURIComponent(profileIdValue)}/replicas`, {
+        headers: { accept: "application/json" },
+      });
+      return { status: response.status, body: await response.json() };
+    }, id);
+    const statuses = projection.body.items?.map((item) => item.status) || [];
+    try {
+      expect(projection.status).toBe(200);
+      expect(statuses.length).toBeGreaterThan(0);
+      expect(statuses.every((status) => status === "removed")).toBe(true);
+    } catch (error) {
+      throw new ProductBehaviorFailure(CONCURRENT_CLASSIFICATION, CONCURRENT_FIRST_OBSERVED, {
+        relation: "same-operation-id-concurrent-dispatch",
+        projectionStatus: projection.status,
+        statuses,
+        dispatchCount: 2,
+        cause: error instanceof Error ? error.message : String(error),
+      });
+    }
+    await harness.restartServer();
+    await page.goto(`${harness.managementUrl}/providers`, { waitUntil: "domcontentloaded" });
+    const restartedProjection = await page.evaluate(async (profileIdValue) => {
+      const response = await fetch(`/v1/auth-profiles/${encodeURIComponent(profileIdValue)}/replicas`, {
+        headers: { accept: "application/json" },
+      });
+      return { status: response.status, body: await response.json() };
+    }, id);
+    const restartedStatuses = restartedProjection.body.items?.map((item) => item.status) || [];
+    try {
+      expect(restartedProjection.status).toBe(200);
+      expect(restartedStatuses.length).toBeGreaterThan(0);
+      expect(restartedStatuses.every((status) => status === "removed")).toBe(true);
+    } catch (error) {
+      throw new ProductBehaviorFailure(
+        CONCURRENT_CLASSIFICATION,
+        CONCURRENT_FIRST_OBSERVED,
+        {
+          relation: "same-operation-id-concurrent-dispatch-after-server-restart",
+          projectionStatus: restartedProjection.status,
+          statuses: restartedStatuses,
+          dispatchCount: 2,
+          cause: error instanceof Error ? error.message : String(error),
+        },
+      );
+    }
+  } catch (error) {
+    primaryError = error;
+  } finally {
+    try {
+      await harness.journal.waitForIdle();
+      if (!captureSetId) {
+        if (primaryError) throw primaryError;
+      } else {
+        const records = recordsFor(harness, captureSetId);
+        const firstFailure = records.find((record) =>
+          record.boundary === "server-endpoint-control" &&
+          record.method === "PUT" &&
+          record.path.includes("/v1/auth-replicas/"),
+        ) || records[0];
+        if (!firstFailure) throw new Error("concurrent tombstone capture contained no Endpoint dispatch");
+        if (primaryError) {
+          const capture = harness.journal.flushCaptureSet(captureSetId, {
+            firstFailureRecordingId: firstFailure.recordingId,
+          });
+          for (const record of records) {
+            expect(fs.statSync(record.rawPath).mode & 0o777).toBe(0o600);
+          }
+          if (captureRequested && primaryError.classification === CONCURRENT_CLASSIFICATION) {
+            const promoted = await harness.journal.promoteCaptureSet(captureSetId, {
+                e2eName: CONCURRENT_E2E_NAME,
+                classification: CONCURRENT_CLASSIFICATION,
+                firstObserved: CONCURRENT_FIRST_OBSERVED,
+                firstFailureRecordingId: firstFailure.recordingId,
+                destinationDirectory: INCIDENT_DIRECTORY,
+                replay: async (envelope) => {
+                  const replayServer = await harness.journal.startReplayServer(envelope);
+                  try {
+                    return await harness.journal.replay(envelope, {
+                      baseUrl: replayServer.baseUrl,
+                      boundaryBaseUrls: {
+                        "management-access-edge": replayServer.baseUrl,
+                        "server-endpoint-control": replayServer.baseUrl,
+                      },
+                    });
+                  } finally {
+                    await replayServer.finish();
+                  }
+                },
+              });
+            primaryError = new ProductBehaviorFailure(
+              CONCURRENT_CLASSIFICATION,
+              `${CONCURRENT_FIRST_OBSERVED}; cassette=${promoted.cassettePath}`,
+              { captureSetId, recordingId: firstFailure.recordingId },
+            );
+          }
+        } else {
+          harness.journal.flushCaptureSet(captureSetId);
+        }
+      }
+    } catch (captureError) {
+      primaryError = captureError;
+    }
+    try { await race.close(); } catch (error) { primaryError ||= error; }
     try { await harness.close(); } catch (error) { primaryError ||= error; }
   }
   if (primaryError) throw primaryError;
