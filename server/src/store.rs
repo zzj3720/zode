@@ -1852,19 +1852,11 @@ impl ControlStore {
             .map_err(|_| StoreError::Internal)?;
         let records = statement
             .query_map([], |row| {
-                let revision = positive_u64(row, 3)?;
-                let observed_revision = optional_u64(row, 6)?;
+                let tombstone = auth_tombstone_from_row(row)?;
+                let secret_ref = row.get(7)?;
                 Ok(AuthTombstoneDispatchRecord {
-                    tombstone: AuthTombstoneRecord {
-                        profile_id: row.get(0)?,
-                        provider: row.get(1)?,
-                        endpoint_id: row.get(2)?,
-                        revision,
-                        operation_id: row.get(4)?,
-                        status: row.get(5)?,
-                        observed_revision,
-                    },
-                    secret_ref: row.get(7)?,
+                    tombstone,
+                    secret_ref,
                 })
             })
             .map_err(|_| StoreError::Internal)?
@@ -2096,23 +2088,23 @@ fn read_auth_profile_tombstones_connection(
         )
         .map_err(|_| StoreError::Internal)?;
     let records = statement
-        .query_map([profile_id], |row| {
-            let revision = positive_u64(row, 3)?;
-            let observed_revision = optional_u64(row, 6)?;
-            Ok(AuthTombstoneRecord {
-                profile_id: row.get(0)?,
-                provider: row.get(1)?,
-                endpoint_id: row.get(2)?,
-                revision,
-                operation_id: row.get(4)?,
-                status: row.get(5)?,
-                observed_revision,
-            })
-        })
+        .query_map([profile_id], |row| auth_tombstone_from_row(row))
         .map_err(|_| StoreError::Internal)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|_| StoreError::Integrity)?;
     Ok(records)
+}
+
+fn auth_tombstone_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthTombstoneRecord> {
+    Ok(AuthTombstoneRecord {
+        profile_id: row.get(0)?,
+        provider: row.get(1)?,
+        endpoint_id: row.get(2)?,
+        revision: positive_u64(row, 3)?,
+        operation_id: row.get(4)?,
+        status: row.get(5)?,
+        observed_revision: optional_u64(row, 6)?,
+    })
 }
 
 fn auth_replica_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthReplicaRecord> {
