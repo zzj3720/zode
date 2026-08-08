@@ -11,9 +11,7 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use url::{Host, Url};
-use zode_protocol::{
-    negotiate_endpoint_protocol, EndpointCapabilities, EndpointIdentity,
-};
+use zode_protocol::{negotiate_endpoint_protocol, EndpointCapabilities, EndpointIdentity};
 
 use crate::{
     access::ActorContext,

@@ -1489,7 +1489,8 @@ impl CountingProxy {
         *self
             .protocol_matrix_variant
             .lock()
-            .map_err(|_| io::Error::other("protocol matrix variant lock poisoned"))? = Some(variant);
+            .map_err(|_| io::Error::other("protocol matrix variant lock poisoned"))? =
+            Some(variant);
         Ok(())
     }
 
@@ -1568,9 +1569,9 @@ fn mutate_protocol_matrix_response(
     }
     let mut body: Value = serde_json::from_slice(&parsed.body)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    let object = body
-        .as_object_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Endpoint DTO was not an object"))?;
+    let object = body.as_object_mut().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "Endpoint DTO was not an object")
+    })?;
     match variant {
         ProtocolMatrixVariant::Baseline => {}
         ProtocolMatrixVariant::UnknownIdentityField if path == "/v1/identity" => {
