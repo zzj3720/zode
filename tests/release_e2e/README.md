@@ -105,7 +105,8 @@ stream marker、Server/Endpoint 管理请求、provider 200/SSE `[DONE]`，再 r
 `local_channel_open_failure_e2e.cjs` 验证 fresh `open` 健康失败不会留下
 edge；`local_channel_edge_admission_e2e.cjs` 验证篡改的非 loopback 状态被
 拒绝；`local_channel_stop_identity_e2e.cjs` 验证 stop 不信任 PATH 伪造的
-`ps` 身份，也不会杀死无关进程组。
+`ps` 身份，也不会杀死无关进程组；`local_channel_update_failure_e2e.cjs`
+验证 fresh update 的无效候选不会留下 edge/runtime。
 
 The test channel supplies the existing authentication inputs through
 `ZODE_RELEASE_ACCESS_ASSERTION` (or `_ACCESS_JWT_ASSERTION`) and

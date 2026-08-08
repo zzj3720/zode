@@ -453,10 +453,18 @@ async function main(options) {
   if (options.operation === 'update') {
     const artifact = options.values.artifact;
     if (!artifact) fail('local_channel_usage', 'update requires --artifact', {}, 2);
-    await ensureEdge(config);
-    const result = runChannel(['update', '--artifact', path.resolve(artifact), '--release-root', root], env);
-    emit({ ok: result.status === 0 && result.payload?.ok === true, operation: 'update', channel_root: root, url: `${config.issuer}/`, ...(result.payload || {}) });
-    return result.status;
+    const priorRuntime = readRuntime(config);
+    const priorEdge = Boolean(priorRuntime?.edge_pid && pidAlive(priorRuntime.edge_pid) && exactEdgeCommand(config, priorRuntime.edge_pid));
+    let keepEdge = priorEdge;
+    try {
+      await ensureEdge(config);
+      const result = runChannel(['update', '--artifact', path.resolve(artifact), '--release-root', root], env);
+      keepEdge = priorEdge || (result.status === 0 && result.payload?.ok === true);
+      emit({ ok: result.status === 0 && result.payload?.ok === true, operation: 'update', channel_root: root, url: `${config.issuer}/`, ...(result.payload || {}) });
+      return result.status;
+    } finally {
+      if (!keepEdge) stopEdge(config);
+    }
   }
   if (options.operation === 'open') {
     let keepEdge = false;
