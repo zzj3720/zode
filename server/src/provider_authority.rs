@@ -1,7 +1,7 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Deserialize;
@@ -14,8 +14,8 @@ use crate::{
     catalog::{Catalog, CatalogError},
     store::{
         hex, AuthProfileRecord, AuthReplicaRecord, ControlStore, ProfileCreatePhase,
-        ProfileCreateWrite, ProviderDefaultProfileWrite, ProviderDescriptorRecord,
-        ProviderDescriptorWrite, StoreError,
+        ProfileCreateWrite, ProfileDeleteWrite, ProviderDefaultProfileWrite,
+        ProviderDescriptorRecord, ProviderDescriptorWrite, StoreError,
     },
 };
 
@@ -27,6 +27,7 @@ const MAX_OPTIONS_BYTES: usize = 64 * 1024;
 const MAX_PROFILE_LABEL_BYTES: usize = 256;
 const MAX_API_KEY_BYTES: usize = 64 * 1024;
 const MAX_ENDPOINTS_PER_SHARING: usize = 100;
+const TOMBSTONE_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Error)]
 pub(crate) enum ProviderError {
@@ -92,6 +93,99 @@ impl Drop for Secret {
 impl ProviderAuthority {
     pub(crate) fn new(store: Arc<ControlStore>, catalog: Arc<Catalog>) -> Self {
         Self { store, catalog }
+    }
+
+    pub(crate) fn spawn_tombstone_reconciler(self: &Arc<Self>) {
+        let authority = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(TOMBSTONE_RECONCILIATION_INTERVAL);
+            loop {
+                interval.tick().await;
+                let _ = authority.reconcile_profile_tombstones().await;
+            }
+        });
+    }
+
+    async fn reconcile_profile_tombstones(&self) -> Result<(), ProviderError> {
+        let store = Arc::clone(&self.store);
+        let (secret_refs, tombstones) = tokio::task::spawn_blocking(move || {
+            Ok::<_, StoreError>((
+                store.list_deleted_provider_secret_refs()?,
+                store.list_auth_tombstones_for_reconciliation()?,
+            ))
+        })
+        .await
+        .map_err(|_| ProviderError::Internal)?
+        .map_err(map_store_error)?;
+        let mut cleaned = BTreeSet::new();
+        for secret_ref in secret_refs {
+            let store = Arc::clone(&self.store);
+            let reference = secret_ref.clone();
+            if tokio::task::spawn_blocking(move || store.remove_provider_secret(&reference))
+                .await
+                .map_err(|_| ProviderError::Internal)?
+                .map_err(map_store_error)
+                .is_ok()
+            {
+                cleaned.insert(secret_ref);
+            }
+        }
+        for dispatch in tombstones {
+            if !cleaned.contains(&dispatch.secret_ref) {
+                continue;
+            }
+            let tombstone = dispatch.tombstone;
+            let (status, observed_revision) = self.dispatch_tombstone(&tombstone).await;
+            let store = Arc::clone(&self.store);
+            tokio::task::spawn_blocking(move || {
+                store.mark_profile_tombstone(
+                    &tombstone.profile_id,
+                    &tombstone.endpoint_id,
+                    tombstone.revision,
+                    status,
+                    observed_revision,
+                )
+            })
+            .await
+            .map_err(|_| ProviderError::Internal)?
+            .map_err(map_store_error)?;
+        }
+        Ok(())
+    }
+
+    async fn dispatch_tombstone(
+        &self,
+        tombstone: &crate::store::AuthTombstoneRecord,
+    ) -> (&'static str, Option<u64>) {
+        let body = json!({
+            "schema": "zode.auth-replica.tombstone.v1",
+            "authority_id": self.store.authority_id(),
+            "provider": tombstone.provider,
+            "revision": tombstone.revision,
+        });
+        match self
+            .catalog
+            .install_auth_replica(
+                &tombstone.endpoint_id,
+                &tombstone.profile_id,
+                &tombstone.operation_id,
+                body,
+            )
+            .await
+        {
+            Ok(response)
+                if response["schema"] == "zode.auth-replica.v1"
+                    && response["auth_profile_id"] == tombstone.profile_id
+                    && response["authority_id"] == self.store.authority_id()
+                    && response["provider"] == tombstone.provider
+                    && response["status"] == "tombstoned"
+                    && response["revision"].as_u64().unwrap_or_default() >= tombstone.revision =>
+            {
+                ("removed", response["revision"].as_u64())
+            }
+            Ok(response) => ("unreachable", response["revision"].as_u64()),
+            Err(_) => ("unreachable", None),
+        }
     }
 
     pub(crate) async fn put_descriptor(
@@ -350,6 +444,88 @@ impl ProviderAuthority {
             response["is_default"] = Value::Bool(true);
         }
         Ok(response)
+    }
+
+    pub(crate) async fn delete_profile(
+        &self,
+        actor: &ActorContext,
+        idempotency_key: &str,
+        provider: &str,
+        profile_id: &str,
+    ) -> Result<Value, ProviderError> {
+        if !valid_identifier(provider, MAX_PROVIDER_BYTES)
+            || !valid_text(idempotency_key, MAX_IDEMPOTENCY_KEY_BYTES)
+            || !valid_identifier(profile_id, 128)
+        {
+            return Err(ProviderError::Invalid);
+        }
+        let keys = self.store.keys();
+        let command_key = keys.digest(
+            b"auth-profile-delete-command-v1",
+            &[
+                provider.as_bytes(),
+                profile_id.as_bytes(),
+                idempotency_key.as_bytes(),
+            ],
+        );
+        let request_fingerprint = keys.digest(
+            b"auth-profile-delete-request-v1",
+            &[provider.as_bytes(), profile_id.as_bytes()],
+        );
+        let write = ProfileDeleteWrite {
+            actor_key: *actor.actor_key(),
+            provider: provider.to_owned(),
+            profile_id: profile_id.to_owned(),
+            command_key,
+            request_fingerprint,
+            created_at_ms: unix_millis()?,
+        };
+        let store = Arc::clone(&self.store);
+        let (_operation, profile, tombstones) =
+            tokio::task::spawn_blocking(move || store.begin_profile_delete(write))
+                .await
+                .map_err(|_| ProviderError::Internal)?
+                .map_err(map_store_error)?;
+        let store = Arc::clone(&self.store);
+        let secret_ref = profile.secret_ref.clone();
+        tokio::task::spawn_blocking(move || store.remove_provider_secret(&secret_ref))
+            .await
+            .map_err(|_| ProviderError::Internal)?
+            .map_err(map_store_error)?;
+        for tombstone in tombstones.iter().filter(|item| item.status != "removed") {
+            let (status, observed_revision) = self.dispatch_tombstone(tombstone).await;
+            let store = Arc::clone(&self.store);
+            let profile_id = tombstone.profile_id.clone();
+            let endpoint_id = tombstone.endpoint_id.clone();
+            let revision = tombstone.revision;
+            tokio::task::spawn_blocking(move || {
+                store.mark_profile_tombstone(
+                    &profile_id,
+                    &endpoint_id,
+                    revision,
+                    status,
+                    observed_revision,
+                )
+            })
+            .await
+            .map_err(|_| ProviderError::Internal)?
+            .map_err(map_store_error)?;
+        }
+        let store = Arc::clone(&self.store);
+        let profile_id_owned = profile_id.to_owned();
+        let replicas =
+            tokio::task::spawn_blocking(move || store.list_auth_replicas(&profile_id_owned))
+                .await
+                .map_err(|_| ProviderError::Internal)?
+                .map_err(map_store_error)?;
+        let pending = replicas.iter().any(|replica| replica.status != "removed");
+        Ok(json!({
+            "schema": "zode.auth-profile-delete.v1",
+            "provider": provider,
+            "auth_profile_id": profile_id,
+            "status": if pending { "removal_pending" } else { "deleted" },
+            "distribution": replica_list_value(&replicas, self.store.authority_id()),
+        }))
     }
 
     pub(crate) async fn list_replicas(&self, profile_id: &str) -> Result<Value, ProviderError> {

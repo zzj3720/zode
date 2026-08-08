@@ -1,0 +1,347 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "0002-ad0c969f-49d4-4aaf-9462-19a61e13027d-bed6a91d-21cc-4282-8295-d741ae3c9f2f",
+  "e2e_name": "e2e_browser_provider_profile_delete_tombstones_endpoint_replica",
+  "boundary": "browser-capture-set",
+  "first_observed": "a shared API-key profile had no Delete profile action in the real Providers page, so the browser could not request Server-owned profile deletion and Endpoint tombstone distribution",
+  "classification": "PROVIDER_PROFILE_DELETE_ACTION_MISSING",
+  "source_digest": "1765382847cc78f66d8ead6f2d75eeef27eed7859ae8860786af469a624ecf5d",
+  "first_failure_recording_id": "000025-ea691b8e-7fe1-4b32-9449-0c464519cebc",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000022-2b84141d-f3c4-4535-962d-7f4586b4a099",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/providers",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-cache"
+        },
+        "chunks": [
+          {
+            "offset_us": 5719.292,
+            "data_base64": "PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KICA8aGVhZD4KICAgIDxtZXRhIGNoYXJzZXQ9IlVURi04IiAvPgogICAgPG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLjAiIC8+CiAgICA8dGl0bGU+Wm9kZTwvdGl0bGU+CiAgICA8c2NyaXB0IHR5cGU9Im1vZHVsZSIgY3Jvc3NvcmlnaW4gc3JjPSIvYXNzZXRzL2luZGV4LUIzeWxWQ29FQ1Y3YS5qcyI+PC9zY3JpcHQ+CiAgICA8bGluayByZWw9InN0eWxlc2hlZXQiIGNyb3Nzb3JpZ2luIGhyZWY9Ii9hc3NldHMvaW5kZXgtQ1VxZmZSakVoNEVHLmNzcyI+CiAgPC9oZWFkPgogIDxib2R5PgogICAgPGRpdiBpZD0iYXBwIj48L2Rpdj4KICA8L2JvZHk+CjwvaHRtbD4K"
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000002",
+      "recording_id": "000023-b3a3051c-75bd-46f3-ae0c-78c03a79e226",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/system",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "chunks": [
+          {
+            "offset_us": 7070.5,
+            "data_base64": "eyJkZXBsb3ltZW50Ijoic2VydmVyX29ubHkiLCJmZWF0dXJlcyI6eyJwcm92aWRlcl9hdXRoIjp0cnVlLCJyZW1vdGVfZW5kcG9pbnRzIjp0cnVlfSwiaW5ncmVzcyI6eyJjYWxsYmFja19vcmlnaW4iOiJzZXBhcmF0ZSIsIm1hbmFnZW1lbnRfYXV0aCI6ImNsb3VkZmxhcmVfYWNjZXNzIn0sImxvY2FsX2VuZHBvaW50X2lkIjpudWxsLCJzY2hlbWEiOiJ6b2RlLnN5c3RlbS52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000003",
+      "recording_id": "000024-6ed62c28-f052-40ec-a63c-660602807756",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/endpoints",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 14617.291,
+            "data_base64": "eyJpdGVtcyI6W3siYXV0aF9yZXBsaWNhX3N1bW1hcnkiOnsicGVuZGluZyI6MCwicmVhZHkiOjAsInN0YWxlIjowfSwiY2FwYWJpbGl0aWVzIjp7InByb3RvY29sX3ZlcnNpb24iOiJ6b2RlLmVuZHBvaW50LnYxIiwicHJvdmlkZXJzIjpbIm9wZW5haV9jb21wYXRpYmxlIl0sInRvb2xzIjpbXX0sImNvbnRyb2xsZXJfYXV0aG9yaXR5X2lkIjoid2ViLWUyZS1zZXJ2ZXIiLCJjb250cm9sbGVyX2NyZWRlbnRpYWxfcmV2aXNpb24iOjEsImRpc2FibGVkIjpmYWxzZSwiZW5kcG9pbnRfaWQiOiIwMUtaR1YxU1cwOTU0SlRKQ1ZOMllOTUhCUyIsImtpbmQiOiJyZW1vdGUiLCJsYWJlbCI6IkRlbGV0ZSB0YXJnZXQgRW5kcG9pbnQiLCJsYXN0X29ic2VydmVkX2F0X21zIjoxNzg2MTk3ODk2MTcwLCJzY2hlbWEiOiJ6b2RlLmVuZHBvaW50LnYxIiwic3RhdHVzIjoib25saW5lIn1dLCJzY2hlbWEiOiJ6b2RlLmVuZHBvaW50cy52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000004",
+      "recording_id": "000025-ea691b8e-7fe1-4b32-9449-0c464519cebc",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/providers",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 9450.167,
+            "data_base64": "eyJwcm92aWRlcnMiOlt7ImF1dGhfcHJvZmlsZV9jb3VudCI6MSwiYXV0aF9zdGF0dXMiOiJyZWFkeSIsImRlZmF1bHRfcHJvZmlsZV9pZCI6InByb2ZpbGUtNDEzMGRhZGM2OTlhMGJkOTBmOWE2MzQ0MDY0Njk1OGQiLCJkZXNjcmlwdG9yIjp7ImJhc2VfdXJsIjoiaHR0cDovLzEyNy4wLjAuMTo1MzI3MC92MSIsImtpbmQiOiJvcGVuYWlfY29tcGF0aWJsZSIsIm1vZGVscyI6WyJwcm9maWxlLWRlbGV0ZS1tb2RlbCJdLCJvcHRpb25zIjp7fSwicmV2aXNpb24iOjF9LCJwcm92aWRlciI6InByb2ZpbGUtZGVsZXRlLWZpeHR1cmUifV0sInNjaGVtYSI6InpvZGUucHJvdmlkZXJzLnYxIn0="
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000005",
+      "recording_id": "000026-8bb75249-db26-434c-a628-12d6c6464bab",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/providers",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 4938.333,
+            "data_base64": "eyJwcm92aWRlcnMiOlt7ImF1dGhfcHJvZmlsZV9jb3VudCI6MSwiYXV0aF9zdGF0dXMiOiJyZWFkeSIsImRlZmF1bHRfcHJvZmlsZV9pZCI6InByb2ZpbGUtNDEzMGRhZGM2OTlhMGJkOTBmOWE2MzQ0MDY0Njk1OGQiLCJkZXNjcmlwdG9yIjp7ImJhc2VfdXJsIjoiaHR0cDovLzEyNy4wLjAuMTo1MzI3MC92MSIsImtpbmQiOiJvcGVuYWlfY29tcGF0aWJsZSIsIm1vZGVscyI6WyJwcm9maWxlLWRlbGV0ZS1tb2RlbCJdLCJvcHRpb25zIjp7fSwicmV2aXNpb24iOjF9LCJwcm92aWRlciI6InByb2ZpbGUtZGVsZXRlLWZpeHR1cmUifV0sInNjaGVtYSI6InpvZGUucHJvdmlkZXJzLnYxIn0="
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000006",
+      "recording_id": "000027-6b04ea65-df57-424c-8183-5f32ee1eaf6c",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/providers/profile-delete-fixture/auth-profiles",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 7936.084,
+            "data_base64": "eyJpdGVtcyI6W3siYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS00MTMwZGFkYzY5OWEwYmQ5MGY5YTYzNDQwNjQ2OTU4ZCIsImRlc2NyaXB0b3JfcmV2aXNpb24iOjEsImRpc3RyaWJ1dGlvbiI6W3siYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS00MTMwZGFkYzY5OWEwYmQ5MGY5YTYzNDQwNjQ2OTU4ZCIsImF1dGhvcml0eV9pZCI6IndlYi1lMmUtc2VydmVyIiwiZW5kcG9pbnRfaWQiOiIwMUtaR1YxU1cwOTU0SlRKQ1ZOMllOTUhCUyIsImluc3RhbGxlZF9yZXZpc2lvbiI6MSwib2JzZXJ2ZWRfcmV2aXNpb24iOjEsInByb3ZpZGVyIjoicHJvZmlsZS1kZWxldGUtZml4dHVyZSIsInJldmlzaW9uIjoxLCJzdGF0dXMiOiJyZWFkeSJ9XSwiZXhwaXJlc19hdF9tcyI6bnVsbCwiaXNfZGVmYXVsdCI6dHJ1ZSwia2luZCI6ImFwaV9rZXkiLCJsYWJlbCI6IkRlbGV0ZSBtZSBwcm9maWxlIiwicHJvZmlsZV9pZCI6InByb2ZpbGUtNDEzMGRhZGM2OTlhMGJkOTBmOWE2MzQ0MDY0Njk1OGQiLCJwcm92aWRlciI6InByb2ZpbGUtZGVsZXRlLWZpeHR1cmUiLCJyZXZpc2lvbiI6MSwic2NoZW1hIjoiem9kZS5hdXRoLXByb2ZpbGUudjEiLCJzaGFyaW5nIjp7ImVuZHBvaW50X2lkcyI6WyIwMUtaR1YxU1cwOTU0SlRKQ1ZOMllOTUhCUyJdLCJtb2RlIjoic2VsZWN0ZWQifSwic3RhdHVzIjoicmVhZHkifV0sInNjaGVtYSI6InpvZGUuYXV0aC1wcm9maWxlcy52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000007",
+      "recording_id": "000028-03aa0dc5-06b0-4128-be52-7eb18d731e26",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/endpoints/01KZGV1SW0954JTJCVN2YNMHBS/sessions",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 4695.917,
+            "data_base64": "eyJpdGVtcyI6W10sIm5leHRfY3Vyc29yIjpudWxsLCJzY2hlbWEiOiJ6b2RlLnNlc3Npb24tbGlzdC52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000008",
+      "recording_id": "000029-1bad4689-5b10-42c9-8daa-86822b8f46dd",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/providers",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 7202.375,
+            "data_base64": "eyJwcm92aWRlcnMiOlt7ImF1dGhfcHJvZmlsZV9jb3VudCI6MSwiYXV0aF9zdGF0dXMiOiJyZWFkeSIsImRlZmF1bHRfcHJvZmlsZV9pZCI6InByb2ZpbGUtNDEzMGRhZGM2OTlhMGJkOTBmOWE2MzQ0MDY0Njk1OGQiLCJkZXNjcmlwdG9yIjp7ImJhc2VfdXJsIjoiaHR0cDovLzEyNy4wLjAuMTo1MzI3MC92MSIsImtpbmQiOiJvcGVuYWlfY29tcGF0aWJsZSIsIm1vZGVscyI6WyJwcm9maWxlLWRlbGV0ZS1tb2RlbCJdLCJvcHRpb25zIjp7fSwicmV2aXNpb24iOjF9LCJwcm92aWRlciI6InByb2ZpbGUtZGVsZXRlLWZpeHR1cmUifV0sInNjaGVtYSI6InpvZGUucHJvdmlkZXJzLnYxIn0="
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000009",
+      "recording_id": "000030-16f74164-5491-405c-b510-e4b51d8633d6",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/providers/profile-delete-fixture/auth-profiles",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 5370.417,
+            "data_base64": "eyJpdGVtcyI6W3siYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS00MTMwZGFkYzY5OWEwYmQ5MGY5YTYzNDQwNjQ2OTU4ZCIsImRlc2NyaXB0b3JfcmV2aXNpb24iOjEsImRpc3RyaWJ1dGlvbiI6W3siYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS00MTMwZGFkYzY5OWEwYmQ5MGY5YTYzNDQwNjQ2OTU4ZCIsImF1dGhvcml0eV9pZCI6IndlYi1lMmUtc2VydmVyIiwiZW5kcG9pbnRfaWQiOiIwMUtaR1YxU1cwOTU0SlRKQ1ZOMllOTUhCUyIsImluc3RhbGxlZF9yZXZpc2lvbiI6MSwib2JzZXJ2ZWRfcmV2aXNpb24iOjEsInByb3ZpZGVyIjoicHJvZmlsZS1kZWxldGUtZml4dHVyZSIsInJldmlzaW9uIjoxLCJzdGF0dXMiOiJyZWFkeSJ9XSwiZXhwaXJlc19hdF9tcyI6bnVsbCwiaXNfZGVmYXVsdCI6dHJ1ZSwia2luZCI6ImFwaV9rZXkiLCJsYWJlbCI6IkRlbGV0ZSBtZSBwcm9maWxlIiwicHJvZmlsZV9pZCI6InByb2ZpbGUtNDEzMGRhZGM2OTlhMGJkOTBmOWE2MzQ0MDY0Njk1OGQiLCJwcm92aWRlciI6InByb2ZpbGUtZGVsZXRlLWZpeHR1cmUiLCJyZXZpc2lvbiI6MSwic2NoZW1hIjoiem9kZS5hdXRoLXByb2ZpbGUudjEiLCJzaGFyaW5nIjp7ImVuZHBvaW50X2lkcyI6WyIwMUtaR1YxU1cwOTU0SlRKQ1ZOMllOTUhCUyJdLCJtb2RlIjoic2VsZWN0ZWQifSwic3RhdHVzIjoicmVhZHkifV0sInNjaGVtYSI6InpvZGUuYXV0aC1wcm9maWxlcy52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000010",
+      "recording_id": "000031-d2a54895-139f-4e52-a02e-74a0ba782af4",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/providers",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 7034.459,
+            "data_base64": "eyJwcm92aWRlcnMiOlt7ImF1dGhfcHJvZmlsZV9jb3VudCI6MSwiYXV0aF9zdGF0dXMiOiJyZWFkeSIsImRlZmF1bHRfcHJvZmlsZV9pZCI6InByb2ZpbGUtNDEzMGRhZGM2OTlhMGJkOTBmOWE2MzQ0MDY0Njk1OGQiLCJkZXNjcmlwdG9yIjp7ImJhc2VfdXJsIjoiaHR0cDovLzEyNy4wLjAuMTo1MzI3MC92MSIsImtpbmQiOiJvcGVuYWlfY29tcGF0aWJsZSIsIm1vZGVscyI6WyJwcm9maWxlLWRlbGV0ZS1tb2RlbCJdLCJvcHRpb25zIjp7fSwicmV2aXNpb24iOjF9LCJwcm92aWRlciI6InByb2ZpbGUtZGVsZXRlLWZpeHR1cmUifV0sInNjaGVtYSI6InpvZGUucHJvdmlkZXJzLnYxIn0="
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000011",
+      "recording_id": "000032-6b88b1bf-80c9-4c7c-afa5-f0d4bc1f369a",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/providers/profile-delete-fixture/auth-profiles",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 5894,
+            "data_base64": "eyJpdGVtcyI6W3siYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS00MTMwZGFkYzY5OWEwYmQ5MGY5YTYzNDQwNjQ2OTU4ZCIsImRlc2NyaXB0b3JfcmV2aXNpb24iOjEsImRpc3RyaWJ1dGlvbiI6W3siYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS00MTMwZGFkYzY5OWEwYmQ5MGY5YTYzNDQwNjQ2OTU4ZCIsImF1dGhvcml0eV9pZCI6IndlYi1lMmUtc2VydmVyIiwiZW5kcG9pbnRfaWQiOiIwMUtaR1YxU1cwOTU0SlRKQ1ZOMllOTUhCUyIsImluc3RhbGxlZF9yZXZpc2lvbiI6MSwib2JzZXJ2ZWRfcmV2aXNpb24iOjEsInByb3ZpZGVyIjoicHJvZmlsZS1kZWxldGUtZml4dHVyZSIsInJldmlzaW9uIjoxLCJzdGF0dXMiOiJyZWFkeSJ9XSwiZXhwaXJlc19hdF9tcyI6bnVsbCwiaXNfZGVmYXVsdCI6dHJ1ZSwia2luZCI6ImFwaV9rZXkiLCJsYWJlbCI6IkRlbGV0ZSBtZSBwcm9maWxlIiwicHJvZmlsZV9pZCI6InByb2ZpbGUtNDEzMGRhZGM2OTlhMGJkOTBmOWE2MzQ0MDY0Njk1OGQiLCJwcm92aWRlciI6InByb2ZpbGUtZGVsZXRlLWZpeHR1cmUiLCJyZXZpc2lvbiI6MSwic2NoZW1hIjoiem9kZS5hdXRoLXByb2ZpbGUudjEiLCJzaGFyaW5nIjp7ImVuZHBvaW50X2lkcyI6WyIwMUtaR1YxU1cwOTU0SlRKQ1ZOMllOTUhCUyJdLCJtb2RlIjoic2VsZWN0ZWQifSwic3RhdHVzIjoicmVhZHkifV0sInNjaGVtYSI6InpvZGUuYXV0aC1wcm9maWxlcy52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>",
+    "<secret:access_assertion_10>",
+    "<secret:profile_delete_me>",
+    "<secret:access_assertion_19>",
+    "<secret:access_assertion_30>"
+  ],
+  "integrity_sha256": "3dd588eba383806311ebe8ed579e4aba82a8522963ca64e47d1e9b20b207bcdf"
+}

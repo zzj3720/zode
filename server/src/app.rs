@@ -6,7 +6,7 @@ use axum::{
     http::{header, uri::Authority, HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use serde_json::{json, Value};
@@ -104,6 +104,10 @@ pub(crate) fn router(
         .route(
             "/v1/providers/{provider}/auth-profiles",
             get(list_auth_profiles).post(create_auth_profile),
+        )
+        .route(
+            "/v1/providers/{provider}/auth-profiles/{profile_id}",
+            delete(delete_auth_profile),
         )
         .route(
             "/v1/providers/{provider}/default-auth-profile",
@@ -392,6 +396,21 @@ async fn set_default_auth_profile(
     state
         .providers
         .set_default_profile(&actor, &idempotency_key, &provider, request)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_provider)
+}
+
+async fn delete_auth_profile(
+    State(state): State<AppState>,
+    Path((provider, profile_id)): Path<(String, String)>,
+    Extension(actor): Extension<ActorContext>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    let idempotency_key = one_header(request.headers(), "idempotency-key")?;
+    state
+        .providers
+        .delete_profile(&actor, &idempotency_key, &provider, &profile_id)
         .await
         .map(Json)
         .map_err(ApiError::from_provider)

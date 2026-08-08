@@ -1,0 +1,85 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "0003-5f4e36bf-d9a9-4bc5-ad15-7f4666c1c800-6b5cb8a3-a966-403c-ab43-e52fcba27fbf",
+  "e2e_name": "e2e_provider_profile_delete_offline_tombstone_reconciles_after_restart",
+  "boundary": "browser-capture-set",
+  "first_observed": "a profile deleted while its Endpoint was offline remained ready at the Endpoint after Server and Endpoint restart instead of being reconciled by the durable tombstone",
+  "classification": "AUTH_PROFILE_DELETE_TOMBSTONE_NOT_RECONCILED_AFTER_RESTART",
+  "source_digest": "6f08ade8b688d94675c0a128932b830a28c899ac07b52fc167e665a99d93ae63",
+  "first_failure_recording_id": "000047-26a7c2cd-a534-4b58-b135-a43578031497",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000047-26a7c2cd-a534-4b58-b135-a43578031497",
+      "boundary": "server-endpoint-control",
+      "method": "GET",
+      "path": "/v1/auth-replicas/profile-18bb9e63291c735233be13626493e8e5",
+      "request_headers": {
+        "accept": "*/*",
+        "user-agent": "node",
+        "host": "127.0.0.1:60436"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 3080.625,
+            "data_base64": "eyJzY2hlbWEiOiJ6b2RlLmF1dGgtcmVwbGljYS52MSIsImF1dGhvcml0eV9pZCI6IndlYi1lMmUtc2VydmVyIiwiYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS0xOGJiOWU2MzI5MWM3MzUyMzNiZTEzNjI2NDkzZThlNSIsInByb3ZpZGVyIjoiZGVsZXRlLW9mZmxpbmUtZml4dHVyZSIsInJldmlzaW9uIjoxLCJleHBpcmVzX2F0X21zIjpudWxsLCJzdGF0dXMiOiJyZWFkeSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000002",
+      "recording_id": "000048-d36e375d-f307-4d41-9120-60d6ecd86b3b",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/auth-profiles/profile-18bb9e63291c735233be13626493e8e5/replicas",
+      "request_headers": {
+        "accept": "application/json",
+        "user-agent": "node",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 3175.084,
+            "data_base64": "eyJpdGVtcyI6W3siYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS0xOGJiOWU2MzI5MWM3MzUyMzNiZTEzNjI2NDkzZThlNSIsImF1dGhvcml0eV9pZCI6IndlYi1lMmUtc2VydmVyIiwiZW5kcG9pbnRfaWQiOiIwMUtaR1gzNTA1WlJBVEc3WEtTR00wN0U0RyIsImluc3RhbGxlZF9yZXZpc2lvbiI6bnVsbCwib2JzZXJ2ZWRfcmV2aXNpb24iOm51bGwsInByb3ZpZGVyIjoiZGVsZXRlLW9mZmxpbmUtZml4dHVyZSIsInJldmlzaW9uIjoyLCJzdGF0dXMiOiJ1bnJlYWNoYWJsZSJ9XSwic2NoZW1hIjoiem9kZS5hdXRoLXJlcGxpY2FzLnYxIn0="
+          }
+        ],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>",
+    "<secret:access_assertion_5>",
+    "<secret:access_assertion_13>",
+    "<secret:access_assertion_20>",
+    "<secret:access_assertion_26>",
+    "<secret:access_assertion_33>"
+  ],
+  "integrity_sha256": "e7a63d51e8e9720be4ba2babbd5ba3f30b45e2e9a05247632727b87ffe59c273"
+}
