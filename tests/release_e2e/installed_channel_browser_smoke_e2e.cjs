@@ -39,9 +39,12 @@ const liveProviderBaseUrl = process.env.ZODE_RELEASE_LIVE_PROVIDER_BASE_URL || n
 const liveProviderApiKey = process.env.ZODE_RELEASE_LIVE_PROVIDER_API_KEY || null;
 const liveProviderMode = Boolean(liveProviderBaseUrl || liveProviderApiKey);
 const expectedAssistant = liveProviderMode ? 'ZODE_E2_LIVE_OK' : 'ZODE_INSTALLED_BROWSER_OK';
-const providerId = liveProviderMode ? 'opencode-go' : 'installed-e2e-provider';
+// A persistent user channel may retain earlier smoke profiles.  Each live
+// run owns a fresh provider descriptor/profile so the browser cannot select a
+// stale revision while still exercising the same configured adapter.
+const providerId = liveProviderMode ? `opencode-go-live-${randomUUID().slice(0, 8)}` : 'installed-e2e-provider';
 const modelId = liveProviderMode ? 'deepseek-v4-flash' : 'installed-e2e-model';
-const profileLabel = liveProviderMode ? 'Installed live smoke profile' : 'Installed smoke profile';
+const profileLabel = liveProviderMode ? `Installed live smoke profile ${runId.slice(-8)}` : 'Installed smoke profile';
 const smokePrompt = liveProviderMode
   ? 'Reply with exactly ZODE_E2_LIVE_OK.'
   : 'Reply with the installed-channel smoke marker.';
@@ -357,11 +360,14 @@ async function main() {
     await page.getByLabel('Models').fill(modelId);
     await page.getByRole('button', { name: 'Save provider' }).click();
     await page.getByText(`${providerId} is ready for an auth profile.`, { exact: true }).waitFor();
-    await page.getByRole('button', { name: 'Add API key profile' }).click();
-    await page.getByLabel('Profile label').fill(profileLabel);
-    await page.getByLabel('API key').fill(fixtures.providerKey);
-    await page.getByLabel('Share with this machine').check();
-    await page.getByRole('button', { name: 'Create profile' }).click();
+    const providerCard = page.locator('article.resource-card').filter({
+      has: page.getByRole('heading', { name: providerId, exact: true }),
+    });
+    await providerCard.getByRole('button', { name: 'Add API key profile' }).click();
+    await providerCard.getByLabel('Profile label').fill(profileLabel);
+    await providerCard.getByLabel('API key').fill(fixtures.providerKey);
+    await providerCard.getByLabel('Share with this machine').check();
+    await providerCard.getByRole('button', { name: 'Create profile' }).click();
     await page.getByText('Profile installed on the selected Endpoint.', { exact: true }).waitFor();
     await page.getByRole('link', { name: 'Sessions' }).click();
     await page.getByRole('button', { name: 'New session' }).click();

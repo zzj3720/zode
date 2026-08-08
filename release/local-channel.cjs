@@ -251,13 +251,25 @@ function edgeCommand(pid) {
   return command === '<defunct>' ? '' : command;
 }
 
-function exactEdgeCommand(config, pid) {
+function runtimeExecutable(runtime) {
+  if (typeof runtime?.executable_path !== 'string' || !path.isAbsolute(runtime.executable_path)) {
+    return process.execPath;
+  }
+  const executable = realpathSync(runtime.executable_path);
+  const stat = statOrNull(executable);
+  if (!stat || !stat.isFile() || (stat.mode & 0o111) === 0) {
+    fail('local_channel_state_invalid', 'runtime edge executable is not a regular executable', { path: executable });
+  }
+  return executable;
+}
+
+function exactEdgeCommand(config, pid, executable = process.execPath) {
   const command = edgeCommand(pid);
   const expected = `${edgeEntry} --state ${config.state_path}`;
   // A detached child can briefly remain as a zombie after its parent exits;
   // `kill(pid, 0)` still succeeds for that window, while `ps` has no command.
   // Treat that as already reaped, but never accept a different live command.
-  return command === `${process.execPath} ${expected}`;
+  return command === `${executable} ${expected}`;
 }
 
 function edgeReady(config) {
@@ -276,7 +288,7 @@ async function ensureEdge(config) {
   if (current?.edge_pid && pidAlive(current.edge_pid)) {
     if (!edgeCommand(current.edge_pid)) {
       try { unlinkSync(runtimePath(config)); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
-    } else if (!exactEdgeCommand(config, current.edge_pid)) {
+    } else if (!exactEdgeCommand(config, current.edge_pid, runtimeExecutable(current))) {
       fail('local_channel_edge_identity', 'recorded local edge PID does not match its private state command', { pid: current.edge_pid });
     } else {
       if (await edgeReady(config)) return current;
@@ -302,7 +314,13 @@ async function ensureEdge(config) {
   const deadline = Date.now() + EDGE_TIMEOUT_MS;
   while (Date.now() < deadline) {
     if (await edgeReady(config)) {
-      const runtime = { schema: RUNTIME_SCHEMA, edge_pid: child.pid, started_at_unix_ms: Date.now(), url: `${config.issuer}/` };
+      const runtime = {
+        schema: RUNTIME_SCHEMA,
+        edge_pid: child.pid,
+        started_at_unix_ms: Date.now(),
+        executable_path: realpathSync(process.execPath),
+        url: `${config.issuer}/`,
+      };
       writeJsonAtomic(runtimePath(config), runtime);
       return runtime;
     }
@@ -318,7 +336,7 @@ function stopEdge(config) {
   const pid = runtime.edge_pid;
   const command = edgeCommand(pid);
   if (pidAlive(pid) && command) {
-    if (!exactEdgeCommand(config, pid)) fail('local_channel_edge_identity', 'refusing to signal an unrelated process in local channel state', { pid });
+    if (!exactEdgeCommand(config, pid, runtimeExecutable(runtime))) fail('local_channel_edge_identity', 'refusing to signal an unrelated process in local channel state', { pid });
     try { process.kill(-pid, 'SIGTERM'); } catch (error) { if (error?.code !== 'ESRCH') throw error; }
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline && pidAlive(pid) && edgeCommand(pid)) {
@@ -328,7 +346,7 @@ function stopEdge(config) {
       while (Date.now() < waitUntil) { /* bounded wait */ }
     }
     if (pidAlive(pid) && edgeCommand(pid)) {
-      if (!exactEdgeCommand(config, pid)) fail('local_channel_edge_identity', 'local edge command changed before forced stop', { pid, command: edgeCommand(pid) });
+      if (!exactEdgeCommand(config, pid, runtimeExecutable(runtime))) fail('local_channel_edge_identity', 'local edge command changed before forced stop', { pid, command: edgeCommand(pid) });
       try { process.kill(-pid, 'SIGKILL'); } catch (error) { if (error?.code !== 'ESRCH') throw error; }
     }
   }
@@ -445,7 +463,7 @@ async function main(options) {
       emit({ ok: true, operation: 'status', channel_root: root, running: false, url: `${config.issuer}/` });
       return 0;
     }
-    if (!exactEdgeCommand(config, runtime.edge_pid)) fail('local_channel_edge_identity', 'runtime edge PID does not match its command');
+    if (!exactEdgeCommand(config, runtime.edge_pid, runtimeExecutable(runtime))) fail('local_channel_edge_identity', 'runtime edge PID does not match its command');
     const result = runChannel(['health', '--release-root', root], env);
     emit({ ok: result.status === 0, operation: 'status', channel_root: root, running: true, url: `${config.issuer}/`, health: result.payload || null });
     return result.status;
@@ -454,7 +472,7 @@ async function main(options) {
     const artifact = options.values.artifact;
     if (!artifact) fail('local_channel_usage', 'update requires --artifact', {}, 2);
     const priorRuntime = readRuntime(config);
-    const priorEdge = Boolean(priorRuntime?.edge_pid && pidAlive(priorRuntime.edge_pid) && exactEdgeCommand(config, priorRuntime.edge_pid));
+    const priorEdge = Boolean(priorRuntime?.edge_pid && pidAlive(priorRuntime.edge_pid) && exactEdgeCommand(config, priorRuntime.edge_pid, runtimeExecutable(priorRuntime)));
     let keepEdge = priorEdge;
     try {
       await ensureEdge(config);

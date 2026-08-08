@@ -50,7 +50,9 @@ edge 与它的管理上游都固定为 `127.0.0.1` HTTP loopback；篡改私有�
 fail closed。`open` 在健康失败或无法启动系统浏览器时会回收本次 edge，不能
 留下 runtime 指针或 detached 进程。`update` 在 fresh 根或候选 admission
 失败时也必须回收本次启动的 edge/runtime；已有健康通道更新失败时保留原
-edge，避免把仍可用的 current 通道一并停掉。
+edge，避免把仍可用的 current 通道一并停掉。runtime 会记录启动 edge 时的
+真实 Node executable path；后续 start/status/stop 必须按该路径和精确 argv
+核对，不因调用者换用另一套受信 Node runtime 而误拒绝或误杀。
 
 外部 artifact 的 `install`/`bootstrap`/`stage` admission 先由 checkout 中的
 受信 driver 校验 manifest、组件 digest 和不可变树；不会先执行 artifact 自带
