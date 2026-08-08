@@ -29,7 +29,6 @@ const KEY_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 #[derive(Clone)]
 pub(crate) struct ActorContext {
     actor_key: [u8; 32],
-    endpoint_subject: String,
 }
 
 impl ActorContext {
@@ -37,9 +36,6 @@ impl ActorContext {
         &self.actor_key
     }
 
-    pub(crate) fn endpoint_subject(&self) -> &str {
-        &self.endpoint_subject
-    }
 }
 
 pub(crate) struct AccessVerifier {
@@ -154,10 +150,7 @@ impl AccessVerifier {
             _ => return Err(()),
         };
         let actor_key = self.subject_keys.actor_key(kind, actor);
-        Ok(ActorContext {
-            endpoint_subject: self.subject_keys.endpoint_subject(&actor_key),
-            actor_key,
-        })
+        Ok(ActorContext { actor_key })
     }
 
     async fn key_for(&self, kid: &str) -> Result<CachedKey, ()> {

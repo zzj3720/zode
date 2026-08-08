@@ -1,7 +1,8 @@
 # zode management Server API
 
 Status: authoritative v0 contract for Server and the web UI. Endpoint protocol
-details live in `docs/http-api.md`. Routes may be introduced incrementally only
+details live in `docs/http-api.md`; cross-version admission is frozen in
+[`docs/protocol-compatibility.md`](protocol-compatibility.md). Routes may be introduced incrementally only
 with a failing real-process E2E.
 
 ## 1. Boundary

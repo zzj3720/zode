@@ -11,7 +11,9 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use url::{Host, Url};
-use zode_protocol::{EndpointCapabilities, EndpointIdentity};
+use zode_protocol::{
+    negotiate_endpoint_protocol, EndpointCapabilities, EndpointIdentity,
+};
 
 use crate::{
     access::ActorContext,
@@ -175,7 +177,6 @@ impl Catalog {
         let probe = self
             .probe_endpoint(
                 &operation.base_url,
-                Some(actor.endpoint_subject()),
                 &request.control_auth.secret,
             )
             .await?;
@@ -237,32 +238,18 @@ impl Catalog {
         base_url: &str,
         secret: &str,
     ) -> Result<EndpointProbe, CatalogError> {
-        self.probe_endpoint(base_url, None, secret).await
+        self.probe_endpoint(base_url, secret).await
     }
 
-    async fn probe_endpoint(
-        &self,
-        base_url: &str,
-        endpoint_subject: Option<&str>,
-        secret: &str,
-    ) -> Result<EndpointProbe, CatalogError> {
+    async fn probe_endpoint(&self, base_url: &str, secret: &str) -> Result<EndpointProbe, CatalogError> {
         let identity: EndpointIdentity = self
-            .probe_json(base_url, "/v1/identity", endpoint_subject, secret)
+            .probe_json(base_url, "/v1/identity", secret)
             .await?;
-        identity
-            .validate()
-            .map_err(|_| CatalogError::EndpointUnavailable)?;
         let capabilities: EndpointCapabilities = self
-            .probe_json(base_url, "/v1/capabilities", endpoint_subject, secret)
+            .probe_json(base_url, "/v1/capabilities", secret)
             .await?;
-        capabilities
-            .validate()
+        negotiate_endpoint_protocol(&identity, &capabilities)
             .map_err(|_| CatalogError::EndpointUnavailable)?;
-        if capabilities.endpoint_id != identity.endpoint_id
-            || capabilities.protocol_version != identity.protocol_version
-        {
-            return Err(CatalogError::EndpointUnavailable);
-        }
         Ok(EndpointProbe {
             identity,
             capabilities,
@@ -273,17 +260,12 @@ impl Catalog {
         &self,
         base_url: &str,
         path: &str,
-        endpoint_subject: Option<&str>,
         secret: &str,
     ) -> Result<T, CatalogError> {
-        let mut request = self
+        let response = self
             .client
             .get(format!("{base_url}{path}"))
-            .header("authorization", format!("Bearer {secret}"));
-        if let Some(endpoint_subject) = endpoint_subject {
-            request = request.header("zode-subject", endpoint_subject);
-        }
-        let response = request
+            .header("authorization", format!("Bearer {secret}"))
             .send()
             .await
             .map_err(|_| CatalogError::EndpointUnavailable)?;

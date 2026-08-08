@@ -138,10 +138,6 @@ impl KeyMaterial {
         self.digest(b"access-actor-v1", &[kind.as_bytes(), actor.as_bytes()])
     }
 
-    pub(crate) fn endpoint_subject(&self, actor_key: &[u8; DIGEST_BYTES]) -> String {
-        format!("v1:{}", hex(actor_key))
-    }
-
     fn seal(&self, reference: &str, plaintext: &[u8]) -> Result<Vec<u8>, StoreError> {
         let cipher = XChaCha20Poly1305::new((&self.encryption).into());
         let mut nonce = [0_u8; NONCE_BYTES];
