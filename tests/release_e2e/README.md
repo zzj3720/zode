@@ -62,6 +62,29 @@ ZODE_RELEASE_CHANNEL_ARTIFACT=<artifact> \
 provider secret 写入 artifact、日志或测试输出；失败首遇只进入 ignored
 quarantine。
 
+安装版真实 provider 正向路径由 Rust harness 包住同一浏览器入口，并把
+`OPENCODE_GO_API_KEY` 只在测试进程内交给 test-owned recorder。recorder 通过
+`https://opencode.ai` 的既有 provider 边界转发，安装版 Server/Endpoint 子进程
+不会继承该变量；录制完成后会 flush、扫描并在 ignored quarantine 原子写入
+`recording.json`，输出不包含凭据。该入口需要本机已批准的安全 provider 引用，
+不会把密钥写入仓库或 cassette：
+
+```sh
+OPENCODE_GO_API_KEY=<local-secure-provider-key> \
+ZODE_RUN_INSTALLED_CHANNEL_LIVE_BROWSER_E2E=1 \
+ZODE_RELEASE_CHANNEL_ARTIFACT=<artifact> \
+vp exec cargo test --test installed_channel_live_browser_e2e \
+  e2e_installed_channel_live_browser_provider_roundtrip -- --exact --nocapture
+```
+
+该正向 E2E 在安装版浏览器中配置 `opencode-go`/`deepseek-v4-flash` provider
+及共享 API-key profile，创建 Endpoint session，发送精确 marker 提示词，断言
+stream marker、Server/Endpoint 管理请求、provider 200/SSE `[DONE]`，再 reload
+确认最终回复仍由 durable session 恢复。真实 provider 请求数量必须为 1；失败时
+先保留首遇 browser/quarantine 证据并完成 recorder flush。另有
+`installed_channel_live_provider_contract_e2e.cjs` 作为本地 loopback provider
+边界的红绿 contract anchor，不替代真实 provider gate。
+
 The test channel supplies the existing authentication inputs through
 `ZODE_RELEASE_ACCESS_ASSERTION` (or `_ACCESS_JWT_ASSERTION`) and
 `ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER` (or `_CONTROLLER_BEARER`). Optional

@@ -4,8 +4,10 @@
 /*
  * Installed-channel browser smoke.  The only product processes in this test
  * are the immutable artifact's zode-server/zode children.  The JWKS edge and
- * fake provider are test-owned boundary fixtures; the browser uses the same
- * Access-protected origin for every management request.
+ * provider boundary are test-owned fixtures; the browser uses the same
+ * Access-protected origin for every management request.  When the live
+ * provider variables are present, the provider boundary is the shared
+ * recorder URL and the production child receives neither variable.
  */
 const {
   generateKeyPairSync,
@@ -30,6 +32,16 @@ const { chromium } = require(path.join(repositoryRoot, 'web', 'e2e', 'node_modul
 const channelEntry = path.join(repositoryRoot, 'release', 'channel.cjs');
 const runId = `${Date.now()}-${randomUUID()}`;
 const artifact = process.env.ZODE_RELEASE_CHANNEL_ARTIFACT;
+const liveProviderBaseUrl = process.env.ZODE_RELEASE_LIVE_PROVIDER_BASE_URL || null;
+const liveProviderApiKey = process.env.ZODE_RELEASE_LIVE_PROVIDER_API_KEY || null;
+const liveProviderMode = Boolean(liveProviderBaseUrl || liveProviderApiKey);
+const expectedAssistant = liveProviderMode ? 'ZODE_E2_LIVE_OK' : 'ZODE_INSTALLED_BROWSER_OK';
+const providerId = liveProviderMode ? 'opencode-go' : 'installed-e2e-provider';
+const modelId = liveProviderMode ? 'deepseek-v4-flash' : 'installed-e2e-model';
+const profileLabel = liveProviderMode ? 'Installed live smoke profile' : 'Installed smoke profile';
+const smokePrompt = liveProviderMode
+  ? 'Reply with exactly ZODE_E2_LIVE_OK.'
+  : 'Reply with the installed-channel smoke marker.';
 const quarantine = path.join(repositoryRoot, 'target', 'test-recordings', 'quarantine', runId);
 
 function fail(message, details = {}) {
@@ -127,18 +139,42 @@ async function startFixtures() {
   const jwk = publicKey.export({ format: 'jwk' });
   const kid = `installed-channel-${randomUUID()}`;
   const audience = 'zode-installed-channel-browser';
-  const providerKey = `installed-provider-${randomUUID()}`;
+  if (Boolean(liveProviderBaseUrl) !== Boolean(liveProviderApiKey)) {
+    fail('live provider configuration is incomplete');
+  }
+  let providerOrigin;
+  let providerBaseUrl;
+  let provider = null;
+  const providerKey = liveProviderApiKey || `installed-provider-${randomUUID()}`;
   const controllerSecret = `installed-controller-${randomUUID()}`;
   const requests = [];
-  const provider = http.createServer(async (request, response) => {
-    const body = await readRequest(request);
-    requests.push({ method: request.method, path: request.url, body });
-    response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
-    response.write('data: {"choices":[{"delta":{"content":"ZODE_INSTALLED_BROWSER_OK"},"finish_reason":null}]}\n\n');
-    response.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
-    response.end('data: [DONE]\n\n');
-  });
-  const providerOrigin = await listen(provider);
+  if (liveProviderBaseUrl) {
+    let parsed;
+    try {
+      parsed = new URL(liveProviderBaseUrl);
+    } catch {
+      fail('live provider base URL is invalid');
+    }
+    if (
+      parsed.protocol !== 'http:' ||
+      !['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname)
+    ) {
+      fail('live provider recorder must use a loopback HTTP URL');
+    }
+    providerOrigin = parsed.origin;
+    providerBaseUrl = liveProviderBaseUrl.replace(/\/$/, '');
+  } else {
+    provider = http.createServer(async (request, response) => {
+      const body = await readRequest(request);
+      requests.push({ method: request.method, path: request.url, body });
+      response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      response.write('data: {"choices":[{"delta":{"content":"ZODE_INSTALLED_BROWSER_OK"},"finish_reason":null}]}\n\n');
+      response.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
+      response.end('data: [DONE]\n\n');
+    });
+    providerOrigin = await listen(provider);
+    providerBaseUrl = providerOrigin;
+  }
   const jwks = http.createServer((request, response) => {
     if (request.method !== 'GET' || request.url !== '/jwks') {
       response.writeHead(404).end();
@@ -181,6 +217,8 @@ async function startFixtures() {
   const edgeOrigin = await listen(edge);
   return {
     providerOrigin,
+    providerBaseUrl,
+    live: liveProviderMode,
     provider,
     providerKey,
     requests,
@@ -223,10 +261,32 @@ async function main() {
     ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER: fixtures.controllerSecret,
     ZODE_RELEASE_PROVIDER_ORIGINS: fixtures.providerOrigin,
   };
+  const channelEnv = { ...env };
+  for (const key of [
+    'ZODE_RELEASE_LIVE_PROVIDER_BASE_URL',
+    'ZODE_RELEASE_LIVE_PROVIDER_API_KEY',
+    'ZODE_E2E_LIVE_PROVIDER_API_KEY',
+    'OPENCODE_GO_API_KEY',
+    'OPENCODE_API_KEY',
+    'OPENAI_API_KEY',
+    'OPENROUTER_API_KEY',
+    'ANTHROPIC_API_KEY',
+    'GOOGLE_API_KEY',
+    'GEMINI_API_KEY',
+    'MISTRAL_API_KEY',
+    'TOGETHER_API_KEY',
+    'XAI_API_KEY',
+    'GROQ_API_KEY',
+    'COHERE_API_KEY',
+  ]) {
+    delete channelEnv[key];
+  }
+  let streamMarkerVisible = false;
+  let durableFinalVisible = false;
   try {
-    const installed = await command(process.execPath, [channelEntry, 'install', '--artifact', path.resolve(artifact), '--release-root', root], env);
+    const installed = await command(process.execPath, [channelEntry, 'install', '--artifact', path.resolve(artifact), '--release-root', root], channelEnv);
     if (installed.status !== 0 || installed.payload?.ok !== true) fail('installed artifact install failed', installed);
-    const startedResult = await command(process.execPath, [channelEntry, 'start', '--artifact', path.resolve(artifact), '--release-root', root], env);
+    const startedResult = await command(process.execPath, [channelEntry, 'start', '--artifact', path.resolve(artifact), '--release-root', root], channelEnv);
     if (startedResult.status !== 0 || startedResult.payload?.ok !== true) fail('installed artifact start failed', startedResult);
     started = true;
     const serverUrl = startedResult.payload?.health?.probes?.server_url;
@@ -256,27 +316,31 @@ async function main() {
     await page.getByText('All-in-one ready', { exact: true }).waitFor();
     await page.getByRole('link', { name: 'Providers' }).click();
     await page.getByRole('button', { name: 'Configure provider' }).click();
-    await page.getByLabel('Provider ID').fill('installed-e2e-provider');
-    await page.getByLabel('Base URL').fill(fixtures.providerOrigin);
-    await page.getByLabel('Models').fill('installed-e2e-model');
+    await page.getByLabel('Provider ID').fill(providerId);
+    await page.getByLabel('Base URL').fill(fixtures.providerBaseUrl);
+    await page.getByLabel('Models').fill(modelId);
     await page.getByRole('button', { name: 'Save provider' }).click();
-    await page.getByText('installed-e2e-provider is ready for an auth profile.', { exact: true }).waitFor();
+    await page.getByText(`${providerId} is ready for an auth profile.`, { exact: true }).waitFor();
     await page.getByRole('button', { name: 'Add API key profile' }).click();
-    await page.getByLabel('Profile label').fill('Installed smoke profile');
+    await page.getByLabel('Profile label').fill(profileLabel);
     await page.getByLabel('API key').fill(fixtures.providerKey);
     await page.getByLabel('Share with this machine').check();
     await page.getByRole('button', { name: 'Create profile' }).click();
     await page.getByText('Profile installed on the selected Endpoint.', { exact: true }).waitFor();
     await page.getByRole('link', { name: 'Sessions' }).click();
     await page.getByRole('button', { name: 'New session' }).click();
-    await page.getByLabel('Provider').selectOption('installed-e2e-provider');
-    await page.getByLabel('Model').selectOption('installed-e2e-model');
+    await page.getByLabel('Provider').selectOption(providerId);
+    await page.getByLabel('Model').selectOption(modelId);
     const profileSelect = page.getByLabel('Auth profile');
-    await profileSelect.selectOption({ label: 'Installed smoke profile' });
+    await profileSelect.selectOption({ label: profileLabel });
     await page.getByRole('button', { name: 'Start session' }).click();
-    await page.getByPlaceholder('Message Zode').fill('Reply with the installed-channel smoke marker.');
+    await page.getByPlaceholder('Message Zode').fill(smokePrompt);
     await page.getByRole('button', { name: 'Send' }).click();
-    await page.getByText('ZODE_INSTALLED_BROWSER_OK', { exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByText(expectedAssistant, { exact: true }).waitFor({ timeout: 20_000 });
+    streamMarkerVisible = true;
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.getByText(expectedAssistant, { exact: true }).waitFor({ timeout: 20_000 });
+    durableFinalVisible = true;
     const edge = new URL(fixtures.edgeOrigin);
     const managementRequests = browserRequests.filter((item) => new URL(item.url).origin === edge.origin);
     if (!managementRequests.some((item) => item.method === 'POST' && /\/v1\/endpoints\/[^/]+\/sessions$/.test(new URL(item.url).pathname))) {
@@ -288,7 +352,7 @@ async function main() {
     if (browserRequests.some((item) => new URL(item.url).origin !== edge.origin && new URL(item.url).protocol.startsWith('http'))) {
       fail('browser contacted a non-management origin');
     }
-    if (fixtures.requests.length !== 1 || !fixtures.requests[0].path.includes('/chat/completions')) {
+    if (!fixtures.live && (fixtures.requests.length !== 1 || !fixtures.requests[0].path.includes('/chat/completions'))) {
       fail('installed Endpoint did not make exactly one provider chat request', {
         count: fixtures.requests.length,
         paths: fixtures.requests.map((request) => request.path),
@@ -296,10 +360,19 @@ async function main() {
     }
     await browser.close();
     browser = null;
-    const stopped = await command(process.execPath, [channelEntry, 'stop', '--release-root', root], env);
+    const stopped = await command(process.execPath, [channelEntry, 'stop', '--release-root', root], channelEnv);
     if (stopped.status !== 0 || stopped.payload?.ok !== true) fail('installed channel stop failed', stopped);
     started = false;
-    process.stdout.write(JSON.stringify({ status: 'PASS', root, browser_origin: fixtures.edgeOrigin, provider_requests: fixtures.requests.length, browser_management_requests: managementRequests.length }) + '\n');
+    process.stdout.write(JSON.stringify({
+      status: 'PASS',
+      root,
+      browser_origin: fixtures.edgeOrigin,
+      live_provider: fixtures.live,
+      stream_marker_visible: streamMarkerVisible,
+      durable_final_visible_after_reload: durableFinalVisible,
+      provider_requests: fixtures.live ? null : fixtures.requests.length,
+      browser_management_requests: managementRequests.length,
+    }) + '\n');
   } catch (error) {
     failure = error;
     const browserState = page
@@ -318,7 +391,7 @@ async function main() {
   } finally {
     if (browser) await browser.close().catch(() => {});
     if (started) {
-      await command(process.execPath, [channelEntry, 'stop', '--release-root', root], env).catch(() => {});
+      await command(process.execPath, [channelEntry, 'stop', '--release-root', root], channelEnv).catch(() => {});
     }
     await fixtures.close();
     if (!failure) process.exitCode = 0;
