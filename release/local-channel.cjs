@@ -41,6 +41,7 @@ const commonProviderVariables = [
   'ZODE_RELEASE_LIVE_PROVIDER_BASE_URL',
   'ZODE_RELEASE_LIVE_PROVIDER_API_KEY',
   'ZODE_E2E_LIVE_PROVIDER_API_KEY',
+  'DEEPSEEK_API_KEY',
   'OPENCODE_GO_API_KEY',
   'OPENCODE_API_KEY',
   'OPENAI_API_KEY',
@@ -174,6 +175,7 @@ async function createConfig(root) {
     let value;
     try { value = JSON.parse(readFileSync(statePath, 'utf8')); } catch (error) { fail('local_channel_state_invalid', 'channel state is not valid JSON', { error: String(error) }); }
     if (value?.schema !== EDGE_SCHEMA || value.channel_root !== root || typeof value.key_path !== 'string') fail('local_channel_state_invalid', 'channel state schema is invalid');
+    validateLocalConfig(value);
     loadPrivateKey(value);
     return { ...value, state_path: statePath };
   }
@@ -195,11 +197,42 @@ async function createConfig(root) {
     key_id: `zode-local-${randomUUID()}`,
     key_path: keyPath,
   };
+  validateLocalConfig(config);
   writeJsonAtomic(statePath, config);
   return { ...config, state_path: statePath };
 }
 
 function runtimePath(config) { return path.join(config.channel_root, 'runtime.json'); }
+
+function isLoopbackHost(value) {
+  return value === '127.0.0.1' || value === '::1' || /^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(value);
+}
+
+function validateLocalConfig(config) {
+  if (!config || config.schema !== EDGE_SCHEMA) fail('local_channel_state_invalid', 'local channel state schema is invalid');
+  if (config.edge_host !== '127.0.0.1' || !Number.isInteger(config.edge_port) || config.edge_port < 1 || config.edge_port > 65535) {
+    fail('local_channel_state_invalid', 'local Access edge must bind a loopback address');
+  }
+  let serverOrigin;
+  try { serverOrigin = new URL(config.server_origin); } catch { fail('local_channel_state_invalid', 'local Server origin is not a URL'); }
+  if (serverOrigin.protocol !== 'http:' || !isLoopbackHost(serverOrigin.hostname) || !serverOrigin.port) {
+    fail('local_channel_state_invalid', 'local Server origin must be an HTTP loopback address');
+  }
+  let endpointOrigin;
+  try { endpointOrigin = new URL(`http://${config.endpoint_listen}`); } catch { fail('local_channel_state_invalid', 'local Endpoint listen address is invalid'); }
+  if (!isLoopbackHost(endpointOrigin.hostname) || !endpointOrigin.port) {
+    fail('local_channel_state_invalid', 'local Endpoint must bind a loopback address');
+  }
+  let issuer;
+  try { issuer = new URL(config.issuer); } catch { fail('local_channel_state_invalid', 'local Access issuer is not a URL'); }
+  if (issuer.protocol !== 'http:' || !isLoopbackHost(issuer.hostname) || !issuer.port) {
+    fail('local_channel_state_invalid', 'local Access issuer must be an HTTP loopback address');
+  }
+  if (issuer.hostname !== config.edge_host || Number(issuer.port) !== config.edge_port) {
+    fail('local_channel_state_invalid', 'local Access issuer must match the loopback edge address');
+  }
+  return config;
+}
 
 function readRuntime(config) {
   const value = statOrNull(runtimePath(config));
@@ -213,7 +246,7 @@ function pidAlive(pid) {
 }
 
 function edgeCommand(pid) {
-  const output = spawnSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' });
+  const output = spawnSync('/bin/ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' });
   const command = String(output.stdout || '').trim();
   return command === '<defunct>' ? '' : command;
 }
@@ -224,7 +257,7 @@ function exactEdgeCommand(config, pid) {
   // A detached child can briefly remain as a zombie after its parent exits;
   // `kill(pid, 0)` still succeeds for that window, while `ps` has no command.
   // Treat that as already reaped, but never accept a different live command.
-  return command === `${process.execPath} ${expected}` || command.endsWith(` ${expected}`);
+  return command === `${process.execPath} ${expected}`;
 }
 
 function edgeReady(config) {
@@ -426,14 +459,20 @@ async function main(options) {
     return result.status;
   }
   if (options.operation === 'open') {
-    const runtime = await ensureEdge(config);
-    const result = runChannel(['health', '--release-root', root], env);
-    if (result.status !== 0) fail('local_channel_not_running', 'start the local channel before opening its UI', { channel_root: root });
-    const url = `${config.issuer}/`;
-    const openCommand = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
-    const opened = spawnSync(openCommand, [url], { stdio: 'ignore' });
-    emit({ ok: opened.status === 0, operation: 'open', channel_root: root, url, edge_pid: runtime.edge_pid });
-    return opened.status ?? 1;
+    let keepEdge = false;
+    try {
+      const runtime = await ensureEdge(config);
+      const result = runChannel(['health', '--release-root', root], env);
+      if (result.status !== 0) fail('local_channel_not_running', 'start the local channel before opening its UI', { channel_root: root });
+      const url = `${config.issuer}/`;
+      const openCommand = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+      const opened = spawnSync(openCommand, [url], { stdio: 'ignore' });
+      keepEdge = opened.status === 0;
+      emit({ ok: keepEdge, operation: 'open', channel_root: root, url, edge_pid: runtime.edge_pid });
+      return opened.status ?? 1;
+    } finally {
+      if (!keepEdge) stopEdge(config);
+    }
   }
   fail('local_channel_usage', 'unsupported persistent-channel operation', { operation: options.operation }, 2);
 }

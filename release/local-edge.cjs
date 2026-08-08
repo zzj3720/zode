@@ -23,6 +23,20 @@ function fail(message) {
   process.exitCode = 1;
 }
 
+function isLoopbackHost(value) {
+  return value === '127.0.0.1' || value === '::1' || /^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(value);
+}
+
+function loopbackOrigin(value, label) {
+  let parsed;
+  try { parsed = new URL(value); } catch { throw new Error(`${label} is not a URL`); }
+  if (parsed.protocol !== 'http:' || !isLoopbackHost(parsed.hostname) || !parsed.port
+      || parsed.pathname !== '/' || parsed.search || parsed.hash || parsed.username || parsed.password) {
+    throw new Error(`${label} must be an HTTP loopback origin`);
+  }
+  return parsed;
+}
+
 const statePath = arg('--state');
 if (!statePath) {
   fail('local edge requires --state');
@@ -36,6 +50,7 @@ if (!statePath) {
     }
     state = JSON.parse(readFileSync(absoluteStatePath, 'utf8'));
     if (state?.schema !== 'zode.local-channel.v1'
+        || typeof state.channel_root !== 'string'
         || typeof state.edge_host !== 'string'
         || !Number.isInteger(state.edge_port)
         || typeof state.server_origin !== 'string'
@@ -43,6 +58,18 @@ if (!statePath) {
         || typeof state.audience !== 'string'
         || typeof state.key_path !== 'string') {
       throw new Error('state file has an invalid local-channel schema');
+    }
+    if (state.edge_host !== '127.0.0.1' || state.edge_port < 1 || state.edge_port > 65535) {
+      throw new Error('local Access edge must bind a loopback address');
+    }
+    const serverOrigin = loopbackOrigin(state.server_origin, 'local Server origin');
+    const issuerOrigin = loopbackOrigin(state.issuer, 'local Access issuer');
+    if (issuerOrigin.hostname !== state.edge_host || Number(issuerOrigin.port) !== state.edge_port) {
+      throw new Error('local Access issuer must match the loopback edge address');
+    }
+    const endpointOrigin = new URL(`http://${state.endpoint_listen}`);
+    if (!isLoopbackHost(endpointOrigin.hostname) || !endpointOrigin.port) {
+      throw new Error('local Endpoint must bind a loopback address');
     }
     const keyPath = resolve(state.key_path);
     const keyStat = lstatSync(keyPath);
@@ -57,7 +84,7 @@ if (!statePath) {
     const kid = state.key_id;
     const audience = state.audience;
     const issuer = state.issuer;
-    const target = new URL(state.server_origin);
+    const target = serverOrigin;
 
     function base64Url(value) {
       return Buffer.from(JSON.stringify(value)).toString('base64url');

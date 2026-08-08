@@ -101,6 +101,12 @@ stream marker、Server/Endpoint 管理请求、provider 200/SSE `[DONE]`，再 r
 `installed_channel_live_provider_contract_e2e.cjs` 作为本地 loopback provider
 边界的红绿 contract anchor，不替代真实 provider gate。
 
+持久入口的失败清理与边界也由真实进程 E2E 固定：
+`local_channel_open_failure_e2e.cjs` 验证 fresh `open` 健康失败不会留下
+edge；`local_channel_edge_admission_e2e.cjs` 验证篡改的非 loopback 状态被
+拒绝；`local_channel_stop_identity_e2e.cjs` 验证 stop 不信任 PATH 伪造的
+`ps` 身份，也不会杀死无关进程组。
+
 The test channel supplies the existing authentication inputs through
 `ZODE_RELEASE_ACCESS_ASSERTION` (or `_ACCESS_JWT_ASSERTION`) and
 `ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER` (or `_CONTROLLER_BEARER`). Optional

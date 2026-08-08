@@ -45,6 +45,10 @@ Server 持久状态和本地 Access edge 配置会在 stop/start 后保留，用
 Server/Endpoint 进程。若要在 UI 中配置外部 provider，启动时用不含凭据的
 `ZODE_RELEASE_PROVIDER_ORIGINS=https://<approved-provider-origin>` 声明允许的
 origin；provider key 仍只在 Access-protected UI 的 profile 表单中输入。
+edge 与它的管理上游都固定为 `127.0.0.1` HTTP loopback；篡改私有状态使其
+监听其它地址或把 Access assertion 转发到非 loopback origin 时，入口必须
+fail closed。`open` 在健康失败或无法启动系统浏览器时会回收本次 edge，不能
+留下 runtime 指针或 detached 进程。
 
 外部 artifact 的 `install`/`bootstrap`/`stage` admission 先由 checkout 中的
 受信 driver 校验 manifest、组件 digest 和不可变树；不会先执行 artifact 自带

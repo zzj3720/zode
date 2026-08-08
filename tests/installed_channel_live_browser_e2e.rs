@@ -211,6 +211,7 @@ async fn run_live(artifact: PathBuf, secret: Secret, persistent: bool) -> TestRe
     }
     for variable in [
         "OPENCODE_GO_API_KEY",
+        "DEEPSEEK_API_KEY",
         "OPENCODE_API_KEY",
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
