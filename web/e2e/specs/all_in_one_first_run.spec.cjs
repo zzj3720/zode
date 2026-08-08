@@ -16,12 +16,29 @@ const path = require("node:path");
 const { createInterface } = require("node:readline");
 
 const { expect, test } = require("@playwright/test");
+const {
+  ProductBehaviorFailure,
+  RecordingJournal,
+  SecretLedger,
+} = require("../support/harness.cjs");
 
 const E2E = "e2e_all_in_one_first_run_uses_normal_server_api_and_local_endpoint";
 const HISTORICAL_INCIDENT_OWNER = "e2e_ui_all_in_one_first_run_creates_profile_and_chats";
-const FINAL_ASSISTANT = "ZODE_UI_DURABLE_FINAL_ASSISTANT";
-const PROVIDER_ID = "openai-compatible-e2e";
-const MODEL_ID = "ui-e2e-model";
+const liveProviderBaseUrl = process.env.ZODE_E2E_LIVE_PROVIDER_BASE_URL;
+const liveProviderApiKey = process.env.ZODE_E2E_LIVE_PROVIDER_API_KEY;
+if (Boolean(liveProviderBaseUrl) !== Boolean(liveProviderApiKey)) {
+  throw new Error("live browser provider configuration is incomplete");
+}
+const LIVE_PROVIDER = Boolean(liveProviderBaseUrl);
+const FINAL_ASSISTANT = LIVE_PROVIDER ? "ZODE_E2_LIVE_OK" : "ZODE_UI_DURABLE_FINAL_ASSISTANT";
+const PROVIDER_ID = LIVE_PROVIDER ? "opencode-go" : "openai-compatible-e2e";
+const MODEL_ID = LIVE_PROVIDER ? "deepseek-v4-flash" : "ui-e2e-model";
+const USER_MESSAGE = LIVE_PROVIDER
+  ? "Reply with exactly ZODE_E2_LIVE_OK."
+  : "Hello from the real browser";
+const LATER_GAP_RELATION = "later_test_reproduction_of_gap";
+const CAPTURE_LATER_GAP = process.env.ZODE_UI_CAPTURE_LATER_RECONNECT_GAP === "1";
+const RECONNECT_FAILURE = "UI_SSE_RECONNECT_STATUS_STUCK";
 const SERVER_AUTHORITY_ID = "server-all-in-one-ui-e2e";
 const SAME_START_CAPABILITY_TOOL = "all_in_one_same_start_probe";
 const BARRIERS = Object.freeze({
@@ -53,6 +70,21 @@ const SAFE_RESPONSE_HEADERS = new Set([
   "content-type",
   "referrer-policy",
 ]);
+
+function productEnvironment(source) {
+  const environment = { ...source };
+  for (const key of [
+    "ZODE_E2E_LIVE_PROVIDER_API_KEY",
+    "OPENCODE_GO_API_KEY",
+    "OPENCODE_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENROUTER_API_KEY",
+  ]) {
+    delete environment[key];
+  }
+  return environment;
+}
 
 const repositoryRoot = path.resolve(__dirname, "..", "..", "..");
 const trackedIncidentPath = path.join(
@@ -223,7 +255,7 @@ function prioritizeGateFailure(primary, error, label) {
   return new AggregateError(primary ? [error, primary] : [error], label);
 }
 
-async function readBounded(stream) {
+async function readBounded(stream, onChunk = null) {
   const chunks = [];
   let total = 0;
   for await (const chunk of stream) {
@@ -232,6 +264,7 @@ async function readBounded(stream) {
     if (total > MAX_BODY_BYTES) {
       throw new Error("test HTTP body exceeded the recording bound");
     }
+    onChunk?.(bytes);
     chunks.push(bytes);
   }
   return Buffer.concat(chunks);
@@ -668,6 +701,10 @@ async function writePrivate(pathname, bytes) {
   await fs.writeFile(pathname, bytes, { flag: "wx", mode: 0o600 });
 }
 
+async function writeExecutable(pathname, source) {
+  await fs.writeFile(pathname, source, { flag: "wx", mode: 0o700 });
+}
+
 async function writeJson(pathname, value) {
   await fs.writeFile(pathname, `${JSON.stringify(value, null, 2)}\n`, {
     flag: "wx",
@@ -752,6 +789,51 @@ async function privateFileFact(pathname, label) {
   };
 }
 
+async function bootstrapSeedCreationFact(pathname, label) {
+  const metadata = await fs.lstat(pathname);
+  const parent = await fs.lstat(path.dirname(pathname));
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error(`${label} is not a regular file`);
+  }
+  if (!parent.isDirectory() || parent.isSymbolicLink() || (parent.mode & 0o077) !== 0) {
+    throw new Error(`${label} is not inside a private directory`);
+  }
+  if ((metadata.mode & 0o077) !== 0 || ![1, 2].includes(metadata.nlink)) {
+    throw new Error(`${label} is not a private create-new seed candidate`);
+  }
+  if (metadata.nlink === 2) {
+    const siblings = [];
+    for (const candidate of await regularFilesUnder(path.dirname(pathname))) {
+      const fact = await fs.lstat(candidate);
+      if (fact.dev === metadata.dev && fact.ino === metadata.ino) siblings.push(candidate);
+    }
+    if (
+      siblings.length !== 2 ||
+      !siblings.includes(pathname) ||
+      !siblings.some((candidate) => path.basename(candidate).endsWith(".zode-server-pending"))
+    ) {
+      throw new Error(`${label} hard-link claim was not the bounded create-new pending file`);
+    }
+  }
+  const bytes = await fs.readFile(pathname);
+  if (
+    bytes.length === 0 ||
+    bytes.length > 64 * 1024 ||
+    bytes.some((byte) => byte <= 0x20 || byte === 0x7f)
+  ) {
+    throw new Error(`${label} is not a bounded bearer credential`);
+  }
+  return {
+    pathname,
+    bytes,
+    digest: sha256(bytes),
+    dev: metadata.dev,
+    ino: metadata.ino,
+    nlink: metadata.nlink,
+    mode: metadata.mode & 0o777,
+  };
+}
+
 function assertIndependentCopies(left, right, label) {
   if (!left.bytes.equals(right.bytes)) {
     throw new Error(`${label} did not contain identical controller authority bytes`);
@@ -762,6 +844,55 @@ function assertIndependentCopies(left, right, label) {
   ) {
     throw new Error(`${label} reused one file instead of two independent copies`);
   }
+}
+
+function assertIndependentFiles(left, right, label) {
+  if (
+    path.resolve(left.pathname) === path.resolve(right.pathname) ||
+    (left.dev === right.dev && left.ino === right.ino)
+  ) {
+    throw new Error(`${label} reused one file instead of two independent stores`);
+  }
+}
+
+async function privateOpaqueFileFact(pathname, label) {
+  const metadata = await fs.lstat(pathname);
+  const parent = await fs.lstat(path.dirname(pathname));
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error(`${label} is not a regular file`);
+  }
+  if (!parent.isDirectory() || parent.isSymbolicLink() || (parent.mode & 0o077) !== 0) {
+    throw new Error(`${label} is not inside a private directory`);
+  }
+  if ((metadata.mode & 0o077) !== 0 || metadata.nlink !== 1) {
+    throw new Error(`${label} is not private and independently owned`);
+  }
+  const bytes = await fs.readFile(pathname);
+  if (bytes.length === 0 || bytes.length > 128 * 1024) {
+    throw new Error(`${label} is not a bounded protected value`);
+  }
+  return {
+    pathname,
+    bytes,
+    digest: sha256(bytes),
+    dev: metadata.dev,
+    ino: metadata.ino,
+    nlink: metadata.nlink,
+    mode: metadata.mode & 0o777,
+  };
+}
+
+async function oneEncryptedAuthorityFile(directory, plaintext, label) {
+  const files = await regularFilesUnder(directory);
+  if (files.length !== 1) {
+    throw new Error(`${label} had ${files.length} protected files, expected one`);
+  }
+  const fact = await privateOpaqueFileFact(files[0], label);
+  const magic = Buffer.from("zode.server-secret.v1\0", "utf8");
+  if (!fact.bytes.subarray(0, magic.length).equals(magic) || fact.bytes.includes(plaintext)) {
+    throw new Error(`${label} did not retain one encrypted-at-rest controller authority`);
+  }
+  return fact;
 }
 
 async function matchingPrivateFiles(directory, expectedBytes) {
@@ -818,8 +949,8 @@ class ReadyProcess {
     return new ReadyProcess(child, binary);
   }
 
-  static async start(binary, args, prefix) {
-    const managed = ReadyProcess.launch(binary, args);
+  static async start(binary, args, prefix, options = {}) {
+    const managed = ReadyProcess.launch(binary, args, options);
     try {
       managed.readyValue = await managed.waitForLine(prefix);
       return managed;
@@ -835,6 +966,7 @@ class ReadyProcess {
     this.readyValue = null;
     this.stdout = "";
     this.stderr = "";
+    this.stopObservation = null;
     child.stdout.on("data", (chunk) => {
       this.stdout += chunk.toString("utf8");
     });
@@ -914,15 +1046,29 @@ class ReadyProcess {
 
   async stop() {
     if (this.child.exitCode != null || this.child.signalCode != null) {
-      await this.exit;
+      const result = await this.exit;
+      this.stopObservation ??= {
+        forcedSigkill: false,
+        result,
+      };
       return;
     }
     this.child.kill("SIGTERM");
     try {
-      await withTimeout(this.exit, STOP_TIMEOUT_MS, `${path.basename(this.binary)} shutdown`);
+      const result = await withTimeout(
+        this.exit,
+        STOP_TIMEOUT_MS,
+        `${path.basename(this.binary)} shutdown`,
+      );
+      this.stopObservation = { forcedSigkill: false, result };
     } catch {
       this.child.kill("SIGKILL");
-      await withTimeout(this.exit, STOP_TIMEOUT_MS, `${path.basename(this.binary)} reap`);
+      const result = await withTimeout(
+        this.exit,
+        STOP_TIMEOUT_MS,
+        `${path.basename(this.binary)} reap`,
+      );
+      this.stopObservation = { forcedSigkill: true, result };
     }
   }
 }
@@ -1108,6 +1254,187 @@ class IncidentRecorder {
   }
 }
 
+async function writePrivateDurableJson(pathname, value) {
+  const handle = await fs.open(pathname, "wx", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  const directory = await fs.open(path.dirname(pathname), "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
+class LaterGapCapture {
+  static async create() {
+    if (!CAPTURE_LATER_GAP) {
+      return null;
+    }
+    const quarantine = path.join(
+      repositoryRoot,
+      "target",
+      "test-recordings",
+      "quarantine",
+      "management-browser-reconnect-later",
+    );
+    await fs.mkdir(quarantine, { recursive: true, mode: 0o700 });
+    await fs.chmod(quarantine, 0o700);
+    const root = await fs.mkdtemp(path.join(quarantine, "run-"));
+    await fs.chmod(root, 0o700);
+    const ledger = new SecretLedger();
+    return new LaterGapCapture(root, ledger, new RecordingJournal({ rootDir: root, ledger }));
+  }
+
+  constructor(root, ledger, journal) {
+    this.root = root;
+    this.ledger = ledger;
+    this.journal = journal;
+    this.captureSetId = null;
+    this.firstFailure = null;
+    this.lastRecord = null;
+    this.accessAssertionSequence = 0;
+    this.flushed = null;
+    this.activeRecordings = new Set();
+  }
+
+  addSecret(label, value) {
+    this.ledger.add(label, value);
+  }
+
+  addAccessAssertion(value) {
+    this.accessAssertionSequence += 1;
+    this.ledger.add(`access_assertion_${this.accessAssertionSequence}`, value);
+  }
+
+  arm() {
+    if (this.captureSetId) {
+      throw new Error("later gap capture was armed more than once");
+    }
+    this.captureSetId = this.journal.beginCaptureSet({ e2eName: E2E, maxMembers: 64 });
+  }
+
+  begin(request, { reconnect = false } = {}) {
+    if (!this.captureSetId) {
+      return null;
+    }
+    const recording = this.journal.beginIngress({
+      boundary: "management-access-edge",
+      method: request.method,
+      requestPath: request.url,
+      requestHeaders: request.headers,
+      captureSetId: this.captureSetId,
+    });
+    recording.laterGapReconnect = reconnect;
+    this.activeRecordings.add(recording);
+    return recording;
+  }
+
+  ingressChunk(recording, chunk) {
+    if (recording) {
+      this.journal.ingressChunk(recording, chunk);
+    }
+  }
+
+  endIngress(recording) {
+    return recording ? this.journal.endIngress(recording) : null;
+  }
+
+  updateHeaders(recording, headers) {
+    if (recording) {
+      this.journal.updateIngressHeaders(recording, headers);
+    }
+  }
+
+  responseStarted(recording, status, headers) {
+    if (recording) {
+      this.journal.responseStarted(recording, { status, headers });
+    }
+  }
+
+  chunk(recording, bytes, offsetUs) {
+    if (recording) {
+      this.journal.chunk(recording, bytes, offsetUs);
+    }
+  }
+
+  finish(recording, outcome) {
+    if (!recording) {
+      return null;
+    }
+    if (recording.responseStatus === undefined && outcome === "client_disconnected") {
+      this.journal.responseStarted(recording, { status: 499, headers: {} });
+    }
+    const record = this.journal.finish(recording, outcome);
+    this.activeRecordings.delete(recording);
+    this.lastRecord = record;
+    if (recording.laterGapReconnect) {
+      this.firstFailure = record;
+    }
+    return record;
+  }
+
+  finishReconnectsAfterBrowserContextClose() {
+    for (const recording of [...this.activeRecordings]) {
+      if (recording.laterGapReconnect) {
+        this.finish(recording, "client_disconnected");
+      }
+    }
+  }
+
+  async flushFailure({ classification, firstObserved } = {}) {
+    if (this.flushed) {
+      return this.flushed;
+    }
+    const failure = this.firstFailure ?? this.lastRecord;
+    if (!this.captureSetId || !failure) {
+      throw new Error("later gap capture did not retain a public exchange before failure");
+    }
+    const reconnect = this.firstFailure !== null;
+    const safeClassification = reconnect
+      ? RECONNECT_FAILURE
+      : classification ?? "MANAGEMENT_BROWSER_PRE_RECONNECT_FAILURE";
+    const safeFirstObserved = reconnect
+      ? {
+          expected_connection_state: "Live",
+          observed_connection_state: "Reconnecting",
+          durable_assistant_reply_count: 1,
+        }
+      : firstObserved ?? "the real browser suite stopped before the SSE reconnect assertion";
+    await this.journal.waitForIdle();
+    const capture = this.journal.flushCaptureSet(this.captureSetId, {
+      firstFailureRecordingId: failure.recordingId,
+    });
+    const metadataPath = path.join(this.root, "later-reproduction.v1.json");
+    await writePrivateDurableJson(metadataPath, {
+      schema: "zode.evidence-gap-later-reproduction.v1",
+      version: 1,
+      owning_e2e: E2E,
+      recording_id: this.captureSetId,
+      relation: LATER_GAP_RELATION,
+      original_evidence_gap:
+        "target/test-recordings/quarantine/local-evidence-gaps/all-in-one-sse-live-and-child-reap-first-run-evidence-gap.v1.json",
+      classification: safeClassification,
+      first_failure_recording_id: failure.recordingId,
+      first_observed: safeFirstObserved,
+      raw_exchange_retained: true,
+      source_digest: capture.sourceDigest,
+      do_not_relabel_as_first: true,
+    });
+    this.flushed = {
+      root: this.root,
+      metadataPath,
+      captureSetId: this.captureSetId,
+      firstFailureRecordingId: failure.recordingId,
+    };
+    return this.flushed;
+  }
+}
+
 function base64url(value) {
   return Buffer.from(value).toString("base64url");
 }
@@ -1130,13 +1457,11 @@ function accessAssertion({ privateKey, kid, issuer, audience, subject }) {
   return `${signingInput}.${sign("RSA-SHA256", Buffer.from(signingInput), privateKey).toString("base64url")}`;
 }
 
-function forwardedHeaders(headers, targetHost, assertion) {
+function forwardedHeaders(headers, assertion) {
   const result = { ...headers };
   delete result.connection;
-  delete result.host;
   delete result["proxy-authorization"];
   delete result["transfer-encoding"];
-  result.host = targetHost;
   result["cf-access-jwt-assertion"] = assertion;
   return result;
 }
@@ -1593,13 +1918,13 @@ class EndpointProbeWire {
 }
 
 class AccessEdge {
-  static async start(recorder) {
+  static async start(recorder, laterGapCapture = null) {
     const pair = generateKeyPairSync("rsa", {
       modulusLength: 2048,
       publicKeyEncoding: { format: "pem", type: "spki" },
       privateKeyEncoding: { format: "pem", type: "pkcs8" },
     });
-    const edge = new AccessEdge(recorder, pair.privateKey, pair.publicKey);
+    const edge = new AccessEdge(recorder, laterGapCapture, pair.privateKey, pair.publicKey);
     edge.server = http.createServer((request, response) => {
       edge.handle(request, response).catch((error) => {
         edge.errors.push(error);
@@ -1616,8 +1941,9 @@ class AccessEdge {
     return edge;
   }
 
-  constructor(recorder, privateKey, publicKey) {
+  constructor(recorder, laterGapCapture, privateKey, publicKey) {
     this.recorder = recorder;
+    this.laterGapCapture = laterGapCapture;
     this.privateKey = createPrivateKey(privateKey);
     this.publicKey = createPublicKey(publicKey);
     this.kid = "all-in-one-first-run-rs256";
@@ -1633,6 +1959,7 @@ class AccessEdge {
     this.lastAssertion = null;
     this.jwksRequests = 0;
     this.activeSse = null;
+    this.sseStreams = new Set();
     this.sseFinalText = null;
     this.droppedFinalEventId = null;
     this.sseDropped = false;
@@ -1687,10 +2014,17 @@ class AccessEdge {
     this.droppedFinalEventId = eventId;
     this.sseDropped = true;
     const active = this.activeSse;
-    active.response.destroy();
-    active.upstream.destroy();
-    void active.finish("disconnected");
-    this.resolveSseDrop?.();
+    void (async () => {
+      try {
+        await active.finish("disconnected");
+      } catch (error) {
+        this.errors.push(error);
+      } finally {
+        active.response.destroy();
+        active.upstream.destroy();
+        this.resolveSseDrop?.();
+      }
+    })();
   }
 
   async waitForSseDrop() {
@@ -1699,6 +2033,27 @@ class AccessEdge {
 
   async waitForSseReconnect() {
     await withTimeout(this.sseReconnectPromise, 20_000, "proxied SSE reconnect barrier");
+  }
+
+  async finishActiveSseAfterBrowserContextClose() {
+    const active = [...this.sseStreams];
+    for (const stream of active) {
+      stream.upstream.pause();
+      stream.upstream.removeAllListeners("data");
+    }
+    this.laterGapCapture?.finishReconnectsAfterBrowserContextClose();
+    if (active.length === 0) {
+      return;
+    }
+    await withTimeout(
+      Promise.all(active.map((stream) => stream.finish("client_disconnected"))),
+      STOP_TIMEOUT_MS,
+      "reconnect SSE client-disconnect recording terminal",
+    );
+    for (const stream of active) {
+      stream.response.destroy();
+      stream.upstream.destroy();
+    }
   }
 
   async waitForIdle() {
@@ -1737,7 +2092,27 @@ class AccessEdge {
 
     this.pending += 1;
     try {
-      const body = await readBounded(request);
+      const reconnect =
+        this.sseDropped &&
+        request.url.includes("/events") &&
+        typeof request.headers["last-event-id"] === "string" &&
+        request.headers["last-event-id"].length > 0;
+      const recording = this.laterGapCapture?.begin(request, { reconnect }) ?? null;
+      let body;
+      try {
+        body = await readBounded(request, (chunk) =>
+          this.laterGapCapture?.ingressChunk(recording, chunk),
+        );
+        this.laterGapCapture?.endIngress(recording);
+      } catch (error) {
+        if (recording) {
+          this.laterGapCapture.responseStarted(recording, 400, {
+            "content-type": "application/json",
+          });
+          this.laterGapCapture.finish(recording, "transport_error");
+        }
+        throw error;
+      }
       const assertion = accessAssertion({
         privateKey: this.privateKey,
         kid: this.kid,
@@ -1746,45 +2121,64 @@ class AccessEdge {
         subject: this.subject,
       });
       this.lastAssertion = assertion;
+      if (recording) {
+        this.laterGapCapture.addAccessAssertion(assertion);
+      }
       const target = new URL(request.url, this.target);
-      const headers = forwardedHeaders(request.headers, target.host, assertion);
-      if (
-        this.sseDropped &&
-        request.url.includes("/events") &&
-        typeof request.headers["last-event-id"] === "string" &&
-        request.headers["last-event-id"].length > 0
-      ) {
+      const headers = forwardedHeaders(request.headers, assertion);
+      this.laterGapCapture?.updateHeaders(recording, headers);
+      if (reconnect) {
         if (request.headers["last-event-id"] !== this.droppedFinalEventId) {
           throw new Error("SSE reconnect cursor did not equal the durable final event ID");
         }
         this.resolveSseReconnect?.();
       }
-      await this.proxy({ request, response, body, target, headers });
+      await this.proxy({ request, response, body, target, headers, recording });
     } finally {
       this.settleRequest();
     }
   }
 
-  async proxy({ request, response, body, target, headers }) {
+  async proxy({ request, response, body, target, headers, recording }) {
     await new Promise((resolve, reject) => {
       const upstream = http.request(target, { method: request.method, headers });
-      upstream.once("error", reject);
+      upstream.once("error", (error) => {
+        if (recording && recording.responseStatus === undefined) {
+          this.laterGapCapture.responseStarted(recording, 502, {
+            "content-type": "application/json",
+          });
+          this.laterGapCapture.finish(recording, "transport_error");
+        }
+        reject(error);
+      });
       upstream.once("response", (upstreamResponse) => {
+        if (recording?.finished) {
+          upstreamResponse.destroy();
+          resolve();
+          return;
+        }
         const status = upstreamResponse.statusCode ?? 502;
+        this.laterGapCapture?.responseStarted(recording, status, upstreamResponse.headers);
         response.writeHead(status, responseHeaders(upstreamResponse.headers));
         const chunks = [];
         const started = process.hrtime.bigint();
         let finished = false;
+        let finishPromise = null;
         const isSse = request.url.includes("/events");
-        const finish = async (outcome) => {
-          if (finished) {
-            return;
+        let streamState = null;
+        const finish = (outcome) => {
+          if (finishPromise) {
+            return finishPromise;
           }
           finished = true;
-          if (this.activeSse?.upstream === upstreamResponse) {
-            this.activeSse = null;
-          }
-          try {
+          finishPromise = (async () => {
+            if (this.activeSse?.upstream === upstreamResponse) {
+              this.activeSse = null;
+            }
+            if (streamState) {
+              this.sseStreams.delete(streamState);
+            }
+            this.laterGapCapture?.finish(recording, outcome);
             await this.recorder.observe({
               method: request.method,
               path: request.url,
@@ -1796,29 +2190,34 @@ class AccessEdge {
               response_chunks: chunks,
               outcome,
             });
-            resolve();
-          } catch (error) {
-            reject(error);
-          }
+          })();
+          finishPromise.then(resolve, reject);
+          return finishPromise;
         };
         if (isSse) {
-          this.activeSse = {
+          streamState = {
             response,
             upstream: upstreamResponse,
             finish,
             chunks,
           };
+          this.activeSse = streamState;
+          this.sseStreams.add(streamState);
         }
         response.once("close", () => {
           if (!finished) {
-            upstreamResponse.destroy();
-            void finish("disconnected");
+            void finish("client_disconnected").then(
+              () => upstreamResponse.destroy(),
+              () => upstreamResponse.destroy(),
+            );
           }
         });
         upstreamResponse.on("data", (chunk) => {
           const bytes = Buffer.from(chunk);
+          const offsetUs = Number((process.hrtime.bigint() - started) / 1_000n);
+          this.laterGapCapture?.chunk(recording, bytes, offsetUs);
           chunks.push({
-            offset_us: Number((process.hrtime.bigint() - started) / 1_000n),
+            offset_us: offsetUs,
             body: bytes,
           });
           if (!response.destroyed) {
@@ -1919,13 +2318,31 @@ class FakeProvider {
   }
 }
 
+class ExternalRecordedProvider {
+  static fromEnvironment() {
+    const baseUrl = new URL(liveProviderBaseUrl);
+    return new ExternalRecordedProvider(baseUrl.origin, baseUrl.toString().replace(/\/$/, ""));
+  }
+
+  constructor(origin, baseUrl) {
+    this.origin = origin;
+    this.baseUrl = baseUrl;
+    this.requests = null;
+  }
+
+  async stop() {}
+}
+
 class Harness {
   static async start() {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "zode-all-in-one-ui-e2e-"));
     const recorder = await IncidentRecorder.create();
-    const provider = await FakeProvider.start();
-    const edge = await AccessEdge.start(recorder);
-    const harness = new Harness(root, recorder, provider, edge);
+    const laterGapCapture = await LaterGapCapture.create();
+    const provider = LIVE_PROVIDER
+      ? ExternalRecordedProvider.fromEnvironment()
+      : await FakeProvider.start();
+    const edge = await AccessEdge.start(recorder, laterGapCapture);
+    const harness = new Harness(root, recorder, provider, edge, laterGapCapture);
     try {
       await harness.startProcesses();
       await harness.assertIndependentEndpointChild();
@@ -1958,11 +2375,12 @@ class Harness {
     }
   }
 
-  constructor(root, recorder, provider, edge) {
+  constructor(root, recorder, provider, edge, laterGapCapture) {
     this.root = root;
     this.recorder = recorder;
     this.provider = provider;
     this.edge = edge;
+    this.laterGapCapture = laterGapCapture;
     this.server = null;
     this.preReadyBootstrapProcess = null;
     this.publicBindGate = null;
@@ -1971,6 +2389,7 @@ class Harness {
     this.scaffoldEndpoint = null;
     this.scaffoldCapture = false;
     this.endpointBinary = null;
+    this.endpointConfiguredExecutable = null;
     this.serverBinary = null;
     this.endpointConfig = null;
     this.endpointConfigDocument = null;
@@ -1984,12 +2403,13 @@ class Harness {
     this.serverRoot = null;
     this.serverAuthorityFact = null;
     this.endpointActiveAuthorityFact = null;
+    this.controllerAuthorityBytes = null;
     this.staleSeedFact = null;
     this.preReadyCatalogBytes = null;
     this.sameStartCatalogBytes = null;
     this.bootstrapStage = "entry";
     this.endpointSessionId = null;
-    this.apiKey = randomSecret("all-in-one-api-key");
+    this.apiKey = liveProviderApiKey ?? randomSecret("all-in-one-api-key");
     this.endpointControlSecret = randomSecret("all-in-one-controller");
     this.staleEndpointSeed = randomSecret("all-in-one-stale-seed");
     this.subjectKey = randomBytes(24).toString("base64url");
@@ -2000,6 +2420,48 @@ class Harness {
       this.subjectKey,
       this.edge.subject,
     ];
+    for (const [label, value] of [
+      ["provider_api_key", this.apiKey],
+      ["endpoint_controller_secret", this.endpointControlSecret],
+      ["stale_endpoint_seed", this.staleEndpointSeed],
+      ["access_subject_key", this.subjectKey],
+      ["access_subject", this.edge.subject],
+    ]) {
+      this.laterGapCapture?.addSecret(label, value);
+    }
+  }
+
+  armLaterGapCapture() {
+    this.laterGapCapture?.arm();
+  }
+
+  async retainLaterGapFailure(options) {
+    if (!this.laterGapCapture) {
+      return null;
+    }
+    return this.laterGapCapture.flushFailure(options);
+  }
+
+  endpointServerEnvironment(source, { stopEndpointAtEntry = false } = {}) {
+    const environment = productEnvironment(source);
+    if (this.endpointConfiguredExecutable !== this.endpointBinary) {
+      environment.ZODE_E2E_REAL_ENDPOINT = this.endpointBinary;
+      if (stopEndpointAtEntry) {
+        environment.ZODE_E2E_ENDPOINT_SELF_STOP = "1";
+      } else {
+        delete environment.ZODE_E2E_ENDPOINT_SELF_STOP;
+      }
+    }
+    return environment;
+  }
+
+  isOwnedEndpointCommand(command) {
+    return (
+      (command.includes(this.endpointBinary) ||
+        command.includes(this.endpointConfiguredExecutable)) &&
+      command.includes(`--config ${this.endpointConfig}`) &&
+      command.includes(`--listen ${this.endpointListen}`)
+    );
   }
 
   async startProcesses() {
@@ -2024,10 +2486,30 @@ class Harness {
     await fs.mkdir(path.join(serverRoot, "secrets"), { recursive: true, mode: 0o700 });
     const scaffoldCapture = process.env.ZODE_UI_SCAFFOLD_CAPTURE === "1";
     this.scaffoldCapture = scaffoldCapture;
+    let endpointConfiguredExecutable = endpointBinary;
     if (!scaffoldCapture) {
       this.publicBindGate = await TcpGate.start("final public Server bind barrier");
+      // The first launch stops in the same child PID before exec so the
+      // short-lived seed can be inspected without racing its real Endpoint
+      // consumer. Resuming that PID immediately execs the production binary.
+      endpointConfiguredExecutable = path.join(this.root, "endpoint-launch-gate");
+      await writeExecutable(
+        endpointConfiguredExecutable,
+        [
+          "#!/bin/sh",
+          "set -eu",
+          'if [ "${ZODE_E2E_ENDPOINT_SELF_STOP:-}" = "1" ]; then',
+          '  kill -STOP "$$"',
+          "fi",
+          'exec "$ZODE_E2E_REAL_ENDPOINT" "$@"',
+          "",
+        ].join("\n"),
+      );
     }
+    this.endpointConfiguredExecutable = endpointConfiguredExecutable;
     const endpointListen = await allocateLoopbackAddress();
+    const callbackOrigin = new URL(this.edge.baseUrl);
+    callbackOrigin.hostname = "127.0.0.2";
     const endpointConfig = path.join(endpointRoot, "endpoint.json");
     this.endpointConfig = endpointConfig;
     this.endpointListen = endpointListen;
@@ -2059,7 +2541,7 @@ class Harness {
         adapter_kinds: ["openai_compatible"],
         allowed_base_url_origins: [this.provider.origin],
       },
-      callback: { allowed_public_origins: [this.edge.baseUrl] },
+      callback: { allowed_public_origins: [callbackOrigin.origin] },
       tools: [],
     };
     this.endpointConfigDocument = endpointConfigDocument;
@@ -2071,6 +2553,7 @@ class Harness {
         endpointBinary,
         ["--config", endpointConfig],
         "ZODE_READY ",
+        { env: productEnvironment(process.env) },
       );
     }
 
@@ -2080,15 +2563,25 @@ class Harness {
       ? "127.0.0.1:0"
       : this.publicBindGate.listenAddress;
     this.serverListen = serverListen;
+    const installedUiDirectory = path.join(serverRoot, "ui");
+    if (!scaffoldCapture) {
+      await fs.cp(path.join(repositoryRoot, "web", "dist"), installedUiDirectory, {
+        recursive: true,
+        force: false,
+        errorOnExist: true,
+      });
+    }
     const serverConfig = {
       schema: "zode.server-config.v1",
       listen: serverListen,
+      management_origin: this.edge.baseUrl,
+      callback_origin: callbackOrigin.origin,
       server_authority_id: SERVER_AUTHORITY_ID,
       deployment: scaffoldCapture ? "server_only" : "all_in_one",
       ui_mode: scaffoldCapture ? "api_only" : "assets",
       ...(scaffoldCapture
         ? {}
-        : { ui_assets_directory: path.join(repositoryRoot, "web", "dist") }),
+        : { ui_assets_directory: installedUiDirectory }),
       control_database: "control.sqlite3",
       secret_directory: "secrets",
       access: {
@@ -2101,7 +2594,7 @@ class Harness {
     };
     if (!scaffoldCapture) {
       serverConfig.local_endpoint = {
-        executable: endpointBinary,
+        executable: endpointConfiguredExecutable,
         config: endpointConfig,
         listen: endpointListen,
         bootstrap_controller_secret_file: "controller.seed",
@@ -2115,6 +2608,7 @@ class Harness {
         serverBinary,
         ["--config", serverConfigPath],
         "ZODE_SERVER_READY ",
+        { env: productEnvironment(process.env) },
       );
       this.edge.setTarget(this.server.readyValue);
       return;
@@ -2192,6 +2686,7 @@ class Harness {
     let endpointPid = null;
     let endpointPaused = false;
     let serverPausedAtCatalog = false;
+    let readinessCatalogFallback = false;
 
     try {
       catalogBarrier = FileContentBarrier.arm(
@@ -2211,7 +2706,7 @@ class Harness {
       managed = ReadyProcess.launch(
         this.serverBinary,
         ["--config", this.serverConfig],
-        { env: wire.processEnvironment(process.env) },
+        { env: wire.processEnvironment(this.endpointServerEnvironment(process.env)) },
       );
       wire.setExpectedServerPid(managed.child.pid);
       this.server = managed;
@@ -2275,16 +2770,34 @@ class Harness {
       this.sameStartCatalogBytes = await Promise.race([
         catalogBarrier.wait(managed),
         readiness.then(() => {
-          throw new HarnessBarrierError(
-            "Server reached ZODE_SERVER_READY before the local Endpoint catalog barrier",
+          const markers = wire.catalogMarkers();
+          const bytes = storeFamilyBytesSync(this.serverRoot, "control.sqlite3");
+          const missing = markers.filter(
+            (marker) => !bytes.some((content) => content.includes(Buffer.from(marker))),
           );
+          if (missing.length > 0) {
+            throw new HarnessBarrierError(
+              `Server reached ZODE_SERVER_READY before a complete local Endpoint catalog; missing=${missing.join(",")}`,
+            );
+          }
+          readinessCatalogFallback = true;
+          return bytes;
         }),
       ]);
       this.bootstrapStage = BARRIERS.localCatalog;
       if (!serverPausedAtCatalog) {
-        throw new HarnessBarrierError(
-          "catalog projection was observed without stopping the Server",
-        );
+        if (!readinessCatalogFallback) {
+          throw new HarnessBarrierError(
+            "catalog projection was observed without a pre-READY or durable-at-READY barrier",
+          );
+        }
+        await this.assertRestartIgnoredStaleSeed();
+        const readyValue = await readiness;
+        wire.finishStartupObservation();
+        managed.readyValue = readyValue;
+        this.allInOneEndpointPid = endpointPid;
+        this.bootstrapStage = BARRIERS.serverReady;
+        return managed;
       }
       try {
         await waitForProcessStopped(
@@ -2352,11 +2865,7 @@ class Harness {
     const matching = [];
     for (const pid of await directChildPids(parentPid)) {
       const command = await processCommand(pid);
-      if (
-        command.includes(this.endpointBinary) &&
-        command.includes(`--config ${this.endpointConfig}`) &&
-        command.includes(`--listen ${this.endpointListen}`)
-      ) {
+      if (this.isOwnedEndpointCommand(command)) {
         matching.push(pid);
       }
     }
@@ -2401,10 +2910,7 @@ class Harness {
     if (!command) {
       return;
     }
-    const isOwnedEndpoint =
-      command.includes(this.endpointBinary) &&
-      command.includes(`--config ${this.endpointConfig}`) &&
-      command.includes(`--listen ${this.endpointListen}`);
+    const isOwnedEndpoint = this.isOwnedEndpointCommand(command);
     if (!isOwnedEndpoint) {
       throw new Error(`${label} Endpoint PID was unexpectedly reused`);
     }
@@ -2426,62 +2932,69 @@ class Harness {
 
   async observeBootstrapBeforePublicBind() {
     let process;
-    let pausedAtSeed = false;
-    let childBarrier;
+    let endpointPid;
+    let endpointPausedAtEntry = false;
     const seedCreated = FileCreationBarrier.arm(
       this.endpointSeed,
       "Server-generated Endpoint seed creation",
-      () => {
-        if (!process?.child.kill("SIGSTOP")) {
-          throw new HarnessBarrierError(
-            "could not pause Server at the Endpoint seed creation barrier",
-          );
-        }
-        pausedAtSeed = true;
-      },
+      () => {},
     );
-    process = ReadyProcess.launch(this.serverBinary, ["--config", this.serverConfig]);
+    process = ReadyProcess.launch(this.serverBinary, ["--config", this.serverConfig], {
+      env: this.endpointServerEnvironment(globalThis.process.env, {
+        stopEndpointAtEntry: true,
+      }),
+    });
     this.preReadyBootstrapProcess = process;
     try {
       await seedCreated.wait(process);
+      endpointPid = await this.waitForOneEndpointChild(process);
       try {
         await waitForProcessStopped(
-          process.child.pid,
-          "Server stopped at one-time Endpoint seed creation",
+          endpointPid,
+          "test-owned Endpoint launch gate stopped before seed consumption",
         );
       } catch (error) {
-        throw new HarnessBarrierError("Server seed stop barrier did not settle", error);
+        throw new HarnessBarrierError("Endpoint seed-consumption gate did not settle", error);
       }
-      if (!pausedAtSeed || process.child.exitCode != null || process.child.signalCode != null) {
-        throw new HarnessBarrierError("Server did not remain paused at the one-time seed barrier");
+      endpointPausedAtEntry = true;
+      const entryCommand = await processCommand(endpointPid);
+      if (!entryCommand.includes(this.endpointConfiguredExecutable)) {
+        throw new HarnessBarrierError(
+          "Endpoint launch gate did not retain the configured executable before real exec",
+        );
       }
-      const seed = await privateFileFact(this.endpointSeed, "one-time Endpoint bootstrap seed");
-      const authority = await oneMatchingPrivateFile(
-        path.join(this.serverRoot, "secrets"),
+      const seed = await bootstrapSeedCreationFact(
+        this.endpointSeed,
+        "one-time Endpoint bootstrap seed",
+      );
+      const authority = await oneEncryptedAuthorityFile(
+        path.join(this.serverRoot, "secrets", "endpoints"),
         seed.bytes,
         "Server controller authority store",
       );
-      assertIndependentCopies(authority, seed, "Server authority and Endpoint seed");
+      assertIndependentFiles(authority, seed, "Server authority and Endpoint seed");
       this.serverAuthorityFact = authority;
+      this.controllerAuthorityBytes = Buffer.from(seed.bytes);
       this.bootstrapStage = BARRIERS.controllerSeed;
-      const authorityText = authority.bytes.toString("utf8");
-      if (!Buffer.from(authorityText, "utf8").equals(authority.bytes)) {
+      const authorityText = seed.bytes.toString("utf8");
+      if (!Buffer.from(authorityText, "utf8").equals(seed.bytes)) {
         throw new Error("Server-generated controller authority was not UTF-8 bearer text");
       }
       this.secrets.push(authorityText);
-      childBarrier = this.waitForOneEndpointChild(process);
     } finally {
-      if (pausedAtSeed && process.child.exitCode == null && process.child.signalCode == null) {
-        if (!process.child.kill("SIGCONT")) {
-          throw new HarnessBarrierError("could not resume Server after the one-time seed barrier");
+      if (endpointPausedAtEntry) {
+        try {
+          globalThis.process.kill(endpointPid, "SIGCONT");
+          endpointPausedAtEntry = false;
+        } catch (error) {
+          if (error?.code !== "ESRCH") {
+            throw error;
+          }
         }
       }
       seedCreated.stop();
     }
-    const [result, endpointPid] = await Promise.all([
-      process.waitForExit("all-in-one pre-public-bind process exit"),
-      childBarrier,
-    ]);
+    const result = await process.waitForExit("all-in-one pre-public-bind process exit");
     this.preReadyEndpointPid = endpointPid;
     await this.assertEndpointPidReaped(endpointPid, "pre-public-bind");
     this.publicBindGate.assertStillHolding(this.serverListen);
@@ -2504,7 +3017,7 @@ class Harness {
       throw new Error("Endpoint bootstrap seed was not consumed before final Server bind");
     }
 
-    const authority = await privateFileFact(
+    const authority = await privateOpaqueFileFact(
       this.serverAuthorityFact.pathname,
       "Server controller authority after Endpoint bootstrap",
     );
@@ -2513,10 +3026,13 @@ class Harness {
     }
     const active = await oneMatchingPrivateFile(
       this.endpointRoot,
-      authority.bytes,
+      this.controllerAuthorityBytes,
       "Endpoint durable active controller store",
     );
-    assertIndependentCopies(authority, active, "Server and active Endpoint controller stores");
+    if (authority.bytes.includes(active.bytes)) {
+      throw new Error("Server protected store exposed the active Endpoint controller plaintext");
+    }
+    assertIndependentFiles(authority, active, "Server and active Endpoint controller stores");
     this.serverAuthorityFact = authority;
     this.endpointActiveAuthorityFact = active;
     this.bootstrapStage = BARRIERS.childReady;
@@ -2547,7 +3063,7 @@ class Harness {
     ) {
       throw new Error("restart consumed or replaced the stale Endpoint seed");
     }
-    const authority = await privateFileFact(
+    const authority = await privateOpaqueFileFact(
       this.serverAuthorityFact.pathname,
       "Server controller authority after restart",
     );
@@ -2562,7 +3078,10 @@ class Harness {
     ) {
       throw new Error("restart allowed a stale seed to replace controller authority");
     }
-    assertIndependentCopies(authority, active, "restarted Server and Endpoint controller stores");
+    if (authority.bytes.includes(active.bytes)) {
+      throw new Error("restarted Server protected store exposed controller plaintext");
+    }
+    assertIndependentFiles(authority, active, "restarted Server and Endpoint controller stores");
   }
 
   assertCatalogsPrecedeReady(localEndpointId) {
@@ -2701,6 +3220,9 @@ class Harness {
       async () => {
         await this.server?.stop();
         await this.assertAllInOneChildReaped();
+        process.stderr.write(
+          `ZODE_E2E_CHILD_REAP_OBSERVATION server_forced_sigkill=${this.server?.stopObservation?.forcedSigkill === true} endpoint_reaped=true\n`,
+        );
       },
       () => this.preReadyBootstrapProcess?.stop(),
       () => this.publicBindGate?.stop(),
@@ -2999,10 +3521,21 @@ async function waitForProviderProfileReady(page, endpointId) {
   return selected;
 }
 
-test(E2E, async ({ browser }) => {
-  const harness = await Harness.start();
+test(E2E, async ({ playwright }) => {
+  const browser = await playwright.chromium.launch({ env: productEnvironment(process.env) });
+  delete process.env.ZODE_E2E_LIVE_PROVIDER_API_KEY;
+  let harness;
+  try {
+    harness = await Harness.start();
+  } catch (error) {
+    await browser.close().catch(() => {});
+    throw error;
+  }
   const storageWrites = [];
-  const context = await browser.newContext();
+  const context = await browser.newContext({
+    viewport: { width: 1920, height: 1080 },
+    deviceScaleFactor: 1,
+  });
   await context.exposeBinding("__zodeE2eRecordStorageWrite", (_source, write) => {
     storageWrites.push(write);
   });
@@ -3048,12 +3581,17 @@ test(E2E, async ({ browser }) => {
       });
     }
     if (url.pathname.endsWith("/events")) {
-      eventRequests.push({ url: request.url(), headers: request.headers() });
+      eventRequests.push({
+        url: request.url(),
+        headers: request.allHeaders().catch(() => null),
+      });
     }
   });
 
   let primaryError = null;
+  let reconnectFailureObserved = false;
   try {
+    harness.armLaterGapCapture();
     let entry;
     try {
       entry = await page.goto(`${harness.edge.baseUrl}/`, {
@@ -3123,7 +3661,9 @@ test(E2E, async ({ browser }) => {
       system.json.local_endpoint_id,
     );
     harness.assertCatalogsPrecedeReady(localEndpoint.endpoint_id);
-    expect(harness.provider.requests).toHaveLength(0);
+    if (!LIVE_PROVIDER) {
+      expect(harness.provider.requests).toHaveLength(0);
+    }
 
     await clickVisible(
       page,
@@ -3133,6 +3673,7 @@ test(E2E, async ({ browser }) => {
       ],
       "Providers navigation",
     );
+    await expect(page.getByRole("heading", { name: "Providers", exact: true })).toBeVisible();
     await clickVisible(
       page,
       [
@@ -3153,6 +3694,10 @@ test(E2E, async ({ browser }) => {
       ],
       "provider save",
     );
+
+    await expect(
+      page.getByRole("button", { name: "Add API key profile", exact: true }),
+    ).toBeVisible();
 
     await clickVisible(
       page,
@@ -3190,6 +3735,7 @@ test(E2E, async ({ browser }) => {
       ],
       "Sessions navigation",
     );
+    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
     await clickVisible(
       page,
       [
@@ -3215,7 +3761,7 @@ test(E2E, async ({ browser }) => {
     expect(created.endpointId).toBe(localEndpoint.endpoint_id);
 
     harness.edge.armSseDrop(FINAL_ASSISTANT);
-    await fillVisible(page, ["Message", "Send a message"], "Hello from the real browser", "composer");
+    await fillVisible(page, ["Message", "Send a message"], USER_MESSAGE, "composer");
     await clickVisible(
       page,
       [
@@ -3230,10 +3776,40 @@ test(E2E, async ({ browser }) => {
     await harness.edge.waitForSseDrop();
     await harness.edge.waitForSseReconnect();
     await expect(durableFinal).toHaveCount(1);
+    try {
+      await expect(page.getByText("Live", { exact: true })).toHaveCount(1);
+    } catch (error) {
+      process.stderr.write(
+        `ZODE_E2E_UI_RECONNECT_OBSERVATION classification=${RECONNECT_FAILURE} relation=${LATER_GAP_RELATION} observed=Reconnecting expected=Live durable_assistant_reply_count=1\n`,
+      );
+      throw new ProductBehaviorFailure(
+        RECONNECT_FAILURE,
+        `relation=${LATER_GAP_RELATION}; durable assistant reply remained exactly once but the real browser stayed Reconnecting after a Last-Event-ID reconnect`,
+        { relation: LATER_GAP_RELATION, cause: error instanceof Error ? error.message : String(error) },
+      );
+    }
     expect(sessionIdentity(page.url())).toEqual(created);
+    if (process.env.ZODE_E2E_SCREENSHOT_PATH) {
+      await fs.mkdir(path.dirname(process.env.ZODE_E2E_SCREENSHOT_PATH), {
+        recursive: true,
+        mode: 0o700,
+      });
+      await page.screenshot({
+        path: process.env.ZODE_E2E_SCREENSHOT_PATH,
+        fullPage: true,
+      });
+    }
 
-    expect(eventRequests.length).toBeGreaterThanOrEqual(2);
-    for (const request of eventRequests) {
+    const observedEventRequests = (
+      await Promise.all(
+        eventRequests.map(async (request) => ({
+          url: request.url,
+          headers: await request.headers,
+        })),
+      )
+    ).filter((request) => request.headers !== null);
+    expect(observedEventRequests.length).toBeGreaterThanOrEqual(2);
+    for (const request of observedEventRequests) {
       const url = new URL(request.url);
       expect(url.origin).toBe(harness.edge.baseUrl);
       expect(url.pathname).toBe(
@@ -3241,7 +3817,7 @@ test(E2E, async ({ browser }) => {
       );
     }
     expect(
-      eventRequests
+      observedEventRequests
         .slice(1)
         .some(
           (request) =>
@@ -3261,21 +3837,25 @@ test(E2E, async ({ browser }) => {
       (message) => message.role === "assistant" && message.content === FINAL_ASSISTANT,
     );
     expect(finals).toHaveLength(1);
-    expect(harness.provider.requests).toHaveLength(1);
-    const providerRequest = harness.provider.requests[0];
-    if (providerRequest.headers.authorization !== `Bearer ${harness.apiKey}`) {
-      throw new Error("Endpoint provider request did not use the selected write-only profile secret");
+    if (!LIVE_PROVIDER) {
+      expect(harness.provider.requests).toHaveLength(1);
+      const providerRequest = harness.provider.requests[0];
+      if (providerRequest.headers.authorization !== `Bearer ${harness.apiKey}`) {
+        throw new Error(
+          "Endpoint provider request did not use the selected write-only profile secret",
+        );
+      }
+      expect(providerRequest.method).toBe("POST");
+      expect(providerRequest.path).toBe("/v1/chat/completions");
+      const providerBody = JSON.parse(providerRequest.body.toString("utf8"));
+      expect(providerBody.model).toBe(MODEL_ID);
+      expect(providerBody.messages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ role: "user", content: USER_MESSAGE }),
+        ]),
+      );
+      expect(providerRequest.body.includes(Buffer.from(harness.apiKey))).toBe(false);
     }
-    expect(providerRequest.method).toBe("POST");
-    expect(providerRequest.path).toBe("/v1/chat/completions");
-    const providerBody = JSON.parse(providerRequest.body.toString("utf8"));
-    expect(providerBody.model).toBe(MODEL_ID);
-    expect(providerBody.messages).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ role: "user", content: "Hello from the real browser" }),
-      ]),
-    );
-    expect(providerRequest.body.includes(Buffer.from(harness.apiKey))).toBe(false);
 
     expect(browserHttpRequests.length).toBeGreaterThan(0);
     for (const browserRequest of browserHttpRequests) {
@@ -3321,6 +3901,7 @@ test(E2E, async ({ browser }) => {
     ).toHaveLength(1);
   } catch (error) {
     primaryError = error;
+    reconnectFailureObserved = error?.classification === RECONNECT_FAILURE;
   } finally {
     const evidence = [];
     try {
@@ -3342,11 +3923,49 @@ test(E2E, async ({ browser }) => {
         "all_in_one_first_run secret evidence gate failed",
       );
     }
-    await context.close().catch((error) => {
+    let browserContextClosed = false;
+    try {
+      await context.close();
+      browserContextClosed = true;
+    } catch (error) {
       primaryError = prioritizeGateFailure(
         primaryError,
         error,
         "all_in_one_first_run browser cleanup failed",
+      );
+    }
+    if (CAPTURE_LATER_GAP && primaryError) {
+      try {
+        if (!browserContextClosed) {
+          throw new Error(
+            "browser context did not close, so a client-disconnect terminal cannot be recorded",
+          );
+        }
+        await harness.edge.finishActiveSseAfterBrowserContextClose();
+        const retained = await harness.retainLaterGapFailure({
+          classification: reconnectFailureObserved
+            ? RECONNECT_FAILURE
+            : "MANAGEMENT_BROWSER_PRE_RECONNECT_FAILURE",
+          firstObserved: reconnectFailureObserved
+            ? undefined
+            : `relation=${LATER_GAP_RELATION}; the complete real browser suite stopped before the SSE reconnect assertion`,
+        });
+        if (retained) {
+          process.stderr.write(`ZODE_E2E_LATER_GAP_CAPTURE ${retained.root}\n`);
+        }
+      } catch (error) {
+        primaryError = prioritizeGateFailure(
+          primaryError,
+          error,
+          "all_in_one_first_run later reproduction capture failed",
+        );
+      }
+    }
+    await browser.close().catch((error) => {
+      primaryError = prioritizeGateFailure(
+        primaryError,
+        error,
+        "all_in_one_first_run browser process cleanup failed",
       );
     });
     await harness.stop().catch((error) => {

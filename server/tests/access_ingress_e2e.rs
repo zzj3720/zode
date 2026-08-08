@@ -527,8 +527,6 @@ fn e2e_server_endpoint_protocol_compatibility_matrix() -> TestResult {
         .ok_or_else(|| io::Error::other("protocol matrix identity omitted endpoint_id"))?
         .to_owned();
     let mut endpoint_proxy = CountingProxy::start_protocol_matrix(&endpoint.base_url)?;
-    let shared_ui_assets = temp.path().join("protocol-matrix-ui");
-    build_test_ui(&shared_ui_assets)?;
     let now = unix_seconds();
     let assertion = signed_token(
         INITIAL_PRIVATE_KEY,
@@ -563,11 +561,7 @@ fn e2e_server_endpoint_protocol_compatibility_matrix() -> TestResult {
             endpoint_proxy.set_protocol_matrix_variant(case.variant)?;
             let server_root = temp.path().join(format!("server-{}", case.name));
             fs::create_dir(&server_root)?;
-            let server_config = write_server_config_with_ui(
-                &server_root,
-                &jwks,
-                &shared_ui_assets,
-            )?;
+            let server_config = write_server_config(&server_root, &jwks)?;
             let mut server = ServerProcess::start(&server_config)?;
             let result = (|| -> TestResult {
                 let key = format!("protocol-matrix-{case_index}-{}", case.name);
@@ -1495,7 +1489,8 @@ impl CountingProxy {
         *self
             .protocol_matrix_variant
             .lock()
-            .map_err(|_| io::Error::other("protocol matrix variant lock poisoned"))? = Some(variant);
+            .map_err(|_| io::Error::other("protocol matrix variant lock poisoned"))? =
+            Some(variant);
         Ok(())
     }
 
@@ -1574,13 +1569,16 @@ fn mutate_protocol_matrix_response(
     }
     let mut body: Value = serde_json::from_slice(&parsed.body)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    let object = body
-        .as_object_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Endpoint DTO was not an object"))?;
+    let object = body.as_object_mut().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "Endpoint DTO was not an object")
+    })?;
     match variant {
         ProtocolMatrixVariant::Baseline => {}
         ProtocolMatrixVariant::UnknownIdentityField if path == "/v1/identity" => {
-            object.insert("future_identity_metadata".to_owned(), json!({"supported": true}));
+            object.insert(
+                "future_identity_metadata".to_owned(),
+                json!({"supported": true}),
+            );
         }
         ProtocolMatrixVariant::UnknownCapabilitiesField if path == "/v1/capabilities" => {
             object.insert("future_capability_metadata".to_owned(), json!(["v2-ready"]));
@@ -1595,10 +1593,7 @@ fn mutate_protocol_matrix_response(
             object.insert("schema".to_owned(), json!("zode.identity.v2"));
         }
         ProtocolMatrixVariant::UnsupportedCapabilitiesSchema if path == "/v1/capabilities" => {
-            object.insert(
-                "schema".to_owned(),
-                json!("zode.endpoint-capabilities.v2"),
-            );
+            object.insert("schema".to_owned(), json!("zode.endpoint-capabilities.v2"));
         }
         ProtocolMatrixVariant::EndpointIdMismatch if path == "/v1/capabilities" => {
             object.insert("endpoint_id".to_owned(), json!("matrix-mismatch"));
@@ -1706,6 +1701,41 @@ fn request_with_connection_close(request: &[u8]) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn request_with_upstream_host(
+    request: &[u8],
+    upstream_host: &str,
+    upstream_port: u16,
+) -> io::Result<Vec<u8>> {
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "proxy request was incomplete")
+        })?;
+    let headers = std::str::from_utf8(&request[..header_end]).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "proxy request headers were not UTF-8",
+        )
+    })?;
+    let mut rewritten = String::new();
+    for (index, line) in headers.split("\r\n").enumerate() {
+        if index > 0
+            && (line.to_ascii_lowercase().starts_with("host:")
+                || line.to_ascii_lowercase().starts_with("connection:"))
+        {
+            continue;
+        }
+        rewritten.push_str(line);
+        rewritten.push_str("\r\n");
+    }
+    rewritten.push_str(&format!("Host: {upstream_host}:{upstream_port}\r\n"));
+    rewritten.push_str("Connection: close\r\n\r\n");
+    let mut bytes = rewritten.into_bytes();
+    bytes.extend_from_slice(&request[header_end + 4..]);
+    Ok(bytes)
+}
+
 fn proxy_public_request(
     mut client: TcpStream,
     upstream_host: &str,
@@ -1735,6 +1765,11 @@ fn proxy_public_request(
     let mut upstream = TcpStream::connect((upstream_host, upstream_port))?;
     upstream.set_read_timeout(Some(Duration::from_secs(5)))?;
     upstream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    // The gate is a test-only stand-in for the public edge.  It must preserve
+    // the configured request-target authority when forwarding to the real
+    // Server; otherwise the gate's ephemeral listener authority is rejected
+    // by the production Host/origin surface check before Access can run.
+    let request = request_with_upstream_host(&request, upstream_host, upstream_port)?;
     upstream.write_all(&request)?;
     {
         let (gate, changed) = state;
@@ -2851,9 +2886,14 @@ fn write_server_config_with_ui(
     let subject_key_file = root.join("subject.key");
     fs::write(&subject_key_file, SUBJECT_KEY)?;
     set_restricted_permissions(&subject_key_file)?;
+    let listen_probe = TcpListener::bind("127.0.0.1:0")?;
+    let listen_addr = listen_probe.local_addr()?;
+    drop(listen_probe);
     let config = json!({
         "schema": "zode.server-config.v1",
-        "listen": "127.0.0.1:0",
+        "listen": listen_addr.to_string(),
+        "management_origin": format!("http://{listen_addr}"),
+        "callback_origin": format!("http://127.0.0.2:{}", listen_addr.port()),
         "server_authority_id": "access-e2e-server",
         "deployment": "server_only",
         "ui_mode": "assets",

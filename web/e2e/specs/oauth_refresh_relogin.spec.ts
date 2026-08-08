@@ -1,9 +1,10 @@
 import { createHash, generateKeyPairSync, randomUUID, sign, type KeyObject } from "node:crypto";
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { createInterface } from "node:readline";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { execFile, spawn, type ChildProcessByStdio } from "node:child_process";
 import { once } from "node:events";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { type Readable } from "node:stream";
@@ -11,6 +12,47 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { expect, test, type Browser, type BrowserContext, type Page, type Response } from "@playwright/test";
+
+const require = createRequire(import.meta.url);
+const {
+  RecordingJournal,
+  SecretLedger,
+  proxyHttp,
+} = require("../support/harness.cjs") as {
+  RecordingJournal: new (options: {
+    rootDir: string;
+    ledger: SecretLedgerContract;
+  }) => RecordingJournalContract;
+  SecretLedger: new () => SecretLedgerContract;
+  proxyHttp: (options: Record<string, unknown>) => Promise<void>;
+};
+
+type SecretLedgerContract = {
+  add: (label: string, value: string) => void;
+};
+
+type RecordingJournalContract = {
+  currentCaptureSetId: string;
+  beginCaptureSet: (options: { e2eName: string; maxMembers?: number }) => string;
+  record: (options: Record<string, unknown>) => unknown;
+  first: (options: {
+    boundary?: string;
+    requestPath?: string;
+    responseStatus?: number;
+  }) => { recordingId: string } | undefined;
+  flushCaptureSet: (
+    captureSetId: string,
+    options?: { firstFailureRecordingId?: string },
+  ) => unknown;
+  promoteCaptureSet: (
+    captureSetId: string,
+    options: Record<string, unknown>,
+  ) => Promise<{ cassettePath?: string }>;
+  replay: (
+    cassette: string | Record<string, unknown>,
+    options: Record<string, unknown>,
+  ) => Promise<Array<{ path: string; status: number }>>;
+};
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -112,6 +154,10 @@ const INCIDENT_CASSETTE = resolve(
   FIXTURE_DIR,
   "oauth_refresh_relogin_first_browser_failure.v1.json",
 );
+const PROVIDER_DESCRIPTOR_E2E =
+  "e2e_server_provider_descriptor_round_trips_non_secret_revision";
+const PROVIDER_DESCRIPTOR_ID = "descriptor-roundtrip-provider";
+const PROVIDER_DESCRIPTOR_PATH = `/v1/providers/${PROVIDER_DESCRIPTOR_ID}`;
 const PROVIDER_FIXTURE = resolve(FIXTURE_DIR, "provider_oauth_fixture.mjs");
 const INCIDENT_RECORDING_ID = "oauth-refresh-relogin-browser-first-404-20260807";
 const INCIDENT_PATH = "/v1/providers";
@@ -225,46 +271,87 @@ class AccessFixture {
   private readonly jwksServer: ReturnType<typeof createServer>;
   private edgeServer: ReturnType<typeof createServer> | undefined;
   private targetOrigin = "";
+  private tokenSequence = 0;
+  private readonly ledger: SecretLedgerContract | undefined;
+  private readonly journal: RecordingJournalContract | undefined;
+  private readonly captureSetId: string | undefined;
   issuer: string;
   jwksUrl: string;
+  managementOrigin: string;
+  callbackOrigin: string;
 
-  private constructor() {
+  private constructor(options: {
+    ledger?: SecretLedgerContract;
+    journal?: RecordingJournalContract;
+    captureSetId?: string;
+  } = {}) {
+    this.ledger = options.ledger;
+    this.journal = options.journal;
+    this.captureSetId = options.captureSetId;
     const keys = generateKeyPairSync("rsa", { modulusLength: 2048 });
     this.privateKey = keys.privateKey;
     this.publicKey = keys.publicKey;
+    const publicJwk = this.publicKey.export({ format: "jwk" }) as Record<string, string>;
+    if (publicJwk.n) {
+      this.ledger?.add("provider_descriptor_jwks_modulus", publicJwk.n);
+    }
     this.jwksServer = createServer((request, response) => {
       if (request.method !== "GET" || request.url !== "/jwks") {
         response.writeHead(404, { "content-type": "application/json" });
         response.end(JSON.stringify({ error: { code: "not_found" } }));
         return;
       }
+      const responseBody = JSON.stringify({
+        keys: [
+          {
+            ...(this.publicKey.export({ format: "jwk" }) as Record<string, string>),
+            kid: this.kid,
+            use: "sig",
+            alg: "RS256",
+          },
+        ],
+      });
+      this.journal?.record({
+        boundary: "access-jwks-fixture",
+        method: request.method,
+        requestPath: request.url,
+        requestHeaders: request.headers,
+        requestBody: Buffer.alloc(0),
+        responseStatus: 200,
+        responseHeaders: { "cache-control": "no-store", "content-type": "application/json" },
+        responseChunks: [{ offsetUs: 0, data: Buffer.from(responseBody) }],
+        captureSetId: this.captureSetId,
+      });
       response.writeHead(200, {
         "cache-control": "no-store",
         "content-type": "application/json",
       });
-      response.end(
-        JSON.stringify({
-          keys: [
-            {
-              ...(this.publicKey.export({ format: "jwk" }) as Record<string, string>),
-              kid: this.kid,
-              use: "sig",
-              alg: "RS256",
-            },
-          ],
-        }),
-      );
+      response.end(responseBody);
     });
     this.issuer = "";
     this.jwksUrl = "";
+    this.managementOrigin = "";
+    this.callbackOrigin = "";
   }
 
-  static async start(): Promise<AccessFixture> {
-    const fixture = new AccessFixture();
+  static async start(options: {
+    ledger?: SecretLedgerContract;
+    journal?: RecordingJournalContract;
+    captureSetId?: string;
+  } = {}): Promise<AccessFixture> {
+    const fixture = new AccessFixture(options);
     fixture.jwksServer.listen(0, "127.0.0.1");
     const jwksOrigin = await listenHttp(fixture.jwksServer);
     fixture.issuer = `${jwksOrigin}/`;
     fixture.jwksUrl = `${jwksOrigin}/jwks`;
+    fixture.edgeServer = createServer((request, response) => {
+      void fixture.forward(request, response);
+    });
+    fixture.edgeServer.listen(0, "127.0.0.1");
+    fixture.managementOrigin = await listenHttp(fixture.edgeServer);
+    const callback = new URL(fixture.managementOrigin);
+    callback.hostname = "127.0.0.2";
+    fixture.callbackOrigin = callback.origin;
     return fixture;
   }
 
@@ -283,16 +370,15 @@ class AccessFixture {
       }),
     );
     const input = `${header}.${claims}`;
-    return `${input}.${base64Url(sign("RSA-SHA256", Buffer.from(input), this.privateKey))}`;
+    const token = `${input}.${base64Url(sign("RSA-SHA256", Buffer.from(input), this.privateKey))}`;
+    this.tokenSequence += 1;
+    this.ledger?.add(`provider_descriptor_access_assertion_${this.tokenSequence}`, token);
+    return token;
   }
 
   async startEdge(targetOrigin: string): Promise<string> {
-    this.targetOrigin = normalizeOrigin(targetOrigin);
-    this.edgeServer = createServer((request, response) => {
-      void this.forward(request, response);
-    });
-    this.edgeServer.listen(0, "127.0.0.1");
-    return listenHttp(this.edgeServer);
+    this.setTarget(targetOrigin);
+    return this.managementOrigin;
   }
 
   setTarget(targetOrigin: string): void {
@@ -305,6 +391,21 @@ class AccessFixture {
       response.end();
       return;
     }
+    const assertion = this.token();
+    if (this.journal) {
+      await proxyHttp({
+        targetBaseUrl: this.targetOrigin,
+        request,
+        response,
+        extraHeaders: { "cf-access-jwt-assertion": assertion },
+        boundary: "management-access-edge",
+        journal: this.journal,
+        ledger: this.ledger,
+        captureSetId: this.captureSetId,
+        canonicalOrigin: this.managementOrigin,
+      });
+      return;
+    }
     const body = await requestBody(request);
     const target = new URL(request.url ?? "/", this.targetOrigin);
     const headers: Record<string, string> = {};
@@ -314,7 +415,8 @@ class AccessFixture {
       }
       headers[name] = Array.isArray(value) ? value.join(", ") : value;
     }
-    headers["cf-access-jwt-assertion"] = this.token();
+    headers.host = new URL(this.managementOrigin).host;
+    headers["cf-access-jwt-assertion"] = assertion;
     if (body.length > 0) headers["content-length"] = String(body.length);
     const upstream = httpRequest(
       {
@@ -576,6 +678,8 @@ async function materializeProcessConfigs(
     ) as Record<string, unknown>;
     config.ui_mode = "assets";
     config.ui_assets_directory = uiAssetsDirectory;
+    config.management_origin = access.managementOrigin;
+    config.callback_origin = access.callbackOrigin;
     await writePrivateFile(
       serverPath,
       JSON.stringify(config),
@@ -586,6 +690,8 @@ async function materializeProcessConfigs(
     ) as Record<string, unknown>;
     config.ui_mode = "assets";
     config.ui_assets_directory = uiAssetsDirectory;
+    config.management_origin = access.managementOrigin;
+    config.callback_origin = access.callbackOrigin;
     await writePrivateFile(serverPath, JSON.stringify(config));
   } else {
     const secretDirectory = resolve(root, "server-secrets");
@@ -597,6 +703,8 @@ async function materializeProcessConfigs(
       JSON.stringify({
         schema: "zode.server-config.v1",
         listen: "127.0.0.1:0",
+        management_origin: access.managementOrigin,
+        callback_origin: access.callbackOrigin,
         server_authority_id: "oauth-refresh-browser-server",
         deployment: "server_only",
         ui_mode: "assets",
@@ -667,9 +775,15 @@ class ZodeBrowserHarness {
     private readonly tempRoot: string,
     readonly managementOrigin: string,
     readonly provider: OAuthProviderFixture,
+    private readonly journal?: RecordingJournalContract,
+    private readonly captureSetId?: string,
   ) {}
 
-  static async start(browser: Browser, provider: OAuthProviderFixture): Promise<ZodeBrowserHarness> {
+  static async start(
+    browser: Browser,
+    provider: OAuthProviderFixture,
+    options: { recordE2EName?: string } = {},
+  ): Promise<ZodeBrowserHarness> {
     const serverBinary =
       process.env.ZODE_WEB_E2E_SERVER_BIN ??
       process.env.ZODE_SERVER_BIN ??
@@ -683,7 +797,23 @@ class ZodeBrowserHarness {
       throw new Error("ZODE_WEB_E2E_ENDPOINT_BIN is required unless all-in-one is explicitly configured");
     }
     const tempRoot = await mkdtemp(resolve(tmpdir(), "zode-oauth-refresh-browser-"));
-    const access = await AccessFixture.start();
+    const ledger = options.recordE2EName ? new SecretLedger() : undefined;
+    ledger?.add("synthetic_oauth_refresh_marker", SYNTHETIC_SECRET_MARKER);
+    const journal = options.recordE2EName
+      ? new RecordingJournal({
+          rootDir: resolve(
+            REPO_ROOT,
+            "target/test-recordings/quarantine",
+            `provider-descriptor-${Date.now()}-${randomUUID()}`,
+          ),
+          ledger: ledger as SecretLedgerContract,
+        })
+      : undefined;
+    const captureSetId = journal?.beginCaptureSet({
+      e2eName: options.recordE2EName as string,
+      maxMembers: 16,
+    });
+    const access = await AccessFixture.start({ ledger, journal, captureSetId });
     const configs = await materializeProcessConfigs(tempRoot, provider, access);
     const environment = {
       ZODE_WEB_E2E_OAUTH_FIXTURE_ORIGIN: provider.origin,
@@ -721,11 +851,77 @@ class ZodeBrowserHarness {
       tempRoot,
       managementOrigin,
       provider,
+      journal,
+      captureSetId,
     );
   }
 
   get context(): BrowserContext {
     return this.browserContext;
+  }
+
+  async retainProviderDescriptorFailure(
+    e2eName: string,
+    requestPath: string,
+    status: number,
+  ): Promise<{ cassettePath?: string; rawPath?: string }> {
+    if (!this.journal || !this.captureSetId) {
+      throw new Error("provider descriptor recorder was not initialized before the request");
+    }
+    const record = this.journal.first({
+      boundary: "management-access-edge",
+      requestPath,
+      responseStatus: status,
+    });
+    if (!record) {
+      throw new Error("provider descriptor failure exchange was not retained");
+    }
+    if (process.env.ZODE_CAPTURE_FIRST_OCCURRENCE !== "1") {
+      const flushed = this.journal.flushCaptureSet(this.captureSetId, {
+        firstFailureRecordingId: record.recordingId,
+      }) as { records?: Array<{ recordingId: string; rawPath?: string }> };
+      return {
+        rawPath: flushed.records?.find(
+          (candidate) => candidate.recordingId === record.recordingId,
+        )?.rawPath,
+      };
+    }
+    const promoted = await this.journal.promoteCaptureSet(this.captureSetId, {
+      e2eName,
+      classification: "PRODUCT_ROUTE_MISSING",
+      firstObserved: `${requestPath} returned HTTP ${status}`,
+      firstFailureRecordingId: record.recordingId,
+      destinationDirectory: FIXTURE_DIR,
+      replay: async (envelope: Record<string, unknown>) => {
+        const results = await this.journal?.replay(envelope, {
+          baseUrl: this.managementOrigin,
+          boundaryBaseUrls: {
+            "access-jwks-fixture": new URL(this.access.jwksUrl).origin,
+          },
+        });
+        const reproduced = results?.some(
+          (result) =>
+            result.path === requestPath &&
+            result.status === status,
+        );
+        return { ok: reproduced === true, results };
+      },
+    });
+    return { cassettePath: promoted.cassettePath };
+  }
+
+  async replayProviderDescriptorCassette(
+    cassettePath: string,
+  ): Promise<Array<{ path: string; status: number }>> {
+    if (!this.journal) {
+      throw new Error("provider descriptor recorder was not initialized for replay");
+    }
+    return this.journal.replay(cassettePath, {
+      baseUrl: this.managementOrigin,
+      boundaryBaseUrls: {
+        "access-jwks-fixture": new URL(this.access.jwksUrl).origin,
+      },
+    });
   }
 
   async restartServer(): Promise<void> {
@@ -1620,6 +1816,68 @@ function assertEmptyProviderListProjection(value: JsonValue): void {
   }
 }
 
+async function findProviderDescriptorCassette(): Promise<string | undefined> {
+  const matches: string[] = [];
+  for (const entry of await readdir(FIXTURE_DIR)) {
+    if (!entry.endsWith(".v1.json")) continue;
+    const pathname = resolve(FIXTURE_DIR, entry);
+    const value = JSON.parse(await readFile(pathname, "utf8")) as {
+      schema?: unknown;
+      version?: unknown;
+      e2e_name?: unknown;
+      classification?: unknown;
+      exchanges?: Array<{
+        boundary?: unknown;
+        method?: unknown;
+        path?: unknown;
+        response?: { status?: unknown };
+      }>;
+    };
+    if (value.e2e_name !== PROVIDER_DESCRIPTOR_E2E) continue;
+    const failure = value.exchanges?.find(
+      (exchange) =>
+        exchange.boundary === "management-access-edge" &&
+        exchange.method === "PUT" &&
+        exchange.path === PROVIDER_DESCRIPTOR_PATH,
+    );
+    if (
+      value.schema !== "zode.http-incident-recording.v1" ||
+      value.version !== 1 ||
+      value.classification !== "PRODUCT_ROUTE_MISSING" ||
+      failure?.response?.status !== 404
+    ) {
+      throw new Error("provider descriptor cassette contract is invalid");
+    }
+    matches.push(pathname);
+  }
+  if (matches.length > 1) {
+    throw new Error("provider descriptor E2E found more than one immutable cassette");
+  }
+  return matches[0];
+}
+
+function assertProviderDescriptor(
+  value: JsonValue,
+  providerBaseUrl: string,
+): asserts value is { [key: string]: JsonValue } {
+  expect(value).toEqual({
+    schema: "zode.provider-descriptor.v1",
+    provider: PROVIDER_DESCRIPTOR_ID,
+    revision: 1,
+    kind: "openai_compatible",
+    base_url: providerBaseUrl,
+    models: ["descriptor-model-a", "descriptor-model-b"],
+    options: { organization: "descriptor-org" },
+  });
+  const serialized = JSON.stringify(value);
+  for (const forbidden of FORBIDDEN_PROVIDER_LIST_FIELDS) {
+    expect(serialized).not.toContain(`"${forbidden}"`);
+  }
+  for (const marker of SECRET_MARKERS) {
+    expect(serialized).not.toContain(marker);
+  }
+}
+
 test.describe("Server provider-list foundation", () => {
   test(
     "e2e_server_provider_list_returns_versioned_empty_authority_projection",
@@ -1645,6 +1903,157 @@ test.describe("Server provider-list foundation", () => {
           });
         }
         throw error;
+      } finally {
+        await page.close().catch(() => undefined);
+        await harness.close().catch(() => undefined);
+        await provider.stop().catch(() => undefined);
+      }
+    },
+  );
+
+  test(
+    PROVIDER_DESCRIPTOR_E2E,
+    async ({ browser }) => {
+      test.setTimeout(180_000);
+      const cassette = await findProviderDescriptorCassette();
+      const provider = await OAuthProviderFixture.start();
+      const harness = await ZodeBrowserHarness.start(browser, provider, {
+        recordE2EName: PROVIDER_DESCRIPTOR_E2E,
+      });
+      const page = await harness.context.newPage();
+      const providerBaseUrl = "https://models.descriptor-roundtrip.test/v1";
+      const requestBody = {
+        kind: "openai_compatible",
+        base_url: providerBaseUrl,
+        models: ["descriptor-model-a", "descriptor-model-b"],
+        options: { organization: "descriptor-org" },
+      };
+      try {
+        const system = await page.goto(`${harness.managementOrigin}/v1/system`, {
+          waitUntil: "commit",
+          timeout: HTTP_TIMEOUT,
+        });
+        expect(system?.status()).toBe(200);
+        const mutation = await page.evaluate(
+          async ({ path, body }) => {
+            const response = await fetch(path, {
+              method: "PUT",
+              headers: {
+                "content-type": "application/json",
+                "idempotency-key": "provider-descriptor-roundtrip",
+              },
+              body: JSON.stringify(body),
+            });
+            return {
+              status: response.status,
+              text: await response.text(),
+            };
+          },
+          { path: PROVIDER_DESCRIPTOR_PATH, body: requestBody },
+        );
+
+        if (mutation.status !== 200) {
+          if (cassette && mutation.status === 404) {
+            const replay = await harness.replayProviderDescriptorCassette(cassette);
+            expect(
+              replay.some(
+                (result) =>
+                  result.path === PROVIDER_DESCRIPTOR_PATH &&
+                result.status === 404,
+              ),
+            ).toBe(true);
+            throw new Error("provider descriptor route still replays its retained HTTP 404");
+          }
+          const retained = await harness.retainProviderDescriptorFailure(
+            PROVIDER_DESCRIPTOR_E2E,
+            PROVIDER_DESCRIPTOR_PATH,
+            mutation.status,
+          );
+          throw new Error(
+            `provider descriptor mutation returned ${mutation.status}; retained=${retained.cassettePath ?? retained.rawPath ?? "unavailable"}`,
+          );
+        }
+
+        const descriptor = JSON.parse(mutation.text) as JsonValue;
+        assertProviderDescriptor(descriptor, providerBaseUrl);
+
+        const replayMutation = await page.evaluate(
+          async ({ path, body }) => {
+            const response = await fetch(path, {
+              method: "PUT",
+              headers: {
+                "content-type": "application/json",
+                "idempotency-key": "provider-descriptor-roundtrip",
+              },
+              body: JSON.stringify(body),
+            });
+            return { status: response.status, text: await response.text() };
+          },
+          { path: PROVIDER_DESCRIPTOR_PATH, body: requestBody },
+        );
+        expect(replayMutation.status).toBe(200);
+        expect(replayMutation.text).toBe(mutation.text);
+
+        const list = await page.evaluate(async () => {
+          const response = await fetch("/v1/providers", {
+            headers: { accept: "application/json" },
+          });
+          return { status: response.status, value: await response.json() };
+        });
+        expect(list.status).toBe(200);
+        expect(list.value).toEqual({
+          schema: "zode.providers.v1",
+          providers: [
+            {
+              provider: PROVIDER_DESCRIPTOR_ID,
+              descriptor: {
+                revision: 1,
+                kind: "openai_compatible",
+                base_url: providerBaseUrl,
+                models: ["descriptor-model-a", "descriptor-model-b"],
+                options: { organization: "descriptor-org" },
+              },
+              default_profile_id: null,
+              auth_status: "unconfigured",
+              auth_profile_count: 0,
+            },
+          ],
+        });
+
+        await harness.restartServer();
+        const restarted = await page.evaluate(async () => {
+          const response = await fetch("/v1/providers", {
+            headers: { accept: "application/json" },
+          });
+          return { status: response.status, value: await response.json() };
+        });
+        expect(restarted).toEqual(list);
+
+        if (cassette) {
+          let fixedReplayObserved = false;
+          try {
+            await harness.replayProviderDescriptorCassette(cassette);
+          } catch (error) {
+            const replayError = error as {
+              classification?: unknown;
+              details?: { actualStatus?: unknown };
+            };
+            if (
+              replayError.classification === "REPLAY_MISMATCH" &&
+              replayError.details?.actualStatus === 200
+            ) {
+              fixedReplayObserved = true;
+            } else if (replayError.classification === "REPLAY_RESPONSE_HEADER_MISMATCH") {
+              // The exact 200 body, list projection, idempotent replay, and restart
+              // were already asserted above. A new JSON content type is the first
+              // strict mismatch encountered against the retained empty 404.
+              fixedReplayObserved = true;
+            } else {
+              throw error;
+            }
+          }
+          expect(fixedReplayObserved).toBe(true);
+        }
       } finally {
         await page.close().catch(() => undefined);
         await harness.close().catch(() => undefined);

@@ -1,0 +1,52 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "0002-80b283df-ff3c-4896-b4af-7732babe5094-090e9437-7f1a-46d8-89fd-fc7098d83409",
+  "e2e_name": "e2e_browser_management_surface_authority_rejects_userinfo",
+  "boundary": "browser-capture-set",
+  "first_observed": "userinfo in the actual Host authority selected the Access-protected management surface",
+  "classification": "MANAGEMENT_SURFACE_USERINFO_AUTHORITY_ACCEPTED",
+  "source_digest": "53993c7466de7fcb13fe62f91aebfaa6406932fbe642e11acdc3e1c4bbd66c18",
+  "first_failure_recording_id": "000003-c88e2f4d-9201-426a-b459-1c84c50e78e6",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000003-c88e2f4d-9201-426a-b459-1c84c50e78e6",
+      "boundary": "management-authority-edge",
+      "method": "GET",
+      "path": "/v1/system",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "attacker@127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "chunks": [
+          {
+            "offset_us": 3393.583,
+            "data_base64": "eyJkZXBsb3ltZW50Ijoic2VydmVyX29ubHkiLCJmZWF0dXJlcyI6eyJwcm92aWRlcl9hdXRoIjp0cnVlLCJyZW1vdGVfZW5kcG9pbnRzIjp0cnVlfSwiaW5ncmVzcyI6eyJjYWxsYmFja19vcmlnaW4iOiJzZXBhcmF0ZSIsIm1hbmFnZW1lbnRfYXV0aCI6ImNsb3VkZmxhcmVfYWNjZXNzIn0sImxvY2FsX2VuZHBvaW50X2lkIjpudWxsLCJzY2hlbWEiOiJ6b2RlLnN5c3RlbS52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>"
+  ],
+  "integrity_sha256": "4d08778e8c14c0c3ac9f878adb02bc42fa462fc3bdf16f479d04c2b9ccb1f0ba"
+}

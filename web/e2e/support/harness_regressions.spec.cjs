@@ -308,7 +308,7 @@ test.describe('Zode web E2E harness regressions', () => {
     test.setTimeout(120_000);
     let harness;
     try {
-      harness = await createWebE2EHarness({ uiMode: 'assets' });
+      harness = await createWebE2EHarness({ uiMode: 'assets', includeServerOrigins: true });
       const captureSetId = harness.beginCaptureSet({
         e2eName: 'e2e_first_failure_cassette_tracks_real_browser_exchange',
         maxMembers: 16,

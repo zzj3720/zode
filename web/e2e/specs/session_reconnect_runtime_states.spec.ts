@@ -1234,6 +1234,8 @@ class Topology {
       JSON.stringify({
         schema: "zode.server-config.v1",
         listen: `127.0.0.1:${serverPort}`,
+        management_origin: `http://127.0.0.1:${serverPort}`,
+        callback_origin: `http://127.0.0.2:${serverPort}`,
         server_authority_id: CONTROLLER_AUTHORITY,
         deployment: "server_only",
         ui_mode: "api_only",

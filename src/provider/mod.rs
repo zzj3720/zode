@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
@@ -32,6 +32,7 @@ use url::Url;
 use crate::{
     domain::{
         DurablePayload, ProviderExecutionSelection, ToolCall, TranscriptMessage, TranscriptRole,
+        MAX_PROVIDER_EXECUTION_OPTIONS_BYTES,
     },
     runtime::{ModelError, ModelExecutor, ModelOutcome, ModelRequest},
 };
@@ -444,6 +445,13 @@ pub fn validate_provider_execution_descriptor(
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
+        || serde_json::to_vec(&descriptor.options).map_or(true, |bytes| {
+            bytes.len() > MAX_PROVIDER_EXECUTION_OPTIONS_BYTES
+        })
+        || descriptor
+            .options
+            .iter()
+            .any(|(key, value)| sensitive_option_key(key) || contains_sensitive_option(value))
     {
         return Err(ProviderExecutionValidationError::Invalid);
     }
@@ -510,8 +518,18 @@ impl AimuxProvider {
                 )
             })
             .collect::<Vec<_>>();
+        let provider_options: Option<HashMap<String, Value>> =
+            (!selection.provider_execution.options.is_empty()).then(|| {
+                selection
+                    .provider_execution
+                    .options
+                    .clone()
+                    .into_iter()
+                    .collect()
+            });
         let options = CallOptions {
             tools: Some(tools),
+            provider_options,
             ..CallOptions::new(prompt)
         };
         let config = OpenAIConfig::new(credential.secret)
@@ -1126,6 +1144,26 @@ fn current_time_ms() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
         .unwrap_or(i64::MAX)
+}
+
+fn sensitive_option_key(value: &str) -> bool {
+    let key = value.to_ascii_lowercase().replace('-', "_");
+    key == "authorization"
+        || key == "headers"
+        || key.contains("api_key")
+        || key.contains("access_token")
+        || key.contains("refresh_token")
+        || key.contains("secret")
+}
+
+fn contains_sensitive_option(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .any(|(key, value)| sensitive_option_key(key) || contains_sensitive_option(value)),
+        Value::Array(values) => values.iter().any(contains_sensitive_option),
+        _ => false,
+    }
 }
 
 fn origin_allowed(base: &Url, allowed_origins: &[String]) -> bool {

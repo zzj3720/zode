@@ -1,0 +1,36 @@
+{
+  "schema": "zode.process-incident-recording.v1",
+  "version": 1,
+  "recording_id": "process-98221-1786143384323272000-1",
+  "e2e_name": "e2e_second_server_control_database_alias_with_distinct_secret_store_never_becomes_ready",
+  "classification": "CONTROL_STORE_DATABASE_ALIAS_REJECTION_MISCLASSIFIED__later_test_reproduction_of_gap",
+  "first_observed": "relation=later_test_reproduction_of_gap; alias=hardlink; expected=server_already_owned/server_store_lock; actual=control_store_integrity/control_store; ready_emitted=false",
+  "config": {
+    "label": "server-readiness-database-alias-hardlink",
+    "bytes_hex": "7b22616c696173223a22686172646c696e6b222c22653265223a226532655f7365636f6e645f7365727665725f636f6e74726f6c5f64617461626173655f616c6961735f776974685f64697374696e63745f7365637265745f73746f72655f6e657665725f6265636f6d65735f7265616479222c22656e747279223a227265616c207a6f64652d736572766572202d2d636f6e6669672073686172696e6720616e20616c72656164792d6f776e656420636f6e74726f6c206461746162617365222c2265787065637465645f61667465725f666978223a7b2266697273745f7365727665725f72756e6e696e67223a747275652c2270657273697374656e745f73746f72655f756e6368616e676564223a747275652c227265616479223a66616c73652c22737461727475705f6661696c757265223a22636f64653d7365727665725f616c72656164795f6f776e65642070686173653d7365727665725f73746f72655f6c6f636b227d2c2272656c6174696f6e223a226c617465725f746573745f726570726f64756374696f6e5f6f665f676170222c22736368656d61223a227a6f64652e7365727665722d72656164696e6573732d64617461626173652d616c6961732d6761702d7265706c61792e7631227d",
+    "sha256": "38e21ff649006bb372eeff632df1a9da2bd1cebd5c1639c6a2ced6d3fce19d3a"
+  },
+  "processes": [
+    {
+      "name": "zode-server-database-alias-hardlink",
+      "stdout_hex": "",
+      "stderr_hex": "5a4f44455f5345525645525f535441525455505f4641494c55524520636f64653d636f6e74726f6c5f73746f72655f696e746567726974792070686173653d636f6e74726f6c5f73746f72650a",
+      "exit_code": 1,
+      "signal": null,
+      "termination": "bounded_stop_after_database_alias_rejection",
+      "stop": {
+        "observed_pids": [
+          98233
+        ],
+        "reaped_pids": [
+          98233
+        ],
+        "leaked_pids": [],
+        "timed_out": false,
+        "flush_status": "ok",
+        "proof": true
+      }
+    }
+  ],
+  "integrity_sha256": "0ad79b678f4a677b1909a927d5d0b3062798d0cf5a427408cae51e3e2947b78b"
+}

@@ -1,3 +1,6 @@
+#[path = "../../tests/support/process_capture.rs"]
+mod process_capture;
+
 use std::{
     collections::BTreeMap,
     env,
@@ -12,8 +15,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use process_capture::{
+    ProcessCaptureSet, ProcessIncidentReplay, ProcessObservation, ProcessReplayProof,
+    ProcessStopObservation,
+};
 use rusqlite::{Connection, OptionalExtension};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 const READY_PREFIX: &str = "ZODE_SERVER_READY ";
@@ -22,6 +29,23 @@ const MISSING_SUBJECT_KEY_FAILURE: &str = "code=missing_subject_key phase=access
 const SERVER_ALREADY_OWNED_FAILURE: &str = "code=server_already_owned phase=server_store_lock";
 const CONTROL_STORE_INTEGRITY_FAILURE: &str = "code=control_store_integrity phase=control_store";
 const CAPTURE_FIRST_OCCURRENCE_ENV: &str = "ZODE_CAPTURE_FIRST_OCCURRENCE";
+const METADATA_CAPTURE_ENV: &str = "ZODE_CAPTURE_READINESS_METADATA_LATER_GAP";
+const METADATA_RECOVER_ENV: &str = "ZODE_RECOVER_READINESS_METADATA_LATER_GAP";
+const METADATA_E2E: &str = "e2e_initialized_server_missing_metadata_never_reinitializes";
+const METADATA_RELATION: &str = "later_test_reproduction_of_gap";
+const METADATA_CLASSIFICATION: &str =
+    "CONTROL_STORE_METADATA_DAMAGE_MUTATED_PERSISTENT_FILES__later_test_reproduction_of_gap";
+const METADATA_FIRST_OBSERVED: &str = "relation=later_test_reproduction_of_gap; startup=non_ready_bind_failure_after_metadata_recreation; singleton_row_store_unchanged=false; metadata_table_store_unchanged=false";
+const METADATA_CASSETTE: &str =
+    "tests/fixtures/incidents/server-readiness-missing-metadata-later-gap.v1.json";
+const ALIAS_CAPTURE_ENV: &str = "ZODE_CAPTURE_READINESS_DATABASE_ALIAS_LATER_GAP";
+const ALIAS_RECOVER_EXACT_ENV: &str = "ZODE_RECOVER_READINESS_DATABASE_ALIAS_EXACT_LATER_GAP";
+const ALIAS_RECOVER_HARDLINK_ENV: &str = "ZODE_RECOVER_READINESS_DATABASE_ALIAS_HARDLINK_LATER_GAP";
+const ALIAS_E2E: &str =
+    "e2e_second_server_control_database_alias_with_distinct_secret_store_never_becomes_ready";
+const ALIAS_RELATION: &str = "later_test_reproduction_of_gap";
+const ALIAS_CLASSIFICATION: &str =
+    "CONTROL_STORE_DATABASE_ALIAS_REJECTION_MISCLASSIFIED__later_test_reproduction_of_gap";
 const STARTUP_FAILURE_EXIT_CODE: i32 = 1;
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -194,10 +218,46 @@ fn e2e_second_server_on_same_stores_never_becomes_ready() -> TestResult {
 
 #[test]
 fn e2e_initialized_server_missing_metadata_never_reinitializes() -> TestResult {
+    if let Some(raw) = env::var_os(METADATA_RECOVER_ENV) {
+        return recover_metadata_reproduction(PathBuf::from(raw));
+    }
+    if env::var_os(METADATA_CAPTURE_ENV).is_some() {
+        return capture_metadata_reproduction();
+    }
+    let cassette = metadata_cassette();
+    if cassette.exists() {
+        return replay_metadata_after_fix(&cassette);
+    }
+    Err(io::Error::other(
+        "tracked readiness metadata later-gap cassette is missing; use the explicitly approved capture entry before production repair",
+    )
+    .into())
+}
+
+fn run_metadata_cases_without_capture() -> TestResult {
     let mut failures = Vec::new();
     for damage in [MetadataDamage::SingletonRow, MetadataDamage::Table] {
-        if let Err(error) = run_missing_metadata_case(damage) {
-            failures.push(format!("{}: {error}", damage.label()));
+        match observe_missing_metadata_case(damage, None) {
+            Ok(outcome) if !outcome.store_unchanged => failures.push(format!(
+                "{}: failed restart changed persistent store file set/content/mode",
+                damage.label()
+            )),
+            Ok(outcome) if !outcome.damage_preserved => failures.push(format!(
+                "{}: failed restart recreated missing authority metadata",
+                damage.label()
+            )),
+            Ok(outcome) if !outcome.non_ready => {
+                failures.push(format!("{}: failed restart emitted READY", damage.label()))
+            }
+            Ok(outcome) if outcome.startup_failure_error.is_some() => failures.push(format!(
+                "{}: {}",
+                damage.label(),
+                outcome
+                    .startup_failure_error
+                    .expect("guarded startup failure is present")
+            )),
+            Ok(_) => {}
+            Err(error) => failures.push(format!("{}: {error}", damage.label())),
         }
     }
     finish_cases("missing metadata authority", failures)
@@ -206,12 +266,29 @@ fn e2e_initialized_server_missing_metadata_never_reinitializes() -> TestResult {
 #[test]
 fn e2e_second_server_control_database_alias_with_distinct_secret_store_never_becomes_ready(
 ) -> TestResult {
+    if let Some(raw) = env::var_os(ALIAS_RECOVER_EXACT_ENV) {
+        return recover_control_database_alias(ControlDatabaseAlias::ExactPath, PathBuf::from(raw));
+    }
+    if let Some(raw) = env::var_os(ALIAS_RECOVER_HARDLINK_ENV) {
+        return recover_control_database_alias(ControlDatabaseAlias::HardLink, PathBuf::from(raw));
+    }
+    if env::var_os(ALIAS_CAPTURE_ENV).is_some() {
+        return capture_control_database_alias_sources();
+    }
+    for alias in [
+        ControlDatabaseAlias::ExactPath,
+        ControlDatabaseAlias::HardLink,
+    ] {
+        let replay =
+            ProcessIncidentReplay::load(alias_cassette(alias), ALIAS_E2E, &[SECRET_MARKER])?;
+        assert_alias_replay_identity(alias, &replay)?;
+    }
     let mut failures = Vec::new();
     for alias in [
         ControlDatabaseAlias::ExactPath,
         ControlDatabaseAlias::HardLink,
     ] {
-        if let Err(error) = run_control_database_alias_case(alias) {
+        if let Err(error) = run_control_database_alias_case(alias, None) {
             failures.push(format!("{}: {error}", alias.label()));
         }
     }
@@ -222,6 +299,13 @@ fn e2e_second_server_control_database_alias_with_distinct_secret_store_never_bec
 enum MetadataDamage {
     SingletonRow,
     Table,
+}
+
+struct MetadataCaseOutcome {
+    store_unchanged: bool,
+    damage_preserved: bool,
+    non_ready: bool,
+    startup_failure_error: Option<String>,
 }
 
 impl MetadataDamage {
@@ -236,6 +320,13 @@ impl MetadataDamage {
         match self {
             Self::SingletonRow => "server-readiness-metadata-row-fixed-listen-first-ready-v2",
             Self::Table => "server-readiness-metadata-table-fixed-listen-first-ready-v2",
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::SingletonRow => "metadata-singleton-row",
+            Self::Table => "metadata-table",
         }
     }
 
@@ -300,7 +391,10 @@ impl ControlDatabaseAlias {
     }
 }
 
-fn run_missing_metadata_case(damage: MetadataDamage) -> TestResult {
+fn observe_missing_metadata_case(
+    damage: MetadataDamage,
+    capture: Option<&mut ProcessCaptureSet>,
+) -> TestResult<MetadataCaseOutcome> {
     let temp = tempfile::tempdir()?;
     let config = ConfigFixture::new(temp.path())?;
     establish_ready_baseline(&config, damage.label())?;
@@ -308,6 +402,7 @@ fn run_missing_metadata_case(damage: MetadataDamage) -> TestResult {
     let before = config.live_store_snapshot()?;
     let held_listen = hold_public_listen(config.listen_addr)?;
     let mut restarted = ServerChild::spawn(&config.config_path)?;
+    let restarted_pid = restarted.pid()?;
     let observation = restarted.observe(READY_TIMEOUT)?;
     let stopped = restarted.stop()?;
     if held_listen.local_addr()? != config.listen_addr {
@@ -316,6 +411,9 @@ fn run_missing_metadata_case(damage: MetadataDamage) -> TestResult {
     drop(held_listen);
     let after = config.live_store_snapshot()?;
     let forbidden = config.forbidden_markers();
+    if let Some(capture) = capture {
+        capture.capture_process(process_observation(damage, restarted_pid, &stopped))?;
+    }
     assert_safe_output(damage.label(), &stopped, &forbidden)?;
     let capture = capture_first_readiness_failure(
         damage.evidence_id(),
@@ -331,30 +429,402 @@ fn run_missing_metadata_case(damage: MetadataDamage) -> TestResult {
         &forbidden,
     );
     let port_released = assert_listen_released(config.listen_addr);
-    let startup = assert_startup_failure(
+    let startup_failure_error = assert_startup_failure(
         damage.label(),
         &observation,
         &stopped,
         CONTROL_STORE_INTEGRITY_FAILURE,
         &forbidden,
-    );
+    )
+    .err()
+    .map(|error| error.to_string());
+    let non_ready = !matches!(observation, Observation::Ready) && !stopped.contains_ready();
     let damage_preserved = damage.is_present(&config.control_database)?;
     config.assert_persistent_secret_free()?;
     capture?;
     port_released?;
-    if before != after {
+    Ok(MetadataCaseOutcome {
+        store_unchanged: before == after,
+        damage_preserved,
+        non_ready,
+        startup_failure_error,
+    })
+}
+
+fn metadata_quarantine() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/test-recordings/quarantine")
+        .join("server-readiness-metadata-later")
+}
+
+fn metadata_cassette() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(METADATA_CASSETTE)
+}
+
+fn metadata_replay_config() -> TestResult<Vec<u8>> {
+    Ok(serde_json::to_vec(&json!({
+        "schema": "zode.server-readiness-metadata-gap-replay.v1",
+        "e2e": METADATA_E2E,
+        "relation": METADATA_RELATION,
+        "entry": "real zode-server --config with a pre-damaged initialized control store",
+        "damage": ["missing_metadata_singleton_row", "missing_metadata_table"],
+        "expected_after_fix": {
+            "ready": false,
+            "startup_failure": CONTROL_STORE_INTEGRITY_FAILURE,
+            "persistent_store_unchanged": true
+        }
+    }))?)
+}
+
+fn assert_metadata_replay_identity(replay: &ProcessIncidentReplay) -> TestResult {
+    let config: Value = serde_json::from_slice(replay.config_bytes())?;
+    if replay.config_label() != "server-readiness-metadata-damage"
+        || replay.classification() != METADATA_CLASSIFICATION
+        || replay.first_observed() != METADATA_FIRST_OBSERVED
+        || config["schema"] != "zode.server-readiness-metadata-gap-replay.v1"
+        || config["e2e"] != METADATA_E2E
+        || config["relation"] != METADATA_RELATION
+        || config["expected_after_fix"]["ready"] != false
+        || config["expected_after_fix"]["startup_failure"] != CONTROL_STORE_INTEGRITY_FAILURE
+        || config["expected_after_fix"]["persistent_store_unchanged"] != true
+        || replay.config_bytes() != metadata_replay_config()?
+    {
         return Err(io::Error::other(
-            "failed restart changed persistent store file set/content/mode",
+            "readiness metadata later-gap cassette changed identity or relation",
         )
         .into());
     }
-    if !damage_preserved {
-        return Err(io::Error::other("failed restart recreated missing authority metadata").into());
-    }
-    startup
+    Ok(())
 }
 
-fn run_control_database_alias_case(alias: ControlDatabaseAlias) -> TestResult {
+fn observe_metadata_cases_captured(capture: &mut ProcessCaptureSet) -> TestResult<bool> {
+    let singleton = observe_missing_metadata_case(MetadataDamage::SingletonRow, Some(capture))?;
+    let table = observe_missing_metadata_case(MetadataDamage::Table, Some(capture))?;
+    Ok(!singleton.store_unchanged
+        && singleton.non_ready
+        && !table.store_unchanged
+        && table.non_ready)
+}
+
+fn flush_metadata_observation(
+    capture: &mut ProcessCaptureSet,
+    expected_red: bool,
+) -> TestResult<PathBuf> {
+    let (classification, first_observed) = if expected_red {
+        (METADATA_CLASSIFICATION, METADATA_FIRST_OBSERVED)
+    } else {
+        (
+            "HARNESS_READINESS_METADATA_LATER_CLASSIFICATION_MISMATCH__later_test_reproduction_of_gap",
+            "relation=later_test_reproduction_of_gap; both real process observations were retained before classification but the expected store-mutation red was incomplete",
+        )
+    };
+    capture.flush(classification, first_observed)
+}
+
+fn capture_metadata_same_entry_replay(
+    replay: &ProcessIncidentReplay,
+) -> TestResult<(bool, PathBuf)> {
+    let mut capture =
+        ProcessCaptureSet::new(metadata_quarantine(), METADATA_E2E, &[SECRET_MARKER])?;
+    capture.capture_config("server-readiness-metadata-damage", replay.config_bytes())?;
+    let expected_red = observe_metadata_cases_captured(&mut capture)?;
+    let raw = flush_metadata_observation(&mut capture, expected_red)?;
+    Ok((expected_red, raw))
+}
+
+fn metadata_replay_proof(replay: &ProcessIncidentReplay) -> ProcessReplayProof {
+    let fingerprint = format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{}\0{}\0same-public-entry-red-reproduced",
+                replay.classification(),
+                replay.first_observed()
+            )
+            .as_bytes()
+        )
+    );
+    ProcessReplayProof {
+        matched: true,
+        fingerprint,
+        source_digest: replay.source_digest().to_owned(),
+    }
+}
+
+fn promote_metadata_after_replay(replay: &ProcessIncidentReplay, source: &Path) -> TestResult {
+    assert_metadata_replay_identity(replay)?;
+    let (expected_red, replay_raw) = capture_metadata_same_entry_replay(replay)?;
+    if !expected_red {
+        return Err(io::Error::other(format!(
+            "same-entry readiness replay was retained before classification but did not reproduce the typed store-mutation red; replay={}",
+            replay_raw.display()
+        ))
+        .into());
+    }
+    let destination = metadata_cassette();
+    replay.promote_immutable(
+        &destination,
+        &metadata_replay_proof(replay),
+        &[SECRET_MARKER],
+    )?;
+    Err(io::Error::other(format!(
+        "readiness metadata hardening remains red; relation={METADATA_RELATION}; source={}; replay={}; cassette={}",
+        source.display(),
+        replay_raw.display(),
+        destination.display()
+    ))
+    .into())
+}
+
+fn capture_metadata_reproduction() -> TestResult {
+    if metadata_cassette().exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "readiness metadata later-gap cassette is immutable",
+        )
+        .into());
+    }
+    let config = metadata_replay_config()?;
+    let mut capture =
+        ProcessCaptureSet::new(metadata_quarantine(), METADATA_E2E, &[SECRET_MARKER])?;
+    capture.capture_config("server-readiness-metadata-damage", &config)?;
+    let expected_red = observe_metadata_cases_captured(&mut capture)?;
+    let raw = flush_metadata_observation(&mut capture, expected_red)?;
+    if !expected_red {
+        return Err(io::Error::other(format!(
+            "later readiness reproduction did not retain both typed store-mutation reds; process capture={}",
+            raw.display()
+        ))
+        .into());
+    }
+    let replay = ProcessIncidentReplay::load(&raw, METADATA_E2E, &[SECRET_MARKER])?;
+    promote_metadata_after_replay(&replay, &raw)
+}
+
+fn recover_metadata_reproduction(raw: PathBuf) -> TestResult {
+    if metadata_cassette().exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "readiness metadata later-gap cassette is immutable",
+        )
+        .into());
+    }
+    let replay = ProcessIncidentReplay::load(&raw, METADATA_E2E, &[SECRET_MARKER])?;
+    promote_metadata_after_replay(&replay, &raw)
+}
+
+fn replay_metadata_after_fix(cassette: &Path) -> TestResult {
+    let replay = ProcessIncidentReplay::load(cassette, METADATA_E2E, &[SECRET_MARKER])?;
+    assert_metadata_replay_identity(&replay)?;
+    run_metadata_cases_without_capture()
+}
+
+fn alias_quarantine(alias: ControlDatabaseAlias) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/test-recordings/quarantine")
+        .join("server-readiness-database-alias-later")
+        .join(alias.label_slug())
+}
+
+fn alias_cassette(alias: ControlDatabaseAlias) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/incidents")
+        .join(format!(
+            "server-readiness-database-alias-{}-later-gap.v1.json",
+            alias.label_slug()
+        ))
+}
+
+fn alias_first_observed(alias: ControlDatabaseAlias) -> String {
+    format!(
+        "relation={ALIAS_RELATION}; alias={}; expected=server_already_owned/server_store_lock; actual=control_store_integrity/control_store; ready_emitted=false",
+        alias.label_slug()
+    )
+}
+
+fn alias_replay_config(alias: ControlDatabaseAlias) -> TestResult<Vec<u8>> {
+    Ok(serde_json::to_vec(&json!({
+        "schema": "zode.server-readiness-database-alias-gap-replay.v1",
+        "e2e": ALIAS_E2E,
+        "relation": ALIAS_RELATION,
+        "entry": "real zode-server --config sharing an already-owned control database",
+        "alias": alias.label_slug(),
+        "expected_after_fix": {
+            "ready": false,
+            "startup_failure": SERVER_ALREADY_OWNED_FAILURE,
+            "first_server_running": true,
+            "persistent_store_unchanged": true
+        }
+    }))?)
+}
+
+fn capture_control_database_alias_source(alias: ControlDatabaseAlias) -> TestResult<PathBuf> {
+    let config = alias_replay_config(alias)?;
+    let mut capture = ProcessCaptureSet::new(alias_quarantine(alias), ALIAS_E2E, &[SECRET_MARKER])?;
+    capture.capture_config(
+        format!("server-readiness-database-alias-{}", alias.label_slug()),
+        &config,
+    )?;
+    let observed = run_control_database_alias_case(alias, Some(&mut capture));
+    let raw = capture
+        .flushed_path()
+        .ok_or_else(|| io::Error::other("database alias process capture was not flushed"))?
+        .to_path_buf();
+    if observed.is_ok() {
+        return Err(io::Error::other(format!(
+            "{} unexpectedly matched the stable ownership rejection while capturing a required red; raw={}",
+            alias.label(),
+            raw.display()
+        ))
+        .into());
+    }
+    let replay = ProcessIncidentReplay::load(&raw, ALIAS_E2E, &[SECRET_MARKER])?;
+    assert_alias_replay_identity(alias, &replay)?;
+    Ok(raw)
+}
+
+fn capture_control_database_alias_sources() -> TestResult {
+    let exact = capture_control_database_alias_source(ControlDatabaseAlias::ExactPath)?;
+    let hardlink = capture_control_database_alias_source(ControlDatabaseAlias::HardLink)?;
+    Err(io::Error::other(format!(
+        "database alias later reproductions retained before repair; relation={ALIAS_RELATION}; exact={}; hardlink={}",
+        exact.display(),
+        hardlink.display()
+    ))
+    .into())
+}
+
+fn assert_alias_replay_identity(
+    alias: ControlDatabaseAlias,
+    replay: &ProcessIncidentReplay,
+) -> TestResult {
+    let config: Value = serde_json::from_slice(replay.config_bytes())?;
+    if replay.config_label() != format!("server-readiness-database-alias-{}", alias.label_slug())
+        || replay.classification() != ALIAS_CLASSIFICATION
+        || replay.first_observed() != alias_first_observed(alias)
+        || config["schema"] != "zode.server-readiness-database-alias-gap-replay.v1"
+        || config["e2e"] != ALIAS_E2E
+        || config["relation"] != ALIAS_RELATION
+        || config["alias"] != alias.label_slug()
+        || config["expected_after_fix"]["ready"] != false
+        || config["expected_after_fix"]["startup_failure"] != SERVER_ALREADY_OWNED_FAILURE
+        || config["expected_after_fix"]["first_server_running"] != true
+        || config["expected_after_fix"]["persistent_store_unchanged"] != true
+        || replay.config_bytes() != alias_replay_config(alias)?
+    {
+        return Err(io::Error::other(
+            "database alias later-gap cassette changed identity or relation",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn alias_replay_proof(
+    source: &ProcessIncidentReplay,
+    replay: &ProcessIncidentReplay,
+) -> ProcessReplayProof {
+    let fingerprint = format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{}\0{}\0{}\0same-public-entry-red-reproduced",
+                source.classification(),
+                source.first_observed(),
+                replay.source_digest()
+            )
+            .as_bytes()
+        )
+    );
+    ProcessReplayProof {
+        matched: true,
+        fingerprint,
+        source_digest: source.source_digest().to_owned(),
+    }
+}
+
+fn recover_control_database_alias(alias: ControlDatabaseAlias, source_path: PathBuf) -> TestResult {
+    let destination = alias_cassette(alias);
+    if destination.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "database alias later-gap cassette is immutable",
+        )
+        .into());
+    }
+    let source = ProcessIncidentReplay::load(&source_path, ALIAS_E2E, &[SECRET_MARKER])?;
+    assert_alias_replay_identity(alias, &source)?;
+    let replay_path = capture_control_database_alias_source(alias)?;
+    let replay = ProcessIncidentReplay::load(&replay_path, ALIAS_E2E, &[SECRET_MARKER])?;
+    assert_alias_replay_identity(alias, &replay)?;
+    source.promote_immutable(
+        &destination,
+        &alias_replay_proof(&source, &replay),
+        &[SECRET_MARKER],
+    )?;
+    Err(io::Error::other(format!(
+        "database alias readiness hardening remains red; relation={ALIAS_RELATION}; alias={}; source={}; replay={}; cassette={}",
+        alias.label_slug(),
+        source_path.display(),
+        replay_path.display(),
+        destination.display()
+    ))
+    .into())
+}
+
+fn classify_alias_rejection(
+    alias: ControlDatabaseAlias,
+    observation: &Observation,
+    stopped: &StoppedProcess,
+) -> (String, String) {
+    let actual = if contains_startup_failure(stopped, SERVER_ALREADY_OWNED_FAILURE) {
+        "server_already_owned/server_store_lock"
+    } else if contains_startup_failure(stopped, CONTROL_STORE_INTEGRITY_FAILURE) {
+        "control_store_integrity/control_store"
+    } else if matches!(observation, Observation::Ready) || stopped.contains_ready() {
+        "ready"
+    } else if matches!(observation, Observation::TimedOut) {
+        "timeout"
+    } else {
+        "unclassified_non_ready_exit"
+    };
+    let matched = actual == "server_already_owned/server_store_lock";
+    let classification = if matched {
+        "CONTROL_STORE_DATABASE_ALIAS_REJECTION_MATCHED__later_test_reproduction_of_gap"
+    } else {
+        "CONTROL_STORE_DATABASE_ALIAS_REJECTION_MISCLASSIFIED__later_test_reproduction_of_gap"
+    };
+    (
+        classification.to_owned(),
+        if matched {
+            format!(
+                "relation={ALIAS_RELATION}; alias={}; expected=server_already_owned/server_store_lock; actual={actual}; ready_emitted={}",
+                alias.label_slug(),
+                stopped.contains_ready()
+            )
+        } else if actual == "control_store_integrity/control_store" && !stopped.contains_ready() {
+            alias_first_observed(alias)
+        } else {
+            format!(
+                "relation={ALIAS_RELATION}; alias={}; expected=server_already_owned/server_store_lock; actual={actual}; ready_emitted={}",
+                alias.label_slug(),
+                stopped.contains_ready()
+            )
+        },
+    )
+}
+
+fn contains_startup_failure(stopped: &StoppedProcess, expected_failure: &str) -> bool {
+    let expected_line = format!("{STARTUP_FAILURE_PREFIX}{expected_failure}");
+    String::from_utf8_lossy(&stopped.output.stderr)
+        .lines()
+        .any(|line| line.trim_end() == expected_line)
+}
+
+fn run_control_database_alias_case(
+    alias: ControlDatabaseAlias,
+    capture: Option<&mut ProcessCaptureSet>,
+) -> TestResult {
     let temp = tempfile::tempdir()?;
     let config = ConfigFixture::new(temp.path())?;
     let mut first = ServerChild::spawn(&config.config_path)?;
@@ -404,8 +874,19 @@ fn run_control_database_alias_case(alias: ControlDatabaseAlias) -> TestResult {
 
     let held_peer_listen = hold_public_listen(peer_listen_addr)?;
     let mut second = ServerChild::spawn(&peer_config)?;
+    let second_pid = second.pid()?;
     let second_observation = second.observe(READY_TIMEOUT)?;
     let second_stopped = second.stop()?;
+    if let Some(capture) = capture {
+        capture.capture_process(alias_process_observation(
+            alias,
+            second_pid,
+            &second_stopped,
+        ))?;
+        let (classification, first_observed) =
+            classify_alias_rejection(alias, &second_observation, &second_stopped);
+        capture.flush(classification, first_observed)?;
+    }
     if held_peer_listen.local_addr()? != peer_listen_addr {
         return Err(io::Error::other("ownership failure listen guard changed address").into());
     }
@@ -667,10 +1148,13 @@ impl ConfigFixture {
         fs::write(&subject_key_file, subject_key)?;
         restrict_file(&subject_key_file)?;
         let listen_addr = unused_loopback_addr(&[])?;
+        let callback_addr = unused_loopback_addr(&[listen_addr])?;
 
         let value = json!({
             "schema": "zode.server-config.v1",
             "listen": listen_addr.to_string(),
+            "management_origin": format!("http://{listen_addr}"),
+            "callback_origin": format!("http://{callback_addr}"),
             "server_authority_id": SERVER_AUTHORITY,
             "deployment": "server_only",
             "ui_mode": "api_only",
@@ -730,9 +1214,12 @@ impl ConfigFixture {
         secret_directory: &Path,
     ) -> TestResult<(PathBuf, SocketAddr)> {
         let listen_addr = unused_loopback_addr(&[self.listen_addr])?;
+        let callback_addr = unused_loopback_addr(&[self.listen_addr, listen_addr])?;
         let value = json!({
             "schema": "zode.server-config.v1",
             "listen": listen_addr.to_string(),
+            "management_origin": format!("http://{listen_addr}"),
+            "callback_origin": format!("http://{callback_addr}"),
             "server_authority_id": SERVER_AUTHORITY,
             "deployment": "server_only",
             "ui_mode": "api_only",
@@ -976,6 +1463,64 @@ impl StoppedProcess {
     }
 }
 
+fn process_observation(
+    damage: MetadataDamage,
+    pid: u32,
+    stopped: &StoppedProcess,
+) -> ProcessObservation {
+    ProcessObservation {
+        name: format!("zode-server-missing-{}", damage.slug()),
+        stdout: stopped.output.stdout.clone(),
+        stderr: stopped.output.stderr.clone(),
+        exit_code: stopped.status.code(),
+        signal: exit_signal(&stopped.status).map(|signal| format!("signal-{signal}")),
+        termination: "natural_exit_after_control_store_integrity_rejection".to_owned(),
+        stop: Some(ProcessStopObservation {
+            observed_pids: vec![pid],
+            reaped_pids: vec![pid],
+            leaked_pids: Vec::new(),
+            timed_out: false,
+            flush_status: "ok".to_owned(),
+            proof: true,
+        }),
+    }
+}
+
+fn alias_process_observation(
+    alias: ControlDatabaseAlias,
+    pid: u32,
+    stopped: &StoppedProcess,
+) -> ProcessObservation {
+    ProcessObservation {
+        name: format!("zode-server-database-alias-{}", alias.label_slug()),
+        stdout: stopped.output.stdout.clone(),
+        stderr: stopped.output.stderr.clone(),
+        exit_code: stopped.status.code(),
+        signal: exit_signal(&stopped.status).map(|signal| format!("signal-{signal}")),
+        termination: "bounded_stop_after_database_alias_rejection".to_owned(),
+        stop: Some(ProcessStopObservation {
+            observed_pids: vec![pid],
+            reaped_pids: vec![pid],
+            leaked_pids: Vec::new(),
+            timed_out: false,
+            flush_status: "ok".to_owned(),
+            proof: true,
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
+}
+
 struct ServerChild {
     child: Option<Child>,
     ready_rx: mpsc::Receiver<String>,
@@ -1073,6 +1618,13 @@ impl ServerChild {
             }
             thread::sleep(POLL_INTERVAL);
         }
+    }
+
+    fn pid(&self) -> TestResult<u32> {
+        self.child
+            .as_ref()
+            .map(Child::id)
+            .ok_or_else(|| io::Error::other("zode-server child was already reaped").into())
     }
 
     fn observe_at(

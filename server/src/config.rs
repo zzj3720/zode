@@ -26,6 +26,10 @@ pub(crate) enum ConfigError {
     Json(#[source] serde_json::Error),
     #[error("invalid server configuration: {0}")]
     Invalid(&'static str),
+    #[error("server configuration is missing required origins")]
+    MissingOrigin,
+    #[error("server configuration contains an invalid origin")]
+    InvalidOrigin,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -33,6 +37,8 @@ pub(crate) enum ConfigError {
 pub(crate) struct ServerConfig {
     schema: String,
     listen: String,
+    management_origin: Option<String>,
+    callback_origin: Option<String>,
     server_authority_id: String,
     deployment: Deployment,
     #[serde(default)]
@@ -138,6 +144,42 @@ impl ServerConfig {
         self.deployment
     }
 
+    pub(crate) fn management_origin(&self) -> &str {
+        self.management_origin
+            .as_deref()
+            .expect("validated config has management origin")
+    }
+
+    pub(crate) fn callback_origin(&self) -> &str {
+        self.callback_origin
+            .as_deref()
+            .expect("validated config has callback origin")
+    }
+
+    pub(crate) fn management_authority(&self) -> String {
+        canonical_http_origin(self.management_origin())
+            .expect("validated config has canonical management origin")
+            .authority
+    }
+
+    pub(crate) fn management_default_port(&self) -> u16 {
+        canonical_http_origin(self.management_origin())
+            .expect("validated config has canonical management origin")
+            .default_port
+    }
+
+    pub(crate) fn callback_authority(&self) -> String {
+        canonical_http_origin(self.callback_origin())
+            .expect("validated config has canonical callback origin")
+            .authority
+    }
+
+    pub(crate) fn callback_default_port(&self) -> u16 {
+        canonical_http_origin(self.callback_origin())
+            .expect("validated config has canonical callback origin")
+            .default_port
+    }
+
     pub(crate) fn local_endpoint(&self) -> Option<&LocalEndpointConfig> {
         self.local_endpoint.as_ref()
     }
@@ -166,6 +208,21 @@ impl ServerConfig {
         if self.schema != CONFIG_SCHEMA {
             return Err(ConfigError::Invalid("schema must be zode.server-config.v1"));
         }
+        let management = canonical_http_origin(
+            self.management_origin
+                .as_deref()
+                .ok_or(ConfigError::MissingOrigin)?,
+        )?;
+        let callback = canonical_http_origin(
+            self.callback_origin
+                .as_deref()
+                .ok_or(ConfigError::MissingOrigin)?,
+        )?;
+        if management.authority == callback.authority {
+            return Err(ConfigError::InvalidOrigin);
+        }
+        self.management_origin = Some(management.serialized);
+        self.callback_origin = Some(callback.serialized);
         self.listen_addr()?;
         validate_text(
             &self.server_authority_id,
@@ -188,11 +245,13 @@ impl ServerConfig {
 
         match self.ui_mode {
             UiMode::Assets => {
-                self.ui_assets_directory = Some(resolve_path(
+                self.ui_assets_directory = Some(resolve_confined_path(
                     &base,
-                    self.ui_assets_directory.as_deref().ok_or(ConfigError::Invalid(
-                        "assets mode requires ui_assets_directory",
-                    ))?,
+                    self.ui_assets_directory
+                        .as_deref()
+                        .ok_or(ConfigError::Invalid(
+                            "assets mode requires ui_assets_directory",
+                        ))?,
                     "ui_assets_directory must be a directory path",
                 )?);
             }
@@ -241,6 +300,53 @@ impl ServerConfig {
 
         self.access.validate()
     }
+}
+
+struct CanonicalHttpOrigin {
+    serialized: String,
+    authority: String,
+    default_port: u16,
+}
+
+fn canonical_http_origin(value: &str) -> Result<CanonicalHttpOrigin, ConfigError> {
+    if value.is_empty()
+        || value.len() > MAX_URL_BYTES
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(ConfigError::InvalidOrigin);
+    }
+    let url = Url::parse(value).map_err(|_| ConfigError::InvalidOrigin)?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.host().is_none()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidOrigin);
+    }
+    match url.scheme() {
+        "https" => {}
+        "http" if is_loopback(&url) => {}
+        _ => return Err(ConfigError::InvalidOrigin),
+    }
+    let host = match url.host().ok_or(ConfigError::InvalidOrigin)? {
+        Host::Domain(domain) => domain.to_owned(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => format!("[{address}]"),
+    };
+    let authority = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    };
+    Ok(CanonicalHttpOrigin {
+        serialized: url.origin().ascii_serialization(),
+        authority,
+        default_port: url
+            .port_or_known_default()
+            .expect("validated HTTP origin has a known default port"),
+    })
 }
 
 impl Deployment {
@@ -311,11 +417,7 @@ impl LocalEndpointConfig {
             }
         }
 
-        validate_text(
-            &self.listen,
-            256,
-            "local_endpoint.listen is invalid",
-        )?;
+        validate_text(&self.listen, 256, "local_endpoint.listen is invalid")?;
         let listen = self
             .listen
             .parse::<SocketAddr>()
@@ -419,11 +521,9 @@ impl LocalEndpointConfig {
             blob_store.as_deref(),
             Some(self.bootstrap_controller_secret_file.as_path()),
         ];
-        if endpoint_paths
-            .into_iter()
-            .flatten()
-            .any(|path| paths_overlap(path, control_database) || paths_overlap(path, secret_directory))
-        {
+        if endpoint_paths.into_iter().flatten().any(|path| {
+            paths_overlap(path, control_database) || paths_overlap(path, secret_directory)
+        }) {
             return Err(ConfigError::Invalid(
                 "Server and local Endpoint stores must be separate",
             ));
@@ -560,6 +660,10 @@ fn resolve_path(
     } else {
         base.join(configured)
     };
+    Ok(normalize_path(&path))
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -570,7 +674,39 @@ fn resolve_path(
             _ => normalized.push(component.as_os_str()),
         }
     }
-    Ok(normalized)
+    normalized
+}
+
+fn resolve_confined_path(
+    base: &Path,
+    configured: &Path,
+    error: &'static str,
+) -> Result<PathBuf, ConfigError> {
+    let resolved = resolve_path(base, configured, error)?;
+    let base = normalize_path(base);
+    if resolved == base || !resolved.starts_with(&base) {
+        return Err(ConfigError::Invalid(error));
+    }
+    let base_real = fs::canonicalize(&base).map_err(ConfigError::Read)?;
+    let resolved_real = fs::canonicalize(&resolved).map_err(ConfigError::Read)?;
+    if resolved_real == base_real || !resolved_real.starts_with(&base_real) {
+        return Err(ConfigError::Invalid(error));
+    }
+    let relative = resolved
+        .strip_prefix(&base)
+        .map_err(|_| ConfigError::Invalid(error))?;
+    let mut cursor = base;
+    for component in relative.components() {
+        cursor.push(component.as_os_str());
+        if fs::symlink_metadata(&cursor)
+            .map_err(ConfigError::Read)?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(ConfigError::Invalid(error));
+        }
+    }
+    Ok(resolved)
 }
 
 fn require_regular_file(path: &Path, error: &'static str) -> Result<(), ConfigError> {

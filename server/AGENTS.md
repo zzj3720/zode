@@ -279,6 +279,10 @@ Maintain positive E2Es for:
   provider descriptor created through the public API appears in deterministic
   list order with its exact revision/default/count/status projection and no
   secret, Access subject, OAuth, replica, or header material;
+- `e2e_server_forwards_and_endpoint_persists_provider_execution_options`,
+  proving Server forwards the complete validated non-secret descriptor and a
+  real Endpoint durably returns the same non-empty options after restart while
+  Server retains no session state;
 - `e2e_all_in_one_first_run_uses_normal_server_api_and_local_endpoint`, including
   different Server/Endpoint config directories, final-path preflight, separate
   controller-secret copies/stores, authenticated identity/capability probe,

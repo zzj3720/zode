@@ -502,6 +502,12 @@ descriptor for execution; a receipt miss must validate it against current
 Server policy. An invalid Access assertion never reaches Endpoint receipt
 lookup.
 
+`e2e_server_forwards_and_endpoint_persists_provider_execution_options` fixes
+the full-descriptor boundary: a non-empty, bounded, credential-free `options`
+map validated by Server must reach the Endpoint-owned durable selection
+unchanged and remain visible after a real Endpoint restart. Server still stores
+no session ID, selection, event, or cursor.
+
 Server does not generate or reserve a session ID. It forwards the request and
 `Idempotency-Key` to the Endpoint, which generates a ULID and atomically admits
 the session. If the response is lost, the client retries this same
