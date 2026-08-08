@@ -7,6 +7,7 @@ use std::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
+use tokio::sync::Notify;
 use url::{Host, Url};
 
 use crate::{
@@ -80,6 +81,7 @@ pub(crate) struct SharingRequest {
 pub(crate) struct ProviderAuthority {
     store: Arc<ControlStore>,
     catalog: Arc<Catalog>,
+    reconcile_signal: Arc<Notify>,
 }
 
 struct Secret(Vec<u8>);
@@ -92,21 +94,31 @@ impl Drop for Secret {
 
 impl ProviderAuthority {
     pub(crate) fn new(store: Arc<ControlStore>, catalog: Arc<Catalog>) -> Self {
-        Self { store, catalog }
+        Self {
+            store,
+            catalog,
+            reconcile_signal: Arc::new(Notify::new()),
+        }
     }
 
     pub(crate) fn spawn_tombstone_reconciler(self: &Arc<Self>) {
         let authority = Arc::clone(self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(TOMBSTONE_RECONCILIATION_INTERVAL);
             loop {
-                interval.tick().await;
-                let _ = authority.reconcile_profile_tombstones().await;
+                let pending = authority
+                    .reconcile_profile_tombstones()
+                    .await
+                    .unwrap_or(true);
+                if pending {
+                    tokio::time::sleep(TOMBSTONE_RECONCILIATION_INTERVAL).await;
+                } else {
+                    authority.reconcile_signal.notified().await;
+                }
             }
         });
     }
 
-    async fn reconcile_profile_tombstones(&self) -> Result<(), ProviderError> {
+    async fn reconcile_profile_tombstones(&self) -> Result<bool, ProviderError> {
         let store = Arc::clone(&self.store);
         let (secret_refs, tombstones) = tokio::task::spawn_blocking(move || {
             Ok::<_, StoreError>((
@@ -117,6 +129,7 @@ impl ProviderAuthority {
         .await
         .map_err(|_| ProviderError::Internal)?
         .map_err(map_store_error)?;
+        let secret_ref_count = secret_refs.len();
         let mut cleaned = BTreeSet::new();
         for secret_ref in secret_refs {
             let store = Arc::clone(&self.store);
@@ -130,19 +143,23 @@ impl ProviderAuthority {
                 cleaned.insert(secret_ref);
             }
         }
+        let cleanup_pending = cleaned.len() != secret_ref_count;
         let dispatchable = tombstones
             .into_iter()
             .filter(|(_, secret_ref)| cleaned.contains(secret_ref))
             .map(|(replica, _)| replica)
             .collect::<Vec<_>>();
-        self.dispatch_tombstones(&dispatchable).await?;
-        Ok(())
+        let tombstones_pending = self.dispatch_tombstones(&dispatchable).await?;
+        Ok(cleanup_pending || tombstones_pending)
     }
 
     async fn dispatch_tombstones(
         &self,
         tombstones: &[AuthReplicaRecord],
-    ) -> Result<(), ProviderError> {
+    ) -> Result<bool, ProviderError> {
+        let pending = tombstones
+            .iter()
+            .any(|tombstone| tombstone.kind == "tombstone" && tombstone.status != "removed");
         for tombstone in tombstones
             .iter()
             .filter(|tombstone| tombstone.kind == "tombstone" && tombstone.status != "removed")
@@ -165,7 +182,7 @@ impl ProviderAuthority {
             .map_err(|_| ProviderError::Internal)?
             .map_err(map_store_error)?;
         }
-        Ok(())
+        Ok(pending)
     }
 
     async fn dispatch_tombstone(
@@ -496,6 +513,7 @@ impl ProviderAuthority {
             request_fingerprint,
             created_at_ms: unix_millis()?,
         };
+        self.reconcile_signal.notify_one();
         let store = Arc::clone(&self.store);
         let (_revision, profile, tombstones, receipt) =
             tokio::task::spawn_blocking(move || store.begin_profile_delete(write))
