@@ -832,11 +832,37 @@ function sessionForm(): HTMLFormElement {
         (item) => item.profile_id === profile.value,
       );
       if (!selectedProvider || !selectedProfile) throw new Error("session selection is incomplete");
-      const created = await createSession(endpoint.value, {
-        provider: selectedProvider,
-        model: model.value,
-        profile: selectedProfile,
-      });
+      let created: { session_id: string };
+      try {
+        created = await createSession(endpoint.value, {
+          provider: selectedProvider,
+          model: model.value,
+          profile: selectedProfile,
+        });
+      } catch (error) {
+        if (!(error instanceof ServerClientError) || error.code !== "invalid_request") {
+          throw error;
+        }
+
+        // The request body is intentionally frozen for this admission. A
+        // concurrent provider update can make that concrete selection stale;
+        // refresh only after the failed admission and keep the form open so
+        // the user can review the newly authoritative descriptor/profile.
+        await refreshProviders();
+        const latestProvider = state.providers.find(
+          (item) => item.provider === selectedProvider.provider,
+        );
+        if (
+          !latestProvider ||
+          latestProvider.descriptor.revision <= selectedProvider.descriptor.revision
+        ) {
+          throw error;
+        }
+        state.panel = "session";
+        state.notice =
+          "The provider configuration changed while this form was open. The latest selection is loaded; review it and try again.";
+        return;
+      }
       state.panel = null;
       history.pushState(null, "", `/endpoints/${endpoint.value}/sessions/${created.session_id}`);
       await openSession(endpoint.value, created.session_id);

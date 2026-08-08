@@ -1,0 +1,74 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "0003-90177662-5a96-4b54-ae1c-405785d6a220-b31f0255-6669-4b7d-ad6c-dd51ebb999a3",
+  "e2e_name": "e2e_browser_provider_descriptor_stale_selection_recovers_before_session",
+  "boundary": "browser-capture-set",
+  "first_observed": "a second management flow advanced the provider descriptor while an open session form kept the old revision; Start session returned invalid_request but the page only showed Check the requested values and try again.",
+  "classification": "STALE_PROVIDER_DESCRIPTOR_SELECTION_NOT_RECOVERABLE",
+  "source_digest": "20a3a12e9b490840c3c5f30bce2a278fa8afae50e4faa47e422d3d2769b720cd",
+  "first_failure_recording_id": "000036-fc2c807b-52dc-4b72-ad76-349875e6e0a9",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000036-fc2c807b-52dc-4b72-ad76-349875e6e0a9",
+      "boundary": "management-access-edge",
+      "method": "POST",
+      "path": "/v1/endpoints/01KZH9TFFE9N2P65PD3X66YJV7/sessions",
+      "request_headers": {
+        "idempotency-key": "deae2bea-b530-46c2-a462-79db5e19afe8",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "content-type": "application/json",
+        "origin": "http://127.0.0.1:56316",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "eyJtb2RlbCI6eyJwcm92aWRlciI6InN0YWxlLWRlc2NyaXB0b3ItcHJvdmlkZXIiLCJtb2RlbCI6InN0YWxlLWRlc2NyaXB0b3ItbW9kZWwiLCJwcm92aWRlcl9leGVjdXRpb24iOnsic2NoZW1hIjoiem9kZS5wcm92aWRlci1leGVjdXRpb24udjEiLCJyZXZpc2lvbiI6MSwia2luZCI6Im9wZW5haV9jb21wYXRpYmxlIiwiYmFzZV91cmwiOiJodHRwOi8vMTI3LjAuMC4xOjU2MzEwL3YxIiwib3B0aW9ucyI6e319LCJhdXRoX3Byb2ZpbGVfaWQiOiJwcm9maWxlLTVhM2U5YWNmZDRmZWE2OGI4YTkzYmUxOGQ4NTU0MjM1IiwibWluaW11bV9hdXRoX3JldmlzaW9uIjoxfSwidG9vbHMiOltdfQ==",
+        "canonical_json": {
+          "model": {
+            "provider": "stale-descriptor-provider",
+            "model": "stale-descriptor-model",
+            "provider_execution": {
+              "schema": "zode.provider-execution.v1",
+              "revision": 1,
+              "kind": "openai_compatible",
+              "base_url": "http://127.0.0.1:56310/v1",
+              "options": {}
+            },
+            "auth_profile_id": "profile-5a3e9acfd4fea68b8a93be18d8554235",
+            "minimum_auth_revision": 1
+          },
+          "tools": []
+        },
+        "sha256": "45d081317ca1ff5ac00dbb55ca022b2c03cef0ecf8b9b8bfa00292500db60d43"
+      },
+      "response": {
+        "status": 400,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "chunks": [
+          {
+            "offset_us": 3103.125,
+            "data_base64": "eyJlcnJvciI6eyJjb2RlIjoiaW52YWxpZF9yZXF1ZXN0IiwibWVzc2FnZSI6InJlcXVlc3QgaXMgaW52YWxpZCIsInJldHJ5YWJsZSI6ZmFsc2V9fQ=="
+          }
+        ],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>",
+    "<secret:access_assertion_2>",
+    "<secret:access_assertion_16>",
+    "<secret:access_assertion_22>"
+  ],
+  "integrity_sha256": "a4df10f4c7d466a85e3120ffd09d40e91e6ea48af1371d986cd1a1dbf714f2d9"
+}

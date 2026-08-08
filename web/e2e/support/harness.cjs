@@ -2796,6 +2796,14 @@ async function proxyHttp({
       });
     });
     upstream.on('error', (error) => {
+      // The client may close immediately after the bounded disconnect
+      // observation has been durably finished.  In that case the upstream
+      // socket error is a late transport notification, not a second response
+      // start; never turn it into a recording-state failure.
+      if (recording.finished) {
+        resolve();
+        return;
+      }
       responseStartedAt = process.hrtime.bigint();
       const upstreamErrorStatus = 502;
       const upstreamErrorHeaders = { 'content-type': 'application/json' };
