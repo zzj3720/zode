@@ -136,6 +136,9 @@ fn main() {
         Ok(composition) => composition,
         Err(error) => local_endpoint_startup_failure(error),
     };
+    runtime.block_on(async {
+        providers.spawn_tombstone_reconciler();
+    });
     let router = app::router(
         access,
         catalog,

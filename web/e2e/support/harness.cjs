@@ -731,7 +731,7 @@ function publicHeaders(headers) {
   const result = {};
   for (const [name, value] of Object.entries(headers || {})) {
     if (![
-      'accept', 'content-type', 'cache-control', 'forwarded', 'host', 'last-event-id',
+      'accept', 'content-type', 'cache-control', 'forwarded', 'host', 'idempotency-key', 'last-event-id',
       'origin', 'user-agent', 'x-forwarded-host',
     ].includes(name.toLowerCase())) continue;
     result[name.toLowerCase()] = Array.isArray(value) ? value.join(', ') : String(value);

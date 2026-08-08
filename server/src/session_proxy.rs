@@ -627,6 +627,9 @@ fn validate_profile(
     profile: &AuthProfileRecord,
     replicas: &[AuthReplicaRecord],
 ) -> Result<(), SessionProxyError> {
+    if profile.deleted_at_ms.is_some() {
+        return Err(SessionProxyError::AuthReplicaUnavailable);
+    }
     if profile.profile_id != model.auth_profile_id
         || profile.provider != model.provider
         || profile.kind != "api_key"

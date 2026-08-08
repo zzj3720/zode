@@ -1,12 +1,13 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
+use tokio::sync::Notify;
 use url::{Host, Url};
 
 use crate::{
@@ -14,8 +15,8 @@ use crate::{
     catalog::{Catalog, CatalogError},
     store::{
         hex, AuthProfileRecord, AuthReplicaRecord, ControlStore, ProfileCreatePhase,
-        ProfileCreateWrite, ProviderDefaultProfileWrite, ProviderDescriptorRecord,
-        ProviderDescriptorWrite, StoreError,
+        ProfileCreateWrite, ProfileDeleteWrite, ProviderDefaultProfileWrite,
+        ProviderDescriptorRecord, ProviderDescriptorWrite, StoreError,
     },
 };
 
@@ -27,6 +28,7 @@ const MAX_OPTIONS_BYTES: usize = 64 * 1024;
 const MAX_PROFILE_LABEL_BYTES: usize = 256;
 const MAX_API_KEY_BYTES: usize = 64 * 1024;
 const MAX_ENDPOINTS_PER_SHARING: usize = 100;
+const TOMBSTONE_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Error)]
 pub(crate) enum ProviderError {
@@ -79,6 +81,7 @@ pub(crate) struct SharingRequest {
 pub(crate) struct ProviderAuthority {
     store: Arc<ControlStore>,
     catalog: Arc<Catalog>,
+    reconcile_signal: Arc<Notify>,
 }
 
 struct Secret(Vec<u8>);
@@ -91,7 +94,130 @@ impl Drop for Secret {
 
 impl ProviderAuthority {
     pub(crate) fn new(store: Arc<ControlStore>, catalog: Arc<Catalog>) -> Self {
-        Self { store, catalog }
+        Self {
+            store,
+            catalog,
+            reconcile_signal: Arc::new(Notify::new()),
+        }
+    }
+
+    pub(crate) fn spawn_tombstone_reconciler(self: &Arc<Self>) {
+        let authority = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                let pending = authority
+                    .reconcile_profile_tombstones()
+                    .await
+                    .unwrap_or(true);
+                if pending {
+                    tokio::time::sleep(TOMBSTONE_RECONCILIATION_INTERVAL).await;
+                } else {
+                    authority.reconcile_signal.notified().await;
+                }
+            }
+        });
+    }
+
+    async fn reconcile_profile_tombstones(&self) -> Result<bool, ProviderError> {
+        let store = Arc::clone(&self.store);
+        let (secret_refs, tombstones) = tokio::task::spawn_blocking(move || {
+            Ok::<_, StoreError>((
+                store.list_deleted_provider_secret_refs()?,
+                store.list_auth_tombstones_for_reconciliation()?,
+            ))
+        })
+        .await
+        .map_err(|_| ProviderError::Internal)?
+        .map_err(map_store_error)?;
+        let secret_ref_count = secret_refs.len();
+        let mut cleaned = BTreeSet::new();
+        for secret_ref in secret_refs {
+            let store = Arc::clone(&self.store);
+            let reference = secret_ref.clone();
+            if tokio::task::spawn_blocking(move || store.remove_provider_secret(&reference))
+                .await
+                .map_err(|_| ProviderError::Internal)?
+                .map_err(map_store_error)
+                .is_ok()
+            {
+                cleaned.insert(secret_ref);
+            }
+        }
+        let cleanup_pending = cleaned.len() != secret_ref_count;
+        let dispatchable = tombstones
+            .into_iter()
+            .filter(|(_, secret_ref)| cleaned.contains(secret_ref))
+            .map(|(replica, _)| replica)
+            .collect::<Vec<_>>();
+        let tombstones_pending = self.dispatch_tombstones(&dispatchable).await?;
+        Ok(cleanup_pending || tombstones_pending)
+    }
+
+    async fn dispatch_tombstones(
+        &self,
+        tombstones: &[AuthReplicaRecord],
+    ) -> Result<bool, ProviderError> {
+        let pending = tombstones
+            .iter()
+            .any(|tombstone| tombstone.kind == "tombstone" && tombstone.status != "removed");
+        for tombstone in tombstones
+            .iter()
+            .filter(|tombstone| tombstone.kind == "tombstone" && tombstone.status != "removed")
+        {
+            let (status, observed_revision) = self.dispatch_tombstone(tombstone).await;
+            let store = Arc::clone(&self.store);
+            let profile_id = tombstone.profile_id.clone();
+            let endpoint_id = tombstone.endpoint_id.clone();
+            let revision = tombstone.revision;
+            tokio::task::spawn_blocking(move || {
+                store.mark_tombstone_replica(
+                    &profile_id,
+                    &endpoint_id,
+                    revision,
+                    status,
+                    observed_revision,
+                )
+            })
+            .await
+            .map_err(|_| ProviderError::Internal)?
+            .map_err(map_store_error)?;
+        }
+        Ok(pending)
+    }
+
+    async fn dispatch_tombstone(
+        &self,
+        tombstone: &AuthReplicaRecord,
+    ) -> (&'static str, Option<u64>) {
+        let body = json!({
+            "schema": "zode.auth-replica.tombstone.v1",
+            "authority_id": self.store.authority_id(),
+            "provider": tombstone.provider,
+            "revision": tombstone.revision,
+        });
+        match self
+            .catalog
+            .install_auth_replica(
+                &tombstone.endpoint_id,
+                &tombstone.profile_id,
+                &tombstone.operation_id,
+                body,
+            )
+            .await
+        {
+            Ok(response)
+                if response["schema"] == "zode.auth-replica.v1"
+                    && response["auth_profile_id"] == tombstone.profile_id
+                    && response["authority_id"] == self.store.authority_id()
+                    && response["provider"] == tombstone.provider
+                    && response["status"] == "tombstoned"
+                    && response["revision"].as_u64().unwrap_or_default() >= tombstone.revision =>
+            {
+                ("removed", response["revision"].as_u64())
+            }
+            Ok(response) => ("unreachable", response["revision"].as_u64()),
+            Err(_) => ("unreachable", None),
+        }
     }
 
     pub(crate) async fn put_descriptor(
@@ -352,6 +478,86 @@ impl ProviderAuthority {
         Ok(response)
     }
 
+    pub(crate) async fn delete_profile(
+        &self,
+        actor: &ActorContext,
+        idempotency_key: &str,
+        provider: &str,
+        profile_id: &str,
+    ) -> Result<Value, ProviderError> {
+        if !valid_identifier(provider, MAX_PROVIDER_BYTES)
+            || !valid_text(idempotency_key, MAX_IDEMPOTENCY_KEY_BYTES)
+            || !valid_identifier(profile_id, 128)
+        {
+            return Err(ProviderError::Invalid);
+        }
+        let keys = self.store.keys();
+        let command_key = keys.digest(
+            b"auth-profile-delete-command-v1",
+            &[
+                provider.as_bytes(),
+                profile_id.as_bytes(),
+                idempotency_key.as_bytes(),
+            ],
+        );
+        let request_fingerprint = keys.digest(
+            b"auth-profile-delete-request-v1",
+            &[provider.as_bytes(), profile_id.as_bytes()],
+        );
+        let actor_key = *actor.actor_key();
+        let write = ProfileDeleteWrite {
+            actor_key,
+            provider: provider.to_owned(),
+            profile_id: profile_id.to_owned(),
+            command_key,
+            request_fingerprint,
+            created_at_ms: unix_millis()?,
+        };
+        let store = Arc::clone(&self.store);
+        let (_revision, profile, tombstones, receipt) =
+            tokio::task::spawn_blocking(move || store.begin_profile_delete(write))
+                .await
+                .map_err(|_| ProviderError::Internal)?
+                .map_err(map_store_error)?;
+        if let Some(receipt) = receipt {
+            return serde_json::from_str(&receipt).map_err(|_| ProviderError::Internal);
+        }
+        self.reconcile_signal.notify_one();
+        let store = Arc::clone(&self.store);
+        let secret_ref = profile.secret_ref.clone();
+        tokio::task::spawn_blocking(move || store.remove_provider_secret(&secret_ref))
+            .await
+            .map_err(|_| ProviderError::Internal)?
+            .map_err(map_store_error)?;
+        self.dispatch_tombstones(&tombstones).await?;
+        let store = Arc::clone(&self.store);
+        let profile_id_owned = profile_id.to_owned();
+        let replicas =
+            tokio::task::spawn_blocking(move || store.list_auth_replicas(&profile_id_owned))
+                .await
+                .map_err(|_| ProviderError::Internal)?
+                .map_err(map_store_error)?;
+        let pending = replicas.iter().any(|replica| replica.status != "removed");
+        let response = json!({
+            "schema": "zode.auth-profile-delete.v1",
+            "provider": provider,
+            "auth_profile_id": profile_id,
+            "status": if pending { "removal_pending" } else { "deleted" },
+            "distribution": replica_list_value(&replicas, self.store.authority_id()),
+        });
+        let response_json =
+            serde_json::to_string(&response).map_err(|_| ProviderError::Internal)?;
+        let store = Arc::clone(&self.store);
+        let provider_owned = provider.to_owned();
+        let persisted = tokio::task::spawn_blocking(move || {
+            store.complete_profile_delete(&actor_key, &provider_owned, &command_key, &response_json)
+        })
+        .await
+        .map_err(|_| ProviderError::Internal)?
+        .map_err(map_store_error)?;
+        serde_json::from_str(&persisted).map_err(|_| ProviderError::Internal)
+    }
+
     pub(crate) async fn list_replicas(&self, profile_id: &str) -> Result<Value, ProviderError> {
         let store = Arc::clone(&self.store);
         let profile_id = profile_id.to_owned();
@@ -380,7 +586,10 @@ impl ProviderAuthority {
         .map_err(map_store_error)?;
         let secret = Secret(secret);
         let secret_text = std::str::from_utf8(&secret.0).map_err(|_| ProviderError::Internal)?;
-        for replica in replicas.iter().filter(|replica| replica.status != "ready") {
+        for replica in replicas
+            .iter()
+            .filter(|replica| replica.kind == "install" && replica.status != "ready")
+        {
             let response = self
                 .catalog
                 .install_auth_replica(

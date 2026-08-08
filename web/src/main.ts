@@ -5,6 +5,7 @@ import {
   createApiKeyProfile,
   createEndpoint,
   createSession,
+  deleteProfile,
   eventStreamUrl,
   getSession,
   getSystem,
@@ -46,6 +47,7 @@ const state: {
   panelProvider: string | null;
   busy: boolean;
   notice: string | null;
+  deletingProfile: { profile: AuthProfile; idempotencyKey: string } | null;
   connection: "Connecting" | "Live" | "Reconnecting" | "Disconnected";
 } = {
   system: null,
@@ -61,6 +63,7 @@ const state: {
   panelProvider: null,
   busy: false,
   notice: null,
+  deletingProfile: null,
   connection: "Disconnected",
 };
 
@@ -362,6 +365,9 @@ function providerCard(provider: Provider): HTMLElement {
     for (const profile of profiles) list.append(profileRow(profile));
     card.append(list);
   }
+  if (state.deletingProfile?.profile.provider === provider.provider) {
+    card.append(profileDeleteDialog(state.deletingProfile));
+  }
   return card;
 }
 
@@ -456,6 +462,13 @@ function profileRow(profile: AuthProfile): HTMLElement {
     makeDefault.disabled = state.busy;
     controls.append(makeDefault);
   }
+  const remove = action("Delete profile", "trash", () => {
+    state.deletingProfile = { profile, idempotencyKey: crypto.randomUUID() };
+    state.notice = null;
+    render();
+  });
+  remove.disabled = state.busy;
+  controls.append(remove);
   row.append(
     copy,
     node("span", "profile-default", profile.is_default ? "Default profile" : "Not default"),
@@ -464,6 +477,58 @@ function profileRow(profile: AuthProfile): HTMLElement {
     controls,
   );
   return row;
+}
+
+function profileDeleteDialog(entry: { profile: AuthProfile; idempotencyKey: string }): HTMLElement {
+  const profile = entry.profile;
+  const dialog = node("section", "dialog-panel");
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  dialog.setAttribute("aria-label", "Delete profile");
+  const title = node("div", "panel-title");
+  title.append(
+    node("h2", undefined, "Delete profile"),
+    node(
+      "p",
+      undefined,
+      "Removing the copied API key from an Endpoint is best-effort; complete provider-side revocation may require key rotation.",
+    ),
+  );
+  const acknowledgement = node("label", "checkbox-row");
+  const checkbox = node("input") as HTMLInputElement;
+  checkbox.type = "checkbox";
+  checkbox.setAttribute("aria-label", "I understand the revocation warning");
+  acknowledgement.append(
+    checkbox,
+    node("span", undefined, "I understand that provider-side revocation may require key rotation."),
+  );
+  const actions = node("div", "panel-actions");
+  const cancel = action("Cancel", "x", () => {
+    state.deletingProfile = null;
+    render();
+  });
+  const confirm = action("Delete profile permanently", "trash", async () => {
+    await withBusy(async () => {
+      const result = await deleteProfile(
+        profile.provider,
+        profile.profile_id,
+        entry.idempotencyKey,
+      );
+      state.deletingProfile = null;
+      state.notice =
+        result.status === "deleted"
+          ? `${profile.label} was deleted and Endpoint revocation was acknowledged.`
+          : `${profile.label} was deleted; Endpoint revocation is still pending.`;
+      await refreshProviders();
+    });
+  });
+  confirm.disabled = true;
+  checkbox.addEventListener("change", () => {
+    confirm.disabled = !checkbox.checked || state.busy;
+  });
+  actions.append(cancel, confirm);
+  dialog.append(title, acknowledgement, actions);
+  return dialog;
 }
 
 function renderEndpoints(): void {

@@ -229,6 +229,27 @@ export function setDefaultProfile(provider: string, profileId: string): Promise<
   );
 }
 
+export function deleteProfile(
+  provider: string,
+  profileId: string,
+  idempotencyKey: string,
+): Promise<{
+  auth_profile_id: string;
+  provider: string;
+  status: string;
+  distribution: Replica[];
+}> {
+  return requestJson<{
+    auth_profile_id: string;
+    provider: string;
+    status: string;
+    distribution: Replica[];
+  }>(
+    `/v1/providers/${encodeURIComponent(provider)}/auth-profiles/${encodeURIComponent(profileId)}`,
+    { method: "DELETE", headers: { "Idempotency-Key": idempotencyKey } },
+  );
+}
+
 export function createApiKeyProfile(
   provider: string,
   body: {

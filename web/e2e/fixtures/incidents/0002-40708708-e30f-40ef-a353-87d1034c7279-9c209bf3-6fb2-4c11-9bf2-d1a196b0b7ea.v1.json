@@ -1,0 +1,214 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "0002-40708708-e30f-40ef-a353-87d1034c7279-9c209bf3-6fb2-4c11-9bf2-d1a196b0b7ea",
+  "e2e_name": "e2e_browser_provider_profile_delete_tombstone_status_is_monotonic_under_late_failure",
+  "boundary": "browser-capture-set",
+  "first_observed": "the same tombstone operation was acknowledged by the Endpoint and then a later failed dispatch downgraded the Server replica projection from removed to unreachable",
+  "classification": "AUTH_PROFILE_DELETE_TOMBSTONE_STATUS_REGRESSED_AFTER_LATE_FAILURE",
+  "source_digest": "c487b5ff461d4ae8957785db8bc07dd271fb90fcbfeb9f19b2e5199963b600d4",
+  "first_failure_recording_id": "000029-0e221cee-35ae-45df-a7da-4b29b032f62a",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000028-5e6143b1-1003-4174-949b-8379e733a7af",
+      "boundary": "management-access-edge",
+      "method": "DELETE",
+      "path": "/v1/providers/delete-offline-fixture/auth-profiles/profile-5548e6e09933c3fc9527374572a597ba",
+      "request_headers": {
+        "idempotency-key": "14a0a845-89a8-4564-9c98-ac3de7b49970",
+        "accept": "application/json",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "origin": "http://127.0.0.1:54572",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 3194.541,
+            "data_base64": "eyJhdXRoX3Byb2ZpbGVfaWQiOiJwcm9maWxlLTU1NDhlNmUwOTkzM2MzZmM5NTI3Mzc0NTcyYTU5N2JhIiwiZGlzdHJpYnV0aW9uIjpbeyJhdXRoX3Byb2ZpbGVfaWQiOiJwcm9maWxlLTU1NDhlNmUwOTkzM2MzZmM5NTI3Mzc0NTcyYTU5N2JhIiwiYXV0aG9yaXR5X2lkIjoid2ViLWUyZS1zZXJ2ZXIiLCJlbmRwb2ludF9pZCI6IjAxS1pINTE3OTgwNUtCMkpYWjY1UjI1MUNHIiwiaW5zdGFsbGVkX3JldmlzaW9uIjpudWxsLCJvYnNlcnZlZF9yZXZpc2lvbiI6bnVsbCwicHJvdmlkZXIiOiJkZWxldGUtb2ZmbGluZS1maXh0dXJlIiwicmV2aXNpb24iOjIsInN0YXR1cyI6InVucmVhY2hhYmxlIn1dLCJwcm92aWRlciI6ImRlbGV0ZS1vZmZsaW5lLWZpeHR1cmUiLCJzY2hlbWEiOiJ6b2RlLmF1dGgtcHJvZmlsZS1kZWxldGUudjEiLCJzdGF0dXMiOiJyZW1vdmFsX3BlbmRpbmcifQ=="
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000002",
+      "recording_id": "000029-0e221cee-35ae-45df-a7da-4b29b032f62a",
+      "boundary": "server-endpoint-control",
+      "method": "PUT",
+      "path": "/v1/auth-replicas/profile-5548e6e09933c3fc9527374572a597ba",
+      "request_headers": {
+        "idempotency-key": "profile:profile-5548e6e09933c3fc9527374572a597ba:endpoint:01KZH5179805KB2JXZ65R251CG:tombstone:2",
+        "content-type": "application/json",
+        "accept": "*/*",
+        "host": "127.0.0.1:54570"
+      },
+      "request_body": {
+        "raw_base64": "eyJhdXRob3JpdHlfaWQiOiJ3ZWItZTJlLXNlcnZlciIsInByb3ZpZGVyIjoiZGVsZXRlLW9mZmxpbmUtZml4dHVyZSIsInJldmlzaW9uIjoyLCJzY2hlbWEiOiJ6b2RlLmF1dGgtcmVwbGljYS50b21ic3RvbmUudjEifQ==",
+        "canonical_json": {
+          "authority_id": "web-e2e-server",
+          "provider": "delete-offline-fixture",
+          "revision": 2,
+          "schema": "zode.auth-replica.tombstone.v1"
+        },
+        "sha256": "a14c1c06b18eee95d9feba61e0161bcfd8f8f259b8fa65d6621ab81724f9fa15"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 3783.875,
+            "data_base64": "eyJzY2hlbWEiOiJ6b2RlLmF1dGgtcmVwbGljYS52MSIsImF1dGhvcml0eV9pZCI6IndlYi1lMmUtc2VydmVyIiwiYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS01NTQ4ZTZlMDk5MzNjM2ZjOTUyNzM3NDU3MmE1OTdiYSIsInByb3ZpZGVyIjoiZGVsZXRlLW9mZmxpbmUtZml4dHVyZSIsInJldmlzaW9uIjoyLCJleHBpcmVzX2F0X21zIjpudWxsLCJzdGF0dXMiOiJ0b21ic3RvbmVkIn0="
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000003",
+      "recording_id": "000030-2c384d55-3d3c-468c-97fb-c21be8e63abd",
+      "boundary": "server-endpoint-control",
+      "method": "PUT",
+      "path": "/v1/auth-replicas/profile-5548e6e09933c3fc9527374572a597ba",
+      "request_headers": {
+        "idempotency-key": "profile:profile-5548e6e09933c3fc9527374572a597ba:endpoint:01KZH5179805KB2JXZ65R251CG:tombstone:2",
+        "content-type": "application/json",
+        "accept": "*/*",
+        "host": "127.0.0.1:54578"
+      },
+      "request_body": {
+        "raw_base64": "eyJhdXRob3JpdHlfaWQiOiJ3ZWItZTJlLXNlcnZlciIsInByb3ZpZGVyIjoiZGVsZXRlLW9mZmxpbmUtZml4dHVyZSIsInJldmlzaW9uIjoyLCJzY2hlbWEiOiJ6b2RlLmF1dGgtcmVwbGljYS50b21ic3RvbmUudjEifQ==",
+        "canonical_json": {
+          "authority_id": "web-e2e-server",
+          "provider": "delete-offline-fixture",
+          "revision": 2,
+          "schema": "zode.auth-replica.tombstone.v1"
+        },
+        "sha256": "a14c1c06b18eee95d9feba61e0161bcfd8f8f259b8fa65d6621ab81724f9fa15"
+      },
+      "response": {
+        "status": 502,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 4153.5,
+            "data_base64": "eyJlcnJvciI6eyJjb2RlIjoiZW5kcG9pbnRfdW5hdmFpbGFibGUiLCJyZXRyeWFibGUiOnRydWV9fQ=="
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000004",
+      "recording_id": "000031-19966217-fb74-4990-a3b9-5eda4417dae0",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/providers",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 3510.333,
+            "data_base64": "eyJwcm92aWRlcnMiOlt7ImF1dGhfcHJvZmlsZV9jb3VudCI6MCwiYXV0aF9zdGF0dXMiOiJ1bmNvbmZpZ3VyZWQiLCJkZWZhdWx0X3Byb2ZpbGVfaWQiOm51bGwsImRlc2NyaXB0b3IiOnsiYmFzZV91cmwiOiJodHRwOi8vMTI3LjAuMC4xOjU0NTY4L3YxIiwia2luZCI6Im9wZW5haV9jb21wYXRpYmxlIiwibW9kZWxzIjpbImRlbGV0ZS1vZmZsaW5lLW1vZGVsIl0sIm9wdGlvbnMiOnt9LCJyZXZpc2lvbiI6MX0sInByb3ZpZGVyIjoiZGVsZXRlLW9mZmxpbmUtZml4dHVyZSJ9XSwic2NoZW1hIjoiem9kZS5wcm92aWRlcnMudjEifQ=="
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000005",
+      "recording_id": "000032-6aebb76d-8702-4a7a-848e-89091de27b2a",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/providers/delete-offline-fixture/auth-profiles",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 3829.292,
+            "data_base64": "eyJpdGVtcyI6W10sInNjaGVtYSI6InpvZGUuYXV0aC1wcm9maWxlcy52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000006",
+      "recording_id": "000033-0fc54bdf-6a0a-4d3d-b57e-42a2782f75b3",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/auth-profiles/profile-5548e6e09933c3fc9527374572a597ba/replicas",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 4010.75,
+            "data_base64": "eyJpdGVtcyI6W3siYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS01NTQ4ZTZlMDk5MzNjM2ZjOTUyNzM3NDU3MmE1OTdiYSIsImF1dGhvcml0eV9pZCI6IndlYi1lMmUtc2VydmVyIiwiZW5kcG9pbnRfaWQiOiIwMUtaSDUxNzk4MDVLQjJKWFo2NVIyNTFDRyIsImluc3RhbGxlZF9yZXZpc2lvbiI6bnVsbCwib2JzZXJ2ZWRfcmV2aXNpb24iOm51bGwsInByb3ZpZGVyIjoiZGVsZXRlLW9mZmxpbmUtZml4dHVyZSIsInJldmlzaW9uIjoyLCJzdGF0dXMiOiJ1bnJlYWNoYWJsZSJ9XSwic2NoZW1hIjoiem9kZS5hdXRoLXJlcGxpY2FzLnYxIn0="
+          }
+        ],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>",
+    "<secret:access_assertion_12>",
+    "<secret:access_assertion_24>"
+  ],
+  "integrity_sha256": "49060621a8c259ca75f6ac13e6a7905833485c854b3a2cd97d5996461e735ee6"
+}

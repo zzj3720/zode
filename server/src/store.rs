@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS auth_profiles (
     descriptor_revision INTEGER NOT NULL CHECK (descriptor_revision > 0),
     secret_ref TEXT NOT NULL UNIQUE CHECK (length(secret_ref) = 64),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    deleted_at_ms INTEGER,
     FOREIGN KEY (provider, descriptor_revision)
         REFERENCES provider_descriptor_revisions(provider, revision)
 ) STRICT;
@@ -136,6 +137,18 @@ CREATE TABLE IF NOT EXISTS auth_profile_sharing_revisions (
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
     PRIMARY KEY (profile_id, revision),
     FOREIGN KEY (profile_id) REFERENCES auth_profiles(profile_id)
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS auth_profile_delete_operations (
+    actor_key BLOB NOT NULL CHECK (length(actor_key) = 32),
+    provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 128),
+    profile_id TEXT NOT NULL CHECK (length(profile_id) BETWEEN 1 AND 128),
+    command_key BLOB NOT NULL CHECK (length(command_key) = 32),
+    request_fingerprint BLOB NOT NULL CHECK (length(request_fingerprint) = 32),
+    tombstone_revision INTEGER NOT NULL CHECK (tombstone_revision > 0),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    response_json TEXT,
+    PRIMARY KEY (actor_key, provider, command_key)
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE IF NOT EXISTS provider_default_profile_revisions (
@@ -157,6 +170,7 @@ CREATE TABLE IF NOT EXISTS auth_replica_operations (
     endpoint_id TEXT NOT NULL,
     revision INTEGER NOT NULL CHECK (revision > 0),
     operation_id TEXT NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 256),
+    kind TEXT NOT NULL DEFAULT 'install' CHECK (kind IN ('install', 'tombstone')),
     status TEXT NOT NULL CHECK (status IN ('pending', 'ready', 'unreachable')),
     observed_revision INTEGER,
     PRIMARY KEY (profile_id, endpoint_id, revision),
@@ -410,6 +424,7 @@ pub(crate) struct AuthProfileRecord {
     pub(crate) sharing_mode: String,
     pub(crate) endpoint_ids_json: String,
     pub(crate) is_default: bool,
+    pub(crate) deleted_at_ms: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -419,8 +434,19 @@ pub(crate) struct AuthReplicaRecord {
     pub(crate) provider: String,
     pub(crate) revision: u64,
     pub(crate) operation_id: String,
+    pub(crate) kind: String,
     pub(crate) status: String,
     pub(crate) observed_revision: Option<u64>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProfileDeleteWrite {
+    pub(crate) actor_key: [u8; DIGEST_BYTES],
+    pub(crate) provider: String,
+    pub(crate) profile_id: String,
+    pub(crate) command_key: [u8; DIGEST_BYTES],
+    pub(crate) request_fingerprint: [u8; DIGEST_BYTES],
+    pub(crate) created_at_ms: i64,
 }
 
 #[derive(Clone)]
@@ -805,6 +831,19 @@ impl ControlStore {
         reference: &str,
     ) -> Result<Option<Vec<u8>>, StoreError> {
         self.load_secret("providers", reference)
+    }
+
+    pub(crate) fn remove_provider_secret(&self, reference: &str) -> Result<(), StoreError> {
+        if reference.len() != 64 || !reference.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(StoreError::Integrity);
+        }
+        let path = self.secret_directory.join("providers").join(reference);
+        match fs::remove_file(&path) {
+            Ok(()) => sync_directory(path.parent().ok_or(StoreError::Integrity)?)
+                .map_err(|_| StoreError::Internal),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(StoreError::Internal),
+        }
     }
 
     fn load_secret(&self, namespace: &str, reference: &str) -> Result<Option<Vec<u8>>, StoreError> {
@@ -1277,8 +1316,8 @@ impl ControlStore {
             .execute(
                 "INSERT INTO auth_profiles (
                     profile_id, provider, kind, label, revision, descriptor_revision,
-                    secret_ref, created_at_ms
-                 ) VALUES (?1, ?2, 'api_key', ?3, 1, ?4, ?5, ?6)",
+                    secret_ref, created_at_ms, deleted_at_ms
+                 ) VALUES (?1, ?2, 'api_key', ?3, 1, ?4, ?5, ?6, NULL)",
                 params![
                     &operation.profile_id,
                     &operation.provider,
@@ -1332,9 +1371,9 @@ impl ControlStore {
             );
             transaction
                 .execute(
-                    "INSERT INTO auth_replica_operations (
-                        profile_id, endpoint_id, revision, operation_id, status, observed_revision
-                     ) VALUES (?1, ?2, 1, ?3, 'pending', NULL)",
+                "INSERT INTO auth_replica_operations (
+                        profile_id, endpoint_id, revision, operation_id, kind, status, observed_revision
+                     ) VALUES (?1, ?2, 1, ?3, 'install', 'pending', NULL)",
                     params![&operation.profile_id, endpoint_id, operation_id],
                 )
                 .map_err(|_| StoreError::Internal)?;
@@ -1367,7 +1406,8 @@ impl ControlStore {
             .execute(
                 "UPDATE auth_replica_operations
                  SET status = 'ready', observed_revision = ?3
-                 WHERE profile_id = ?1 AND endpoint_id = ?2 AND revision = ?3",
+                 WHERE profile_id = ?1 AND endpoint_id = ?2 AND revision = ?3
+                   AND kind = 'install'",
                 params![profile_id, endpoint_id, revision],
             )
             .map_err(|_| StoreError::Internal)?;
@@ -1388,7 +1428,8 @@ impl ControlStore {
         let pending = transaction
             .query_row(
                 "SELECT COUNT(*) FROM auth_replica_operations
-                 WHERE profile_id = ?1 AND revision = 1 AND status != 'ready'",
+                 WHERE profile_id = ?1 AND revision = 1 AND kind = 'install'
+                   AND status != 'ready'",
                 [&operation.profile_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -1447,7 +1488,7 @@ impl ControlStore {
             .query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM auth_profiles
-                    WHERE profile_id = ?1 AND provider = ?2
+                    WHERE profile_id = ?1 AND provider = ?2 AND deleted_at_ms IS NULL
                 )",
                 params![&write.profile_id, &write.provider],
                 |row| row.get::<_, i64>(0),
@@ -1497,6 +1538,259 @@ impl ControlStore {
         Ok((record, false))
     }
 
+    pub(crate) fn begin_profile_delete(
+        &self,
+        write: ProfileDeleteWrite,
+    ) -> Result<
+        (
+            u64,
+            AuthProfileRecord,
+            Vec<AuthReplicaRecord>,
+            Option<String>,
+        ),
+        StoreError,
+    > {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_fingerprint, profile_id, tombstone_revision, response_json
+                 FROM auth_profile_delete_operations
+                 WHERE actor_key = ?1 AND provider = ?2 AND command_key = ?3",
+                params![
+                    &write.actor_key[..],
+                    &write.provider,
+                    &write.command_key[..]
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| StoreError::Internal)?;
+        if let Some((fingerprint, profile_id, revision, response_json)) = existing {
+            if !equal_digest(&fingerprint, &write.request_fingerprint)
+                || profile_id != write.profile_id
+            {
+                return Err(StoreError::Conflict);
+            }
+            let record = read_auth_profile(&transaction, &profile_id)?;
+            if record.provider != write.provider || record.deleted_at_ms.is_none() {
+                return Err(StoreError::Integrity);
+            }
+            let tombstones = read_tombstone_replicas(&transaction, &profile_id)?;
+            let revision = u64::try_from(revision).map_err(|_| StoreError::Integrity)?;
+            transaction.commit().map_err(|_| StoreError::Internal)?;
+            return Ok((revision, record, tombstones, response_json));
+        }
+
+        let record = read_auth_profile_optional(&transaction, &write.profile_id)?
+            .ok_or(StoreError::NotFound)?;
+        if record.provider != write.provider || record.deleted_at_ms.is_some() {
+            return Err(StoreError::NotFound);
+        }
+        let current_tombstone_revision = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(revision), 0)
+                 FROM auth_replica_operations
+                 WHERE profile_id = ?1 AND kind = 'tombstone'",
+                [&write.profile_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| StoreError::Internal)?;
+        let profile_revision = i64::try_from(record.revision).map_err(|_| StoreError::Integrity)?;
+        let tombstone_revision = profile_revision
+            .max(current_tombstone_revision)
+            .checked_add(1)
+            .ok_or(StoreError::Integrity)?;
+        if record.is_default {
+            let default_revision = transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(revision), 0) + 1
+                     FROM provider_default_profile_revisions WHERE provider = ?1",
+                    [&write.provider],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|_| StoreError::Internal)?;
+            transaction
+                .execute(
+                    "INSERT INTO provider_default_profile_revisions (
+                        provider, revision, profile_id, created_at_ms
+                     ) VALUES (?1, ?2, NULL, ?3)",
+                    params![&write.provider, default_revision, write.created_at_ms],
+                )
+                .map_err(|_| StoreError::Internal)?;
+        }
+        transaction
+            .execute(
+                "UPDATE auth_profiles SET deleted_at_ms = ?2
+                 WHERE profile_id = ?1 AND deleted_at_ms IS NULL",
+                params![&write.profile_id, write.created_at_ms],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        let endpoint_ids = transaction
+            .prepare(
+                "SELECT endpoint_id FROM auth_replica_operations
+                 WHERE profile_id = ?1 AND kind = 'install'
+                 GROUP BY endpoint_id ORDER BY endpoint_id ASC",
+            )
+            .map_err(|_| StoreError::Internal)?
+            .query_map([&write.profile_id], |row| row.get::<_, String>(0))
+            .map_err(|_| StoreError::Internal)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| StoreError::Integrity)?;
+        for endpoint_id in endpoint_ids {
+            let operation_id = format!(
+                "profile:{}:endpoint:{endpoint_id}:tombstone:{tombstone_revision}",
+                write.profile_id
+            );
+            transaction
+                .execute(
+                    "INSERT INTO auth_replica_operations (
+                        profile_id, endpoint_id, revision, operation_id,
+                        kind, status, observed_revision
+                     ) VALUES (?1, ?2, ?3, ?4, 'tombstone', 'pending', NULL)",
+                    params![
+                        &write.profile_id,
+                        endpoint_id,
+                        tombstone_revision,
+                        operation_id,
+                    ],
+                )
+                .map_err(|_| StoreError::Internal)?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO auth_profile_delete_operations (
+                    actor_key, provider, profile_id, command_key,
+                    request_fingerprint, tombstone_revision, created_at_ms, response_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+                params![
+                    &write.actor_key[..],
+                    &write.provider,
+                    &write.profile_id,
+                    &write.command_key[..],
+                    &write.request_fingerprint[..],
+                    tombstone_revision,
+                    write.created_at_ms,
+                ],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        let record = read_auth_profile(&transaction, &write.profile_id)?;
+        let tombstones = read_tombstone_replicas(&transaction, &write.profile_id)?;
+        let revision = u64::try_from(tombstone_revision).map_err(|_| StoreError::Integrity)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok((revision, record, tombstones, None))
+    }
+
+    pub(crate) fn complete_profile_delete(
+        &self,
+        actor_key: &[u8; DIGEST_BYTES],
+        provider: &str,
+        command_key: &[u8; DIGEST_BYTES],
+        response_json: &str,
+    ) -> Result<String, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        transaction
+            .execute(
+                "UPDATE auth_profile_delete_operations
+                 SET response_json = ?4
+                 WHERE actor_key = ?1 AND provider = ?2 AND command_key = ?3
+                   AND response_json IS NULL",
+                params![&actor_key[..], provider, &command_key[..], response_json],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        let stored = transaction
+            .query_row(
+                "SELECT response_json
+                 FROM auth_profile_delete_operations
+                 WHERE actor_key = ?1 AND provider = ?2 AND command_key = ?3",
+                params![&actor_key[..], provider, &command_key[..]],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|_| StoreError::Internal)?
+            .ok_or(StoreError::Integrity)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok(stored)
+    }
+
+    pub(crate) fn mark_tombstone_replica(
+        &self,
+        profile_id: &str,
+        endpoint_id: &str,
+        revision: u64,
+        status: &str,
+        observed_revision: Option<u64>,
+    ) -> Result<(), StoreError> {
+        if !matches!(status, "pending" | "removed" | "unreachable") {
+            return Err(StoreError::Integrity);
+        }
+        let revision = i64::try_from(revision).map_err(|_| StoreError::Integrity)?;
+        let observed_revision = observed_revision
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StoreError::Integrity)?;
+        let stored_status = if status == "removed" { "ready" } else { status };
+        let connection = self.connection()?;
+        let changed = connection
+            .execute(
+                "UPDATE auth_replica_operations
+                 SET status = CASE
+                         WHEN CASE status
+                                  WHEN 'pending' THEN 0
+                                  WHEN 'unreachable' THEN 1
+                                  WHEN 'ready' THEN 2
+                              END
+                              <= CASE ?4
+                                  WHEN 'pending' THEN 0
+                                  WHEN 'unreachable' THEN 1
+                                  WHEN 'ready' THEN 2
+                              END
+                         THEN ?4 ELSE status END,
+                     observed_revision = CASE
+                         WHEN CASE status
+                                  WHEN 'pending' THEN 0
+                                  WHEN 'unreachable' THEN 1
+                                  WHEN 'ready' THEN 2
+                              END
+                              <= CASE ?4
+                                  WHEN 'pending' THEN 0
+                                  WHEN 'unreachable' THEN 1
+                                  WHEN 'ready' THEN 2
+                              END
+                         THEN CASE
+                                  WHEN observed_revision IS NULL THEN ?5
+                                  WHEN ?5 IS NULL OR observed_revision >= ?5 THEN observed_revision
+                                  ELSE ?5
+                              END
+                         ELSE observed_revision END
+                 WHERE profile_id = ?1 AND endpoint_id = ?2 AND revision = ?3
+                   AND kind = 'tombstone'",
+                params![
+                    profile_id,
+                    endpoint_id,
+                    revision,
+                    stored_status,
+                    observed_revision
+                ],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        if changed != 1 {
+            return Err(StoreError::Integrity);
+        }
+        Ok(())
+    }
+
     pub(crate) fn get_auth_profile(
         &self,
         profile_id: &str,
@@ -1515,7 +1809,7 @@ impl ControlStore {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(&format!(
-                "{} WHERE profile.provider = ?1 ORDER BY profile.created_at_ms ASC, profile.profile_id ASC LIMIT 101",
+                "{} WHERE profile.provider = ?1 AND profile.deleted_at_ms IS NULL ORDER BY profile.created_at_ms ASC, profile.profile_id ASC LIMIT 101",
                 AUTH_PROFILE_SELECT
             ))
             .map_err(|_| StoreError::Internal)?;
@@ -1539,15 +1833,63 @@ impl ControlStore {
             .prepare(
                 "SELECT replica.profile_id, replica.endpoint_id, profile.provider,
                         replica.revision, replica.operation_id, replica.status,
-                        replica.observed_revision
+                        replica.observed_revision, replica.kind
                  FROM auth_replica_operations AS replica
                  INNER JOIN auth_profiles AS profile ON profile.profile_id = replica.profile_id
+                 INNER JOIN (
+                    SELECT profile_id, endpoint_id, MAX(revision) AS revision
+                    FROM auth_replica_operations GROUP BY profile_id, endpoint_id
+                 ) AS latest
+                    ON latest.profile_id = replica.profile_id
+                   AND latest.endpoint_id = replica.endpoint_id
+                   AND latest.revision = replica.revision
                  WHERE replica.profile_id = ?1
                  ORDER BY replica.endpoint_id ASC",
             )
             .map_err(|_| StoreError::Internal)?;
         let records = statement
             .query_map([profile_id], auth_replica_from_row)
+            .map_err(|_| StoreError::Internal)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| StoreError::Integrity)?;
+        Ok(records)
+    }
+
+    pub(crate) fn list_deleted_provider_secret_refs(&self) -> Result<Vec<String>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT secret_ref FROM auth_profiles
+                 WHERE deleted_at_ms IS NOT NULL ORDER BY profile_id ASC",
+            )
+            .map_err(|_| StoreError::Internal)?;
+        let records = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| StoreError::Internal)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| StoreError::Integrity)?;
+        Ok(records)
+    }
+
+    pub(crate) fn list_auth_tombstones_for_reconciliation(
+        &self,
+    ) -> Result<Vec<(AuthReplicaRecord, String)>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT tomb.profile_id, tomb.endpoint_id, profile.provider,
+                        tomb.revision, tomb.operation_id, tomb.status,
+                        tomb.observed_revision, tomb.kind, profile.secret_ref
+                 FROM auth_replica_operations AS tomb
+                 INNER JOIN auth_profiles AS profile
+                    ON profile.profile_id = tomb.profile_id
+                 WHERE tomb.kind = 'tombstone' AND tomb.status <> 'ready'
+                   AND profile.deleted_at_ms IS NOT NULL
+                 ORDER BY tomb.profile_id ASC, tomb.endpoint_id ASC",
+            )
+            .map_err(|_| StoreError::Internal)?;
+        let records = statement
+            .query_map([], |row| Ok((auth_replica_from_row(row)?, row.get(8)?)))
             .map_err(|_| StoreError::Internal)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| StoreError::Integrity)?;
@@ -1579,6 +1921,8 @@ impl ControlStore {
             .execute_batch(CONTROL_SCHEMA)
             .map_err(|_| StartupError::StoreUnavailable)?;
         ensure_endpoint_capability_columns(&connection)?;
+        ensure_auth_profile_columns(&connection)?;
+        ensure_replica_operation_columns(&connection)?;
         if matches!(database_state, ControlDatabaseState::New) {
             let version =
                 i64::try_from(subject_key_version).map_err(|_| StartupError::AuthorityMismatch)?;
@@ -1706,7 +2050,8 @@ const AUTH_PROFILE_SELECT: &str =
     "SELECT profile.profile_id, profile.provider, profile.kind, profile.label,
             profile.revision, profile.descriptor_revision, profile.secret_ref,
             sharing.mode, sharing.endpoint_ids_json,
-            CASE WHEN defaults.profile_id = profile.profile_id THEN 1 ELSE 0 END
+            CASE WHEN defaults.profile_id = profile.profile_id THEN 1 ELSE 0 END,
+            profile.deleted_at_ms
      FROM auth_profiles AS profile
      INNER JOIN auth_profile_sharing_revisions AS sharing
         ON sharing.profile_id = profile.profile_id
@@ -1758,30 +2103,50 @@ fn auth_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthProfil
         sharing_mode: row.get(7)?,
         endpoint_ids_json: row.get(8)?,
         is_default: row.get::<_, i64>(9)? != 0,
+        deleted_at_ms: row.get(10)?,
     })
+}
+
+fn read_tombstone_replicas(
+    connection: &Connection,
+    profile_id: &str,
+) -> Result<Vec<AuthReplicaRecord>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT replica.profile_id, replica.endpoint_id, profile.provider,
+                    replica.revision, replica.operation_id, replica.status,
+                    replica.observed_revision, replica.kind
+             FROM auth_replica_operations AS replica
+             INNER JOIN auth_profiles AS profile ON profile.profile_id = replica.profile_id
+             WHERE replica.profile_id = ?1 AND replica.kind = 'tombstone'
+             ORDER BY replica.endpoint_id ASC",
+        )
+        .map_err(|_| StoreError::Internal)?;
+    let records = statement
+        .query_map([profile_id], auth_replica_from_row)
+        .map_err(|_| StoreError::Internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| StoreError::Integrity)?;
+    Ok(records)
 }
 
 fn auth_replica_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthReplicaRecord> {
     let revision = positive_u64(row, 3)?;
-    let observed_revision = row
-        .get::<_, Option<i64>>(6)?
-        .map(|value| {
-            u64::try_from(value).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    6,
-                    rusqlite::types::Type::Integer,
-                    Box::new(error),
-                )
-            })
-        })
-        .transpose()?;
+    let observed_revision = optional_u64(row, 6)?;
+    let kind = row.get::<_, String>(7)?;
+    let status = row.get::<_, String>(5)?;
     Ok(AuthReplicaRecord {
         profile_id: row.get(0)?,
         endpoint_id: row.get(1)?,
         provider: row.get(2)?,
         revision,
         operation_id: row.get(4)?,
-        status: row.get(5)?,
+        kind: kind.clone(),
+        status: if kind == "tombstone" && status == "ready" {
+            "removed".to_owned()
+        } else {
+            status
+        },
         observed_revision,
     })
 }
@@ -1795,6 +2160,20 @@ fn positive_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> 
             Box::new(error),
         )
     })
+}
+
+fn optional_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
+    row.get::<_, Option<i64>>(index)?
+        .map(|value| {
+            u64::try_from(value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
 }
 
 fn parse_profile_phase(value: &str) -> Result<ProfileCreatePhase, StoreError> {
@@ -1841,14 +2220,7 @@ fn parse_string_list(value: String, column: usize) -> rusqlite::Result<Vec<Strin
 }
 
 fn ensure_endpoint_capability_columns(connection: &Connection) -> Result<(), StartupError> {
-    let mut statement = connection
-        .prepare("PRAGMA table_info(endpoints)")
-        .map_err(|_| StartupError::StoreUnavailable)?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|_| StartupError::StoreUnavailable)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|_| StartupError::StoreUnavailable)?;
+    let columns = table_columns(connection, "endpoints")?;
     for (column, declaration) in [
         ("provider_adapter_kinds", "TEXT NOT NULL DEFAULT '[]'"),
         ("tools", "TEXT NOT NULL DEFAULT '[]'"),
@@ -1873,6 +2245,75 @@ fn ensure_endpoint_capability_columns(connection: &Connection) -> Result<(), Sta
         )
         .map_err(|_| StartupError::StoreUnavailable)?;
     Ok(())
+}
+
+fn ensure_auth_profile_columns(connection: &Connection) -> Result<(), StartupError> {
+    let columns = table_columns(connection, "auth_profiles")?;
+    if !columns.iter().any(|value| value == "deleted_at_ms") {
+        connection
+            .execute(
+                "ALTER TABLE auth_profiles ADD COLUMN deleted_at_ms INTEGER",
+                [],
+            )
+            .map_err(|_| StartupError::StoreUnavailable)?;
+    }
+    let columns = table_columns(connection, "auth_profile_delete_operations")?;
+    if !columns.iter().any(|value| value == "response_json") {
+        connection
+            .execute(
+                "ALTER TABLE auth_profile_delete_operations ADD COLUMN response_json TEXT",
+                [],
+            )
+            .map_err(|_| StartupError::StoreUnavailable)?;
+    }
+    Ok(())
+}
+
+fn ensure_replica_operation_columns(connection: &Connection) -> Result<(), StartupError> {
+    let columns = table_columns(connection, "auth_replica_operations")?;
+    if !columns.iter().any(|value| value == "kind") {
+        connection
+            .execute(
+                "ALTER TABLE auth_replica_operations
+                 ADD COLUMN kind TEXT NOT NULL DEFAULT 'install'",
+                [],
+            )
+            .map_err(|_| StartupError::StoreUnavailable)?;
+    }
+    let tombstone_table = table_columns(connection, "auth_profile_tombstones")?;
+    if tombstone_table.is_empty() {
+        return Ok(());
+    }
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO auth_replica_operations (
+                 profile_id, endpoint_id, revision, operation_id,
+                 kind, status, observed_revision
+             )
+             SELECT profile_id, endpoint_id, revision, operation_id,
+                    'tombstone',
+                    CASE status WHEN 'removed' THEN 'ready' ELSE status END,
+                    observed_revision
+             FROM auth_profile_tombstones",
+            [],
+        )
+        .map_err(|_| StartupError::StoreUnavailable)?;
+    connection
+        .execute("DROP TABLE auth_profile_tombstones", [])
+        .map_err(|_| StartupError::StoreUnavailable)?;
+    Ok(())
+}
+
+fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>, StartupError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|_| StartupError::StoreUnavailable)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|_| StartupError::StoreUnavailable)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| StartupError::StoreUnavailable)?;
+    Ok(columns)
 }
 
 fn validate_server_metadata(
