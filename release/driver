@@ -39,6 +39,9 @@ const MAX_HTTP_BYTES = 2 * 1024 * 1024;
 const READINESS_MS = 20_000;
 const STOP_MS = 5_000;
 const POINTERS = new Set(["current", "previous", "staged"]);
+// Process ownership evidence must not be redirected by an operator PATH.
+const PS_COMMAND = "/bin/ps";
+const LSOF_COMMAND = "/usr/sbin/lsof";
 const FORBIDDEN_ENV = [
   "ZODE_RELEASE_REPLAY_CASSETTE",
   "ZODE_RELEASE_REPLAY_EXPECTATION",
@@ -256,7 +259,7 @@ function validateManifest(artifactPath) {
       fail("release_manifest_mismatch", `${label} digest or executable mode does not match manifest`, { path });
     }
   }
-  return { artifact, manifest, manifestPath, digest, paths: { ui, server, endpoint, driver: driverPath } };
+  return { artifact, installPath: artifact, manifest, manifestPath, digest, paths: { ui, server, endpoint, driver: driverPath } };
 }
 
 function fsyncDirectory(path) {
@@ -522,7 +525,7 @@ async function processIdentity(pid) {
   // macOS exposes the session id as `sess` (not the Linux-only `sid`); keep a
   // fallback for platforms whose procps still uses the latter spelling.
   for (const field of ["sess=", "sid="]) {
-    const output = await commandOutput("ps", ["-p", String(pid), "-o", `pgid=,${field}`]);
+    const output = await commandOutput(PS_COMMAND, ["-p", String(pid), "-o", `pgid=,${field}`]);
     const parts = output.trim().split(/\s+/);
     if (parts.length >= 2 && /^\d+$/.test(parts[0]) && /^\d+$/.test(parts[1])) {
       return { process_group_id: Number(parts[0]), session_id: parts[1] };
@@ -934,20 +937,20 @@ function processExecutablePath(pid) {
   try {
     if (statOrNull(procPath)) return realpathSync(procPath);
   } catch { /* fall through to lsof on macOS */ }
-  const output = commandOutput("lsof", ["-nP", "-a", "-p", String(pid), "-d", "txt", "-Fn"]);
+  const output = commandOutput(LSOF_COMMAND, ["-nP", "-a", "-p", String(pid), "-d", "txt", "-Fn"]);
   const line = output.split(/\r?\n/).find((entry) => entry.startsWith("n"));
   if (!line || line.length === 1) return null;
   return realpathSync(line.slice(1));
 }
 
 function processCommandLine(pid) {
-  return commandOutput("ps", ["-p", String(pid), "-o", "command="]).trim();
+  return commandOutput(PS_COMMAND, ["-p", String(pid), "-o", "command="]).trim();
 }
 
 function processesWithExactCommand(executablePath, args) {
   const expectedExecutable = realpathSync(executablePath);
   const expectedCommand = `${expectedExecutable} ${args.join(" ")}`;
-  const output = commandOutput("ps", ["-axo", "pid=,command="]);
+  const output = commandOutput(PS_COMMAND, ["-axo", "pid=,command="]);
   return output.split(/\r?\n/).flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(.+)$/);
     if (!match || match[2] !== expectedCommand) return [];
@@ -992,7 +995,7 @@ async function recoverInstanceRoles(instance) {
 
 function listenerOwnedBy(pid, port) {
   try {
-    const output = commandOutput("lsof", ["-nP", "-a", "-p", String(pid), `-iTCP:${port}`, "-sTCP:LISTEN", "-Fn"]);
+    const output = commandOutput(LSOF_COMMAND, ["-nP", "-a", "-p", String(pid), `-iTCP:${port}`, "-sTCP:LISTEN", "-Fn"]);
     return output.split(/\r?\n/).some((line) => line.startsWith("n"));
   } catch {
     return false;
@@ -1000,7 +1003,7 @@ function listenerOwnedBy(pid, port) {
 }
 
 function directChildren(parentPid) {
-  const output = commandOutput("ps", ["-axo", "pid=,ppid="]);
+  const output = commandOutput(PS_COMMAND, ["-axo", "pid=,ppid="]);
   return output.split(/\r?\n/).flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)$/);
     return match && Number(match[2]) === parentPid ? [Number(match[1])] : [];
@@ -1148,9 +1151,14 @@ function persistentReleaseState(root, instanceId, kind) {
   validatePrivateTree(serverSecrets);
   for (const databasePath of [join(directory, "endpoint.sqlite3"), join(directory, "server.sqlite3")]) {
     const databaseStat = statOrNull(databasePath);
-    if (databaseStat && (!databaseStat.isFile() || databaseStat.isSymbolicLink() || (databaseStat.mode & 0o077) !== 0)) {
+    if (databaseStat && (!databaseStat.isFile() || databaseStat.isSymbolicLink())) {
       fail("release_state_invalid", "persistent database is not a private regular file", { path: databasePath });
     }
+    // SQLite creates a new database with the process umask.  A user-facing
+    // restart must be able to tighten a legacy 0644 file in place without
+    // changing its durable identity or contents; links and non-regular files
+    // remain fail-closed above.
+    if (databaseStat && (databaseStat.mode & 0o077) !== 0) chmodSync(databasePath, 0o600);
   }
   return {
     directory,
@@ -1217,9 +1225,9 @@ async function createInstance(root, artifact, kind, addresses = null) {
   ), 0o600);
   persistState(root, instance);
   const childEnv = { ...process.env, ZODE_RELEASE_INSTANCE_ID: instanceId, ZODE_RELEASE_ARTIFACT_REVISION: artifact.manifest.revision };
-  // Access/controller assertions and test recorder controls belong only to
-  // this driver's probe process.  Never place them in Server/Endpoint
-  // environments where /proc or diagnostics could expose them.
+  // Access/controller assertions, provider credentials, and test recorder
+  // controls belong only to this driver's probe process.  Never place them in
+  // Server/Endpoint environments where /proc or diagnostics could expose them.
   for (const key of [
     "ZODE_RELEASE_ACCESS_ASSERTION",
     "ZODE_RELEASE_ACCESS_JWT_ASSERTION",
@@ -1235,6 +1243,22 @@ async function createInstance(root, artifact, kind, addresses = null) {
     "ZODE_RELEASE_RECORDER",
     "ZODE_RELEASE_E2E_MODE",
     "ZODE_RELEASE_PROVIDER_ORIGINS",
+    "ZODE_RELEASE_LIVE_PROVIDER_BASE_URL",
+    "ZODE_RELEASE_LIVE_PROVIDER_API_KEY",
+    "ZODE_E2E_LIVE_PROVIDER_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENCODE_GO_API_KEY",
+    "OPENCODE_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "MISTRAL_API_KEY",
+    "TOGETHER_API_KEY",
+    "XAI_API_KEY",
+    "GROQ_API_KEY",
+    "COHERE_API_KEY",
   ]) delete childEnv[key];
   try {
     const server = await startProcess(instance, "server", artifact.paths.server.replace(artifact.artifact, artifact.installPath), ["--config", serverConfigPath], { ...childEnv, ZODE_RELEASE_ROLE: "server" });
@@ -1271,7 +1295,7 @@ function rolePids(instance) {
 }
 
 async function descendants(pids) {
-  const output = await commandOutput("ps", ["-axo", "pid=,ppid="]);
+  const output = await commandOutput(PS_COMMAND, ["-axo", "pid=,ppid="]);
   const entries = output.split(/\r?\n/).flatMap((line) => {
     const match = line.trim().match(/^(\d+)\s+(\d+)$/); return match ? [{ pid: Number(match[1]), ppid: Number(match[2]) }] : [];
   });

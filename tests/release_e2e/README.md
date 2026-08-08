@@ -30,6 +30,22 @@ node release/channel.cjs stop --release-root <channel-root>
 node release/channel.cjs update --artifact <candidate> --release-root <channel-root>
 ```
 
+给本机用户的可留存入口是：
+
+```sh
+node release/local-channel.cjs install --artifact <artifact>
+node release/local-channel.cjs start
+# 打开 start 输出的 URL；停止时：
+node release/local-channel.cjs stop
+```
+
+该入口默认使用 `~/.zode/test-channel`，也可传 `--channel-root` 固定到
+其他本机目录。它保留同一 artifact、持久 Endpoint/Server 状态和本地
+Access-protected edge，因此重启后 URL 不变，普通浏览器仍走
+Access → Server → built-in Endpoint；edge 不提供未认证 fallback，也不带
+recorder/replay/test 参数进入产品进程。配置外部 provider 时只需额外设置不含
+凭据的 `ZODE_RELEASE_PROVIDER_ORIGINS`，API key 仍通过 UI profile 输入。
+
 构建只读取 `git archive`，并在同一 revision 内锁定 Endpoint、Server、Vite+
 UI、协议输入和 release driver 的 manifest/digest。`install` 不切换运行中
 版本；`update` 的 candidate readiness 失败会保留 `current`/`previous` 并返回
@@ -79,11 +95,24 @@ vp exec cargo test --test installed_channel_live_browser_e2e \
 
 该正向 E2E 在安装版浏览器中配置 `opencode-go`/`deepseek-v4-flash` provider
 及共享 API-key profile，创建 Endpoint session，发送精确 marker 提示词，断言
-stream marker、Server/Endpoint 管理请求、provider 200/SSE `[DONE]`，再 reload
+stream marker（允许模型在 marker 后追加一个终止标点）、Server/Endpoint 管理请求、provider 200/SSE `[DONE]`，再 reload
 确认最终回复仍由 durable session 恢复。真实 provider 请求数量必须为 1；失败时
 先保留首遇 browser/quarantine 证据并完成 recorder flush。另有
 `installed_channel_live_provider_contract_e2e.cjs` 作为本地 loopback provider
 边界的红绿 contract anchor，不替代真实 provider gate。
+
+持久入口的失败清理与边界也由真实进程 E2E 固定：
+`local_channel_open_failure_e2e.cjs` 验证 fresh `open` 健康失败不会留下
+edge；`local_channel_edge_admission_e2e.cjs` 验证篡改的非 loopback 状态被
+拒绝；`local_channel_stop_identity_e2e.cjs` 验证 stop 不信任 PATH 伪造的
+`ps` 身份，也不会杀死无关进程组；`local_channel_update_failure_e2e.cjs`
+验证 fresh update 的无效候选不会留下 edge/runtime；
+`local_channel_revision_update_e2e.cjs` 使用两个真实 immutable artifact，验证
+旧 current 经 candidate readiness 后原子推进到新 revision，并且更新后仍只保留
+一个健康的 current 实例；它要求 `ZODE_RELEASE_CHANNEL_BASE_ARTIFACT` 与
+`ZODE_RELEASE_CHANNEL_ARTIFACT`。
+`local_channel_node_runtime_e2e.cjs` 验证由一套 Node 启动后，另一套受信
+Node 仍能按 runtime 中的真实 executable path 检查并停止同一 edge。
 
 The test channel supplies the existing authentication inputs through
 `ZODE_RELEASE_ACCESS_ASSERTION` (or `_ACCESS_JWT_ASSERTION`) and

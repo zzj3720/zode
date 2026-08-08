@@ -28,6 +28,32 @@ candidate，再调用 operator promotion；stage 失败时报告 `current`/
 teardown，任何泄漏或 flush 失败都会返回非零。该入口不接受 cassette、replay、
 recorder、locator 或未认证 health 参数。
 
+需要把测试版交给本机用户时，使用 `release/local-channel.cjs` 建立可留存的
+默认通道 `~/.zode/test-channel`（也可传 `--channel-root`）：
+
+```sh
+node release/local-channel.cjs install --artifact <artifact>
+node release/local-channel.cjs start
+node release/local-channel.cjs status
+node release/local-channel.cjs stop
+```
+
+`start` 输出固定本机浏览器 URL；同一根目录中的不可变 artifact、Endpoint/
+Server 持久状态和本地 Access edge 配置会在 stop/start 后保留，用户不需要
+拼接临时进程。该 edge 只是测试通道的真实 Access 签名转发器，不是 Server
+的未认证 fallback；它不记录请求、不接受 cassette/replay，也不进入产物中的
+Server/Endpoint 进程。若要在 UI 中配置外部 provider，启动时用不含凭据的
+`ZODE_RELEASE_PROVIDER_ORIGINS=https://<approved-provider-origin>` 声明允许的
+origin；provider key 仍只在 Access-protected UI 的 profile 表单中输入。
+edge 与它的管理上游都固定为 `127.0.0.1` HTTP loopback；篡改私有状态使其
+监听其它地址或把 Access assertion 转发到非 loopback origin 时，入口必须
+fail closed。`open` 在健康失败或无法启动系统浏览器时会回收本次 edge，不能
+留下 runtime 指针或 detached 进程。`update` 在 fresh 根或候选 admission
+失败时也必须回收本次启动的 edge/runtime；已有健康通道更新失败时保留原
+edge，避免把仍可用的 current 通道一并停掉。runtime 会记录启动 edge 时的
+真实 Node executable path；后续 start/status/stop 必须按该路径和精确 argv
+核对，不因调用者换用另一套受信 Node runtime 而误拒绝或误杀。
+
 外部 artifact 的 `install`/`bootstrap`/`stage` admission 先由 checkout 中的
 受信 driver 校验 manifest、组件 digest 和不可变树；不会先执行 artifact 自带
 的脚本。安装成功后，`promote`、`health` 和 `teardown` 才从 `current` 读取

@@ -30,15 +30,24 @@ const { spawn } = require('node:child_process');
 const repositoryRoot = path.resolve(__dirname, '..', '..');
 const { chromium } = require(path.join(repositoryRoot, 'web', 'e2e', 'node_modules', '@playwright', 'test'));
 const channelEntry = path.join(repositoryRoot, 'release', 'channel.cjs');
+const localChannelEntry = path.join(repositoryRoot, 'release', 'local-channel.cjs');
 const runId = `${Date.now()}-${randomUUID()}`;
 const artifact = process.env.ZODE_RELEASE_CHANNEL_ARTIFACT;
+const persistentRoot = process.env.ZODE_RELEASE_LOCAL_CHANNEL_ROOT || null;
+const persistentMode = Boolean(persistentRoot);
 const liveProviderBaseUrl = process.env.ZODE_RELEASE_LIVE_PROVIDER_BASE_URL || null;
 const liveProviderApiKey = process.env.ZODE_RELEASE_LIVE_PROVIDER_API_KEY || null;
 const liveProviderMode = Boolean(liveProviderBaseUrl || liveProviderApiKey);
 const expectedAssistant = liveProviderMode ? 'ZODE_E2_LIVE_OK' : 'ZODE_INSTALLED_BROWSER_OK';
-const providerId = liveProviderMode ? 'opencode-go' : 'installed-e2e-provider';
+const expectedAssistantPattern = liveProviderMode
+  ? /^ZODE_E2_LIVE_OK[.!?]?$/
+  : /^ZODE_INSTALLED_BROWSER_OK$/;
+// A persistent user channel may retain earlier smoke profiles.  Each live
+// run owns a fresh provider descriptor/profile so the browser cannot select a
+// stale revision while still exercising the same configured adapter.
+const providerId = liveProviderMode ? `opencode-go-live-${randomUUID().slice(0, 8)}` : 'installed-e2e-provider';
 const modelId = liveProviderMode ? 'deepseek-v4-flash' : 'installed-e2e-model';
-const profileLabel = liveProviderMode ? 'Installed live smoke profile' : 'Installed smoke profile';
+const profileLabel = liveProviderMode ? `Installed live smoke profile ${runId.slice(-8)}` : 'Installed smoke profile';
 const smokePrompt = liveProviderMode
   ? 'Reply with exactly ZODE_E2_LIVE_OK.'
   : 'Reply with the installed-channel smoke marker.';
@@ -134,7 +143,7 @@ function preserveFailure(error, context) {
   }, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
 }
 
-async function startFixtures() {
+async function startFixtures({ persistent = false } = {}) {
   const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const jwk = publicKey.export({ format: 'jwk' });
   const kid = `installed-channel-${randomUUID()}`;
@@ -174,6 +183,18 @@ async function startFixtures() {
     });
     providerOrigin = await listen(provider);
     providerBaseUrl = providerOrigin;
+  }
+  if (persistent) {
+    return {
+      providerOrigin,
+      providerBaseUrl,
+      live: liveProviderMode,
+      provider,
+      providerKey,
+      requests,
+      controllerSecret,
+      async close() { await close(provider); },
+    };
   }
   const jwks = http.createServer((request, response) => {
     if (request.method !== 'GET' || request.url !== '/jwks') {
@@ -244,14 +265,15 @@ async function main() {
     process.exitCode = 78;
     return;
   }
-  const root = mkdtempSync(path.join(os.tmpdir(), 'zode-installed-browser-smoke-'));
-  const fixtures = await startFixtures();
+  const root = persistentMode ? path.resolve(persistentRoot) : mkdtempSync(path.join(os.tmpdir(), 'zode-installed-browser-smoke-'));
+  const fixtures = await startFixtures({ persistent: persistentMode });
   let started = false;
   let browser;
   let page;
   let browserRequests = [];
   let browserResponses = [];
   let failure;
+  let browserOrigin = null;
   const env = {
     ...process.env,
     ZODE_RELEASE_ACCESS_ASSERTION: fixtures.assertion,
@@ -266,6 +288,7 @@ async function main() {
     'ZODE_RELEASE_LIVE_PROVIDER_BASE_URL',
     'ZODE_RELEASE_LIVE_PROVIDER_API_KEY',
     'ZODE_E2E_LIVE_PROVIDER_API_KEY',
+    'DEEPSEEK_API_KEY',
     'OPENCODE_GO_API_KEY',
     'OPENCODE_API_KEY',
     'OPENAI_API_KEY',
@@ -281,17 +304,36 @@ async function main() {
   ]) {
     delete channelEnv[key];
   }
+  if (persistentMode) channelEnv.ZODE_RELEASE_PROVIDER_ORIGINS = fixtures.providerOrigin;
   let streamMarkerVisible = false;
   let durableFinalVisible = false;
   try {
-    const installed = await command(process.execPath, [channelEntry, 'install', '--artifact', path.resolve(artifact), '--release-root', root], channelEnv);
+    const installed = await command(
+      process.execPath,
+      persistentMode
+        ? [localChannelEntry, 'install', '--artifact', path.resolve(artifact), '--channel-root', root]
+        : [channelEntry, 'install', '--artifact', path.resolve(artifact), '--release-root', root],
+      channelEnv,
+    );
     if (installed.status !== 0 || installed.payload?.ok !== true) fail('installed artifact install failed', installed);
-    const startedResult = await command(process.execPath, [channelEntry, 'start', '--artifact', path.resolve(artifact), '--release-root', root], channelEnv);
+    const startedResult = await command(
+      process.execPath,
+      persistentMode
+        ? [localChannelEntry, 'start', '--channel-root', root]
+        : [channelEntry, 'start', '--artifact', path.resolve(artifact), '--release-root', root],
+      channelEnv,
+    );
     if (startedResult.status !== 0 || startedResult.payload?.ok !== true) fail('installed artifact start failed', startedResult);
     started = true;
-    const serverUrl = startedResult.payload?.health?.probes?.server_url;
-    if (typeof serverUrl !== 'string') fail('installed start did not expose live server probe', startedResult);
-    fixtures.setTarget(new URL(serverUrl).origin);
+    if (persistentMode) {
+      if (typeof startedResult.payload?.url !== 'string') fail('persistent start did not expose a browser URL', startedResult);
+      browserOrigin = new URL(startedResult.payload.url).origin;
+    } else {
+      const serverUrl = startedResult.payload?.health?.probes?.server_url;
+      if (typeof serverUrl !== 'string') fail('installed start did not expose live server probe', startedResult);
+      fixtures.setTarget(new URL(serverUrl).origin);
+      browserOrigin = new URL(fixtures.edgeOrigin).origin;
+    }
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext();
     page = await context.newPage();
@@ -311,7 +353,7 @@ async function main() {
         void response.text().then((body) => { entry.body = body.slice(0, 4096); }).catch(() => {});
       }
     });
-    await page.goto(`${fixtures.edgeOrigin}/`, { waitUntil: 'domcontentloaded' });
+    await page.goto(`${browserOrigin}/`, { waitUntil: 'domcontentloaded' });
     await page.getByRole('link', { name: 'Sessions', exact: true }).waitFor();
     await page.getByText('All-in-one ready', { exact: true }).waitFor();
     await page.getByRole('link', { name: 'Providers' }).click();
@@ -321,11 +363,14 @@ async function main() {
     await page.getByLabel('Models').fill(modelId);
     await page.getByRole('button', { name: 'Save provider' }).click();
     await page.getByText(`${providerId} is ready for an auth profile.`, { exact: true }).waitFor();
-    await page.getByRole('button', { name: 'Add API key profile' }).click();
-    await page.getByLabel('Profile label').fill(profileLabel);
-    await page.getByLabel('API key').fill(fixtures.providerKey);
-    await page.getByLabel('Share with this machine').check();
-    await page.getByRole('button', { name: 'Create profile' }).click();
+    const providerCard = page.locator('article.resource-card').filter({
+      has: page.getByRole('heading', { name: providerId, exact: true }),
+    });
+    await providerCard.getByRole('button', { name: 'Add API key profile' }).click();
+    await providerCard.getByLabel('Profile label').fill(profileLabel);
+    await providerCard.getByLabel('API key').fill(fixtures.providerKey);
+    await providerCard.getByLabel('Share with this machine').check();
+    await providerCard.getByRole('button', { name: 'Create profile' }).click();
     await page.getByText('Profile installed on the selected Endpoint.', { exact: true }).waitFor();
     await page.getByRole('link', { name: 'Sessions' }).click();
     await page.getByRole('button', { name: 'New session' }).click();
@@ -336,12 +381,12 @@ async function main() {
     await page.getByRole('button', { name: 'Start session' }).click();
     await page.getByPlaceholder('Message Zode').fill(smokePrompt);
     await page.getByRole('button', { name: 'Send' }).click();
-    await page.getByText(expectedAssistant, { exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByText(expectedAssistantPattern).waitFor({ timeout: 20_000 });
     streamMarkerVisible = true;
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.getByText(expectedAssistant, { exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByText(expectedAssistantPattern).waitFor({ timeout: 20_000 });
     durableFinalVisible = true;
-    const edge = new URL(fixtures.edgeOrigin);
+    const edge = new URL(browserOrigin);
     const managementRequests = browserRequests.filter((item) => new URL(item.url).origin === edge.origin);
     if (!managementRequests.some((item) => item.method === 'POST' && /\/v1\/endpoints\/[^/]+\/sessions$/.test(new URL(item.url).pathname))) {
       fail('browser did not create a session through the installed Server');
@@ -360,13 +405,19 @@ async function main() {
     }
     await browser.close();
     browser = null;
-    const stopped = await command(process.execPath, [channelEntry, 'stop', '--release-root', root], channelEnv);
+    const stopped = await command(
+      process.execPath,
+      persistentMode
+        ? [localChannelEntry, 'stop', '--channel-root', root]
+        : [channelEntry, 'stop', '--release-root', root],
+      channelEnv,
+    );
     if (stopped.status !== 0 || stopped.payload?.ok !== true) fail('installed channel stop failed', stopped);
     started = false;
     process.stdout.write(JSON.stringify({
       status: 'PASS',
       root,
-      browser_origin: fixtures.edgeOrigin,
+      browser_origin: browserOrigin,
       live_provider: fixtures.live,
       stream_marker_visible: streamMarkerVisible,
       durable_final_visible_after_reload: durableFinalVisible,
@@ -391,7 +442,13 @@ async function main() {
   } finally {
     if (browser) await browser.close().catch(() => {});
     if (started) {
-      await command(process.execPath, [channelEntry, 'stop', '--release-root', root], channelEnv).catch(() => {});
+      await command(
+        process.execPath,
+        persistentMode
+          ? [localChannelEntry, 'stop', '--channel-root', root]
+          : [channelEntry, 'stop', '--release-root', root],
+        channelEnv,
+      ).catch(() => {});
     }
     await fixtures.close();
     if (!failure) process.exitCode = 0;
