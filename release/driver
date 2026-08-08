@@ -571,14 +571,27 @@ function probeHeaders(role, secret) {
 function endpointControllerSecret(instance) {
   try {
     const value = readFileSync(instance.endpoint_secret_path, "utf8").trim();
-    return value;
+    if (value) return value;
   } catch {
-    // The all-in-one Server creates the bootstrap secret atomically immediately
-    // before it starts its Endpoint child.  A missing file is therefore an
-    // in-progress readiness state, not a reason for the driver to invent a
-    // second authority.
+    // The Server-generated bootstrap is intentionally consumed by Endpoint.
+  }
+  // Once initialized, Endpoint keeps the active controller credential in its
+  // private, run-owned control sidecar.  Read only the single driver-issued
+  // current revision; never scan outside this instance or emit the secret.
+  const directory = join(instance.persistent_directory, "endpoint.sqlite3.controller-auth");
+  let entries;
+  try {
+    const directoryStat = statOrNull(directory);
+    if (!directoryStat || directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) return "";
+    entries = readdirSync(directory).filter((name) => /^current-[a-f0-9]{64}-1\.secret$/.test(name));
+  } catch {
     return "";
   }
+  if (entries.length !== 1) return "";
+  const path = join(directory, entries[0]);
+  const secretStat = statOrNull(path);
+  if (!secretStat || secretStat.isSymbolicLink() || !secretStat.isFile() || (secretStat.mode & 0o077) !== 0) return "";
+  try { return readFileSync(path, "utf8").trim(); } catch { return ""; }
 }
 
 async function probeInstance(instance) {
