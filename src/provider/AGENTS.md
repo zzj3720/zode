@@ -189,3 +189,13 @@ The remaining independent provider decisions require
 `e2e_endpoint_aimux_calls_provider_directly_without_server_hop`. These cases
 must be real Endpoint-to-network-provider paths through aimux; a direct aimux
 test or replica-route-only assertion does not satisfy them.
+
+The complete public multi-profile lifecycle is fixed by
+`e2e_multiple_profiles_selection_isolated_across_replace_tombstone_restart`:
+two profiles of one provider are installed and selected explicitly over HTTP,
+one profile is replaced and then tombstoned while the other remains usable,
+the tombstone and ready state survive Endpoint restart, and every model answer
+is observed through the real SSE path. The scenario also proves missing or
+tombstoned profile selection fails before provider admission and that profile
+secrets never reach HTTP/SSE responses, headers, process output, or session
+SQLite.
