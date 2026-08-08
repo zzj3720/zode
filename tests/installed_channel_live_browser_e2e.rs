@@ -1,6 +1,11 @@
 mod support;
 
-use std::{env, io::Error, path::PathBuf, time::Duration};
+use std::{
+    env, fs,
+    io::Error,
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use serde_json::Value;
 use support::{
@@ -148,7 +153,7 @@ fn assert_recording(recording: &LlmHttpRecording, secret: &str) -> TestResult<()
     Ok(())
 }
 
-async fn run_live(artifact: PathBuf, secret: Secret) -> TestResult<()> {
+async fn run_live(artifact: PathBuf, secret: Secret, persistent: bool) -> TestResult<()> {
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let quarantine = new_llm_recording_run_dir()?;
     let recording_id = quarantine
@@ -175,12 +180,29 @@ async fn run_live(artifact: PathBuf, secret: Secret) -> TestResult<()> {
 
     let recorder_base_url = recorder.base_url("/zen/go/v1");
     let script = repository.join("tests/release_e2e/installed_channel_browser_smoke_e2e.cjs");
+    let channel_root = if persistent {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let root = env::temp_dir().join(format!(
+            "zode-local-channel-live-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root)?;
+        Some(root)
+    } else {
+        None
+    };
     let mut command = Command::new("node");
     command
         .current_dir(&repository)
         .arg(script)
         .env("ZODE_RELEASE_CHANNEL_ARTIFACT", &artifact)
         .kill_on_drop(true);
+    if let Some(root) = &channel_root {
+        command.env("ZODE_RELEASE_LOCAL_CHANNEL_ROOT", root);
+    }
     for variable in [
         "OPENCODE_GO_API_KEY",
         "OPENCODE_API_KEY",
@@ -251,7 +273,7 @@ async fn run_live(artifact: PathBuf, secret: Secret) -> TestResult<()> {
     if let Err(error) = scan_llm_recording_tree(&quarantine, &[secret.text()?]) {
         cleanup_errors.push(error.to_string());
     }
-    if cleanup_errors.is_empty() {
+    let result = if cleanup_errors.is_empty() {
         println!(
             "installed live browser PASS recording_id={} artifact_revision={} provider_exchanges=1",
             recording_id,
@@ -267,7 +289,12 @@ async fn run_live(artifact: PathBuf, secret: Secret) -> TestResult<()> {
             cleanup_errors.join("; ")
         ))
         .into())
+    };
+
+    if let Some(root) = channel_root {
+        let _ = fs::remove_dir_all(root);
     }
+    result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -292,7 +319,12 @@ async fn e2e_installed_channel_live_browser_provider_roundtrip() -> TestResult<(
     if secret.0.is_empty() {
         return Err(Error::other("OPENCODE_GO_API_KEY must not be empty").into());
     }
-    timeout(Duration::from_secs(360), run_live(artifact, secret))
-        .await
-        .map_err(|_| Error::other("installed live browser E2E exceeded its 360 second deadline"))?
+    let persistent =
+        env::var("ZODE_RUN_INSTALLED_CHANNEL_PERSISTENT_LIVE_BROWSER_E2E").as_deref() == Ok("1");
+    timeout(
+        Duration::from_secs(360),
+        run_live(artifact, secret, persistent),
+    )
+    .await
+    .map_err(|_| Error::other("installed live browser E2E exceeded its 360 second deadline"))?
 }

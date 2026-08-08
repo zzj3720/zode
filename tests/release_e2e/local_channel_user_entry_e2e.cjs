@@ -115,10 +115,14 @@ async function main() {
   }
 
   let provider;
+  const providerRequests = [];
   let browser;
+  let started = false;
+  let phase = 'init';
   try {
     provider = http.createServer(async (request, response) => {
       await readRequest(request);
+      providerRequests.push({ method: request.method, path: request.url });
       response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
       response.write('data: {"choices":[{"delta":{"content":"ZODE_USER_ENTRY_OK"},"finish_reason":null}]}\n\n');
       response.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
@@ -130,11 +134,13 @@ async function main() {
     const installed = run(['install', '--artifact', path.resolve(artifact), '--channel-root', channelRoot], env);
     if (installed.status !== 0 || installed.payload?.ok !== true) fail('persistent channel install failed', installed);
 
-    const started = run(['start', '--channel-root', channelRoot], env);
-    if (started.status !== 0 || started.payload?.ok !== true || typeof started.payload?.url !== 'string') {
-      fail('persistent channel start did not return a user URL', started);
+    const startedResult = run(['start', '--channel-root', channelRoot], env);
+    if (startedResult.status !== 0 || startedResult.payload?.ok !== true || typeof startedResult.payload?.url !== 'string') {
+      fail('persistent channel start did not return a user URL', startedResult);
     }
-    const url = started.payload.url;
+    started = true;
+    const url = startedResult.payload.url;
+    phase = 'initial_browser';
     const page = await (browser = await chromium.launch({ headless: true })).newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.getByRole('link', { name: 'Sessions', exact: true }).waitFor();
@@ -164,14 +170,20 @@ async function main() {
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.getByText('ZODE_USER_ENTRY_OK', { exact: true }).waitFor({ timeout: 20_000 });
 
+    phase = 'first_stop';
     const stopped = run(['stop', '--channel-root', channelRoot], env);
     if (stopped.status !== 0 || stopped.payload?.ok !== true) fail('persistent channel stop failed', stopped);
+    phase = 'restart';
     const restarted = run(['start', '--channel-root', channelRoot], env);
     if (restarted.status !== 0 || restarted.payload?.ok !== true || restarted.payload.url !== url) {
       fail('persistent channel restart did not preserve the user URL', restarted);
     }
+    phase = 'reopened_browser';
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.getByRole('link', { name: 'Sessions', exact: true }).waitFor();
+    const durableSession = page.locator('a.session-row').first();
+    await durableSession.waitFor();
+    await durableSession.click();
     await page.getByText('ZODE_USER_ENTRY_OK', { exact: true }).waitFor({ timeout: 20_000 });
     const finalStop = run(['stop', '--channel-root', channelRoot], env);
     if (finalStop.status !== 0 || finalStop.payload?.ok !== true) fail('persistent channel final stop failed', finalStop);
@@ -183,11 +195,22 @@ async function main() {
       durable_final_visible_after_restart: true,
     }) + '\n');
   } catch (error) {
-    preserveFailure(error, { channel_root: channelRoot, artifact: artifact ? path.resolve(artifact) : null });
+    let browserUrl = null;
+    try { browserUrl = browser?.contexts()?.[0]?.pages()?.[0]?.url() || null; } catch { /* best effort */ }
+    preserveFailure(error, {
+      channel_root: channelRoot,
+      artifact: artifact ? path.resolve(artifact) : null,
+      phase,
+      provider_requests: providerRequests,
+      browser_url: browserUrl,
+    });
     process.stderr.write(JSON.stringify({ status: 'RED', error: String(error.message || error), details: error.details || {} }) + '\n');
     process.exitCode = 1;
   } finally {
     await browser?.close().catch(() => {});
+    if (started) {
+      try { run(['stop', '--channel-root', channelRoot]); } catch { /* preserve process evidence for diagnosis */ }
+    }
     await close(provider);
     cleanupWorkspace();
   }
