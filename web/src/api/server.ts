@@ -323,6 +323,33 @@ export function getSession(endpointId: string, sessionId: string): Promise<Sessi
   );
 }
 
+export function selectSessionModel(
+  endpointId: string,
+  sessionId: string,
+  body: {
+    provider: Provider;
+    model: string;
+    profile: AuthProfile;
+  },
+): Promise<unknown> {
+  return requestJson(
+    `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}/model`,
+    idempotent("PUT", {
+      provider: body.provider.provider,
+      model: body.model,
+      provider_execution: {
+        schema: "zode.provider-execution.v1",
+        revision: body.provider.descriptor.revision,
+        kind: body.provider.descriptor.kind,
+        base_url: body.provider.descriptor.base_url,
+        options: body.provider.descriptor.options,
+      },
+      auth_profile_id: body.profile.auth_profile_id,
+      minimum_auth_revision: body.profile.revision,
+    }),
+  );
+}
+
 export function sendMessage(
   endpointId: string,
   sessionId: string,
