@@ -657,6 +657,12 @@ impl Runtime {
                 return Ok(());
             }
 
+            if self.activation_round_budget_exhausted(&state) {
+                self.finish_round_budget_activation(&owner, &session_id, &state)
+                    .await?;
+                return Ok(());
+            }
+
             if let Some(trigger) = unresolved_user(&state) {
                 let round = self
                     .run_model_round(
@@ -693,6 +699,12 @@ impl Runtime {
             }
             state = next_state;
 
+            if self.activation_round_budget_exhausted(&state) {
+                self.finish_round_budget_activation(&owner, &session_id, &state)
+                    .await?;
+                return Ok(());
+            }
+
             if let Some(round_identity) = model_followup_identity(&state) {
                 let round = self
                     .run_model_round(&owner, &session_id, &selection, &state, round_identity)
@@ -728,6 +740,53 @@ impl Runtime {
                 return Ok(());
             }
         }
+    }
+
+    fn activation_round_budget_exhausted(&self, state: &SessionState) -> bool {
+        let Some(activation) = state.active_activation.as_ref() else {
+            return false;
+        };
+        if activation.rounds_started < self.options.max_rounds_per_activation {
+            return false;
+        }
+        // A scheduled retry belongs to the already-counted round and must
+        // still be claimed.  The budget limits model rounds, not attempts
+        // within one prepared request.
+        !state
+            .active_model_round
+            .as_ref()
+            .is_some_and(|round| round.retry.is_some() && round.attempt.is_none())
+    }
+
+    async fn finish_round_budget_activation(
+        self: &Arc<Self>,
+        owner: &SessionOwner,
+        session_id: &str,
+        state: &SessionState,
+    ) -> Result<(), &'static str> {
+        let Some(activation) = state.active_activation.as_ref() else {
+            return Ok(());
+        };
+        let Some((append, next_state)) = finish_activation(
+            self.store.clone(),
+            owner.clone(),
+            session_id.to_owned(),
+            state,
+            activation.activation_id.clone(),
+            ActivationOutcome::Finished,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        self.observe_commit(&append, &next_state).await;
+        let queued_input = next_state.transcript.last().is_some_and(|message| {
+            message.role == TranscriptRole::User && message.source_queue_id.is_some()
+        });
+        if !next_state.delivery_queue.is_empty() || queued_input {
+            self.wake(owner.clone(), session_id.to_owned());
+        }
+        Ok(())
     }
 
     async fn recover_model_round(

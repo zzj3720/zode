@@ -2458,6 +2458,73 @@ async fn e2e_invalid_model_tool_arguments_are_rejected_before_side_effect() -> T
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_max_rounds_per_activation_stops_tool_feedback_loop() -> TestResult<()> {
+    let database = TempDatabase::new("runtime-max-rounds")?;
+    let mut model = ModelFixture::start(vec![
+        ModelScript::tool_call("call-round-limit", "fixture_tool", r#"{"value":"one"}"#),
+        ModelScript::final_text("unexpected second round"),
+    ])
+    .await?;
+    let mut tool = ToolFixture::start(vec![ToolScript::Response(json!({
+        "status": "completed",
+        "result": {"content": "tool result"}
+    }))])
+    .await?;
+    let config = config_file(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+    )?;
+    let mut config_value: Value = serde_json::from_slice(&fs::read(&config)?)?;
+    config_value["runtime"]["max_rounds_per_activation"] = json!(1);
+    fs::write(&config, serde_json::to_vec_pretty(&config_value)?)?;
+
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id =
+        create_session(&client, &server, &model.provider_url(), "create-max-rounds").await?;
+    let mut events = open_events(&client, &server, &session_id).await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "max-rounds-message",
+        "run the bounded tool loop",
+    )
+    .await?;
+
+    tokio::select! {
+        result = model.wait_for_requests(2) => {
+            result?;
+            return Err(Error::other(
+                "activation exceeded configured max_rounds_per_activation",
+            ).into());
+        }
+        result = next_event_with_kind(&mut events, "activation_finished") => {
+            result?;
+        }
+    }
+    tool.wait_for_invocations(1).await?;
+    assert_eq!(model.request_count(), 1);
+    let state = get_session(&client, &server, &session_id).await?;
+    assert_eq!(state["status"], "idle");
+    assert!(state["active_activation"].is_null());
+    assert!(state["active_model_round"].is_null());
+    assert!(state["transcript"]
+        .as_array()
+        .is_some_and(|messages| messages
+            .iter()
+            .all(|message| { message["content"] != "unexpected second round" })));
+    assert_eq!(tool.invocation_count(), 1);
+    server.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_hard_crash_recovery_exhausts_one_model_attempt_and_keeps_delivery_runnable(
 ) -> TestResult<()> {
     let database = TempDatabase::new("runtime-crash-exhausted")?;

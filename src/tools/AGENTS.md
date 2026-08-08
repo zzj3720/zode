@@ -97,6 +97,7 @@ process-bound, ambiguous remote-response, and external-callback tools.
 
 Existing executable anchors are
 `e2e_invalid_model_tool_arguments_are_rejected_before_side_effect`,
+`e2e_max_rounds_per_activation_stops_tool_feedback_loop`,
 `e2e_mixed_tool_batch_is_concurrent_ordered_and_waits_once`,
 `e2e_explicit_wait_last_wins_without_skipping_ordinary_tool`,
 `e2e_explicit_wait_defaults_to_sixty_seconds_and_survives_restart`,

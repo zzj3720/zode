@@ -78,6 +78,9 @@ SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
   activation; it does not resume an old model HTTP stream.
 - Preserve a configurable consecutive-timeout activation budget so repeated
   waits cannot create an unbounded self-wake loop without external input.
+- Stop an activation after its configured model-round budget; a retry of the
+  already prepared round remains eligible, while a queued user delivery may
+  wake a fresh activation under a new budget.
 - `planned` is strictly pre-dispatch: a durable transition to `running` must
   commit before side effects start, so recovery may dispatch an unclaimed plan
   once. On restart, process-bound running tools become terminal
