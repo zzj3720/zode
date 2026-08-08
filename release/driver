@@ -564,13 +564,26 @@ function probeHeaders(role, secret) {
     const value = process.env.ZODE_RELEASE_ACCESS_ASSERTION || process.env.ZODE_RELEASE_ACCESS_JWT_ASSERTION;
     return value ? { "Cf-Access-Jwt-Assertion": value } : {};
   }
-  const value = process.env.ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER || process.env.ZODE_RELEASE_CONTROLLER_BEARER || secret;
+  const value = secret || process.env.ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER || process.env.ZODE_RELEASE_CONTROLLER_BEARER;
   return value ? { authorization: `Bearer ${value}` } : {};
+}
+
+function endpointControllerSecret(instance) {
+  try {
+    const value = readFileSync(instance.endpoint_secret_path, "utf8").trim();
+    return value;
+  } catch {
+    // The all-in-one Server creates the bootstrap secret atomically immediately
+    // before it starts its Endpoint child.  A missing file is therefore an
+    // in-progress readiness state, not a reason for the driver to invent a
+    // second authority.
+    return "";
+  }
 }
 
 async function probeInstance(instance) {
   const server = await probeHttp(instance.probes.server_url, probeHeaders("server"));
-  const endpoint = await probeHttp(instance.probes.endpoint_url, probeHeaders("endpoint", instance.endpointSecret));
+  const endpoint = await probeHttp(instance.probes.endpoint_url, probeHeaders("endpoint", endpointControllerSecret(instance)));
   const ui = await probeHttp(instance.probes.ui_url, probeHeaders("ui"));
   const serverBody = parseJsonBody(server);
   const endpointBody = parseJsonBody(endpoint);
@@ -720,8 +733,16 @@ function readState(path, root, instanceName) {
     fail("release_state_invalid", "instance state is invalid", { path });
   }
   ownedPath(root, value.directory, "instance directory", { directory: true });
-  ownedPath(root, value.endpoint_secret_path, "endpoint controller secret", { privateFile: true });
   ownedPath(root, value.persistent_directory, "persistent state directory", { directory: true });
+  const expectedEndpointSecretPath = join(value.persistent_directory, "endpoint-controller.secret");
+  if (typeof value.endpoint_secret_path !== "string"
+      || resolve(value.endpoint_secret_path) !== resolve(expectedEndpointSecretPath)) {
+    fail("release_state_invalid", "endpoint controller secret path is not instance-owned", { path: value.endpoint_secret_path });
+  }
+  const endpointSecretStat = statOrNull(value.endpoint_secret_path);
+  if (endpointSecretStat) {
+    ownedPath(root, value.endpoint_secret_path, "endpoint controller secret", { privateFile: true });
+  }
   if (!value.artifact || typeof value.artifact !== "object" || typeof value.artifact.installPath !== "string"
       || !validRevision(value.artifact.manifest?.revision) || !/^[a-f0-9]{64}$/.test(value.artifact.digest)) {
     fail("release_state_invalid", "instance state has no valid installed artifact identity");
@@ -770,7 +791,9 @@ function readState(path, root, instanceName) {
   if (!value.endpointSecret && value.endpoint_secret_path) {
     try { value.endpointSecret = readFileSync(value.endpoint_secret_path, "utf8").trim(); } catch { value.endpointSecret = ""; }
   }
-  if (!value.endpointSecret) fail("release_state_invalid", "instance controller secret is empty");
+  // A fresh all-in-one instance has no secret until Server atomically creates
+  // its bootstrap seed.  Health/readiness will fail closed until that file is
+  // present; teardown and crash recovery still retain the private path.
   return value;
 }
 
@@ -972,8 +995,10 @@ async function observeEndpointChild(instance, serverRole, endpointPath, endpoint
       const expectedCommand = `${expectedExecutable} --config ${expectedConfig} --listen ${expectedListen}`;
       if (command !== expectedCommand) continue;
       if (!listenerOwnedBy(pid, endpointPort)) continue;
-      const identity = await probeHttp(`http://127.0.0.1:${endpointPort}/v1/identity`, probeHeaders("endpoint", instance.endpointSecret));
-      const capabilities = await probeHttp(`http://127.0.0.1:${endpointPort}/v1/capabilities`, probeHeaders("endpoint", instance.endpointSecret));
+      const secret = endpointControllerSecret(instance);
+      if (!secret) continue;
+      const identity = await probeHttp(`http://127.0.0.1:${endpointPort}/v1/identity`, probeHeaders("endpoint", secret));
+      const capabilities = await probeHttp(`http://127.0.0.1:${endpointPort}/v1/capabilities`, probeHeaders("endpoint", secret));
       const identityBody = parseJsonBody(identity);
       const capabilitiesBody = parseJsonBody(capabilities);
       if (identity.status < 200 || identity.status >= 300 || capabilities.status < 200 || capabilities.status >= 300) continue;
@@ -1072,12 +1097,9 @@ function persistentReleaseState(root, instanceId, kind) {
     fail("release_state_invalid", "persistent identity metadata has an invalid authority", { path: metadataPath });
   }
   const endpointSecretPath = join(directory, "endpoint-controller.secret");
-  // Each instance owns a separate private secret file.  The local test
-  // channel may supply one controller bearer for its authenticated probes;
-  // authority IDs and stores remain isolated between current and candidate.
-  const requestedSecret = process.env.ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER
-    || process.env.ZODE_RELEASE_CONTROLLER_BEARER
-    || null;
+  // All-in-one Server is the authority owner.  On a fresh instance it creates
+  // this bootstrap file atomically from its private control store before
+  // spawning Endpoint; the driver must not pre-seed a competing secret.
   const existingSecret = statOrNull(endpointSecretPath);
   if (existingSecret) {
     if (!existingSecret.isFile() || existingSecret.isSymbolicLink() || (existingSecret.mode & 0o077) !== 0) {
@@ -1085,11 +1107,6 @@ function persistentReleaseState(root, instanceId, kind) {
     }
     const storedSecret = readFileSync(endpointSecretPath, "utf8").trim();
     if (!storedSecret) fail("release_state_invalid", "persistent controller secret is empty", { path: endpointSecretPath });
-    if (requestedSecret && requestedSecret !== storedSecret) {
-      fail("release_state_invalid", "configured controller secret differs from the persistent release authority");
-    }
-  } else {
-    privateFile(endpointSecretPath, `${requestedSecret || randomBytes(32).toString("base64url")}\n`);
   }
   const subjectKeyPath = join(directory, "subject.key");
   privateFile(subjectKeyPath, randomBytes(32));
@@ -1109,7 +1126,7 @@ function persistentReleaseState(root, instanceId, kind) {
     server_database: join(directory, "server.sqlite3"),
     server_secrets: serverSecrets,
     subject_key: subjectKeyPath,
-    endpoint_secret: readFileSync(endpointSecretPath, "utf8").trim(),
+    endpoint_secret: existingSecret ? readFileSync(endpointSecretPath, "utf8").trim() : "",
   };
 }
 
