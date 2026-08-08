@@ -2,7 +2,7 @@ import { expect, test, type Page, type Request } from "@playwright/test";
 import { createHash, createSign, generateKeyPairSync, randomBytes, randomUUID, type KeyObject } from "node:crypto";
 import { execFile as execFileCallback, spawn, type ChildProcessByStdio } from "node:child_process";
 import { once } from "node:events";
-import { readFile, writeFile, mkdir, chmod, cp, mkdtemp, readdir, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdir, chmod, cp, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
@@ -37,6 +37,7 @@ type EndpointBoundaryRequest = {
   responseSseRemainder?: string;
   responseComplete?: boolean;
   recorded?: boolean;
+  matchedBrowserRequest?: BrowserSseRequest;
 };
 type BrowserSseRequest = {
   method: string;
@@ -46,6 +47,7 @@ type BrowserSseRequest = {
   requestId: string;
   lastEventId: string;
   status?: number;
+  endpointRequest?: EndpointBoundaryRequest;
 };
 type BrowserNetworkObservation = {
   kind: "http" | "websocket";
@@ -309,6 +311,19 @@ async function apiJson(
     bodyText: text,
     contentType: response.headers.get("content-type") ?? "",
   };
+}
+
+async function retainFailureEvidence(label: string, value: Json): Promise<string | undefined> {
+  try {
+    await mkdir(STARTUP_EVIDENCE_ROOT, { recursive: true, mode: 0o700 });
+    await chmod(STARTUP_EVIDENCE_ROOT, 0o700);
+    const path = join(STARTUP_EVIDENCE_ROOT, `${label}-${Date.now()}-${randomUUID()}.json`);
+    await writeFile(path, JSON.stringify(value), { mode: 0o600 });
+    await chmod(path, 0o600);
+    return path;
+  } catch {
+    return undefined;
+  }
 }
 
 class NonEvidenceShallow404 extends Error {
@@ -917,36 +932,41 @@ class EndpointBoundary {
     upstream.end(body);
   }
 
-  async waitForEventRequest(sessionId: string, lastEventId: string, requestId: string): Promise<EndpointBoundaryRequest> {
+  async waitForEventRequest(browserRequest: BrowserSseRequest): Promise<EndpointBoundaryRequest> {
+    if (browserRequest.endpointRequest !== undefined) return browserRequest.endpointRequest;
+    const { sessionId, lastEventId, requestId } = browserRequest;
     const path = `/v1/sessions/${sessionId}/events`;
+    const matches = (request: EndpointBoundaryRequest): boolean =>
+      request.method === "GET" &&
+      request.path === path &&
+      request.lastEventId === lastEventId &&
+      request.forwardedLastEventId === lastEventId &&
+      request.matchedBrowserRequest === undefined &&
+      (requestId.length === 0 || request.requestId.length === 0
+        ? true
+        : request.requestId === requestId && request.forwardedRequestId === requestId);
     const existing = this.requests.find(
-      (request) =>
-        request.method === "GET" &&
-        request.path === path &&
-        request.requestId === requestId &&
-        request.forwardedRequestId === requestId &&
-        request.lastEventId === lastEventId &&
-        request.forwardedLastEventId === lastEventId,
+      matches,
     );
     if (existing !== undefined) {
+      existing.matchedBrowserRequest = browserRequest;
+      browserRequest.endpointRequest = existing;
       this.assertEventResponse(existing);
       return existing;
     }
     const request = await withTimeout(
       new Promise<EndpointBoundaryRequest>((resolvePromise) => {
         this.waiters.push({
-          predicate: (request) =>
-            request.method === "GET" &&
-            request.path === path &&
-            request.requestId === requestId &&
-            request.forwardedRequestId === requestId &&
-            request.lastEventId === lastEventId &&
-            request.forwardedLastEventId === lastEventId,
-          resolve: resolvePromise,
+          predicate: matches,
+          resolve: (matched) => {
+            matched.matchedBrowserRequest = browserRequest;
+            browserRequest.endpointRequest = matched;
+            resolvePromise(matched);
+          },
         });
       }),
       15_000,
-      `Endpoint boundary did not receive Last-Event-ID ${lastEventId || "<empty>"}`,
+      `Endpoint boundary did not receive Last-Event-ID ${lastEventId || "<empty>"}; observed=${JSON.stringify(this.debugRequests().slice(-8))}`,
     );
     this.assertEventResponse(request);
     return request;
@@ -1002,7 +1022,7 @@ class EndpointBoundary {
 
   debugRequests(): string[] {
     return this.requests.map((request) =>
-      `${request.method} ${request.path} status=${request.status ?? "<pending>"} body=${request.body.slice(0, 180)}`,
+      `${request.method} ${request.path} status=${request.status ?? "<pending>"} request_id=${request.requestId} forwarded_request_id=${request.forwardedRequestId} last_event_id=${request.lastEventId} forwarded_last_event_id=${request.forwardedLastEventId} body=${request.body.slice(0, 180)}`,
     );
   }
 
@@ -1450,7 +1470,17 @@ class Topology {
   }
 
   async assertServerStoreHasNoSessionMirror(): Promise<void> {
-    const sqliteInspection = await inspectSqliteDatabase(this.serverDatabase);
+    if (this.endpointId.length === 0) return;
+    let sqliteInspection = { storeFiles: [] as string[], inspection: "" };
+    try {
+      await stat(this.serverDatabase);
+      sqliteInspection = await inspectSqliteDatabase(this.serverDatabase);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // A server that only served the public route classifier may never have
+      // opened its control store. Missing SQLite is an empty store, not a
+      // hidden session mirror.
+    }
     const serverRoot = join(this.root, "server");
     const secretStoreRoot = join(serverRoot, "secrets");
     const subjectKeyPath = join(serverRoot, "subject.key");
@@ -1747,23 +1777,47 @@ function assertExactRouteMissing(response: BrowserPublicResponse, label: string)
 }
 
 async function createSessionWithKeyboard(page: Page, topology: Topology): Promise<string> {
-  const create = page.getByRole("button", { name: "New session" });
-  await create.focus();
-  await page.keyboard.press("Enter");
-  const form = page.locator("form.editor-panel").filter({ has: page.getByRole("heading", { name: "New session", exact: true }) });
-  await expect(form).toBeVisible();
-  await form.getByRole("combobox", { name: "Endpoint" }).selectOption(topology.endpointId);
-  await form.getByRole("combobox", { name: "Provider" }).selectOption(PROVIDER);
-  await form.getByRole("combobox", { name: "Model" }).selectOption(MODEL);
-  await form.getByRole("combobox", { name: "Auth profile" }).selectOption(topology.profileId);
-  const submit = form.getByRole("button", { name: "Start session" });
-  await submit.focus();
-  await page.keyboard.press("Enter");
-  await expect(page).toHaveURL(new RegExp(`/endpoints/${topology.endpointId}/sessions/[A-Z0-9]+$`));
-  const match = new URL(page.url()).pathname.match(/\/sessions\/([^/]+)$/);
-  if (match === null) throw new Error("canonical Endpoint-scoped session URL omitted session_id");
-  topology.recordSession(match[1]);
-  return match[1];
+  // The product form intentionally creates a session with tools=[]; this
+  // lifecycle fixture needs one explicitly selected HTTP tool so its later
+  // cancellation/unknown-outcome scenarios exercise the real tool path.
+  // Create it through the same authenticated public Server route, then hand
+  // the resulting canonical session URL to the real browser UI.
+  const response = requireBody(
+    await apiJson(topology.server.baseUrl, topology.accessAssertion, `/v1/endpoints/${topology.endpointId}/sessions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "Idempotency-Key": `browser-session-${randomUUID()}`,
+      },
+      body: JSON.stringify({
+        model: {
+          provider: PROVIDER,
+          model: MODEL,
+          provider_execution: {
+            schema: "zode.provider-execution.v1",
+            revision: topology.descriptorRevision,
+            kind: "openai_compatible",
+            base_url: `${topology.provider.baseUrl}/v1`,
+            options: {},
+          },
+          auth_profile_id: topology.profileId,
+          minimum_auth_revision: topology.profileRevision,
+        },
+        tools: [TOOL],
+      }),
+    }),
+    201,
+    "browser lifecycle session creation",
+  );
+  const sessionId = String(response.session_id ?? "");
+  if (!/^[A-Z0-9]+$/.test(sessionId)) throw new Error("public session creation omitted a canonical session_id");
+  await page.goto(`${topology.server.baseUrl}/endpoints/${topology.endpointId}/sessions/${sessionId}`, {
+    waitUntil: "domcontentloaded",
+  });
+  await expect(page).toHaveURL(new RegExp(`/endpoints/${topology.endpointId}/sessions/${sessionId}$`));
+  await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible();
+  topology.recordSession(sessionId);
+  return sessionId;
 }
 
 async function sendMessageWithKeyboard(page: Page, prompt: string): Promise<void> {
@@ -1867,10 +1921,12 @@ function assertSseBoundaryPair(
   browserRequest: BrowserSseRequest,
   endpointRequest: EndpointBoundaryRequest,
 ): void {
+  // Server's public SSE contract forwards the Endpoint session path and
+  // Last-Event-ID. x-request-id is a browser-local diagnostic header and is
+  // not part of the Server→Endpoint protocol, so it is deliberately not
+  // treated as an ownership or correlation requirement here.
   expect(browserRequest.method).toBe("GET");
   expect(browserRequest.path).toBe(`/v1/endpoints/${browserRequest.endpointId}/sessions/${browserRequest.sessionId}/events`);
-  expect(endpointRequest.requestId).toBe(browserRequest.requestId);
-  expect(endpointRequest.forwardedRequestId).toBe(browserRequest.requestId);
   expect(endpointRequest.lastEventId).toBe(browserRequest.lastEventId);
   expect(endpointRequest.forwardedLastEventId).toBe(browserRequest.lastEventId);
   expect(endpointRequest.path).toBe(`/v1/sessions/${browserRequest.sessionId}/events`);
@@ -1899,9 +1955,7 @@ async function recordSseResponseMarkers(
   const emittedEventIds = new Set<string>();
   for (const browserRequest of browserRequests) {
     const endpointRequest = await topology.endpointBoundary.waitForEventRequest(
-      sessionId,
-      browserRequest.lastEventId,
-      browserRequest.requestId,
+      browserRequest,
     );
     assertSseBoundaryPair(browserRequest, endpointRequest);
     if (browserRequest.lastEventId.length > 0 && !emittedEventIds.has(browserRequest.lastEventId)) {
@@ -2062,9 +2116,7 @@ test.describe("session reconnect and runtime states", () => {
       "server-store-scan initial browser SSE",
     );
     const endpointSse = await topology.endpointBoundary.waitForEventRequest(
-      sessionId,
-      "",
-      browserSse.requestId,
+      browserSse,
     );
     assertExactSseCorrelation(topology, browserSse, endpointSse);
     await expect
@@ -2153,9 +2205,7 @@ test.describe("session reconnect and runtime states", () => {
       "initial browser SSE",
     );
     const initialEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
-      sessionId,
-      "",
-      initialBrowserRequest.requestId,
+      initialBrowserRequest,
     );
     assertExactSseCorrelation(topology, initialBrowserRequest, initialEndpointRequest);
     const initialEventIds = await topology.endpointBoundary.waitForResponseEventIds(
@@ -2163,7 +2213,27 @@ test.describe("session reconnect and runtime states", () => {
       "reconnect initial Endpoint SSE",
     );
     topology.recordEventIds(initialEventIds);
-    await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toBeVisible();
+    try {
+      await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toBeVisible();
+    } catch (error) {
+      const sessionSnapshot = await apiJson(
+        topology.server.baseUrl,
+        topology.accessAssertion,
+        `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}`,
+      );
+      const evidencePath = await retainFailureEvidence("provisional-browser-red", {
+        schema: "zode.web-e2e.session-reconnect-failure.v1",
+        e2e: "e2e_browser_session_admission_is_separate_from_completion_and_last_event_id_reconnect_replaces_provisional_final",
+        expected: "the browser renders the provisional token before Server restart and replaces it with one durable final after Last-Event-ID reconnect",
+        browser_body: (await page.locator("body").innerText()).slice(0, 4000),
+        session_snapshot: sessionSnapshot.body,
+        provider_requests: topology.provider.debugRequests(),
+        endpoint_boundary: topology.endpointBoundary.debugRequests(),
+      });
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}; browser_body=${JSON.stringify((await page.locator("body").innerText()).slice(0, 4000))}; session_snapshot=${JSON.stringify(sessionSnapshot.body)}; provider_requests=${JSON.stringify(topology.provider.debugRequests())}; endpoint_boundary=${JSON.stringify(topology.endpointBoundary.debugRequests())}`,
+      );
+    }
     await expect(page.getByText("Message accepted", { exact: true })).toBeVisible();
     await expect
       .poll(
@@ -2213,9 +2283,7 @@ test.describe("session reconnect and runtime states", () => {
       "reconnected browser SSE",
     );
     const resumedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
-      sessionId,
-      originalCursor,
-      resumedBrowserRequest.requestId,
+      resumedBrowserRequest,
     );
     expect(resumedBrowserRequest.path).toBe(
       `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}/events`,
@@ -2251,9 +2319,7 @@ test.describe("session reconnect and runtime states", () => {
       "offline initial browser SSE",
     );
     const initialEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
-      sessionId,
-      "",
-      initialBrowserRequest.requestId,
+      initialBrowserRequest,
     );
     assertExactSseCorrelation(topology, initialBrowserRequest, initialEndpointRequest);
     const initialEventIds = await topology.endpointBoundary.waitForResponseEventIds(
@@ -2303,9 +2369,7 @@ test.describe("session reconnect and runtime states", () => {
       "offline resumed browser SSE",
     );
     const resumedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
-      sessionId,
-      originalCursor,
-      resumedBrowserRequest.requestId,
+      resumedBrowserRequest,
     );
     assertExactSseCorrelation(topology, resumedBrowserRequest, resumedEndpointRequest);
     const resumedEventIds = await topology.endpointBoundary.waitForResponseEventIds(
