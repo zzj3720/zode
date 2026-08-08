@@ -156,7 +156,10 @@ function run(command, args, options = {}) {
     cwd: options.cwd,
     env: options.env,
     input: options.input,
-    encoding: options.encoding ?? 'utf8',
+    // `null` deliberately requests binary stdout from Node.  The archive
+    // checkout passes tar bytes through this helper; coercing null to UTF-8
+    // corrupts the stream and makes tar terminate with EPIPE.
+    encoding: options.encoding === undefined ? 'utf8' : options.encoding,
     timeout: options.timeout ?? 300_000,
     maxBuffer: MAX_BUFFER,
     stdio: options.input === undefined ? ['ignore', 'pipe', 'pipe'] : undefined,
