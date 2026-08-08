@@ -80,3 +80,8 @@ The create-receipt projection recovery path is anchored by
 stopped Endpoint loses the derived receipt row, restart must rebuild it from
 the verified `SessionCreated` event and replay the exact original response via
 HTTP/SSE without allocating another session or event.
+
+`e2e_conflicting_create_receipt_projection_fails_closed` anchors the corruption
+boundary: if verified version-one events map one authority/subject/command
+scope to multiple streams, restart must reject readiness transactionally and
+must not choose, rewrite, or publish either receipt.

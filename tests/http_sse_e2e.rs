@@ -8,6 +8,7 @@ use http_sse_support::*;
 use reqwest::StatusCode;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use support::{
     authenticated, authenticated_as, db_blocking, http_client, install_test_replica, require_ulid,
     response_json, response_text, write_endpoint_config, ConfiguredServer, HttpRequestExt,
@@ -676,6 +677,191 @@ async fn e2e_create_receipt_projection_rebuilds_from_verified_creation_event(
 
     restarted.stop().await?;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_conflicting_create_receipt_projection_fails_closed(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let database = test_database("create-receipt-conflicting-projection")?;
+    let mut server = TestServer::start(&database).await?;
+    let client = http_client()?;
+
+    let first = authenticated(client.post(server.url("/v1/sessions")))
+        .header("Idempotency-Key", "conflicting-receipt-first")
+        .json(&json!({}))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body: Value = response_json(first).await?;
+    let first_session = require_ulid(&first_body)?.to_owned();
+    let first_events = authenticated(
+        client
+            .get(server.url(&format!("/v1/sessions/{first_session}/events")))
+            .header("Last-Event-ID", "0"),
+    )
+    .send_with_timeout()
+    .await?;
+    assert_eq!(first_events.status(), StatusCode::OK);
+    assert_eq!(
+        read_sse_events(first_events, 1).await?[0].event,
+        "session_created"
+    );
+
+    let second = authenticated(client.post(server.url("/v1/sessions")))
+        .header("Idempotency-Key", "conflicting-receipt-second")
+        .json(&json!({}))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(second.status(), StatusCode::CREATED);
+    let second_body: Value = response_json(second).await?;
+    let second_session = require_ulid(&second_body)?.to_owned();
+    let second_events = authenticated(
+        client
+            .get(server.url(&format!("/v1/sessions/{second_session}/events")))
+            .header("Last-Event-ID", "0"),
+    )
+    .send_with_timeout()
+    .await?;
+    assert_eq!(second_events.status(), StatusCode::OK);
+    assert_eq!(
+        read_sse_events(second_events, 1).await?[0].event,
+        "session_created"
+    );
+
+    server.stop().await?;
+    let database_file = database.path().to_owned();
+    db_blocking(move || {
+        let mut connection = Connection::open(database_file)?;
+        let transaction = connection.transaction()?;
+        let (command_id, command_fingerprint): (String, Vec<u8>) = transaction.query_row(
+            "SELECT command_id, command_fingerprint FROM events
+             WHERE stream_id = ?1 AND stream_version = 1",
+            params![first_session],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (event_id, event_schema_version, event_type, payload, event_version): (
+            String,
+            i64,
+            String,
+            Vec<u8>,
+            i64,
+        ) = transaction.query_row(
+            "SELECT event_id, event_schema_version, event_type, payload, stream_version
+             FROM events WHERE stream_id = ?1 AND stream_version = 1",
+            params![second_session],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        let event_fingerprint = receipt_event_fingerprint(
+            &second_session,
+            u64::try_from(event_version)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+            &event_id,
+            &command_id,
+            u32::try_from(event_schema_version)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+            &event_type,
+            &payload,
+        );
+        let prefix_digest = receipt_prefix_digest(&second_session, &event_fingerprint);
+        transaction.execute(
+            "UPDATE events SET command_id = ?1, command_fingerprint = ?2,
+                event_fingerprint = ?3
+             WHERE stream_id = ?4 AND stream_version = 1",
+            params![
+                command_id,
+                command_fingerprint,
+                event_fingerprint,
+                second_session
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE integrity_anchors SET event_prefix_digest = ?1
+             WHERE stream_id = ?2 AND stream_version = 1",
+            params![prefix_digest, second_session],
+        )?;
+        transaction.execute(
+            "UPDATE storage_metadata SET projections_dirty = 1 WHERE singleton = 1",
+            [],
+        )?;
+        let duplicate_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM events WHERE stream_version = 1 AND command_id = ?1",
+            params![command_id],
+            |row| row.get(0),
+        )?;
+        if duplicate_count != 2 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        transaction.commit()?;
+        Ok::<(), rusqlite::Error>(())
+    })
+    .await?;
+
+    let restart = TestServer::start(&database).await;
+    assert!(
+        restart.is_err(),
+        "conflicting verified create receipt projection must fail before READY"
+    );
+    db_blocking(move || {
+        let connection = Connection::open(database.path())?;
+        let event_count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        let receipt_count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM session_create_receipts", [], |row| {
+                row.get(0)
+            })?;
+        if event_count != 2 || receipt_count != 2 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        Ok::<(), rusqlite::Error>(())
+    })
+    .await?;
+    Ok(())
+}
+
+fn receipt_hash_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn receipt_event_fingerprint(
+    stream_id: &str,
+    stream_version: u64,
+    event_id: &str,
+    command_id: &str,
+    event_schema_version: u32,
+    event_type: &str,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zode:event-fingerprint:v1");
+    receipt_hash_field(&mut hasher, stream_id.as_bytes());
+    hasher.update(stream_version.to_be_bytes());
+    receipt_hash_field(&mut hasher, event_id.as_bytes());
+    receipt_hash_field(&mut hasher, command_id.as_bytes());
+    hasher.update(event_schema_version.to_be_bytes());
+    receipt_hash_field(&mut hasher, event_type.as_bytes());
+    receipt_hash_field(&mut hasher, payload);
+    hasher.finalize().to_vec()
+}
+
+fn receipt_prefix_digest(stream_id: &str, event_fingerprint: &[u8]) -> Vec<u8> {
+    let mut seed = Sha256::new();
+    seed.update(b"zode:event-prefix:v1");
+    receipt_hash_field(&mut seed, stream_id.as_bytes());
+    let seed = seed.finalize();
+    let mut linked = Sha256::new();
+    linked.update(b"zode:event-prefix-link:v1");
+    receipt_hash_field(&mut linked, &seed);
+    receipt_hash_field(&mut linked, event_fingerprint);
+    linked.finalize().to_vec()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

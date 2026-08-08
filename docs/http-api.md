@@ -736,6 +736,7 @@ Executable anchors are
 `e2e_create_generates_ulid_and_binds_idempotency_payload`,
 `e2e_create_receipt_lookup_precedes_current_admission`,
 `e2e_create_receipt_projection_rebuilds_from_verified_creation_event`,
+`e2e_conflicting_create_receipt_projection_fails_closed`,
 `e2e_concurrent_create_receipt_and_event_are_atomic`, and
 `e2e_session_ownership_safe_not_found_and_ordered_sse`, with the independent
 single-page list assertion in `e2e_session_list_is_subject_scoped`. Authority-
