@@ -233,7 +233,7 @@ an unrelated corruption or migration fixture.
 | --- | --- | --- |
 | Controller authority and bounded subject are established before any scoped lookup | `e2e_invalid_controller_auth_and_subject_fail_before_lookup` | core anchor exists |
 | Endpoint alone allocates the ULID; canonical create identity is independent of candidate ULIDs; caller IDs fail without side effects | `e2e_create_generates_ulid_and_binds_idempotency_payload` and `e2e_caller_supplied_session_id_has_no_list_side_effect` | core anchors exist |
-| Receipt hit/conflict/replay-only miss returns before current provider, tool, outbound-policy, replica, clock, ULID, or event effects | `e2e_create_receipt_lookup_precedes_current_admission` | functional follow-up; required red before this ordering is implemented |
+| Receipt hit/conflict/replay-only miss returns before current provider, tool, outbound-policy, replica, clock, ULID, or event effects | `e2e_create_receipt_lookup_precedes_current_admission` | anchor green |
 | Concurrent equal creates atomically select one creation event and return byte-identical canonical `201` results | `e2e_concurrent_create_receipt_and_event_are_atomic` | core anchor exists |
 | The create-receipt projection rebuilds from the verified creation event and exact replay survives restart | `e2e_create_receipt_projection_rebuilds_from_verified_creation_event` | recovery hardening; required red before repair implementation |
 | One scoped create digest resolving to multiple verified streams is corruption and never chooses a winner | `e2e_conflicting_create_receipt_projection_fails_closed` | corruption hardening; required red before repair implementation |
