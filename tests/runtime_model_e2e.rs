@@ -2358,6 +2358,121 @@ async fn e2e_model_partial_stream_retry_has_no_partial_tool_effect() -> TestResu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_provider_stream_disconnect_finishes_activation_for_next_message() -> TestResult<()> {
+    let database = TempDatabase::new("runtime-provider-disconnect-recovery")?;
+    let hold = ModelHold::new();
+    let mut model = ModelFixture::start(vec![
+        ModelScript::stream_failure_hold(hold.clone()),
+        ModelScript::final_text("message after provider disconnect"),
+    ])
+    .await?;
+    let mut tool = ToolFixture::start(Vec::new()).await?;
+    let config = config_file(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-provider-disconnect-recovery",
+    )
+    .await?;
+    let mut events = open_events(&client, &server, &session_id).await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "provider-disconnect-first-message",
+        "first message before provider disconnect",
+    )
+    .await?;
+    hold.wait_entered().await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "provider-disconnect-second-message",
+        "message after provider disconnect",
+    )
+    .await?;
+    hold.release();
+
+    let failure = next_event_with_kind(&mut events, "model_attempt_failed").await?;
+    assert_eq!(failure.data["session_id"], session_id);
+
+    let assistant =
+        next_assistant_with_content(&mut events, "message after provider disconnect").await?;
+    assert_eq!(assistant.data["session_id"], session_id);
+    let finished = next_event_with_kind(&mut events, "activation_finished").await?;
+    assert_eq!(finished.data["session_id"], session_id);
+    let recovered_state = get_session(&client, &server, &session_id).await?;
+    assert_eq!(recovered_state["active_activation"], Value::Null);
+    assert_eq!(recovered_state["active_model_round"], Value::Null);
+    assert_eq!(recovered_state["status"], "idle");
+    assert_eq!(model.request_count(), 2);
+
+    server.stop().await?;
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_provider_process_exit_finishes_activation_without_stuck_working() -> TestResult<()> {
+    let database = TempDatabase::new("runtime-provider-process-exit")?;
+    let hold = ModelHold::new();
+    let model = ModelFixture::start(vec![ModelScript::stream_hold(hold.clone())]).await?;
+    let mut tool = ToolFixture::start(Vec::new()).await?;
+    let config = config_file(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+    )?;
+    let mut config_value: Value = serde_json::from_slice(&fs::read(&config)?)?;
+    config_value["runtime"]["model_stream_idle_timeout_ms"] = json!(100);
+    fs::write(&config, serde_json::to_vec_pretty(&config_value)?)?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-provider-process-exit",
+    )
+    .await?;
+    let mut events = open_events(&client, &server, &session_id).await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "provider-process-exit-message",
+        "message before provider process exit",
+    )
+    .await?;
+    hold.wait_entered().await?;
+    drop(model);
+
+    let failure = next_event_with_kind(&mut events, "model_attempt_failed").await?;
+    assert_eq!(failure.data["session_id"], session_id);
+    let finished = next_event_with_kind(&mut events, "activation_finished").await?;
+    assert_eq!(finished.data["session_id"], session_id);
+    let state = get_session(&client, &server, &session_id).await?;
+    assert_eq!(state["active_activation"], Value::Null);
+    assert_eq!(state["active_model_round"], Value::Null);
+    assert_eq!(state["status"], "idle");
+
+    server.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_invalid_model_tool_arguments_are_rejected_before_side_effect() -> TestResult<()> {
     let database = TempDatabase::new("runtime-invalid-tool-arguments")?;
     let mut model = ModelFixture::start(vec![

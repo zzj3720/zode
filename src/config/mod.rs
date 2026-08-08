@@ -23,6 +23,7 @@ const MAX_SNAPSHOT_EVENTS: u64 = 1_000_000_000;
 const MAX_ROUNDS_PER_ACTIVATION: u64 = 10_000;
 const MAX_MODEL_STEP_ATTEMPTS: u64 = 64;
 const MAX_MODEL_RETRY_MS: u64 = 3_600_000;
+const MAX_MODEL_STREAM_IDLE_TIMEOUT_MS: u64 = 86_400_000;
 const MAX_AUTO_WAIT_TIMEOUT_SECONDS: u64 = 600;
 const MAX_NAME_BYTES: usize = 128;
 const MAX_AUTHORITY_ID_BYTES: usize = 64;
@@ -107,6 +108,7 @@ struct RuntimeConfig {
     model_step_max_attempts: u64,
     model_retry_base_ms: u64,
     model_retry_max_ms: u64,
+    model_stream_idle_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -220,6 +222,9 @@ impl EndpointConfig {
             model_step_max_attempts: self.runtime.model_step_max_attempts as u32,
             model_retry_base: Duration::from_millis(self.runtime.model_retry_base_ms),
             model_retry_max: Duration::from_millis(self.runtime.model_retry_max_ms),
+            model_stream_idle_timeout: Duration::from_millis(
+                self.runtime.model_stream_idle_timeout_ms,
+            ),
         }
     }
 
@@ -426,6 +431,7 @@ impl Default for RuntimeConfig {
             model_step_max_attempts: 3,
             model_retry_base_ms: 500,
             model_retry_max_ms: 5_000,
+            model_stream_idle_timeout_ms: 30_000,
         }
     }
 }
@@ -637,6 +643,11 @@ fn validate_runtime(runtime: &RuntimeConfig) -> Result<(), ConfigError> {
         runtime.model_retry_max_ms,
         MAX_MODEL_RETRY_MS,
         "runtime.model_retry_max_ms",
+    )?;
+    validate_positive(
+        runtime.model_stream_idle_timeout_ms,
+        MAX_MODEL_STREAM_IDLE_TIMEOUT_MS,
+        "runtime.model_stream_idle_timeout_ms",
     )?;
     if runtime.model_retry_base_ms > runtime.model_retry_max_ms {
         return Err(ConfigError::Invalid(

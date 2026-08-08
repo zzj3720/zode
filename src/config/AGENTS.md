@@ -35,6 +35,9 @@ runtime state.
   an explicit blocking boundary.
 - Reject runtime-reserved tool names, including `wait_for`, before readiness.
   Configuration cannot create a second registry entry for an internal tool.
+- Keep `model_stream_idle_timeout_ms` positive and bounded to 24 hours. It is
+  an aimux first-chunk/chunk-gap bound, not a total model-task deadline, so a
+  continuously streaming long task is not cancelled by elapsed wall time.
 - Prefer typed bounded fields over unstructured JSON passthrough. Adapter
   configuration may remain opaque only behind a versioned kind whose owning
   adapter validates it before Endpoint readiness.
@@ -46,4 +49,6 @@ runtime state.
 
 Configuration behavior is covered only by real-binary E2Es. They start zode
 with a temporary JSON file and assert readiness or a bounded startup failure;
-there are no parser unit tests or test-only configuration branches.
+there are no parser unit tests or test-only configuration branches. The idle
+timeout boundary is anchored by
+`e2e_model_stream_idle_timeout_zero_is_rejected_before_ready`.
