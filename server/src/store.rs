@@ -1601,7 +1601,7 @@ impl ControlStore {
             if record.provider != write.provider || record.deleted_at_ms.is_none() {
                 return Err(StoreError::Integrity);
             }
-            let tombstones = read_auth_profile_tombstones(&transaction, &profile_id)?;
+            let tombstones = read_auth_profile_tombstones_connection(&transaction, &profile_id)?;
             let revision = u64::try_from(revision).map_err(|_| StoreError::Integrity)?;
             transaction.commit().map_err(|_| StoreError::Internal)?;
             return Ok((revision, record, tombstones));
@@ -1700,7 +1700,7 @@ impl ControlStore {
             )
             .map_err(|_| StoreError::Internal)?;
         let record = read_auth_profile(&transaction, &write.profile_id)?;
-        let tombstones = read_auth_profile_tombstones(&transaction, &write.profile_id)?;
+        let tombstones = read_auth_profile_tombstones_connection(&transaction, &write.profile_id)?;
         let revision = u64::try_from(tombstone_revision).map_err(|_| StoreError::Integrity)?;
         transaction.commit().map_err(|_| StoreError::Internal)?;
         Ok((revision, record, tombstones))
@@ -1755,7 +1755,7 @@ impl ControlStore {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(&format!(
-                "{} WHERE profile.provider = ?1 ORDER BY profile.created_at_ms ASC, profile.profile_id ASC LIMIT 101",
+                "{} WHERE profile.provider = ?1 AND profile.deleted_at_ms IS NULL ORDER BY profile.created_at_ms ASC, profile.profile_id ASC LIMIT 101",
                 AUTH_PROFILE_SELECT
             ))
             .map_err(|_| StoreError::Internal)?;
@@ -1764,10 +1764,6 @@ impl ControlStore {
             .map_err(|_| StoreError::Internal)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| StoreError::Integrity)?;
-        let records = records
-            .into_iter()
-            .filter(|record| record.deleted_at_ms.is_none())
-            .collect::<Vec<_>>();
         if records.len() > 100 {
             return Err(StoreError::Internal);
         }
@@ -1856,25 +1852,8 @@ impl ControlStore {
             .map_err(|_| StoreError::Internal)?;
         let records = statement
             .query_map([], |row| {
-                let revision = u64::try_from(row.get::<_, i64>(3)?).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Integer,
-                        Box::new(error),
-                    )
-                })?;
-                let observed_revision = row
-                    .get::<_, Option<i64>>(6)?
-                    .map(|value| {
-                        u64::try_from(value).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                6,
-                                rusqlite::types::Type::Integer,
-                                Box::new(error),
-                            )
-                        })
-                    })
-                    .transpose()?;
+                let revision = positive_u64(row, 3)?;
+                let observed_revision = optional_u64(row, 6)?;
                 Ok(AuthTombstoneDispatchRecord {
                     tombstone: AuthTombstoneRecord {
                         profile_id: row.get(0)?,
@@ -2104,13 +2083,6 @@ fn auth_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthProfil
     })
 }
 
-fn read_auth_profile_tombstones(
-    transaction: &rusqlite::Transaction<'_>,
-    profile_id: &str,
-) -> Result<Vec<AuthTombstoneRecord>, StoreError> {
-    read_auth_profile_tombstones_connection(transaction, profile_id)
-}
-
 fn read_auth_profile_tombstones_connection(
     connection: &Connection,
     profile_id: &str,
@@ -2125,25 +2097,8 @@ fn read_auth_profile_tombstones_connection(
         .map_err(|_| StoreError::Internal)?;
     let records = statement
         .query_map([profile_id], |row| {
-            let revision = u64::try_from(row.get::<_, i64>(3)?).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Integer,
-                    Box::new(error),
-                )
-            })?;
-            let observed_revision = row
-                .get::<_, Option<i64>>(6)?
-                .map(|value| {
-                    u64::try_from(value).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            6,
-                            rusqlite::types::Type::Integer,
-                            Box::new(error),
-                        )
-                    })
-                })
-                .transpose()?;
+            let revision = positive_u64(row, 3)?;
+            let observed_revision = optional_u64(row, 6)?;
             Ok(AuthTombstoneRecord {
                 profile_id: row.get(0)?,
                 provider: row.get(1)?,
@@ -2162,18 +2117,7 @@ fn read_auth_profile_tombstones_connection(
 
 fn auth_replica_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthReplicaRecord> {
     let revision = positive_u64(row, 3)?;
-    let observed_revision = row
-        .get::<_, Option<i64>>(6)?
-        .map(|value| {
-            u64::try_from(value).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    6,
-                    rusqlite::types::Type::Integer,
-                    Box::new(error),
-                )
-            })
-        })
-        .transpose()?;
+    let observed_revision = optional_u64(row, 6)?;
     Ok(AuthReplicaRecord {
         profile_id: row.get(0)?,
         endpoint_id: row.get(1)?,
@@ -2194,6 +2138,20 @@ fn positive_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> 
             Box::new(error),
         )
     })
+}
+
+fn optional_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
+    row.get::<_, Option<i64>>(index)?
+        .map(|value| {
+            u64::try_from(value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
 }
 
 fn parse_profile_phase(value: &str) -> Result<ProfileCreatePhase, StoreError> {
@@ -2240,14 +2198,7 @@ fn parse_string_list(value: String, column: usize) -> rusqlite::Result<Vec<Strin
 }
 
 fn ensure_endpoint_capability_columns(connection: &Connection) -> Result<(), StartupError> {
-    let mut statement = connection
-        .prepare("PRAGMA table_info(endpoints)")
-        .map_err(|_| StartupError::StoreUnavailable)?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|_| StartupError::StoreUnavailable)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|_| StartupError::StoreUnavailable)?;
+    let columns = table_columns(connection, "endpoints")?;
     for (column, declaration) in [
         ("provider_adapter_kinds", "TEXT NOT NULL DEFAULT '[]'"),
         ("tools", "TEXT NOT NULL DEFAULT '[]'"),
@@ -2275,14 +2226,7 @@ fn ensure_endpoint_capability_columns(connection: &Connection) -> Result<(), Sta
 }
 
 fn ensure_auth_profile_columns(connection: &Connection) -> Result<(), StartupError> {
-    let mut statement = connection
-        .prepare("PRAGMA table_info(auth_profiles)")
-        .map_err(|_| StartupError::StoreUnavailable)?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|_| StartupError::StoreUnavailable)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|_| StartupError::StoreUnavailable)?;
+    let columns = table_columns(connection, "auth_profiles")?;
     if !columns.iter().any(|value| value == "deleted_at_ms") {
         connection
             .execute(
@@ -2292,6 +2236,18 @@ fn ensure_auth_profile_columns(connection: &Connection) -> Result<(), StartupErr
             .map_err(|_| StartupError::StoreUnavailable)?;
     }
     Ok(())
+}
+
+fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>, StartupError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|_| StartupError::StoreUnavailable)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|_| StartupError::StoreUnavailable)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| StartupError::StoreUnavailable)?;
+    Ok(columns)
 }
 
 fn validate_server_metadata(

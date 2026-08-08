@@ -130,18 +130,33 @@ impl ProviderAuthority {
                 cleaned.insert(secret_ref);
             }
         }
-        for dispatch in tombstones {
-            if !cleaned.contains(&dispatch.secret_ref) {
-                continue;
-            }
-            let tombstone = dispatch.tombstone;
-            let (status, observed_revision) = self.dispatch_tombstone(&tombstone).await;
+        let dispatchable = tombstones
+            .into_iter()
+            .filter(|dispatch| cleaned.contains(&dispatch.secret_ref))
+            .map(|dispatch| dispatch.tombstone)
+            .collect::<Vec<_>>();
+        self.dispatch_tombstones(&dispatchable).await?;
+        Ok(())
+    }
+
+    async fn dispatch_tombstones(
+        &self,
+        tombstones: &[crate::store::AuthTombstoneRecord],
+    ) -> Result<(), ProviderError> {
+        for tombstone in tombstones
+            .iter()
+            .filter(|tombstone| tombstone.status != "removed")
+        {
+            let (status, observed_revision) = self.dispatch_tombstone(tombstone).await;
             let store = Arc::clone(&self.store);
+            let profile_id = tombstone.profile_id.clone();
+            let endpoint_id = tombstone.endpoint_id.clone();
+            let revision = tombstone.revision;
             tokio::task::spawn_blocking(move || {
                 store.mark_profile_tombstone(
-                    &tombstone.profile_id,
-                    &tombstone.endpoint_id,
-                    tombstone.revision,
+                    &profile_id,
+                    &endpoint_id,
+                    revision,
                     status,
                     observed_revision,
                 )
@@ -492,25 +507,7 @@ impl ProviderAuthority {
             .await
             .map_err(|_| ProviderError::Internal)?
             .map_err(map_store_error)?;
-        for tombstone in tombstones.iter().filter(|item| item.status != "removed") {
-            let (status, observed_revision) = self.dispatch_tombstone(tombstone).await;
-            let store = Arc::clone(&self.store);
-            let profile_id = tombstone.profile_id.clone();
-            let endpoint_id = tombstone.endpoint_id.clone();
-            let revision = tombstone.revision;
-            tokio::task::spawn_blocking(move || {
-                store.mark_profile_tombstone(
-                    &profile_id,
-                    &endpoint_id,
-                    revision,
-                    status,
-                    observed_revision,
-                )
-            })
-            .await
-            .map_err(|_| ProviderError::Internal)?
-            .map_err(map_store_error)?;
-        }
+        self.dispatch_tombstones(&tombstones).await?;
         let store = Arc::clone(&self.store);
         let profile_id_owned = profile_id.to_owned();
         let replicas =
