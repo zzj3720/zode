@@ -37,6 +37,11 @@ test -f "$UI_DIR/index.html" || die 'Vite+ build did not produce index.html'
 
 printf '%s\n' '== deterministic real-process/browser/replay E2E =='
 cargo test --locked --test process_capture_e2e -- --nocapture
+printf '%s\n' '== Server--Endpoint protocol compatibility matrix E2E =='
+cargo test --locked --manifest-path "$ROOT/server/Cargo.toml" \
+  --test access_ingress_e2e \
+  e2e_server_endpoint_protocol_compatibility_matrix \
+  -- --exact --nocapture
 printf '%s\n' '== locked Server incident replay E2E =='
 set +e
 cargo test --locked --manifest-path "$ROOT/server/Cargo.toml" \

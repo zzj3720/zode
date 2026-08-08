@@ -515,6 +515,223 @@ fn e2e_system_and_endpoint_catalog_bootstrap_through_access() -> TestResult {
 }
 
 #[test]
+fn e2e_server_endpoint_protocol_compatibility_matrix() -> TestResult {
+    let jwks = JwksFixture::start()?;
+    let temp = tempfile::tempdir()?;
+    let endpoint_root = temp.path().join("endpoint");
+    let endpoint_config = write_catalog_endpoint_config(&endpoint_root)?;
+    let mut endpoint = ServerProcess::start_endpoint(&endpoint_config)?;
+    let endpoint_identity = catalog_endpoint_identity(&endpoint.base_url)?;
+    let endpoint_id = endpoint_identity["endpoint_id"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("protocol matrix identity omitted endpoint_id"))?
+        .to_owned();
+    let mut endpoint_proxy = CountingProxy::start_protocol_matrix(&endpoint.base_url)?;
+    let shared_ui_assets = temp.path().join("protocol-matrix-ui");
+    build_test_ui(&shared_ui_assets)?;
+    let now = unix_seconds();
+    let assertion = signed_token(
+        INITIAL_PRIVATE_KEY,
+        JWKS_INITIAL_KID,
+        actor_claims(
+            &jwks.issuer(),
+            HUMAN_SUB,
+            None,
+            HUMAN_EMAIL,
+            "app",
+            now + 300,
+        ),
+    )?;
+    let create_body = serde_json::to_vec(&json!({
+        "label": CATALOG_ENDPOINT_LABEL,
+        "base_url": endpoint_proxy.base_url,
+        "control_auth": {
+            "kind": "bearer",
+            "secret": CATALOG_CONTROLLER_SECRET
+        }
+    }))?;
+    let forbidden = [
+        assertion.as_str(),
+        CATALOG_CONTROLLER_SECRET,
+        CATALOG_DIRECT_SUBJECT,
+        HUMAN_SUB,
+        HUMAN_EMAIL,
+    ];
+
+    let matrix_result = (|| -> TestResult {
+        for (case_index, case) in protocol_matrix_cases().iter().enumerate() {
+            endpoint_proxy.set_protocol_matrix_variant(case.variant)?;
+            let server_root = temp.path().join(format!("server-{}", case.name));
+            fs::create_dir(&server_root)?;
+            let server_config = write_server_config_with_ui(
+                &server_root,
+                &jwks,
+                &shared_ui_assets,
+            )?;
+            let mut server = ServerProcess::start(&server_config)?;
+            let result = (|| -> TestResult {
+                let key = format!("protocol-matrix-{case_index}-{}", case.name);
+                let create = catalog_request(
+                    &server.base_url,
+                    "POST",
+                    "/v1/endpoints",
+                    &assertion,
+                    Some(&key),
+                    Some(&create_body),
+                    &forbidden,
+                )?;
+                match case.expected {
+                    MatrixExpectation::Accepted { revision } => {
+                        if create.status != 201 {
+                            return Err(io::Error::other(format!(
+                                "protocol matrix case {} expected HTTP 201, got {}",
+                                case.name, create.status
+                            ))
+                            .into());
+                        }
+                        let record: Value = serde_json::from_slice(&create.body)?;
+                        assert_endpoint_record_with_revision(
+                            &format!("protocol matrix case {}", case.name),
+                            &record,
+                            &endpoint_id,
+                            revision,
+                        )?;
+                    }
+                    MatrixExpectation::Rejected => {
+                        if create.status != 503
+                            || serde_json::from_slice::<Value>(&create.body)?["error"]["code"]
+                                != "endpoint_unavailable"
+                        {
+                            return Err(io::Error::other(format!(
+                                "protocol matrix case {} did not fail closed at the Server boundary",
+                                case.name
+                            ))
+                            .into());
+                        }
+                        let list = catalog_request(
+                            &server.base_url,
+                            "GET",
+                            "/v1/endpoints",
+                            &assertion,
+                            None,
+                            None,
+                            &forbidden,
+                        )?;
+                        assert_endpoint_list("rejected protocol matrix list", &list, None)?;
+                    }
+                }
+                Ok(())
+            })();
+            let capture = server.stop()?;
+            if capture
+                .stdout
+                .windows(CATALOG_CONTROLLER_SECRET.len())
+                .any(|window| window == CATALOG_CONTROLLER_SECRET.as_bytes())
+                || capture
+                    .stderr
+                    .windows(CATALOG_CONTROLLER_SECRET.len())
+                    .any(|window| window == CATALOG_CONTROLLER_SECRET.as_bytes())
+            {
+                return Err(io::Error::other(format!(
+                    "protocol matrix case {} leaked the controller secret in process output",
+                    case.name
+                ))
+                .into());
+            }
+            result?;
+        }
+        Ok(())
+    })();
+    let proxy_result = endpoint_proxy.finish();
+    let endpoint_result = endpoint.stop();
+    matrix_result?;
+    proxy_result?;
+    endpoint_result?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ProtocolMatrixVariant {
+    Baseline,
+    UnknownIdentityField,
+    UnknownCapabilitiesField,
+    CredentialRevisionTwo,
+    UnsupportedProtocol,
+    UnsupportedIdentitySchema,
+    UnsupportedCapabilitiesSchema,
+    EndpointIdMismatch,
+    CapabilityLimitsMismatch,
+    ZeroRevision,
+}
+
+#[derive(Clone, Copy)]
+enum MatrixExpectation {
+    Accepted { revision: u64 },
+    Rejected,
+}
+
+struct ProtocolMatrixCase {
+    name: &'static str,
+    variant: ProtocolMatrixVariant,
+    expected: MatrixExpectation,
+}
+
+fn protocol_matrix_cases() -> &'static [ProtocolMatrixCase] {
+    &[
+        ProtocolMatrixCase {
+            name: "v1-baseline",
+            variant: ProtocolMatrixVariant::Baseline,
+            expected: MatrixExpectation::Accepted { revision: 1 },
+        },
+        ProtocolMatrixCase {
+            name: "v1-unknown-identity-field",
+            variant: ProtocolMatrixVariant::UnknownIdentityField,
+            expected: MatrixExpectation::Accepted { revision: 1 },
+        },
+        ProtocolMatrixCase {
+            name: "v1-unknown-capabilities-field",
+            variant: ProtocolMatrixVariant::UnknownCapabilitiesField,
+            expected: MatrixExpectation::Accepted { revision: 1 },
+        },
+        ProtocolMatrixCase {
+            name: "v1-credential-revision-two",
+            variant: ProtocolMatrixVariant::CredentialRevisionTwo,
+            expected: MatrixExpectation::Accepted { revision: 2 },
+        },
+        ProtocolMatrixCase {
+            name: "unsupported-protocol",
+            variant: ProtocolMatrixVariant::UnsupportedProtocol,
+            expected: MatrixExpectation::Rejected,
+        },
+        ProtocolMatrixCase {
+            name: "unsupported-identity-schema",
+            variant: ProtocolMatrixVariant::UnsupportedIdentitySchema,
+            expected: MatrixExpectation::Rejected,
+        },
+        ProtocolMatrixCase {
+            name: "unsupported-capabilities-schema",
+            variant: ProtocolMatrixVariant::UnsupportedCapabilitiesSchema,
+            expected: MatrixExpectation::Rejected,
+        },
+        ProtocolMatrixCase {
+            name: "endpoint-id-mismatch",
+            variant: ProtocolMatrixVariant::EndpointIdMismatch,
+            expected: MatrixExpectation::Rejected,
+        },
+        ProtocolMatrixCase {
+            name: "capability-limits-mismatch",
+            variant: ProtocolMatrixVariant::CapabilityLimitsMismatch,
+            expected: MatrixExpectation::Rejected,
+        },
+        ProtocolMatrixCase {
+            name: "zero-credential-revision",
+            variant: ProtocolMatrixVariant::ZeroRevision,
+            expected: MatrixExpectation::Rejected,
+        },
+    ]
+}
+
+#[test]
 #[ignore = "explicit test-only incident recording; never part of the default suite"]
 fn e2e_record_access_ingress_initial_404_cassette() -> TestResult {
     if env::var("ZODE_RECORD_ACCESS_CASSETTE").ok().as_deref() != Some("1") {
@@ -1201,6 +1418,7 @@ struct CountingProxy {
     base_url: String,
     requests: Arc<AtomicUsize>,
     changed: Arc<(Mutex<()>, Condvar)>,
+    protocol_matrix_variant: Arc<Mutex<Option<ProtocolMatrixVariant>>>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -1220,9 +1438,11 @@ impl CountingProxy {
         let address = listener.local_addr()?;
         let requests = Arc::new(AtomicUsize::new(0));
         let changed = Arc::new((Mutex::new(()), Condvar::new()));
+        let protocol_matrix_variant = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_requests = Arc::clone(&requests);
         let thread_changed = Arc::clone(&changed);
+        let thread_protocol_matrix_variant = Arc::clone(&protocol_matrix_variant);
         let thread_stop = Arc::clone(&stop);
         let join = thread::spawn(move || {
             let mut workers = Vec::new();
@@ -1232,6 +1452,7 @@ impl CountingProxy {
                         let host = upstream_host.clone();
                         let requests = Arc::clone(&thread_requests);
                         let changed = Arc::clone(&thread_changed);
+                        let protocol_matrix_variant = Arc::clone(&thread_protocol_matrix_variant);
                         workers.push(thread::spawn(move || {
                             let _ = proxy_counted_request(
                                 stream,
@@ -1239,6 +1460,7 @@ impl CountingProxy {
                                 upstream_port,
                                 &requests,
                                 &changed,
+                                &protocol_matrix_variant,
                             );
                         }));
                     }
@@ -1257,9 +1479,24 @@ impl CountingProxy {
             base_url: format!("http://{address}"),
             requests,
             changed,
+            protocol_matrix_variant,
             stop,
             join: Some(join),
         })
+    }
+
+    fn start_protocol_matrix(upstream_base_url: &str) -> TestResult<Self> {
+        let proxy = Self::start(upstream_base_url)?;
+        proxy.set_protocol_matrix_variant(ProtocolMatrixVariant::Baseline)?;
+        Ok(proxy)
+    }
+
+    fn set_protocol_matrix_variant(&self, variant: ProtocolMatrixVariant) -> TestResult<()> {
+        *self
+            .protocol_matrix_variant
+            .lock()
+            .map_err(|_| io::Error::other("protocol matrix variant lock poisoned"))? = Some(variant);
+        Ok(())
     }
 
     fn request_count(&self) -> usize {
@@ -1309,16 +1546,112 @@ impl Drop for CountingProxy {
     }
 }
 
+fn request_target_path(request: &[u8]) -> io::Result<String> {
+    let line_end = request
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "HTTP request line missing"))?;
+    let line = std::str::from_utf8(&request[..line_end])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "HTTP request line invalid"))?;
+    line.split_whitespace()
+        .nth(1)
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "HTTP request target missing"))
+}
+
+fn mutate_protocol_matrix_response(
+    path: &str,
+    response: &[u8],
+    variant: ProtocolMatrixVariant,
+) -> io::Result<Vec<u8>> {
+    if response.is_empty() || !matches!(path, "/v1/identity" | "/v1/capabilities") {
+        return Ok(response.to_vec());
+    }
+    let parsed = parse_http_response(response)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    if parsed.status != 200 {
+        return Ok(response.to_vec());
+    }
+    let mut body: Value = serde_json::from_slice(&parsed.body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Endpoint DTO was not an object"))?;
+    match variant {
+        ProtocolMatrixVariant::Baseline => {}
+        ProtocolMatrixVariant::UnknownIdentityField if path == "/v1/identity" => {
+            object.insert("future_identity_metadata".to_owned(), json!({"supported": true}));
+        }
+        ProtocolMatrixVariant::UnknownCapabilitiesField if path == "/v1/capabilities" => {
+            object.insert("future_capability_metadata".to_owned(), json!(["v2-ready"]));
+        }
+        ProtocolMatrixVariant::CredentialRevisionTwo if path == "/v1/identity" => {
+            object.insert("revision".to_owned(), json!(2));
+        }
+        ProtocolMatrixVariant::UnsupportedProtocol => {
+            object.insert("protocol_version".to_owned(), json!("zode.endpoint.v2"));
+        }
+        ProtocolMatrixVariant::UnsupportedIdentitySchema if path == "/v1/identity" => {
+            object.insert("schema".to_owned(), json!("zode.identity.v2"));
+        }
+        ProtocolMatrixVariant::UnsupportedCapabilitiesSchema if path == "/v1/capabilities" => {
+            object.insert(
+                "schema".to_owned(),
+                json!("zode.endpoint-capabilities.v2"),
+            );
+        }
+        ProtocolMatrixVariant::EndpointIdMismatch if path == "/v1/capabilities" => {
+            object.insert("endpoint_id".to_owned(), json!("matrix-mismatch"));
+        }
+        ProtocolMatrixVariant::CapabilityLimitsMismatch if path == "/v1/capabilities" => {
+            let limits = object
+                .get_mut("limits")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "capabilities limits missing")
+                })?;
+            limits.insert("max_session_request_bytes".to_owned(), json!(1));
+        }
+        ProtocolMatrixVariant::ZeroRevision if path == "/v1/identity" => {
+            object.insert("revision".to_owned(), json!(0));
+        }
+        _ => {}
+    }
+    let body = serde_json::to_vec(&body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let mut rebuilt = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    rebuilt.extend_from_slice(&body);
+    Ok(rebuilt)
+}
+
 fn proxy_counted_request(
     mut client: TcpStream,
     upstream_host: &str,
     upstream_port: u16,
     requests: &AtomicUsize,
     changed: &(Mutex<()>, Condvar),
+    protocol_matrix_variant: &Mutex<Option<ProtocolMatrixVariant>>,
 ) -> io::Result<()> {
     client.set_read_timeout(Some(Duration::from_secs(5)))?;
     client.set_write_timeout(Some(Duration::from_secs(5)))?;
     let request = read_bounded_http_request(&mut client)?;
+    let path = request_target_path(&request)?;
+    let protocol_matrix_variant = *protocol_matrix_variant
+        .lock()
+        .map_err(|_| io::Error::other("protocol matrix variant lock poisoned"))?;
+    if protocol_matrix_variant.is_some()
+        && matches!(path.as_str(), "/v1/identity" | "/v1/capabilities")
+        && request_has_header(&request, "zode-subject")
+    {
+        client.write_all(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return Ok(());
+    }
     let request = request_with_connection_close(&request)?;
     let mut upstream = TcpStream::connect((upstream_host, upstream_port))?;
     upstream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -1328,7 +1661,22 @@ fn proxy_counted_request(
     changed.1.notify_all();
     let mut response = Vec::new();
     upstream.read_to_end(&mut response)?;
+    if let Some(variant) = protocol_matrix_variant {
+        response = mutate_protocol_matrix_response(&path, &response, variant)?;
+    }
     client.write_all(&response)
+}
+
+fn request_has_header(request: &[u8], expected: &str) -> bool {
+    let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    std::str::from_utf8(&request[..header_end])
+        .ok()
+        .into_iter()
+        .flat_map(|headers| headers.split("\r\n").skip(1))
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, _)| name.trim().eq_ignore_ascii_case(expected))
 }
 
 fn request_with_connection_close(request: &[u8]) -> io::Result<Vec<u8>> {
@@ -2487,20 +2835,29 @@ fn base64url_decode(value: &str) -> TestResult<Vec<u8>> {
 
 fn write_server_config(root: &Path, fixture: &JwksFixture) -> TestResult<PathBuf> {
     let root = root.canonicalize()?;
+    let ui_assets_directory = root.join("ui-dist");
+    build_test_ui(&ui_assets_directory)?;
+    write_server_config_with_ui(&root, fixture, &ui_assets_directory)
+}
+
+fn write_server_config_with_ui(
+    root: &Path,
+    fixture: &JwksFixture,
+    ui_assets_directory: &Path,
+) -> TestResult<PathBuf> {
+    let root = root.canonicalize()?;
     let secret_directory = root.join("secrets");
     fs::create_dir(&secret_directory)?;
     let subject_key_file = root.join("subject.key");
     fs::write(&subject_key_file, SUBJECT_KEY)?;
     set_restricted_permissions(&subject_key_file)?;
-    let ui_assets_directory = root.join("ui-dist");
-    build_test_ui(&ui_assets_directory)?;
     let config = json!({
         "schema": "zode.server-config.v1",
         "listen": "127.0.0.1:0",
         "server_authority_id": "access-e2e-server",
         "deployment": "server_only",
         "ui_mode": "assets",
-        "ui_assets_directory": "ui-dist",
+        "ui_assets_directory": ui_assets_directory,
         "control_database": root.join("control.sqlite"),
         "secret_directory": secret_directory,
         "access": {
@@ -2801,6 +3158,15 @@ fn assert_endpoint_list(
 }
 
 fn assert_endpoint_record(label: &str, record: &Value, endpoint_id: &str) -> TestResult<()> {
+    assert_endpoint_record_with_revision(label, record, endpoint_id, 1)
+}
+
+fn assert_endpoint_record_with_revision(
+    label: &str,
+    record: &Value,
+    endpoint_id: &str,
+    expected_revision: u64,
+) -> TestResult<()> {
     if record["schema"] != "zode.endpoint.v1"
         || record["endpoint_id"] != endpoint_id
         || record["label"] != CATALOG_ENDPOINT_LABEL
@@ -2808,7 +3174,7 @@ fn assert_endpoint_record(label: &str, record: &Value, endpoint_id: &str) -> Tes
         || record["status"] != "online"
         || record["disabled"] != false
         || record["controller_authority_id"] != CATALOG_CONTROLLER_AUTHORITY
-        || record["controller_credential_revision"] != 1
+        || record["controller_credential_revision"] != expected_revision
         || record["capabilities"]["protocol_version"] != "zode.endpoint.v1"
         || !record["capabilities"]["providers"]
             .as_array()

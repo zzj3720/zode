@@ -4,7 +4,9 @@ Status: authoritative system boundary. `docs/design.md` defines the Endpoint
 runtime, `docs/http-api.md` defines the Endpoint protocol,
 `docs/server-api.md` defines the management Server and UI-facing protocol, and
 `docs/auth-replication.md` defines credential distribution. `docs/access.md`
-defines Cloudflare Access ingress and actor isolation.
+defines Cloudflare Access ingress and actor isolation. The Server's
+cross-version Endpoint admission matrix is frozen in
+[`docs/protocol-compatibility.md`](protocol-compatibility.md).
 
 ## 1. Product shape
 
