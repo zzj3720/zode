@@ -6,9 +6,10 @@ use std::io::{Error, ErrorKind};
 
 use http_sse_support::*;
 use reqwest::StatusCode;
+use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use support::{
-    authenticated, authenticated_as, http_client, install_test_replica, require_ulid,
+    authenticated, authenticated_as, db_blocking, http_client, install_test_replica, require_ulid,
     response_json, response_text, write_endpoint_config, ConfiguredServer, HttpRequestExt,
 };
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -585,6 +586,93 @@ async fn e2e_create_receipt_lookup_precedes_current_admission(
     let session = response_json(session).await?;
     assert_eq!(session["version"], 1);
     assert_eq!(session["transcript"], json!([]));
+
+    restarted.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_create_receipt_projection_rebuilds_from_verified_creation_event(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let database = test_database("create-receipt-projection-rebuild")?;
+    let mut server = TestServer::start(&database).await?;
+    let client = http_client()?;
+    let create = authenticated(client.post(server.url("/v1/sessions")))
+        .header("Idempotency-Key", "create-receipt-projection-key")
+        .json(&json!({}))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let first_body = response_text(create).await?;
+    let first_json: Value = serde_json::from_str(&first_body)?;
+    let session_id = require_ulid(&first_json)?;
+
+    let events = authenticated(
+        client
+            .get(server.url(&format!("/v1/sessions/{session_id}/events")))
+            .header("Last-Event-ID", "0"),
+    )
+    .send_with_timeout()
+    .await?;
+    assert_eq!(events.status(), StatusCode::OK);
+    let events = read_sse_events(events, 1).await?;
+    assert_eq!(events[0].event, "session_created");
+
+    server.stop().await?;
+    let database_file = database.path().to_owned();
+    let session_for_db = session_id.clone();
+    let session_for_events = session_id.clone();
+    let (deleted, remaining_events) = db_blocking(move || {
+        let connection = Connection::open(database_file)?;
+        let deleted = connection.execute(
+            "DELETE FROM session_create_receipts WHERE stream_id = ?1",
+            params![session_for_db],
+        )?;
+        let remaining_events = connection.query_row(
+            "SELECT COUNT(*) FROM events WHERE stream_id = ?1",
+            params![session_for_events],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok((deleted, remaining_events))
+    })
+    .await?;
+    assert_eq!(deleted, 1);
+    assert_eq!(remaining_events, 1);
+
+    let mut restarted = TestServer::start(&database).await?;
+    let replay = authenticated(client.post(restarted.url("/v1/sessions")))
+        .header("Idempotency-Key", "create-receipt-projection-key")
+        .json(&json!({}))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(response_text(replay).await?, first_body);
+
+    let replay_only = authenticated(client.post(restarted.url("/v1/sessions")))
+        .header("Idempotency-Key", "create-receipt-projection-key")
+        .header("Zode-Idempotency-Mode", "replay-only")
+        .json(&json!({}))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(replay_only.status(), StatusCode::CREATED);
+    assert_eq!(response_text(replay_only).await?, first_body);
+
+    let read = authenticated(client.get(restarted.url(&format!("/v1/sessions/{session_id}"))))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(read.status(), StatusCode::OK);
+    assert_eq!(response_json(read).await?["version"], 1);
+
+    let replay_events = authenticated(
+        client
+            .get(restarted.url(&format!("/v1/sessions/{session_id}/events")))
+            .header("Last-Event-ID", "0"),
+    )
+    .send_with_timeout()
+    .await?;
+    assert_eq!(replay_events.status(), StatusCode::OK);
+    let replay_events = read_sse_events(replay_events, 1).await?;
+    assert_eq!(replay_events[0].event, "session_created");
 
     restarted.stop().await?;
     Ok(())

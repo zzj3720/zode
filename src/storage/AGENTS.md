@@ -74,3 +74,9 @@ healthy startup without history-wide repair, missing/stale index rebuilding,
 historical command-idempotency preservation, snapshot creation leaving the
 public cursor unchanged, and oversized/credential-shaped payloads remaining
 bounded and secret-free.
+
+The create-receipt projection recovery path is anchored by
+`e2e_create_receipt_projection_rebuilds_from_verified_creation_event`: after a
+stopped Endpoint loses the derived receipt row, restart must rebuild it from
+the verified `SessionCreated` event and replay the exact original response via
+HTTP/SSE without allocating another session or event.
