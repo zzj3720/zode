@@ -22,18 +22,18 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::{Client, Response, StatusCode};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use support::{
-    assert_response_headers_secret_free, authenticated, canonical_json, db_blocking,
-    install_test_replica, require_ulid, response_json, response_text, sqlite_contains_secret,
-    write_endpoint_config, ConfiguredServer, HttpFixture, HttpRequestExt, LlmHttpChunkKind,
-    LlmHttpHeader, LlmHttpProxy, LlmHttpRecording, LlmHttpRecordingChunk, LlmHttpRecordingExchange,
-    LlmHttpRecordingMetadata, LlmHttpRecordingRequest, LlmHttpRecordingResponse,
-    LlmHttpResponseOutcome, ModelFixture, ModelHold, ModelScript, TempDatabase, TestResult,
-    ToolFixture, ToolScript, HTTP_INCIDENT_RECORDING_SCHEMA, LLM_HTTP_RECORDING_SCHEMA,
-    TEST_PROVIDER_SECRET,
+    assert_response_headers_secret_free, authenticated, authenticated_as, canonical_json,
+    db_blocking, install_test_replica, require_ulid, response_json, response_text,
+    sqlite_contains_secret, write_endpoint_config, ConfiguredServer, HttpFixture, HttpRequestExt,
+    LlmHttpChunkKind, LlmHttpHeader, LlmHttpProxy, LlmHttpRecording, LlmHttpRecordingChunk,
+    LlmHttpRecordingExchange, LlmHttpRecordingMetadata, LlmHttpRecordingRequest,
+    LlmHttpRecordingResponse, LlmHttpResponseOutcome, ModelFixture, ModelHold, ModelScript,
+    TempDatabase, TestResult, ToolFixture, ToolScript, HTTP_INCIDENT_RECORDING_SCHEMA,
+    LLM_HTTP_RECORDING_SCHEMA, TEST_PROVIDER_SECRET,
 };
 use tokio::{sync::Notify, time::timeout};
 
@@ -46,6 +46,64 @@ const TEXT_AND_TOOL_CALL_INCIDENT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/incidents/model_tool_call_preserves_assistant_text.incident.json"
 );
+const FIELD_RECOVERY_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/runtime_recovery/field_failed_attempt_stream_v1.sqlite3"
+);
+const FIELD_RECOVERY_FIXTURE_SHA256: &str =
+    "a446cd869b6f57b210480c42ff36409b1eba9fcbd6c56173d3ba2cfc555bc04e";
+const FIELD_RECOVERY_SESSION_ID: &str = "01KZH0KEZMZC5EPF55NY87CHR7";
+const FIELD_RECOVERY_AUTHORITY: &str = "release-178723ff-5a4c-48fd-a642-83c6ad643b8e";
+const FIELD_RECOVERY_SUBJECT: &str =
+    "v1:50a5cc940638d9e8b9d5f8571a1111228d4eca3b7b22fc778d9abaca5c591239";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FieldEventSnapshot {
+    global_position: i64,
+    stream_version: i64,
+    event_id: String,
+    command_id: String,
+    command_fingerprint_version: i64,
+    command_fingerprint: Vec<u8>,
+    event_schema_version: i64,
+    event_type: String,
+    payload: Vec<u8>,
+    event_fingerprint_version: i64,
+    event_fingerprint: Vec<u8>,
+}
+
+async fn field_event_prefix(path: &Path) -> TestResult<Vec<FieldEventSnapshot>> {
+    let path = path.to_owned();
+    db_blocking(move || {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let mut statement = connection.prepare(
+            "SELECT global_position, stream_version, event_id, command_id,
+                    command_fingerprint_version, command_fingerprint,
+                    event_schema_version, event_type, payload,
+                    event_fingerprint_version, event_fingerprint
+             FROM events
+             WHERE stream_id = ?1 AND stream_version <= 42
+             ORDER BY stream_version ASC",
+        )?;
+        let rows = statement.query_map([FIELD_RECOVERY_SESSION_ID], |row| {
+            Ok(FieldEventSnapshot {
+                global_position: row.get(0)?,
+                stream_version: row.get(1)?,
+                event_id: row.get(2)?,
+                command_id: row.get(3)?,
+                command_fingerprint_version: row.get(4)?,
+                command_fingerprint: row.get(5)?,
+                event_schema_version: row.get(6)?,
+                event_type: row.get(7)?,
+                payload: row.get(8)?,
+                event_fingerprint_version: row.get(9)?,
+                event_fingerprint: row.get(10)?,
+            })
+        })?;
+        rows.collect()
+    })
+    .await
+}
 
 #[derive(Clone)]
 struct RawProviderResponse {
@@ -2118,6 +2176,8 @@ async fn e2e_tombstoned_replica_never_reaches_provider_before_or_after_restart()
     )
     .await?;
     let second_failure = next_auth_replica_unavailable(&mut restarted_events, &session_id).await?;
+    next_event_with_kind(&mut restarted_events, "model_attempts_exhausted").await?;
+    next_event_with_kind(&mut restarted_events, "activation_finished").await?;
     let first_failure_position = first_failure.id.parse::<u64>().map_err(|error| {
         Error::other(format!(
             "first auth failure had a non-numeric SSE id: {error}"
@@ -2137,6 +2197,14 @@ async fn e2e_tombstoned_replica_never_reaches_provider_before_or_after_restart()
     assert_eq!(model.request_count(), 0);
     let second_state = get_session(&client, &restarted, &session_id).await?;
     assert_no_model_effect(&second_state, "post-restart tombstone session")?;
+    assert!(
+        second_state["active_activation"].is_null(),
+        "second terminal failure left an active activation"
+    );
+    assert!(
+        second_state["active_model_round"].is_null(),
+        "second terminal failure left an active model round"
+    );
 
     drop(restarted_events);
     let mut replay =
@@ -2150,6 +2218,123 @@ async fn e2e_tombstoned_replica_never_reaches_provider_before_or_after_restart()
     restarted.stop().await?;
     model.stop().await?;
     assert!(!sqlite_contains_secret(database.path(), TOMBSTONE_PROVIDER_SECRET).await?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_restart_reconciles_failed_attempt_after_prior_activation_exhaustion() -> TestResult<()>
+{
+    let database = TempDatabase::new("field-failed-attempt-recovery")?;
+    let mut model = ModelFixture::start(Vec::new()).await?;
+    let config = config_file(&database, &model.provider_url(), None, 3)?;
+    let mut config_value: Value = serde_json::from_slice(&fs::read(&config)?)?;
+    config_value["controller_auth"][0]["authority_id"] = json!(FIELD_RECOVERY_AUTHORITY);
+    fs::write(&config, serde_json::to_vec_pretty(&config_value)?)?;
+
+    // Bootstrap only the test-owned control sidecars.  The database itself is
+    // then replaced with the immutable, secret-safe field observation fixture.
+    let mut bootstrap = ConfiguredServer::start(&database, &config).await?;
+    bootstrap.stop().await?;
+    let fixture_digest = Sha256::digest(fs::read(FIELD_RECOVERY_FIXTURE)?);
+    assert_eq!(
+        format!("{fixture_digest:x}"),
+        FIELD_RECOVERY_FIXTURE_SHA256,
+        "field recovery fixture changed from the captured immutable observation"
+    );
+    fs::copy(FIELD_RECOVERY_FIXTURE, database.path())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(database.path())?.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(database.path(), permissions)?;
+    }
+    #[cfg(not(unix))]
+    let mut permissions = fs::metadata(database.path())?.permissions();
+    #[cfg(not(unix))]
+    {
+        permissions.set_readonly(false);
+        fs::set_permissions(database.path(), permissions)?;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = database.path().as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let _ = fs::remove_file(PathBuf::from(sidecar));
+    }
+
+    let before = field_event_prefix(database.path()).await?;
+    assert_eq!(before.len(), 42, "field fixture stream prefix was altered");
+    assert_eq!(before.last().map(|event| event.stream_version), Some(42));
+    assert_eq!(
+        before.last().map(|event| event.event_type.as_str()),
+        Some("model_attempt_failed")
+    );
+    let cursor = before
+        .last()
+        .map(|event| event.global_position.to_string())
+        .ok_or_else(|| Error::other("field fixture had no event cursor"))?;
+
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    assert_eq!(
+        model.request_count(),
+        0,
+        "field recovery reached the provider"
+    );
+    let client = support::http_client()?;
+    let response = authenticated_as(
+        client.get(server.url(&format!("/v1/sessions/{FIELD_RECOVERY_SESSION_ID}/events"))),
+        FIELD_RECOVERY_SUBJECT,
+    )
+    .header("Last-Event-ID", &cursor)
+    .send_with_timeout()
+    .await?;
+    assert_response_headers_secret_free(&response, &[TEST_PROVIDER_SECRET]);
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut events = SseFrames::new(response);
+    let exhausted = next_event_with_kind(&mut events, "model_attempts_exhausted").await?;
+    assert_eq!(exhausted.data["version"], 43);
+    let terminal = next_event_with_kind(&mut events, "model_attempt_failed").await?;
+    assert_eq!(terminal.data["version"], 44);
+    let finished = next_event_with_kind(&mut events, "activation_finished").await?;
+    assert_eq!(finished.data["version"], 45);
+
+    let response = authenticated_as(
+        client.get(server.url(&format!("/v1/sessions/{FIELD_RECOVERY_SESSION_ID}"))),
+        FIELD_RECOVERY_SUBJECT,
+    )
+    .send_with_timeout()
+    .await?;
+    assert_response_headers_secret_free(&response, &[TEST_PROVIDER_SECRET]);
+    assert_eq!(response.status(), StatusCode::OK);
+    let state = response_json(response).await?;
+    assert_eq!(state["session_id"], FIELD_RECOVERY_SESSION_ID);
+    assert_eq!(state["version"], 45);
+    assert!(state["active_activation"].is_null());
+    assert!(state["active_model_round"].is_null());
+    assert_eq!(field_event_prefix(database.path()).await?, before);
+
+    server.stop().await?;
+    let mut restarted = ConfiguredServer::start(&database, &config).await?;
+    assert_eq!(
+        model.request_count(),
+        0,
+        "idempotent recovery reached provider"
+    );
+    let response = authenticated_as(
+        client.get(restarted.url(&format!("/v1/sessions/{FIELD_RECOVERY_SESSION_ID}"))),
+        FIELD_RECOVERY_SUBJECT,
+    )
+    .send_with_timeout()
+    .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let restarted_state = response_json(response).await?;
+    assert_eq!(restarted_state["version"], 45);
+    assert!(restarted_state["active_activation"].is_null());
+    assert!(restarted_state["active_model_round"].is_null());
+    assert_eq!(field_event_prefix(database.path()).await?, before);
+
+    restarted.stop().await?;
+    model.stop().await?;
     Ok(())
 }
 

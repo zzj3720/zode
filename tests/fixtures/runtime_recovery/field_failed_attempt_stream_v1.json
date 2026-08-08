@@ -1,0 +1,73 @@
+{
+  "schema": "zode.runtime-recovery-fixture.v1",
+  "source": "test-channel field observation, copied before repair",
+  "database": "field_failed_attempt_stream_v1.sqlite3",
+  "sha256": "a446cd869b6f57b210480c42ff36409b1eba9fcbd6c56173d3ba2cfc555bc04e",
+  "session_id": "01KZH0KEZMZC5EPF55NY87CHR7",
+  "owner": {
+    "authority_id": "release-178723ff-5a4c-48fd-a642-83c6ad643b8e",
+    "subject": "v1:50a5cc940638d9e8b9d5f8571a1111228d4eca3b7b22fc778d9abaca5c591239"
+  },
+  "stream_version": 42,
+  "event_sequence": [
+    "session_created",
+    "delivery_queued",
+    "activation_started",
+    "delivery_materialized",
+    "delivery_acknowledged",
+    "model_round_started",
+    "model_request_prepared",
+    "model_attempt_started",
+    "model_request_completed",
+    "activation_finished",
+    "message_appended",
+    "delivery_queued",
+    "activation_started",
+    "delivery_materialized",
+    "delivery_acknowledged",
+    "model_round_started",
+    "model_request_prepared",
+    "model_attempt_started",
+    "model_attempt_failed",
+    "model_step_retry_scheduled",
+    "model_attempt_started",
+    "model_attempt_failed",
+    "model_step_retry_scheduled",
+    "model_attempt_started",
+    "model_attempt_failed",
+    "model_attempts_exhausted",
+    "model_attempt_failed",
+    "activation_finished",
+    "delivery_queued",
+    "activation_started",
+    "delivery_materialized",
+    "delivery_acknowledged",
+    "model_round_started",
+    "model_request_prepared",
+    "model_attempt_started",
+    "model_attempt_failed",
+    "model_step_retry_scheduled",
+    "model_attempt_started",
+    "model_attempt_failed",
+    "model_step_retry_scheduled",
+    "model_attempt_started",
+    "model_attempt_failed"
+  ],
+  "last_fact": {
+    "stream_version": 42,
+    "event_type": "model_attempt_failed",
+    "attempt_number": 3,
+    "retry": null,
+    "retryable": false
+  },
+  "secret_scan": {
+    "scope": "events payloads and SQLite text/blob bytes",
+    "checked_against": [
+      "controller-auth secret",
+      "provider replica files",
+      "server provider/endpoint secret files",
+      "subject key"
+    ],
+    "result": "no known secret bytes; fixture contains no credential material"
+  }
+}

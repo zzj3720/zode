@@ -2060,9 +2060,11 @@ impl SessionState {
                     if existing == fact {
                         return Ok(());
                     }
-                    return Err(DomainError::InvalidState(
-                        "model exhaustion has conflicting semantics".into(),
-                    ));
+                    if existing.activation_id == fact.activation_id {
+                        return Err(DomainError::InvalidState(
+                            "model exhaustion has conflicting semantics".into(),
+                        ));
+                    }
                 }
                 let round = self.active_model_round.as_ref().ok_or_else(|| {
                     DomainError::InvalidState("model exhaustion has no active round".into())
