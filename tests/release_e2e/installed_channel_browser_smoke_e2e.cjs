@@ -347,7 +347,7 @@ async function preparePersistentProvider(page) {
 
 async function retainProviderOwnershipMarker(page) {
   if (!persistentMode || !liveProviderMode) return;
-  await page.evaluate(async ({ provider, marker }) => {
+  await page.evaluate(async ({ provider, marker, markerKey }) => {
     const response = await fetch('/v1/providers', { headers: { accept: 'application/json' } });
     if (!response.ok) throw new Error(`provider list returned ${response.status}`);
     const record = ((await response.json()).providers || []).find((item) => item.provider === provider);
@@ -358,7 +358,7 @@ async function retainProviderOwnershipMarker(page) {
       headers: {
         accept: 'application/json',
         'content-type': 'application/json',
-        'Idempotency-Key': `persistent-provider-marker-${runId}`,
+        'Idempotency-Key': `persistent-provider-marker-${markerKey}`,
       },
       body: JSON.stringify({
         kind: descriptor.kind,
@@ -368,7 +368,7 @@ async function retainProviderOwnershipMarker(page) {
       }),
     });
     if (!put.ok) throw new Error(`provider ownership marker returned ${put.status}`);
-  }, { provider: providerId, marker: testOwnershipMarker });
+  }, { provider: providerId, marker: testOwnershipMarker, markerKey: runId });
 }
 
 async function findOrCreateProfile(page, providerCard, { providerId, profileLabel, providerKey }) {
