@@ -430,8 +430,7 @@ async fn e2e_capabilities_sort_all_arrays_with_multiple_provider_adapters() -> T
     let provider = AnthropicFixture::start(false).await?;
     let path = write_endpoint_config(database.path(), Vec::new(), 1)?;
     let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
-    config["provider_execution"]["adapter_kinds"] =
-        json!(["openai_compatible", "anthropic"]);
+    config["provider_execution"]["adapter_kinds"] = json!(["openai_compatible", "anthropic"]);
     config["provider_execution"]["allowed_base_url_origins"] = json!([provider.base_url()]);
     fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
     let mut server = ConfiguredServer::start(&database, &path).await?;
@@ -450,7 +449,10 @@ async fn e2e_capabilities_sort_all_arrays_with_multiple_provider_adapters() -> T
         capabilities["auth_replica_credential_schemas"],
         json!(["anthropic.api-key.v1", "openai-compatible.api-key.v1"])
     );
-    assert_eq!(capabilities["outbound_capabilities"], json!(["provider_http"]));
+    assert_eq!(
+        capabilities["outbound_capabilities"],
+        json!(["provider_http"])
+    );
     assert_eq!(capabilities["built_in_tools"], json!(["wait_for"]));
     server.stop().await?;
     let mut provider = provider;
