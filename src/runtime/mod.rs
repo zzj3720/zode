@@ -31,6 +31,7 @@ pub enum ModelError {
     InvalidSelection,
     AuthReplicaUnavailable,
     ProviderFailed,
+    InvalidToolArguments,
 }
 
 pub const WAIT_FOR_TOOL_NAME: &str = "wait_for";
@@ -656,6 +657,12 @@ impl Runtime {
                 return Ok(());
             }
 
+            if self.activation_round_budget_exhausted(&state) {
+                self.finish_round_budget_activation(&owner, &session_id, &state)
+                    .await?;
+                return Ok(());
+            }
+
             if let Some(trigger) = unresolved_user(&state) {
                 let round = self
                     .run_model_round(
@@ -692,6 +699,12 @@ impl Runtime {
             }
             state = next_state;
 
+            if self.activation_round_budget_exhausted(&state) {
+                self.finish_round_budget_activation(&owner, &session_id, &state)
+                    .await?;
+                return Ok(());
+            }
+
             if let Some(round_identity) = model_followup_identity(&state) {
                 let round = self
                     .run_model_round(&owner, &session_id, &selection, &state, round_identity)
@@ -727,6 +740,53 @@ impl Runtime {
                 return Ok(());
             }
         }
+    }
+
+    fn activation_round_budget_exhausted(&self, state: &SessionState) -> bool {
+        let Some(activation) = state.active_activation.as_ref() else {
+            return false;
+        };
+        if activation.rounds_started < self.options.max_rounds_per_activation {
+            return false;
+        }
+        // A scheduled retry belongs to the already-counted round and must
+        // still be claimed.  The budget limits model rounds, not attempts
+        // within one prepared request.
+        !state
+            .active_model_round
+            .as_ref()
+            .is_some_and(|round| round.retry.is_some() && round.attempt.is_none())
+    }
+
+    async fn finish_round_budget_activation(
+        self: &Arc<Self>,
+        owner: &SessionOwner,
+        session_id: &str,
+        state: &SessionState,
+    ) -> Result<(), &'static str> {
+        let Some(activation) = state.active_activation.as_ref() else {
+            return Ok(());
+        };
+        let Some((append, next_state)) = finish_activation(
+            self.store.clone(),
+            owner.clone(),
+            session_id.to_owned(),
+            state,
+            activation.activation_id.clone(),
+            ActivationOutcome::Finished,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        self.observe_commit(&append, &next_state).await;
+        let queued_input = next_state.transcript.last().is_some_and(|message| {
+            message.role == TranscriptRole::User && message.source_queue_id.is_some()
+        });
+        if !next_state.delivery_queue.is_empty() || queued_input {
+            self.wake(owner.clone(), session_id.to_owned());
+        }
+        Ok(())
     }
 
     async fn recover_model_round(
@@ -932,7 +992,18 @@ impl Runtime {
         let mut attempt_number = request_identity.attempt_number;
         let mut attempt_id = request_identity.attempt_id.clone();
         let outcome = loop {
-            match self.model.complete(request.clone()).await {
+            let completion = self
+                .model
+                .complete(request.clone())
+                .await
+                .and_then(|value| {
+                    if validate_tool_calls(&value.tool_calls, &tools).is_ok() {
+                        Ok(value)
+                    } else {
+                        Err(ModelError::InvalidToolArguments)
+                    }
+                });
+            match completion {
                 Ok(value) => break value,
                 Err(ModelError::AuthReplicaUnavailable) => {
                     let failure = append_model_lifecycle_failure(
@@ -1023,7 +1094,8 @@ impl Runtime {
                             .last()
                             .is_some_and(|message| message.role == TranscriptRole::User)
                         {
-                            let terminal = append_model_attempt_failure(
+                            let (terminal_class, terminal_message) = terminal_model_error(&error);
+                            let terminal = append_model_attempt_failure_with_error(
                                 self.store.clone(),
                                 owner.clone(),
                                 session_id.to_owned(),
@@ -1032,6 +1104,8 @@ impl Runtime {
                                     .last()
                                     .map(|message| message.message_id.clone())
                                     .unwrap_or_default(),
+                                terminal_class,
+                                terminal_message,
                             )
                             .await?;
                             self.observe_commit(&terminal.0, &terminal.1).await;
@@ -1116,12 +1190,11 @@ impl Runtime {
                 activation_id: request_identity.activation_id.clone(),
                 round_id: request_identity.round_id.clone(),
                 request_id,
-                attempt_id,
+                attempt_id: attempt_id.clone(),
             },
         )
         .await?;
         self.observe_commit(&completed.0, &completed.1).await;
-        validate_tool_calls(&outcome.tool_calls, &state.selection.tools)?;
         if outcome.tool_calls.is_empty() {
             let commit = append_assistant(
                 self.store.clone(),
@@ -1652,18 +1725,30 @@ fn inline_tool_input(call: &ToolCall) -> Result<Value, &'static str> {
     Ok(payload.value().clone())
 }
 
-fn validate_tool_calls(calls: &[ToolCall], selected: &[String]) -> Result<(), &'static str> {
+fn validate_tool_calls(
+    calls: &[ToolCall],
+    definitions: &[ToolDefinition],
+) -> Result<(), &'static str> {
     let mut ids = HashSet::new();
-    let selected = selected.iter().collect::<HashSet<_>>();
+    let definitions = definitions
+        .iter()
+        .map(|definition| (definition.name.as_str(), definition))
+        .collect::<HashMap<_, _>>();
     for call in calls {
         if !ids.insert(call.tool_call_id.as_str()) {
             return Err("duplicate tool call id");
         }
-        if call.tool_name != WAIT_FOR_TOOL_NAME && !selected.contains(&call.tool_name) {
-            return Err("unselected tool call");
+        if call.tool_name == WAIT_FOR_TOOL_NAME {
+            continue;
         }
-        if call.tool_name != WAIT_FOR_TOOL_NAME {
-            inline_tool_input(call)?;
+        let Some(definition) = definitions.get(call.tool_name.as_str()) else {
+            return Err("unselected tool call");
+        };
+        let input = inline_tool_input(call)?;
+        let validator = jsonschema::validator_for(&definition.input_schema)
+            .map_err(|_| "invalid tool schema")?;
+        if !validator.is_valid(&input) {
+            return Err("invalid tool arguments");
         }
     }
     Ok(())
@@ -1675,8 +1760,34 @@ async fn append_model_attempt_failure(
     session_id: String,
     trigger_message_id: String,
 ) -> Result<(AppendResult, SessionState), &'static str> {
+    append_model_attempt_failure_with_error(
+        store,
+        owner,
+        session_id,
+        trigger_message_id,
+        ModelAttemptErrorClass::AuthReplicaUnavailable,
+        "credential replica unavailable",
+    )
+    .await
+}
+
+async fn append_model_attempt_failure_with_error(
+    store: Arc<dyn EventStore>,
+    owner: SessionOwner,
+    session_id: String,
+    trigger_message_id: String,
+    error_class: ModelAttemptErrorClass,
+    error_message: &'static str,
+) -> Result<(AppendResult, SessionState), &'static str> {
     tokio::task::spawn_blocking(move || {
-        append_model_attempt_failure_blocking(&*store, &owner, &session_id, &trigger_message_id)
+        append_model_attempt_failure_blocking(
+            &*store,
+            &owner,
+            &session_id,
+            &trigger_message_id,
+            error_class,
+            error_message,
+        )
     })
     .await
     .map_err(|_| "model_failure_join")?
@@ -1687,12 +1798,14 @@ fn append_model_attempt_failure_blocking(
     owner: &SessionOwner,
     session_id: &str,
     trigger_message_id: &str,
+    error_class: ModelAttemptErrorClass,
+    error_message: &str,
 ) -> Result<(AppendResult, SessionState), &'static str> {
     let failure = ModelAttemptFailure {
         trigger_message_id: trigger_message_id.to_owned(),
         error: ModelAttemptError {
-            class: ModelAttemptErrorClass::AuthReplicaUnavailable,
-            message: "credential replica unavailable".to_owned(),
+            class: error_class,
+            message: error_message.to_owned(),
         },
     };
     let identity = model_failure_identity(owner, session_id, trigger_message_id);
@@ -2259,6 +2372,20 @@ fn model_error_class(error: &ModelError) -> &'static str {
         ModelError::InvalidSelection => "invalid_selection",
         ModelError::AuthReplicaUnavailable => "auth_replica_unavailable",
         ModelError::ProviderFailed => "provider_failed",
+        ModelError::InvalidToolArguments => "invalid_tool_arguments",
+    }
+}
+
+fn terminal_model_error(error: &ModelError) -> (ModelAttemptErrorClass, &'static str) {
+    match error {
+        ModelError::InvalidToolArguments => (
+            ModelAttemptErrorClass::InvalidToolArguments,
+            "model supplied invalid tool arguments",
+        ),
+        _ => (
+            ModelAttemptErrorClass::AuthReplicaUnavailable,
+            "credential replica unavailable",
+        ),
     }
 }
 

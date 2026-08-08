@@ -12,9 +12,12 @@ Tool configuration and public status/cancel/callback routes are defined in
 - The model's original `tool_call_id` is the only lifecycle identity. Use it
   for invocation, early result, async status, callback, cancellation, result
   lookup, wait membership, and recovery.
-- Validate every disclosed schema and model-supplied argument. Never silently
-  omit a tool whose JSON schema cannot be represented by aimux, and never start
-  side effects for invalid arguments.
+- Validate each configured ordinary adapter's disclosed schema and every
+  model-supplied argument for that adapter. Never silently omit a tool whose
+  JSON schema cannot be represented by aimux, and never start side effects for
+  invalid adapter arguments. The runtime-owned `wait_for` call is governed by
+  its existing session-control contract and is outside this adapter-schema
+  validation rule.
 - Every model request discloses exactly the ordinary tools selected by that
   session plus one runtime-owned `wait_for`; it never discloses an unselected
   configured tool. Preserve each selected schema on the provider wire, and
@@ -96,6 +99,8 @@ idempotency, oversized output via blob reference, and restart outcomes for
 process-bound, ambiguous remote-response, and external-callback tools.
 
 Existing executable anchors are
+`e2e_invalid_model_tool_arguments_are_rejected_before_side_effect`,
+`e2e_max_rounds_per_activation_stops_tool_feedback_loop`,
 `e2e_mixed_tool_batch_is_concurrent_ordered_and_waits_once`,
 `e2e_explicit_wait_last_wins_without_skipping_ordinary_tool`,
 `e2e_explicit_wait_defaults_to_sixty_seconds_and_survives_restart`,

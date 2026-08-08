@@ -65,7 +65,10 @@ SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
   out of prepared envelopes/events.
 - Do not commit an assistant outcome or execute any tool until the complete
   stream ends normally with a valid finish and all completed tool calls pass
-  validation. Incremental tool-input parts are never executable.
+  validation for configured ordinary adapter tools. The runtime-owned
+  `wait_for` call keeps its existing session-control/result contract and is
+  outside this adapter-schema validation boundary. Incremental tool-input parts
+  are never executable.
 
 - An ordinary tool batch may create at most one automatic wait. If a model
   batch also contains explicit `wait_for`, ordinary tools still execute and
@@ -78,6 +81,9 @@ SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
   activation; it does not resume an old model HTTP stream.
 - Preserve a configurable consecutive-timeout activation budget so repeated
   waits cannot create an unbounded self-wake loop without external input.
+- Stop an activation after its configured model-round budget; a retry of the
+  already prepared round remains eligible, while a queued user delivery may
+  wake a fresh activation under a new budget.
 - `planned` is strictly pre-dispatch: a durable transition to `running` must
   commit before side effects start, so recovery may dispatch an unclaimed plan
   once. On restart, process-bound running tools become terminal

@@ -699,6 +699,8 @@ fn validate_tools(
                 "tools.input_schema must be a bounded object",
             ));
         }
+        jsonschema::validator_for(&value.input_schema)
+            .map_err(|_| ConfigError::Invalid("tools.input_schema is invalid"))?;
         validate_positive(
             value.auto_wait_timeout_seconds,
             MAX_AUTO_WAIT_TIMEOUT_SECONDS,
