@@ -42,7 +42,9 @@ node release/local-channel.cjs stop
 Server 持久状态和本地 Access edge 配置会在 stop/start 后保留，用户不需要
 拼接临时进程。该 edge 只是测试通道的真实 Access 签名转发器，不是 Server
 的未认证 fallback；它不记录请求、不接受 cassette/replay，也不进入产物中的
-Server/Endpoint 进程。
+Server/Endpoint 进程。若要在 UI 中配置外部 provider，启动时用不含凭据的
+`ZODE_RELEASE_PROVIDER_ORIGINS=https://<approved-provider-origin>` 声明允许的
+origin；provider key 仍只在 Access-protected UI 的 profile 表单中输入。
 
 外部 artifact 的 `install`/`bootstrap`/`stage` admission 先由 checkout 中的
 受信 driver 校验 manifest、组件 digest 和不可变树；不会先执行 artifact 自带
