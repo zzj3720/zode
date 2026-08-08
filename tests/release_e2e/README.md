@@ -30,6 +30,21 @@ node release/channel.cjs stop --release-root <channel-root>
 node release/channel.cjs update --artifact <candidate> --release-root <channel-root>
 ```
 
+给本机用户的可留存入口是：
+
+```sh
+node release/local-channel.cjs install --artifact <artifact>
+node release/local-channel.cjs start
+# 打开 start 输出的 URL；停止时：
+node release/local-channel.cjs stop
+```
+
+该入口默认使用 `~/.zode/test-channel`，也可传 `--channel-root` 固定到
+其他本机目录。它保留同一 artifact、持久 Endpoint/Server 状态和本地
+Access-protected edge，因此重启后 URL 不变，普通浏览器仍走
+Access → Server → built-in Endpoint；edge 不提供未认证 fallback，也不带
+recorder/replay/test 参数进入产品进程。
+
 构建只读取 `git archive`，并在同一 revision 内锁定 Endpoint、Server、Vite+
 UI、协议输入和 release driver 的 manifest/digest。`install` 不切换运行中
 版本；`update` 的 candidate readiness 失败会保留 `current`/`previous` 并返回

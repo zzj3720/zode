@@ -1148,9 +1148,14 @@ function persistentReleaseState(root, instanceId, kind) {
   validatePrivateTree(serverSecrets);
   for (const databasePath of [join(directory, "endpoint.sqlite3"), join(directory, "server.sqlite3")]) {
     const databaseStat = statOrNull(databasePath);
-    if (databaseStat && (!databaseStat.isFile() || databaseStat.isSymbolicLink() || (databaseStat.mode & 0o077) !== 0)) {
+    if (databaseStat && (!databaseStat.isFile() || databaseStat.isSymbolicLink())) {
       fail("release_state_invalid", "persistent database is not a private regular file", { path: databasePath });
     }
+    // SQLite creates a new database with the process umask.  A user-facing
+    // restart must be able to tighten a legacy 0644 file in place without
+    // changing its durable identity or contents; links and non-regular files
+    // remain fail-closed above.
+    if (databaseStat && (databaseStat.mode & 0o077) !== 0) chmodSync(databasePath, 0o600);
   }
   return {
     directory,
