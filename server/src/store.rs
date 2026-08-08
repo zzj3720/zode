@@ -147,6 +147,11 @@ CREATE TABLE IF NOT EXISTS provider_default_profile_revisions (
     FOREIGN KEY (profile_id) REFERENCES auth_profiles(profile_id)
 ) WITHOUT ROWID, STRICT;
 
+CREATE TABLE IF NOT EXISTS provider_default_profile_operations (
+    actor_key BLOB NOT NULL CHECK (length(actor_key) = 32), provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 128), command_key BLOB NOT NULL CHECK (length(command_key) = 32), request_fingerprint BLOB NOT NULL CHECK (length(request_fingerprint) = 32), profile_id TEXT NOT NULL CHECK (length(profile_id) BETWEEN 1 AND 128),
+    PRIMARY KEY (actor_key, provider, command_key), FOREIGN KEY (profile_id) REFERENCES auth_profiles(profile_id)
+) WITHOUT ROWID, STRICT;
+
 CREATE TABLE IF NOT EXISTS auth_replica_operations (
     profile_id TEXT NOT NULL,
     endpoint_id TEXT NOT NULL,
@@ -202,6 +207,8 @@ enum ControlDatabaseState {
 pub(crate) enum StoreError {
     #[error("management command conflicts with an existing receipt")]
     Conflict,
+    #[error("management resource was not found")]
+    NotFound,
     #[error("control store integrity check failed")]
     Integrity,
     #[error("control store operation failed")]
@@ -357,6 +364,15 @@ pub(crate) struct ProfileCreateWrite {
     pub(crate) secret_ref: String,
     pub(crate) sharing_json: String,
     pub(crate) make_default: bool,
+    pub(crate) created_at_ms: i64,
+}
+
+pub(crate) struct ProviderDefaultProfileWrite {
+    pub(crate) actor_key: [u8; DIGEST_BYTES],
+    pub(crate) provider: String,
+    pub(crate) command_key: [u8; DIGEST_BYTES],
+    pub(crate) request_fingerprint: [u8; DIGEST_BYTES],
+    pub(crate) profile_id: String,
     pub(crate) created_at_ms: i64,
 }
 
@@ -1395,6 +1411,90 @@ impl ControlStore {
         let record = read_auth_profile(&transaction, &operation.profile_id)?;
         transaction.commit().map_err(|_| StoreError::Internal)?;
         Ok(record)
+    }
+
+    pub(crate) fn set_provider_default_profile(
+        &self,
+        write: ProviderDefaultProfileWrite,
+    ) -> Result<(AuthProfileRecord, bool), StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_fingerprint, profile_id
+                 FROM provider_default_profile_operations
+                 WHERE actor_key = ?1 AND provider = ?2 AND command_key = ?3",
+                params![
+                    &write.actor_key[..],
+                    &write.provider,
+                    &write.command_key[..]
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Internal)?;
+        if let Some((fingerprint, profile_id)) = existing {
+            if !equal_digest(&fingerprint, &write.request_fingerprint) {
+                return Err(StoreError::Conflict);
+            }
+            let record = read_auth_profile_optional(&transaction, &profile_id)?
+                .ok_or(StoreError::Integrity)?;
+            return Ok((record, true));
+        }
+        let profile_exists = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM auth_profiles
+                    WHERE profile_id = ?1 AND provider = ?2
+                )",
+                params![&write.profile_id, &write.provider],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| StoreError::Internal)?
+            != 0;
+        if !profile_exists {
+            return Err(StoreError::NotFound);
+        }
+        let revision = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(revision), 0) + 1
+                 FROM provider_default_profile_revisions WHERE provider = ?1",
+                [&write.provider],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| StoreError::Internal)?;
+        transaction
+            .execute(
+                "INSERT INTO provider_default_profile_revisions (
+                    provider, revision, profile_id, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &write.provider,
+                    revision,
+                    &write.profile_id,
+                    write.created_at_ms
+                ],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        transaction
+            .execute(
+                "INSERT INTO provider_default_profile_operations (
+                    actor_key, provider, command_key, request_fingerprint, profile_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &write.actor_key[..],
+                    &write.provider,
+                    &write.command_key[..],
+                    &write.request_fingerprint[..],
+                    &write.profile_id,
+                ],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        let record = read_auth_profile(&transaction, &write.profile_id)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok((record, false))
     }
 
     pub(crate) fn get_auth_profile(

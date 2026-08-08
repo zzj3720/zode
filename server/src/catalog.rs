@@ -503,6 +503,6 @@ fn unix_millis() -> Result<i64, CatalogError> {
 fn map_store_error(error: StoreError) -> CatalogError {
     match error {
         StoreError::Conflict => CatalogError::Conflict,
-        StoreError::Integrity | StoreError::Internal => CatalogError::Internal,
+        _ => CatalogError::Internal,
     }
 }

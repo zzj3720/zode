@@ -330,6 +330,12 @@ routes are:
 - `GET /v1/auth-refresh-operations/{operation_id}`
 - `GET /v1/auth-refresh-operations/{operation_id}/events`
 
+`PUT /v1/providers/{provider}/default-auth-profile` accepts
+`{"profile_id":"..."}` and returns the selected non-secret auth-profile
+projection. The pointer is provider-scoped, versioned, and idempotent for the
+same Access actor, provider, key, and request body; it never selects a
+replacement implicitly.
+
 An API-key create body is:
 
 ```json

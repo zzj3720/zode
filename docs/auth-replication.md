@@ -348,6 +348,9 @@ Endpoint aimux.
 
 - configure one API-key profile on Server, share it to two Endpoints, and prove
   both Endpoints call the provider directly without per-Endpoint setup;
+- `e2e_browser_provider_profile_default_action_updates_server_pointer` creates
+  two profiles through the real management UI, changes the provider-scoped
+  default, and verifies the Server-owned pointer and non-secret projection;
 - complete one OAuth profile on Server, distribute the execution credential,
   restart both Endpoints, and run sessions without another login;
 - crash Endpoint before and after secret promotion and prove one revision and
