@@ -1,6 +1,6 @@
 # Approved common-user E2E matrix
 
-Status: approved Zode behavior map, current protected main `2beff070a6cdbe67c2422f564c285264c5d7c496`.
+Status: approved Zode behavior map, current protected main `5c5867570c332881f4a62fd0195657532697e2d4`.
 
 This document turns the approved outside-repository adoption baseline into
 Zode-owned black-box anchors. It is a traceability document, not a claim that
@@ -93,7 +93,7 @@ green result is deliberately not a product-acceptance result. The separate
 the Endpoint, Server, and UI from that checkout, and executes every tracked
 file under `web/e2e/specs/` through Chromium and real child processes. Its
 collection audit is pinned by
-`scripts/ci/approved-product-playwright-manifest.json` to 24 files and 53 test
+`scripts/ci/approved-product-playwright-manifest.json` to 25 files and 54 test
 identities; any missing/extra file or test, failure, skip, or unrun test fails
 the job. It never reads live-provider credentials. `approved-product-merge-gate`
 requires both jobs, so a shared-only green cannot make a product merge appear

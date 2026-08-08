@@ -4,8 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const [listPath, specRoot, manifestPath] = process.argv.slice(2);
-const EXPECTED_FILE_COUNT = 24;
-const EXPECTED_TEST_COUNT = 53;
+const EXPECTED_FILE_COUNT = 25;
+const EXPECTED_TEST_COUNT = 54;
 if (!listPath || !specRoot || !manifestPath) {
   console.error('CI_VERIFY_FAILURE: product Playwright list, spec root, and manifest are required');
   process.exit(1);
