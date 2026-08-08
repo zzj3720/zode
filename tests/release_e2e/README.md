@@ -107,6 +107,10 @@ edge；`local_channel_edge_admission_e2e.cjs` 验证篡改的非 loopback 状态
 拒绝；`local_channel_stop_identity_e2e.cjs` 验证 stop 不信任 PATH 伪造的
 `ps` 身份，也不会杀死无关进程组；`local_channel_update_failure_e2e.cjs`
 验证 fresh update 的无效候选不会留下 edge/runtime；
+`local_channel_revision_update_e2e.cjs` 使用两个真实 immutable artifact，验证
+旧 current 经 candidate readiness 后原子推进到新 revision，并且更新后仍只保留
+一个健康的 current 实例；它要求 `ZODE_RELEASE_CHANNEL_BASE_ARTIFACT` 与
+`ZODE_RELEASE_CHANNEL_ARTIFACT`。
 `local_channel_node_runtime_e2e.cjs` 验证由一套 Node 启动后，另一套受信
 Node 仍能按 runtime 中的真实 executable path 检查并停止同一 edge。
 

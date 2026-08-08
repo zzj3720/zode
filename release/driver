@@ -259,7 +259,7 @@ function validateManifest(artifactPath) {
       fail("release_manifest_mismatch", `${label} digest or executable mode does not match manifest`, { path });
     }
   }
-  return { artifact, manifest, manifestPath, digest, paths: { ui, server, endpoint, driver: driverPath } };
+  return { artifact, installPath: artifact, manifest, manifestPath, digest, paths: { ui, server, endpoint, driver: driverPath } };
 }
 
 function fsyncDirectory(path) {
