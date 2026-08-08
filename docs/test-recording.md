@@ -217,6 +217,13 @@ Timing mode may not alter request/response semantics. Performance replay may
 report elapsed time and distributions but the canonical correctness suite has
 no machine-specific latency threshold.
 
+The opt-in `e2e_live_opencode_provider_roundtrip_and_restart` gate reloads the
+newly flushed immutable live recording, then performs three immediate and three
+captured replays through the same Endpoint/aimux public path. It writes only
+non-secret elapsed time samples and exchange/chunk counts to the ignored
+`target/test-recordings/live/<run-id>/replay-benchmark.v1.json`; ordinary CI
+never invokes this real-provider gate.
+
 ## 7. Defect workflow
 
 When a recording exposes a problem:

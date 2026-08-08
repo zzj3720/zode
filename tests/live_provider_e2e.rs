@@ -2,9 +2,9 @@ mod support;
 
 use std::{
     fs,
-    io::Error,
+    io::{Error, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::{json, Value};
@@ -27,6 +27,8 @@ const OFFLINE_REPLAY_SECRET: &str = "offline-live-recording-provider-key";
 const RECORDING_PATH: &str =
     "tests/fixtures/provider_recordings/opencode_go_deepseek_v4_flash.v2.json";
 const LIVE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
+const LIVE_REPLAY_BENCHMARK_SCHEMA: &str = "zode.llm-http-replay-benchmark.v1";
+const LIVE_REPLAY_BENCHMARK_REPETITIONS: usize = 3;
 
 fn live_config(database: &Path, provider_origin: &str) -> TestResult<PathBuf> {
     let path = write_endpoint_config(database, Vec::new(), 1)?;
@@ -136,6 +138,7 @@ async fn run_live_provider(api_key: String) -> TestResult<()> {
         }
     };
     if let Some(recording) = recording {
+        let mut live_directory = None;
         if let Err(error) = recording.write_atomic(
             &quarantine.join("recording.json"),
             &[&api_key, TEST_CONTROLLER_SECRET],
@@ -150,18 +153,39 @@ async fn run_live_provider(api_key: String) -> TestResult<()> {
                 ));
             } else {
                 match new_llm_live_recording_run_dir(&recording_id) {
-                    Ok(live_directory) => {
+                    Ok(directory) => {
                         if let Err(error) = recording.promote_immutable(
-                            &live_directory.join("recording.json"),
+                            &directory.join("recording.json"),
                             &[&api_key, TEST_CONTROLLER_SECRET],
                         ) {
                             cleanup_errors.push(format!("live envelope flush failed: {error}"));
+                        } else {
+                            live_directory = Some(directory);
                         }
                     }
                     Err(error) => {
                         cleanup_errors.push(format!("live run allocation failed: {error}"))
                     }
                 }
+            }
+        }
+        if primary.is_ok() && cleanup_errors.is_empty() {
+            if let Some(directory) = live_directory.as_deref() {
+                let promoted = LlmHttpRecording::load(&directory.join("recording.json"));
+                match promoted {
+                    Ok(promoted) => {
+                        if let Err(error) =
+                            benchmark_live_replay(&promoted, &api_key, directory).await
+                        {
+                            cleanup_errors.push(format!("live replay benchmark failed: {error}"));
+                        }
+                    }
+                    Err(error) => cleanup_errors.push(format!(
+                        "promoted live recording reload failed before benchmark: {error}"
+                    )),
+                }
+            } else {
+                cleanup_errors.push("live replay benchmark had no recording directory".to_owned());
             }
         }
         if primary.is_ok()
@@ -200,15 +224,21 @@ fn assert_retained_live_recording_exactly_two_exchanges() -> TestResult<()> {
     Ok(())
 }
 
-async fn replay_retained_live_recording(recording: LlmHttpRecording) -> TestResult<()> {
+async fn replay_recording_roundtrip(
+    recording: LlmHttpRecording,
+    captured_timing: bool,
+    provider_secret: &str,
+    idempotency_prefix: &str,
+) -> TestResult<Duration> {
     let mut replay = LlmHttpProxy::replay_with_authorization(
         recording,
-        false,
-        Some(OFFLINE_REPLAY_SECRET.to_owned()),
+        captured_timing,
+        Some(provider_secret.to_owned()),
     )
     .await?;
     let database = TempDatabase::new("live-recording-exact-count")?;
     let config = live_config(database.path(), &replay.base_url(""))?;
+    let started = Instant::now();
     let primary = run_provider_roundtrip_and_restart(ProviderRoundtripSpec {
         database: database.path().to_owned(),
         config,
@@ -217,31 +247,29 @@ async fn replay_retained_live_recording(recording: LlmHttpRecording) -> TestResu
         model: MODEL.to_owned(),
         profile: PROFILE.to_owned(),
         subject: SUBJECT.to_owned(),
-        provider_secret: OFFLINE_REPLAY_SECRET.to_owned(),
+        provider_secret: provider_secret.to_owned(),
         first_prompt: FIRST_PROMPT.to_owned(),
         first_marker: "ZODE_LIVE_OK".to_owned(),
         restart_prompt: RESTART_PROMPT.to_owned(),
         restart_marker: "ZODE_LIVE_RESTART_OK".to_owned(),
-        idempotency_prefix: "live-recording-exact-count".to_owned(),
+        idempotency_prefix: idempotency_prefix.to_owned(),
         forbidden: vec![
-            OFFLINE_REPLAY_SECRET.to_owned(),
+            provider_secret.to_owned(),
             TEST_CONTROLLER_SECRET.to_owned(),
         ],
         child_environment: Vec::new(),
     })
     .await;
+    let elapsed = started.elapsed();
     let mut cleanup_errors = Vec::new();
     if !replay.replay_exhausted() || replay.observed_requests().len() != 2 {
-        cleanup_errors
-            .push("retained live replay did not consume exactly two exchanges".to_owned());
+        cleanup_errors.push("live replay did not consume exactly two exchanges".to_owned());
     }
     if let Err(error) = replay.stop().await {
-        cleanup_errors.push(format!("retained live replay proxy stop failed: {error}"));
+        cleanup_errors.push(format!("live replay proxy stop failed: {error}"));
     }
-    match sqlite_contains_secret(database.path(), OFFLINE_REPLAY_SECRET).await {
-        Ok(true) => {
-            cleanup_errors.push("offline replay credential reached runtime SQLite".to_owned())
-        }
+    match sqlite_contains_secret(database.path(), provider_secret).await {
+        Ok(true) => cleanup_errors.push("replay credential reached runtime SQLite".to_owned()),
         Ok(false) => {}
         Err(error) => cleanup_errors.push(error.to_string()),
     }
@@ -250,7 +278,118 @@ async fn replay_retained_live_recording(recording: LlmHttpRecording) -> TestResu
         Ok(false) => {}
         Err(error) => cleanup_errors.push(error.to_string()),
     }
-    merge_live_errors(primary, cleanup_errors, OFFLINE_REPLAY_SECRET)
+    merge_live_errors(primary, cleanup_errors, provider_secret)?;
+    Ok(elapsed)
+}
+
+async fn replay_retained_live_recording(recording: LlmHttpRecording) -> TestResult<()> {
+    replay_recording_roundtrip(
+        recording,
+        false,
+        OFFLINE_REPLAY_SECRET,
+        "live-recording-exact-count",
+    )
+    .await
+    .map(|_| ())
+}
+
+fn write_live_replay_benchmark(
+    directory: &Path,
+    recording: &LlmHttpRecording,
+    immediate_ms: &[u128],
+    captured_ms: &[u128],
+    forbidden: &[&str],
+) -> TestResult<()> {
+    let path = directory.join("replay-benchmark.v1.json");
+    let response_chunks = recording
+        .requests
+        .iter()
+        .map(|exchange| exchange.response.chunks.len())
+        .sum::<usize>();
+    let value = json!({
+        "schema": LIVE_REPLAY_BENCHMARK_SCHEMA,
+        "recording_id": recording.recording_id,
+        "owner": recording.owner,
+        "provider": recording.provider,
+        "model": recording.model,
+        "measurement": "endpoint_roundtrip_and_restart",
+        "exchanges": recording.requests.len(),
+        "response_chunks": response_chunks,
+        "repetitions": LIVE_REPLAY_BENCHMARK_REPETITIONS,
+        "immediate_elapsed_ms": immediate_ms,
+        "captured_elapsed_ms": captured_ms,
+    });
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    if forbidden
+        .iter()
+        .filter(|marker| !marker.is_empty())
+        .any(|marker| {
+            bytes
+                .windows(marker.len())
+                .any(|candidate| candidate == marker.as_bytes())
+        })
+    {
+        return Err(Error::other("live replay benchmark contained credential material").into());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+async fn benchmark_live_replay(
+    recording: &LlmHttpRecording,
+    provider_secret: &str,
+    live_directory: &Path,
+) -> TestResult<()> {
+    let mut immediate_ms = Vec::with_capacity(LIVE_REPLAY_BENCHMARK_REPETITIONS);
+    let mut captured_ms = Vec::with_capacity(LIVE_REPLAY_BENCHMARK_REPETITIONS);
+    for repetition in 0..LIVE_REPLAY_BENCHMARK_REPETITIONS {
+        immediate_ms.push(
+            replay_recording_roundtrip(
+                recording.clone(),
+                false,
+                provider_secret,
+                &format!("live-replay-benchmark-immediate-{repetition}"),
+            )
+            .await?
+            .as_millis(),
+        );
+        captured_ms.push(
+            replay_recording_roundtrip(
+                recording.clone(),
+                true,
+                provider_secret,
+                &format!("live-replay-benchmark-captured-{repetition}"),
+            )
+            .await?
+            .as_millis(),
+        );
+    }
+    write_live_replay_benchmark(
+        live_directory,
+        recording,
+        &immediate_ms,
+        &captured_ms,
+        &[provider_secret, TEST_CONTROLLER_SECRET],
+    )?;
+    eprintln!(
+        "live provider replay benchmark: run_id={} exchanges={} immediate_ms={:?} captured_ms={:?}",
+        recording.recording_id,
+        recording.requests.len(),
+        immediate_ms,
+        captured_ms,
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
