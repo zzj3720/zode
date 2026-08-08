@@ -20,7 +20,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
@@ -32,6 +32,31 @@ const ARTIFACT_BINDING_E2E = "e2e_release_artifact_binds_server_endpoint_and_ui_
 const PROMOTION_REVISION_E2E = "e2e_release_promotion_never_mixes_server_and_ui_revision";
 const BLOCKED_EXIT = 78;
 const BODY_LIMIT = 2 * 1024 * 1024;
+const PROCESS_LOCATOR_SCHEMA = "zode.e2e.process-locator.v1";
+const PROCESS_STOP_SCHEMA = "zode.e2e.process-stop.v1";
+const PROCESS_LOCATOR_REQUIRED_KEYS = new Set([
+  "schema",
+  "instance_id",
+  "role",
+  "pid",
+  "started_at_unix_ms",
+  "process_group_id",
+  "session_id",
+  "executable_path",
+  "executable_sha256",
+]);
+const PROCESS_LOCATOR_OPTIONAL_KEYS = new Set(["control_origin"]);
+const PROCESS_STOP_REQUIRED_KEYS = new Set([
+  "schema",
+  "instance_id",
+  "requested_at_unix_ms",
+  "observed_pids",
+  "reaped_pids",
+  "leaked_pids",
+  "timed_out",
+  "exit_status",
+  "flush_status",
+]);
 
 class Blocked extends Error {
   constructor(code, message, details = {}) {
@@ -56,6 +81,7 @@ function usage() {
     "usage: run_release_e2e.sh [--promote-incident] [--replay CASSETTE] [--keep-workdir]",
     "required env: ZODE_RELEASE_BASELINE_REVISION ZODE_RELEASE_CANDIDATE_REVISION",
     "              ZODE_RELEASE_FAILED_REVISION ZODE_RELEASE_DRIVER_RELATIVE_PATH ZODE_RELEASE_UI_URL",
+    "replay env: ZODE_RELEASE_REPLAY_EXPECTATION=red|green (required with --replay)",
   ].join("\n");
 }
 
@@ -81,12 +107,18 @@ function parseArgs(argv) {
 }
 
 function runSync(command, args, options = {}) {
+  const encoding = Object.prototype.hasOwnProperty.call(options, "encoding")
+    ? options.encoding
+    : "utf8";
   const result = spawnSync(command, args, {
     cwd: options.cwd,
     env: options.env,
-    encoding: options.encoding ?? "utf8",
+    // `null` is intentional for git archive: tar receives the exact bytes,
+    // never a UTF-8 round-trip of an opaque binary stream.
+    encoding,
     input: options.input,
     maxBuffer: 8 * 1024 * 1024,
+    timeout: options.timeout ?? 300_000,
   });
   if (result.error) throw result.error;
   return {
@@ -112,7 +144,12 @@ function jsonBytes(value) {
   return Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+function sleep(milliseconds) {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
 function ensureDirectory(path, mode = 0o700) {
+  rejectSymlinkAncestors(path, "directory");
   mkdirSync(path, { recursive: true, mode });
   chmodSync(path, mode);
 }
@@ -126,12 +163,234 @@ function lstatOrNull(path) {
   }
 }
 
+function exactObjectKeys(value, required, optional = new Set(), label = "object") {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Blocked("process_contract_invalid", `${label} must be a JSON object`);
+  }
+  const keys = new Set(Object.keys(value));
+  for (const key of required) {
+    if (!keys.has(key)) throw new Blocked("process_contract_invalid", `${label} is missing ${key}`);
+  }
+  for (const key of keys) {
+    if (!required.has(key) && !optional.has(key)) {
+      throw new Blocked("process_contract_invalid", `${label} contains an unsupported field`, { field: key });
+    }
+  }
+}
+
+function positiveInteger(value, label) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Blocked("process_contract_invalid", `${label} must be a positive integer`);
+  }
+}
+
+function readJsonContract(path, schema, required, optional, phase, label) {
+  if (typeof path !== "string" || !isAbsolute(path)) {
+    throw new Blocked("process_contract_invalid", `${phase}: ${label} path must be absolute`);
+  }
+  const stat = lstatOrNull(path);
+  if (!stat || !stat.isFile() || stat.isSymbolicLink()) {
+    throw new Blocked("process_contract_invalid", `${phase}: ${label} path is not a regular file`, { label });
+  }
+  let value;
+  try {
+    value = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    throw new Blocked("process_contract_invalid", `${phase}: ${label} is not valid JSON`, { error: String(error) });
+  }
+  exactObjectKeys(value, required, optional, label);
+  if (value.schema !== schema) {
+    throw new Blocked("process_contract_invalid", `${phase}: ${label} has the wrong schema`, {
+      expected: schema,
+      observed: value.schema ?? null,
+    });
+  }
+  return value;
+}
+
+function validateProcessLocator(path, phase) {
+  const locator = readJsonContract(
+    path,
+    PROCESS_LOCATOR_SCHEMA,
+    PROCESS_LOCATOR_REQUIRED_KEYS,
+    PROCESS_LOCATOR_OPTIONAL_KEYS,
+    phase,
+    "process locator",
+  );
+  if (!new Set(["server", "endpoint"]).has(locator.role)) {
+    throw new Blocked("process_contract_invalid", `${phase}: process locator role is not server/endpoint`, {
+      role: locator.role,
+    });
+  }
+  for (const [field, value] of Object.entries({
+    instance_id: locator.instance_id,
+    session_id: locator.session_id,
+    executable_path: locator.executable_path,
+    executable_sha256: locator.executable_sha256,
+  })) {
+    if (typeof value !== "string" || !value) {
+      throw new Blocked("process_contract_invalid", `${phase}: locator ${field} must be non-empty text`);
+    }
+  }
+  positiveInteger(locator.pid, `${phase}: locator pid`);
+  positiveInteger(locator.started_at_unix_ms, `${phase}: locator started_at_unix_ms`);
+  positiveInteger(locator.process_group_id, `${phase}: locator process_group_id`);
+  if (!isAbsolute(locator.executable_path)) {
+    throw new Blocked("process_contract_invalid", `${phase}: locator executable_path must be absolute`);
+  }
+  if (!/^[a-f0-9]{64}$/.test(locator.executable_sha256)) {
+    throw new Blocked("process_contract_invalid", `${phase}: locator executable_sha256 is not a SHA-256 digest`);
+  }
+  if (locator.control_origin !== undefined) {
+    let origin;
+    try {
+      origin = new URL(locator.control_origin);
+    } catch {
+      throw new Blocked("process_contract_invalid", `${phase}: locator control_origin is not a URL`);
+    }
+    if (origin.protocol !== "http:" || !new Set(["127.0.0.1", "localhost", "::1"]).has(origin.hostname)) {
+      throw new Blocked("process_contract_invalid", `${phase}: locator control_origin is not local HTTP`);
+    }
+  }
+  return locator;
+}
+
+function validateProcessStop(report, phase) {
+  exactObjectKeys(report, PROCESS_STOP_REQUIRED_KEYS, new Set(), "process stop report");
+  if (report.schema !== PROCESS_STOP_SCHEMA) {
+    throw new Blocked("process_contract_invalid", `${phase}: process stop report has the wrong schema`, {
+      expected: PROCESS_STOP_SCHEMA,
+      observed: report.schema ?? null,
+    });
+  }
+  if (typeof report.instance_id !== "string" || !report.instance_id) {
+    throw new Blocked("process_contract_invalid", `${phase}: process stop instance_id must be non-empty text`);
+  }
+  positiveInteger(report.requested_at_unix_ms, `${phase}: stop requested_at_unix_ms`);
+  if (!Array.isArray(report.observed_pids) || report.observed_pids.length === 0) {
+    throw new Blocked("process_contract_invalid", `${phase}: stop observed_pids must contain process evidence`);
+  }
+  const observedIds = new Set();
+  for (const [index, observed] of report.observed_pids.entries()) {
+    exactObjectKeys(
+      observed,
+      new Set(["pid", "role", "started_at_unix_ms", "process_group_id", "session_id", "executable_path", "executable_sha256"]),
+      new Set(),
+      `process stop observed_pids[${index}]`,
+    );
+    positiveInteger(observed.pid, `${phase}: stop observed_pids[${index}].pid`);
+    if (observedIds.has(observed.pid)) throw new Blocked("process_contract_invalid", `${phase}: stop observed_pids contains duplicate PIDs`);
+    observedIds.add(observed.pid);
+    if (!(observed.role === "supervisor" || observed.role === "server" || observed.role === "endpoint")) {
+      throw new Blocked("process_contract_invalid", `${phase}: stop observed_pids[${index}].role is not recognized`);
+    }
+    positiveInteger(observed.started_at_unix_ms, `${phase}: stop observed_pids[${index}].started_at_unix_ms`);
+    positiveInteger(observed.process_group_id, `${phase}: stop observed_pids[${index}].process_group_id`);
+    if (typeof observed.session_id !== "string" || !observed.session_id) {
+      throw new Blocked("process_contract_invalid", `${phase}: stop observed_pids[${index}].session_id must be non-empty text`);
+    }
+    if (typeof observed.executable_path !== "string" || !isAbsolute(observed.executable_path)) {
+      throw new Blocked("process_contract_invalid", `${phase}: stop observed_pids[${index}].executable_path must be absolute`);
+    }
+    if (!/^[a-f0-9]{64}$/.test(observed.executable_sha256)) {
+      throw new Blocked("process_contract_invalid", `${phase}: stop observed_pids[${index}].executable_sha256 is not a SHA-256 digest`);
+    }
+  }
+  for (const field of ["reaped_pids", "leaked_pids"]) {
+    if (!Array.isArray(report[field]) || report[field].some((pid) => !Number.isSafeInteger(pid) || pid <= 0)) {
+      throw new Blocked("process_contract_invalid", `${phase}: stop ${field} must contain positive integer PIDs`);
+    }
+    if (new Set(report[field]).size !== report[field].length) {
+      throw new Blocked("process_contract_invalid", `${phase}: stop ${field} contains duplicate PIDs`);
+    }
+    if (report[field].some((pid) => !observedIds.has(pid))) {
+      throw new Blocked("process_contract_invalid", `${phase}: stop ${field} contains an unobserved PID`);
+    }
+  }
+  if (typeof report.timed_out !== "boolean") {
+    throw new Blocked("process_contract_invalid", `${phase}: stop timed_out must be boolean`);
+  }
+  if (report.exit_status !== null && !Number.isSafeInteger(report.exit_status)) {
+    throw new Blocked("process_contract_invalid", `${phase}: stop exit_status must be integer or null`);
+  }
+  if (typeof report.flush_status !== "string" || !report.flush_status) {
+    throw new Blocked("process_contract_invalid", `${phase}: stop flush_status must be non-empty text`);
+  }
+  return report;
+}
+
+function stopReportsFromPayload(payload, phase) {
+  if (Array.isArray(payload?.stop_reports)) {
+    if (!payload.stop_reports.length) {
+      throw new Blocked("release_process_stop_missing", `${phase}: teardown returned no stop reports`);
+    }
+    return payload.stop_reports.map((report) => validateProcessStop(report, phase));
+  }
+  if (payload?.stop && typeof payload.stop === "object") return [validateProcessStop(payload.stop, phase)];
+  if (payload?.schema === PROCESS_STOP_SCHEMA) return [validateProcessStop(payload, phase)];
+  throw new Blocked("release_process_stop_missing", `${phase}: teardown did not return process-stop.v1 evidence`);
+}
+
+function parseReadyLocatorLines(output, phase) {
+  const paths = [];
+  for (const line of String(output ?? "").split(/\r?\n/)) {
+    const match = line.match(/^ZODE_PROCESS_READY\s+(\S+)$/);
+    if (!match) continue;
+    if (!isAbsolute(match[1])) {
+      throw new Blocked("process_locator_invalid", `${phase}: ZODE_PROCESS_READY path must be absolute`);
+    }
+    paths.push(match[1]);
+  }
+  if (new Set(paths).size !== paths.length) {
+    throw new Blocked("process_locator_invalid", `${phase}: duplicate ZODE_PROCESS_READY locator paths`);
+  }
+  return paths;
+}
+
 function pathIsContained(root, candidate) {
   const relativePath = relative(resolve(root), resolve(candidate));
   return relativePath === ""
     || (!isAbsolute(relativePath)
       && relativePath !== ".."
       && !relativePath.startsWith(`..${sep}`));
+}
+
+function rejectSymlinkAncestors(path, label) {
+  let current = resolve(path);
+  while (true) {
+    const stat = lstatOrNull(current);
+    if (stat?.isSymbolicLink()) {
+      throw new Blocked("release_path_invalid", `${label} has a symlink ancestor`, { path: current });
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+}
+
+function assertOwnedFilePath(root, path, label) {
+  if (!pathIsContained(root, path)) {
+    throw new BehaviorFailure("release_process_instance_mismatch", `${label} is outside the release root`, {
+      path,
+      release_root: root,
+    });
+  }
+  rejectSymlinkAncestors(path, label);
+  const stat = lstatOrNull(path);
+  if (!stat || stat.isSymbolicLink()) {
+    throw new BehaviorFailure("release_process_locator_invalid", `${label} is not a regular file`, { path });
+  }
+  let canonical;
+  try { canonical = realpathSync(path); } catch (error) {
+    throw new BehaviorFailure("release_process_locator_invalid", `${label} cannot be resolved`, { path, error: String(error) });
+  }
+  if (!pathIsContained(root, canonical)) {
+    throw new BehaviorFailure("release_process_instance_mismatch", `${label} resolves outside the release root`, {
+      path,
+      canonical,
+      release_root: root,
+    });
+  }
 }
 
 function assertReleaseRoot(releaseRoot) {
@@ -273,16 +532,48 @@ function extractCommit(repoRoot, commit, destination) {
       stderr: unpack.stderr.trim().slice(-1000),
     });
   }
+  assertArchiveTree(destination, destination);
 }
 
-function requiredSurface(repoRoot, commit) {
+function assertArchiveTree(path, root) {
+  const stat = lstatOrNull(path);
+  if (!stat) throw new Blocked("archive_surface_invalid", "frozen archive is missing an extracted path", { path });
+  if (stat.isSymbolicLink()) {
+    throw new Blocked("archive_surface_invalid", "frozen archive contains a symlink", {
+      path: relative(root, path),
+    });
+  }
+  if (stat.isDirectory()) {
+    for (const name of readdirSync(path).sort()) assertArchiveTree(join(path, name), root);
+  } else if (!stat.isFile()) {
+    throw new Blocked("archive_surface_invalid", "frozen archive contains a non-regular entry", {
+      path: relative(root, path),
+    });
+  }
+}
+
+function requiredSurface(repoRoot, commit, driverRelativePath) {
   const required = [
     "Cargo.toml",
     "Cargo.lock",
+    "src",
+    "protocol/Cargo.toml",
+    "protocol/src",
+    "protocol/src/lib.rs",
     "server/Cargo.toml",
     "server/Cargo.lock",
+    "server/src",
+    "server/src/main.rs",
     "web/package.json",
+    "web/pnpm-lock.yaml",
+    "web/pnpm-workspace.yaml",
+    "web/tsconfig.json",
+    "web/index.html",
+    "web/src",
+    "web/src/main.ts",
+    "web/vite.config.ts",
   ];
+  if (driverRelativePath) required.push(driverRelativePath);
   const missing = required.filter((path) => !trackedPathExists(repoRoot, commit, path));
   return missing;
 }
@@ -343,7 +634,7 @@ function selectDriverSource(checkout, relativePath) {
     });
   }
   const stat = lstatOrNull(source);
-  if (!stat || !stat.isFile() || stat.isSymbolicLink()) {
+  if (!stat || !stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o111) === 0) {
     throw new Blocked("release_driver_missing", "frozen checkout does not contain the real release driver", {
       relative_path: relativePath,
       source,
@@ -352,9 +643,9 @@ function selectDriverSource(checkout, relativePath) {
   return source;
 }
 
-function packageArtifact(checkout, commit, outputRoot, logsRoot, driverSource) {
+function packageArtifact(checkout, commit, outputRoot, logsRoot, driverSource, sourceTreeSha256) {
   const web = join(checkout, "web");
-  const ui = firstExisting([join(web, "dist"), join(web, "build")]);
+  const ui = firstExisting([join(web, "dist")]);
   const server = firstExisting([
     join(checkout, "server", "target", "release", "zode-server"),
     join(checkout, "target", "release", "zode-server"),
@@ -417,10 +708,16 @@ function packageArtifact(checkout, commit, outputRoot, logsRoot, driverSource) {
   const manifest = {
     schema: SCHEMA,
     revision: commit,
+    source: {
+      kind: "git-archive",
+      revision: commit,
+      tree_sha256: sourceTreeSha256,
+    },
     components,
     driver: driverBinding,
     binding: {
       revision: commit,
+      source_tree_sha256: sourceTreeSha256,
       ui_tree_sha256: components.ui.tree_sha256,
       server_binary_sha256: components.server.binary_sha256,
       endpoint_binary_sha256: components.endpoint.binary_sha256,
@@ -472,6 +769,30 @@ function treeDigest(path) {
       else if (stat.isFile()) entries.push({ path: rel, mode: stat.mode & 0o777, sha256: sha256(readFileSync(absolute)) });
       else artifactBindingFailure("UI artifact tree contains a non-regular entry", { path: absolute, relative_path: rel });
     }
+  }
+  visit(path, "");
+  return sha256(jsonBytes(entries));
+}
+
+function sourceTreeDigest(path) {
+  const entries = [];
+  function visit(current, relativePath) {
+    const stat = lstatSync(current);
+    if (stat.isSymbolicLink()) {
+      throw new Blocked("archive_surface_invalid", "frozen source tree contains a symlink", {
+        path: relative(path, current),
+      });
+    }
+    if (stat.isDirectory()) {
+      for (const name of readdirSync(current).sort()) visit(join(current, name), join(relativePath, name));
+      return;
+    }
+    if (!stat.isFile()) {
+      throw new Blocked("archive_surface_invalid", "frozen source tree contains a non-regular entry", {
+        path: relative(path, current),
+      });
+    }
+    entries.push({ path: relativePath, mode: stat.mode & 0o777, sha256: sha256(readFileSync(current)) });
   }
   visit(path, "");
   return sha256(jsonBytes(entries));
@@ -580,6 +901,14 @@ function e2e_release_artifact_binds_server_endpoint_and_ui_tree({ artifact, labe
       schema: manifest.schema ?? null,
     });
   }
+  if (
+    !manifest.source
+    || manifest.source.kind !== "git-archive"
+    || manifest.source.revision !== revision
+    || !/^[a-f0-9]{64}$/.test(String(manifest.source.tree_sha256 ?? ""))
+  ) {
+    artifactBindingFailure("release manifest does not bind immutable archived source", { ...details });
+  }
   assertManifestEnvelope(artifact.manifestPath, manifest, details);
   const manifestStat = lstatOrNull(artifact.manifestPath);
   if (!manifestStat || !manifestStat.isFile() || manifestStat.isSymbolicLink()) {
@@ -605,6 +934,7 @@ function e2e_release_artifact_binds_server_endpoint_and_ui_tree({ artifact, labe
     || typeof binding.server_binary_sha256 !== "string"
     || typeof binding.endpoint_binary_sha256 !== "string"
     || typeof binding.driver_binary_sha256 !== "string"
+    || binding.source_tree_sha256 !== manifest.source.tree_sha256
   ) {
     artifactBindingFailure("release manifest has no revision binding for all runtime components", { ...details });
   }
@@ -691,6 +1021,71 @@ function parseJsonLine(output, label) {
   });
 }
 
+function driverInvocationArgs(operation, releaseRoot, artifact) {
+  const args = [operation, "--release-root", releaseRoot, "--json"];
+  if (artifact) args.push("--artifact", artifact);
+  return args;
+}
+
+function productionDriverEnv() {
+  const env = { ...process.env };
+  for (const key of [
+    "ZODE_RELEASE_DRIVER_ARGS_JSON",
+    "ZODE_RELEASE_E2E_OWNER",
+    "ZODE_RELEASE_E2E_MODE",
+    "ZODE_RELEASE_E2E_NAME",
+    "ZODE_RELEASE_REPLAY_CASSETTE",
+    "ZODE_RELEASE_REPLAY_EXPECTATION",
+    "ZODE_RELEASE_REPLAY_ADAPTER",
+    "ZODE_RELEASE_SECRET_VALUES_JSON",
+    "ZODE_RELEASE_QUARANTINE",
+    "ZODE_RELEASE_CASSETTES",
+  ]) delete env[key];
+  return env;
+}
+
+function driverCapture(options, operation, artifact, result) {
+  if (!options.capture) return;
+  const requestBody = {
+    operation,
+    e2e_name: options.e2eName ?? PROMOTION_REVISION_E2E,
+    artifact_revision: options.captureArtifact?.manifest?.revision ?? null,
+    artifact_manifest_sha256: options.captureArtifact?.manifestPath
+      ? sha256(readFileSync(options.captureArtifact.manifestPath))
+      : null,
+  };
+  const sequence = options.sequenceAllocator
+    ? options.sequenceAllocator()
+    : options.capture.length;
+  options.capture.push({
+    sequence,
+    boundary: "release-driver",
+    request: {
+      method: "CLI",
+      path: `release-driver/${operation}`,
+      headers: {},
+      body: boundedBuffer(Buffer.from(JSON.stringify(requestBody), "utf8")),
+    },
+    response: {
+      status: result.status,
+      headers: {},
+      body: boundedBuffer(Buffer.from(`${result.stdout}${result.stderr}`, "utf8")),
+      completed: result.status !== null && result.status !== undefined,
+      request_failed: result.status === null || result.status === undefined,
+      disconnected: result.status === null || result.status === undefined,
+      failure: options.failure ?? null,
+      expected_failure: options.expectedFailure === true,
+    },
+  });
+}
+
+function finalizeDriverResult(driver, operation, result, options = {}) {
+  const output = `${result.stdout}\n${result.stderr}`;
+  const readyLocatorPaths = parseReadyLocatorLines(output, `${operation} driver`);
+  const payload = parseJsonLine(output, `${operation} driver`);
+  return { ...result, payload, readyLocatorPaths };
+}
+
 function runDriver(driver, operation, releaseRoot, artifact, options = {}) {
   if (typeof options.driverSha256 !== "string") {
     throw new Blocked("release_driver_unbound", "release driver invocation has no immutable manifest binding", {
@@ -698,49 +1093,194 @@ function runDriver(driver, operation, releaseRoot, artifact, options = {}) {
     });
   }
   assertExecutableDigest(driver, options.driverSha256, "release driver", `${operation} driver invocation`);
-  let extra = [];
-  if (process.env.ZODE_RELEASE_DRIVER_ARGS_JSON) {
-    try {
-      extra = JSON.parse(process.env.ZODE_RELEASE_DRIVER_ARGS_JSON);
-    } catch (error) {
-      throw new Blocked("driver_arguments", "ZODE_RELEASE_DRIVER_ARGS_JSON is malformed", { error: String(error) });
-    }
+  if (options.replay) {
+    throw new Blocked("production_driver_replay_forbidden", "the production release driver cannot receive a cassette or replay mode");
   }
-  if (!Array.isArray(extra) || extra.some((value) => typeof value !== "string")) {
-    throw new Blocked("driver_arguments", "ZODE_RELEASE_DRIVER_ARGS_JSON must be a JSON string array");
+  const args = driverInvocationArgs(operation, releaseRoot, artifact);
+  let result;
+  try {
+    result = runSync(driver, args, {
+      // A driver is an immutable artifact executable.  Never let it resolve
+      // relative helpers/configuration from the dirty harness checkout.
+      cwd: options.cwd ?? dirname(driver),
+      env: productionDriverEnv(),
+    });
+  } catch (error) {
+    const failed = { status: null, signal: null, stdout: "", stderr: String(error) };
+    driverCapture({ ...options, failure: "driver_exception" }, operation, artifact, failed);
+    throw error;
   }
-  const args = [...extra, operation, "--release-root", releaseRoot, "--json"];
-  if (artifact) args.push("--artifact", artifact);
-  if (options.replay) args.push("--replay-cassette", options.replay);
-  const result = runSync(driver, args, {
-    cwd: options.cwd,
-    env: {
-      ...process.env,
-      ZODE_RELEASE_E2E_OWNER: OWNER,
-      ZODE_RELEASE_E2E_MODE: options.replay ? "replay" : "live",
-      ZODE_RELEASE_E2E_NAME: options.e2eName ?? PROMOTION_REVISION_E2E,
-      ...(options.replay ? { ZODE_RELEASE_REPLAY_CASSETTE: options.replay } : {}),
-    },
+  driverCapture(options, operation, artifact, result);
+  return finalizeDriverResult(driver, operation, result, options);
+}
+
+function runDriverAsync(driver, operation, releaseRoot, artifact, options = {}) {
+  if (typeof options.driverSha256 !== "string") {
+    return Promise.reject(new Blocked("release_driver_unbound", "release driver invocation has no immutable manifest binding", {
+      operation,
+    }));
+  }
+  if (options.replay) {
+    return Promise.reject(new Blocked("production_driver_replay_forbidden", "the production release driver cannot receive a cassette or replay mode"));
+  }
+  try {
+    assertExecutableDigest(driver, options.driverSha256, "release driver", `${operation} driver invocation`);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  const args = driverInvocationArgs(operation, releaseRoot, artifact);
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(driver, args, {
+      cwd: options.cwd ?? dirname(driver),
+      env: productionDriverEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const rejectWithCapture = (failure) => {
+      const result = { status: null, signal: "SIGKILL", stdout, stderr };
+      try {
+        driverCapture({ ...options, failure: failure.code }, operation, artifact, result);
+      } catch (captureError) {
+        rejectPromise(captureError);
+        return;
+      }
+      rejectPromise(failure);
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      rejectWithCapture(new BehaviorFailure("release_driver_timeout", `${operation} driver exceeded its bounded timeout`, {
+        e2e_name: PROMOTION_REVISION_E2E,
+        operation,
+      }));
+    }, options.timeoutMs ?? 120_000);
+    child.stdout.on("data", (chunk) => {
+      if (settled) return;
+      stdout += chunk.toString("utf8");
+      if (stdout.length + stderr.length > 8 * 1024 * 1024 && !settled) {
+        settled = true;
+        clearTimeout(timer);
+        child.kill("SIGKILL");
+        rejectWithCapture(new BehaviorFailure("release_driver_output_oversize", `${operation} driver output exceeded its bound`, {
+          e2e_name: PROMOTION_REVISION_E2E,
+          operation,
+        }));
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      if (settled) return;
+      stderr += chunk.toString("utf8");
+      if (stdout.length + stderr.length > 8 * 1024 * 1024) {
+        settled = true;
+        clearTimeout(timer);
+        child.kill("SIGKILL");
+        rejectWithCapture(new BehaviorFailure("release_driver_output_oversize", `${operation} driver output exceeded its bound`, {
+          e2e_name: PROMOTION_REVISION_E2E,
+          operation,
+        }));
+      }
+    });
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const failure = new Blocked("release_driver_spawn_failed", `${operation} driver could not be started`, { error: String(error) });
+      try {
+        driverCapture({ ...options, failure: "driver_spawn_failed" }, operation, artifact, { status: null, signal: null, stdout, stderr: String(error) });
+        rejectPromise(failure);
+      } catch (captureError) {
+        rejectPromise(captureError);
+      }
+    });
+    child.on("close", (status, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const result = { status: status ?? 1, signal, stdout, stderr };
+      try {
+        driverCapture(options, operation, artifact, result);
+        resolvePromise(finalizeDriverResult(driver, operation, result, options));
+      } catch (error) {
+        rejectPromise(error);
+      }
+    });
   });
-  if (options.capture) {
-    options.capture.push({
-      sequence: options.capture.length,
-      request: {
-        method: "CLI",
-        path: `release-driver/${operation}`,
-        headers: {},
-        body: boundedBuffer(Buffer.from(JSON.stringify({ operation, e2e_name: options.e2eName ?? PROMOTION_REVISION_E2E }), "utf8")),
-      },
-      response: {
-        status: result.status,
-        headers: {},
-        body: boundedBuffer(Buffer.from(`${result.stdout}${result.stderr}`, "utf8")),
-        completed: true,
-      },
+}
+
+function runReplayAdapter(adapter, driver, operation, releaseRoot, artifact, cassette, options = {}) {
+  if (!cassette) throw new Blocked("replay_cassette_missing", "replay adapter requires an immutable cassette path");
+  if (typeof adapter !== "string" || !isAbsolute(adapter)) {
+    throw new Blocked("replay_adapter_missing", "a test-owned absolute replay adapter is required for cassette replay");
+  }
+  const adapterStat = lstatOrNull(adapter);
+  if (
+    !adapterStat
+    || !adapterStat.isFile()
+    || adapterStat.isSymbolicLink()
+    || (adapterStat.mode & 0o111) === 0
+    || (adapterStat.mode & 0o222) !== 0
+  ) {
+    throw new Blocked("replay_adapter_missing", "the configured replay adapter is not an immutable executable");
+  }
+  if (options.adapterRoot && !pathIsContained(options.adapterRoot, adapter)) {
+    throw new Blocked("replay_adapter_missing", "the replay adapter must be selected from the repository's test-owned seam", {
+      adapter,
+      adapter_root: resolve(options.adapterRoot),
     });
   }
-  const payload = parseJsonLine(`${result.stdout}\n${result.stderr}`, `${operation} driver`);
-  return { ...result, payload };
+  if (options.adapterRoot) {
+    try { rejectSymlinkAncestors(adapter, "replay adapter"); } catch (error) {
+      if (error instanceof Blocked) throw error;
+      throw new Blocked("replay_adapter_missing", "the replay adapter path could not be verified", { error: String(error) });
+    }
+    let adapterRootReal;
+    let adapterReal;
+    try {
+      adapterRootReal = realpathSync(options.adapterRoot);
+      adapterReal = realpathSync(adapter);
+    } catch (error) {
+      throw new Blocked("replay_adapter_missing", "the replay adapter path could not be resolved", { error: String(error) });
+    }
+    if (!pathIsContained(adapterRootReal, adapterReal)) {
+      throw new Blocked("replay_adapter_missing", "the replay adapter resolves outside the test-owned seam");
+    }
+  }
+  assertExecutableDigest(driver, options.driverSha256, "release driver", `${operation} replay adapter invocation`);
+  const cassetteStat = lstatOrNull(cassette);
+  if (!cassetteStat || !cassetteStat.isFile() || cassetteStat.isSymbolicLink() || (cassetteStat.mode & 0o222) !== 0) {
+    throw new Blocked("cassette_not_immutable", "replay cassette is missing or writable");
+  }
+  const args = [
+    "--driver", driver,
+    ...driverInvocationArgs(operation, releaseRoot, artifact),
+    "--cassette", cassette,
+  ];
+  const env = {
+    PATH: process.env.PATH || "/usr/bin:/bin",
+    NODE_PATH: process.env.NODE_PATH,
+    TMPDIR: process.env.TMPDIR,
+    ZODE_RELEASE_ACCESS_ASSERTION: process.env.ZODE_RELEASE_ACCESS_ASSERTION,
+    ZODE_RELEASE_ACCESS_JWT_ASSERTION: process.env.ZODE_RELEASE_ACCESS_JWT_ASSERTION,
+    ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER: process.env.ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER,
+    ZODE_RELEASE_CONTROLLER_BEARER: process.env.ZODE_RELEASE_CONTROLLER_BEARER,
+    ZODE_RELEASE_ACCESS_ISSUER: process.env.ZODE_RELEASE_ACCESS_ISSUER,
+    ZODE_RELEASE_ACCESS_JWKS_URL: process.env.ZODE_RELEASE_ACCESS_JWKS_URL,
+    ZODE_RELEASE_ACCESS_AUDIENCE: process.env.ZODE_RELEASE_ACCESS_AUDIENCE,
+    ZODE_RELEASE_SERVER_LISTEN: process.env.ZODE_RELEASE_SERVER_LISTEN,
+    ZODE_RELEASE_ENDPOINT_LISTEN: process.env.ZODE_RELEASE_ENDPOINT_LISTEN,
+    ZODE_RELEASE_UI_URL: process.env.ZODE_RELEASE_UI_URL,
+    ZODE_RELEASE_REPLAY_EXPECTATION: process.env.ZODE_RELEASE_REPLAY_EXPECTATION,
+  };
+  for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
+  const result = runSync(adapter, args, {
+    cwd: dirname(adapter),
+    env,
+  });
+  driverCapture(options, operation, artifact, result);
+  return finalizeDriverResult(driver, operation, result, options);
 }
 
 function readPointer(releaseRoot, pointer) {
@@ -755,7 +1295,31 @@ function readPointer(releaseRoot, pointer) {
   if (!lstatOrNull(path)) return null;
   let target = path;
   try {
-    if (lstatSync(path).isSymbolicLink()) target = realpathSync(path);
+    if (lstatSync(path).isSymbolicLink()) {
+      try {
+        target = realpathSync(path);
+      } catch (error) {
+        // Before bootstrap (or when previous is intentionally empty), the
+        // stable alias may point into the active pointer-state directory
+        // without a corresponding entry.  That is a canonical null pointer;
+        // any other broken link remains a torn-pointer failure.
+        const alias = readlinkSync(path);
+        const stateLink = join(root, "pointer-state");
+        const stateStat = lstatOrNull(stateLink);
+        if (
+          alias === `pointer-state/${pointer}`
+          && stateStat?.isSymbolicLink()
+        ) {
+          try {
+            const stateRoot = realpathSync(stateLink);
+            if (pathIsContained(root, stateRoot) && !lstatOrNull(join(stateRoot, pointer))) return null;
+          } catch {
+            // Fall through to the torn-pointer error below.
+          }
+        }
+        throw error;
+      }
+    }
     assertReleasePointerPath(root, target, pointer);
   } catch (error) {
     if (error instanceof BehaviorFailure) throw error;
@@ -775,6 +1339,14 @@ function readPointer(releaseRoot, pointer) {
       throw new Error("invalid release manifest schema");
     }
     assertManifestEnvelope(manifestPath, manifest, { pointer, path: manifestPath });
+    // Pointer metadata is an artifact admission boundary as well.  Validate
+    // the immutable UI/binary digests here, before any state comparison or
+    // health claim can rely on a same-revision forged manifest.
+    e2e_release_artifact_binds_server_endpoint_and_ui_tree({
+      artifact: { artifact: target, manifest, manifestPath },
+      label: `pointer:${pointer}`,
+      revision: manifest.revision,
+    });
     return { path, target, manifest };
   } catch (error) {
     if (error instanceof BehaviorFailure) throw error;
@@ -1179,18 +1751,6 @@ function processExecutablePath(entry, phase) {
   return pathLine.slice(1);
 }
 
-function processHasRole(executable, role) {
-  const rolePattern = role === "server"
-    ? /(?:^|[\/\s])zode-server(?:$|[\s])/i
-    : /(?:^|[\/\s])zode(?:$|[\s])/i;
-  return rolePattern.test(executable);
-}
-
-function processNameHasRole(name, role) {
-  const executableName = basename(String(name));
-  return role === "server" ? executableName === "zode-server" : executableName === "zode";
-}
-
 function processDescendantPids(entries, roots) {
   const pids = new Set(roots);
   let changed = true;
@@ -1206,77 +1766,193 @@ function processDescendantPids(entries, roots) {
   return [...pids];
 }
 
-function assertLiveReleaseProcesses(releaseRoot, expectedArtifact, phase) {
-  const entries = releaseProcessTable(releaseRoot, phase);
-  const candidates = entries.filter((entry) => (
-    processNameHasRole(entry.comm, "server") || processNameHasRole(entry.comm, "endpoint")
-  ));
-  if (!candidates.length) {
-    throw new Blocked("release_process_missing", `${phase}: no live release process was available for independent observation`, {
-      required: ["Server PID", "Endpoint PID", "immutable executable", "HTTP listener"],
-    });
+function locatorPathsFromHealth(health, phase) {
+  const processes = health?.processes;
+  if (!processes || typeof processes !== "object" || Array.isArray(processes)) {
+    throw new Blocked("release_process_locator_missing", `${phase}: live health omitted process locator evidence`);
   }
-  const annotated = candidates.map((entry) => ({ ...entry, executable: processExecutablePath(entry, phase) }));
-  const servers = annotated.filter((entry) => processHasRole(entry.executable, "server"));
-  const endpoints = annotated.filter((entry) => processHasRole(entry.executable, "endpoint"));
-  if (servers.length !== 1 || endpoints.length !== 1 || servers[0].pid === endpoints[0].pid) {
-    throw new BehaviorFailure("release_process_topology", `${phase}: live Server and Endpoint PIDs were not independently observed`, {
+  exactObjectKeys(processes, new Set(["locator_paths"]), new Set(), "health.processes");
+  if (!Array.isArray(processes.locator_paths) || processes.locator_paths.length !== 2) {
+    throw new Blocked("release_process_locator_missing", `${phase}: health.processes.locator_paths must contain Server and Endpoint locators`);
+  }
+  if (processes.locator_paths.some((path) => typeof path !== "string" || !isAbsolute(path))) {
+    throw new Blocked("release_process_locator_invalid", `${phase}: process locator paths must be absolute`);
+  }
+  if (new Set(processes.locator_paths).size !== processes.locator_paths.length) {
+    throw new Blocked("release_process_locator_invalid", `${phase}: process locator paths are not unique`);
+  }
+  return processes.locator_paths;
+}
+
+function processIdentityProbe(pid, phase) {
+  const result = runSync("ps", ["-p", String(pid), "-o", "pid=,pgid=,sid="]);
+  if (result.status !== 0) {
+    throw new BehaviorFailure("release_process_missing", `${phase}: locator PID is not live`, {
       e2e_name: PROMOTION_REVISION_E2E,
       phase,
-      server_pids: servers.map((entry) => entry.pid),
-      endpoint_pids: endpoints.map((entry) => entry.pid),
-      processes: annotated,
+      pid,
+    });
+  }
+  const match = result.stdout.trim().match(/^(\d+)\s+(\d+)\s+(\d+)$/);
+  if (!match) {
+    throw new BehaviorFailure("release_process_probe_failed", `${phase}: locator PID identity probe was malformed`, {
+      e2e_name: PROMOTION_REVISION_E2E,
+      phase,
+      pid,
+    });
+  }
+  return { pid: Number(match[1]), process_group_id: Number(match[2]), session_id: match[3] };
+}
+
+function assertLiveReleaseProcesses(releaseRoot, expectedArtifact, phase, health) {
+  const root = assertReleaseRoot(releaseRoot);
+  const locatorPaths = locatorPathsFromHealth(health, phase);
+  const locators = locatorPaths.map((path) => {
+    if (!pathIsContained(root, path) || !path.includes(`${sep}instances${sep}`)) {
+      throw new BehaviorFailure("release_process_instance_mismatch", `${phase}: locator is outside this release instance namespace`, {
+        e2e_name: PROMOTION_REVISION_E2E,
+        phase,
+        path,
+        release_root: root,
+      });
+    }
+    assertOwnedFilePath(root, path, `${phase}: process locator`);
+    const stat = lstatOrNull(path);
+    if (!stat || (stat.mode & 0o222) !== 0 || (stat.mode & 0o777) !== 0o444) {
+      throw new BehaviorFailure("release_process_locator_invalid", `${phase}: locator is not an immutable driver-owned file`, {
+        e2e_name: PROMOTION_REVISION_E2E,
+        phase,
+        path,
+      });
+    }
+    return validateProcessLocator(path, phase);
+  });
+  const instances = new Set(locators.map((locator) => locator.instance_id));
+  if (instances.size !== 1) {
+    throw new BehaviorFailure("release_process_instance_mismatch", `${phase}: Server and Endpoint locators are not from one release instance`, {
+      e2e_name: PROMOTION_REVISION_E2E,
+      phase,
+      instances: [...instances],
+    });
+  }
+  const roles = new Set(locators.map((locator) => locator.role));
+  if (roles.size !== 2 || !roles.has("server") || !roles.has("endpoint")) {
+    throw new BehaviorFailure("release_process_topology", `${phase}: locator evidence does not contain one Server and one Endpoint`, {
+      e2e_name: PROMOTION_REVISION_E2E,
+      phase,
+      roles: [...roles],
     });
   }
   const expected = expectedArtifact.manifest.components;
-  for (const [role, entry, digest] of [
-    ["server", servers[0], expected.server.binary_sha256],
-    ["endpoint", endpoints[0], expected.endpoint.binary_sha256],
-  ]) {
-    const stat = lstatOrNull(entry.executable);
-    if (!stat || !stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o222) !== 0 || (stat.mode & 0o111) === 0) {
-      throw new BehaviorFailure("release_process_executable_invalid", `${phase}: live ${role} executable is not immutable`, {
+  const byRole = {};
+  for (const locator of locators) {
+    const identity = processIdentityProbe(locator.pid, phase);
+    if (identity.process_group_id !== locator.process_group_id || identity.session_id !== locator.session_id) {
+      throw new BehaviorFailure("release_process_instance_mismatch", `${phase}: live PID identity does not match its locator`, {
         e2e_name: PROMOTION_REVISION_E2E,
         phase,
-        role,
-        pid: entry.pid,
-        executable: entry.executable,
+        role: locator.role,
+        pid: locator.pid,
       });
     }
-    let observed;
-    try {
-      observed = sha256(readFileSync(entry.executable));
-    } catch (error) {
-      throw new BehaviorFailure("release_process_probe_failed", `${phase}: live ${role} executable could not be hashed`, {
+    const executable = processExecutablePath({ pid: locator.pid }, phase);
+    const resolvedLocatorExecutable = realpathSync(locator.executable_path);
+    if (executable !== resolvedLocatorExecutable) {
+      throw new BehaviorFailure("release_process_instance_mismatch", `${phase}: locator executable does not own its live PID`, {
         e2e_name: PROMOTION_REVISION_E2E,
         phase,
-        role,
-        pid: entry.pid,
-        executable: entry.executable,
-        error: String(error),
+        role: locator.role,
+        pid: locator.pid,
       });
     }
-    if (observed !== digest) {
-      throw new BehaviorFailure("release_process_digest_mismatch", `${phase}: live ${role} executable is not the bound artifact`, {
+    const digest = sha256(readFileSync(executable));
+    const expectedDigest = locator.role === "server" ? expected.server.binary_sha256 : expected.endpoint.binary_sha256;
+    if (digest !== locator.executable_sha256 || digest !== expectedDigest) {
+      throw new BehaviorFailure("release_process_digest_mismatch", `${phase}: live executable is not the locator and artifact digest`, {
         e2e_name: PROMOTION_REVISION_E2E,
         phase,
-        role,
-        pid: entry.pid,
-        executable: entry.executable,
-        expected: digest,
-        observed,
+        role: locator.role,
+        pid: locator.pid,
+        expected: expectedDigest,
+        observed: digest,
       });
     }
+    const stat = lstatOrNull(executable);
+    if (!stat || stat.isSymbolicLink() || (stat.mode & 0o222) !== 0 || (stat.mode & 0o111) === 0) {
+      throw new BehaviorFailure("release_process_executable_invalid", `${phase}: live ${locator.role} executable is not immutable`, {
+        e2e_name: PROMOTION_REVISION_E2E,
+        phase,
+        role: locator.role,
+        pid: locator.pid,
+      });
+    }
+    byRole[locator.role] = { pid: locator.pid, executable, locator };
   }
-  const pids = processDescendantPids(entries, [servers[0].pid, endpoints[0].pid]);
+  const entries = releaseProcessTable(releaseRoot, phase);
+  const entryByPid = new Map(entries.map((entry) => [entry.pid, entry]));
+  if (entryByPid.get(byRole.endpoint.pid)?.ppid !== byRole.server.pid) {
+    throw new BehaviorFailure("release_process_topology", `${phase}: Endpoint PID is not the Server's direct child`, {
+      e2e_name: PROMOTION_REVISION_E2E,
+      phase,
+      server_pid: byRole.server.pid,
+      endpoint_pid: byRole.endpoint.pid,
+      observed_parent_pid: entryByPid.get(byRole.endpoint.pid)?.ppid ?? null,
+    });
+  }
+  const pids = processDescendantPids(entries, [byRole.server.pid, byRole.endpoint.pid]);
   return {
-    server: { pid: servers[0].pid, executable: servers[0].executable },
-    endpoint: { pid: endpoints[0].pid, executable: endpoints[0].executable },
+    ...byRole,
+    instance_id: locators[0].instance_id,
+    locator_paths: locatorPaths,
     pids,
   };
 }
 
-function assertReleaseProcessesReaped(releaseRoot, phase, observedPids = []) {
+function assertReleaseProcessesReaped(releaseRoot, phase, observedPids = [], stopReports = [], observedEvidence = new Map()) {
+  if (!Array.isArray(stopReports) || !stopReports.length) {
+    throw new Blocked("release_process_stop_missing", `${phase}: teardown did not return process-stop.v1 evidence`);
+  }
+  for (const report of stopReports) {
+    validateProcessStop(report, phase);
+    if (report.timed_out || report.leaked_pids.length || report.flush_status !== "success" || report.exit_status !== 0) {
+      throw new BehaviorFailure("release_process_stop_failed", `${phase}: process-stop.v1 reported an incomplete stop`, {
+        e2e_name: PROMOTION_REVISION_E2E,
+        instance_id: report.instance_id,
+        timed_out: report.timed_out,
+        leaked_pids: report.leaked_pids,
+        exit_status: report.exit_status,
+        flush_status: report.flush_status,
+      });
+    }
+    for (const entry of report.observed_pids) {
+      const expected = observedEvidence.get(entry.pid);
+      if (expected && (
+        entry.role !== expected.role
+        || entry.started_at_unix_ms !== expected.started_at_unix_ms
+        || entry.process_group_id !== expected.process_group_id
+        || entry.session_id !== expected.session_id
+        || entry.executable_path !== expected.executable
+        || entry.executable_sha256 !== expected.executable_sha256
+      )) {
+        throw new BehaviorFailure("release_process_stop_mismatch", `${phase}: stop evidence disagrees with the independently observed locator`, {
+          e2e_name: PROMOTION_REVISION_E2E,
+          pid: entry.pid,
+          expected,
+          observed: entry,
+        });
+      }
+    }
+    const observed = new Set(report.observed_pids.map((entry) => entry.pid));
+    for (const pid of observed) {
+      if (!report.reaped_pids.includes(pid)) {
+        throw new BehaviorFailure("release_process_stop_failed", `${phase}: stop report omitted an observed PID from reaped_pids`, {
+          e2e_name: PROMOTION_REVISION_E2E,
+          instance_id: report.instance_id,
+          pid,
+        });
+      }
+    }
+  }
   let persistent = [];
   if (observedPids.length) {
     let result;
@@ -1334,7 +2010,31 @@ function assertLocalHealthProbeUrl(value, role, phase) {
   return url.toString();
 }
 
+function healthProbeHeaders(role, phase) {
+  if (role === "server" || role === "ui") {
+    const assertion = process.env.ZODE_RELEASE_ACCESS_ASSERTION
+      || process.env.ZODE_RELEASE_ACCESS_JWT_ASSERTION;
+    if (!assertion) {
+      throw new Blocked("release_http_probe_auth_missing", `${phase}: local Server probe requires a test-channel Access assertion`, {
+        role,
+        required_env: "ZODE_RELEASE_ACCESS_ASSERTION",
+      });
+    }
+    return [`Cf-Access-Jwt-Assertion: ${assertion}`];
+  }
+  const bearer = process.env.ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER
+    || process.env.ZODE_RELEASE_CONTROLLER_BEARER;
+  if (!bearer) {
+    throw new Blocked("release_http_probe_auth_missing", `${phase}: local Endpoint probe requires a test-channel controller bearer`, {
+      role,
+      required_env: "ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER",
+    });
+  }
+  return [`Authorization: Bearer ${bearer}`];
+}
+
 function readRealHttpResponse(url, role, phase) {
+  const probeHeaders = healthProbeHeaders(role, phase);
   const probeRoot = mkdtempSync(join(tmpdir(), "zode-release-http-probe-"));
   const bodyPath = join(probeRoot, "body");
   let result;
@@ -1348,6 +2048,7 @@ function readRealHttpResponse(url, role, phase) {
       "5",
       "--max-redirs",
       "0",
+      ...probeHeaders.flatMap((header) => ["--header", header]),
       "--output",
       bodyPath,
       "--write-out",
@@ -1406,8 +2107,8 @@ function parseRealHealthBody(observation, role) {
   }
   if (role === "server") {
     const valid = value.schema === "zode.system.v1"
-      && (value.deployment === "server_only" || value.deployment === "all_in_one")
-      && (typeof value.local_endpoint_id === "string" || value.local_endpoint_id === null)
+      && value.deployment === "all_in_one"
+      && typeof value.local_endpoint_id === "string"
       && value.ingress?.management_auth === "cloudflare_access"
       && value.ingress?.callback_origin === "separate"
       && typeof value.features?.remote_endpoints === "boolean"
@@ -1446,8 +2147,8 @@ function publicHttpObservation(observation) {
 }
 
 function assertHttpProbeOwnedByProcess(url, role, processEvidence, phase, label = role) {
-  const process = processEvidence?.[role];
-  if (!process) {
+  const owner = processEvidence?.[role];
+  if (!owner || !Number.isSafeInteger(owner.pid) || owner.pid <= 0) {
     throw new BehaviorFailure("release_http_listener_mismatch", `${phase}: no live ${label} listener owner PID is available`, {
       e2e_name: PROMOTION_REVISION_E2E,
       phase,
@@ -1459,7 +2160,11 @@ function assertHttpProbeOwnedByProcess(url, role, processEvidence, phase, label 
   const port = parsed.port || (parsed.protocol === "http:" ? "80" : "443");
   let result;
   try {
-    result = runSync("lsof", ["-nP", "-a", "-p", String(process.pid), `-iTCP:${port}`, "-sTCP:LISTEN", "-Fn"]);
+    // The listener owner is the independently observed release process, not
+    // this harness.  Using process.pid here would only prove that the test
+    // process itself does not own the port and would turn every valid release
+    // into a false mismatch.
+    result = runSync("lsof", ["-nP", "-a", "-p", String(owner.pid), `-iTCP:${port}`, "-sTCP:LISTEN", "-Fn"]);
   } catch (error) {
     throw new Blocked("release_http_probe_unavailable", `${phase}: lsof is required to bind HTTP readiness to the live PID`, {
       role: label,
@@ -1472,7 +2177,7 @@ function assertHttpProbeOwnedByProcess(url, role, processEvidence, phase, label 
       phase,
       role: label,
       owner_role: role,
-      pid: process.pid,
+      pid: owner.pid,
       port,
       url: safeUrl(url),
       status: result.status,
@@ -1531,13 +2236,82 @@ function assertRealHttpReadiness(health, phase, processEvidence, options = {}) {
       });
     }
   }
-  if (options.uiUrl) {
-    observations.push(probeUiListener(options.uiUrl, processEvidence, phase, { expectHealthy }));
+  // A staged instance deliberately uses isolated listeners.  When no stable
+  // browser URL is supplied, probe its own UI origin derived from the same
+  // live Server readiness URL instead of accidentally checking current.
+  const uiUrl = options.uiUrl ?? `${new URL(serverUrl).origin}/`;
+  if (uiUrl) {
+    observations.push(probeUiListener(uiUrl, processEvidence, phase, {
+      expectHealthy,
+      expectedArtifact: options.expectedArtifact,
+    }));
   }
   return observations;
 }
 
-function probeUiListener(uiUrl, processEvidence, phase, { expectHealthy = true } = {}) {
+function servedUiAssetReferences(html) {
+  const references = new Set(["/index.html"]);
+  const pattern = /\b(?:src|href)\s*=\s*["']([^"']+)["']/gi;
+  for (const match of html.matchAll(pattern)) {
+    const value = String(match[1] ?? "").split(/[?#]/, 1)[0];
+    if (value.startsWith("/")) references.add(value);
+  }
+  return [...references].sort();
+}
+
+function assertServedUiTree(uiUrl, rootObservation, expectedArtifact, phase) {
+  if (!expectedArtifact) return;
+  const uiRoot = join(expectedArtifact.artifact, "ui");
+  const indexPath = join(uiRoot, "index.html");
+  const indexStat = lstatOrNull(indexPath);
+  if (!indexStat || !indexStat.isFile() || indexStat.isSymbolicLink()) {
+    throw new BehaviorFailure("release_ui_tree_missing", `${phase}: packaged UI has no index.html`, {
+      e2e_name: PROMOTION_REVISION_E2E,
+      phase,
+      path: indexPath,
+    });
+  }
+  const expectedIndex = readFileSync(indexPath);
+  if (sha256(expectedIndex) !== rootObservation.body_sha256) {
+    throw new BehaviorFailure("release_ui_tree_mismatch", `${phase}: served UI index does not match the selected immutable tree`, {
+      e2e_name: PROMOTION_REVISION_E2E,
+      phase,
+      expected: sha256(expectedIndex),
+      observed: rootObservation.body_sha256,
+    });
+  }
+  const html = rootObservation.body.toString("utf8");
+  for (const reference of servedUiAssetReferences(html)) {
+    let url;
+    try { url = new URL(reference, uiUrl); } catch { throw new BehaviorFailure("release_ui_tree_mismatch", `${phase}: UI asset URL is invalid`, { e2e_name: PROMOTION_REVISION_E2E, phase, reference }); }
+    if (url.origin !== new URL(uiUrl).origin || url.search || url.hash) {
+      throw new BehaviorFailure("release_ui_tree_mismatch", `${phase}: UI asset reference leaves the selected origin`, { e2e_name: PROMOTION_REVISION_E2E, phase, reference });
+    }
+    const relativePath = decodeURIComponent(url.pathname).replace(/^\//, "");
+    const localPath = resolve(uiRoot, relativePath);
+    if (!pathIsContained(uiRoot, localPath)) {
+      throw new BehaviorFailure("release_ui_tree_mismatch", `${phase}: UI asset reference escapes the immutable tree`, { e2e_name: PROMOTION_REVISION_E2E, phase, reference });
+    }
+    const fileStat = lstatOrNull(localPath);
+    if (!fileStat || !fileStat.isFile() || fileStat.isSymbolicLink()) {
+      throw new BehaviorFailure("release_ui_tree_mismatch", `${phase}: served UI asset is absent from the immutable tree`, { e2e_name: PROMOTION_REVISION_E2E, phase, reference, path: localPath });
+    }
+    const observation = readRealHttpResponse(url.toString(), "ui", phase);
+    if (observation.transport_status !== 0 || observation.status < 200 || observation.status >= 300
+        || sha256(readFileSync(localPath)) !== observation.body_sha256) {
+      throw new BehaviorFailure("release_ui_tree_mismatch", `${phase}: served UI asset bytes do not match the selected immutable tree`, {
+        e2e_name: PROMOTION_REVISION_E2E,
+        phase,
+        reference,
+        status: observation.status,
+        expected: sha256(readFileSync(localPath)),
+        observed: observation.body_sha256,
+      });
+    }
+  }
+}
+
+function probeUiListener(uiUrl, processEvidence, phase, { expectHealthy = true, expectedArtifact = null } = {}) {
   const url = assertLocalBrowserUrl(uiUrl);
   assertHttpProbeOwnedByProcess(url, "server", processEvidence, phase, "ui");
   const observation = readRealHttpResponse(url, "ui", phase);
@@ -1569,15 +2343,17 @@ function probeUiListener(uiUrl, processEvidence, phase, { expectHealthy = true }
       stderr: observation.stderr,
     });
   }
+  if (!observation.failed && expectHealthy) assertServedUiTree(uiUrl, observation, expectedArtifact, phase);
   return observation;
 }
 
 function assertFailedStageIndependentObservation(result, failedArtifact, releaseRoot, phase, options = {}) {
-  const liveProcesses = assertLiveReleaseProcesses(releaseRoot, failedArtifact, phase);
+  const liveProcesses = assertLiveReleaseProcesses(releaseRoot, failedArtifact, phase, result.payload?.health);
   options.onLiveProcesses?.(liveProcesses);
   const observations = assertRealHttpReadiness(result.payload?.health, phase, liveProcesses, {
     expectHealthy: false,
-    uiUrl: options.uiUrl,
+    uiUrl: null,
+    expectedArtifact: failedArtifact,
   });
   const failedObservations = observations.filter((observation) => observation.failed);
   if (!failedObservations.length) {
@@ -1589,19 +2365,53 @@ function assertFailedStageIndependentObservation(result, failedArtifact, release
   return { liveProcesses, observations };
 }
 
+function assertCandidateStageIndependentObservation(result, candidateArtifact, releaseRoot, phase, options = {}) {
+  if (result.status !== 0) {
+    throw new Blocked("candidate_stage_failed", `${phase}: candidate staging did not complete`, { status: result.status });
+  }
+  const liveProcesses = assertLiveReleaseProcesses(releaseRoot, candidateArtifact, phase, result.payload?.health);
+  options.onLiveProcesses?.(liveProcesses);
+  const observations = assertRealHttpReadiness(result.payload?.health, phase, liveProcesses, {
+    expectHealthy: true,
+    uiUrl: null,
+    expectedArtifact: candidateArtifact,
+  });
+  const health = assertHealthPayload(result.payload?.health, candidateArtifact, phase);
+  return { liveProcesses, observations, health };
+}
+
 function readReleaseHealth(driver, releaseRoot, expectedArtifact, phase, options = {}) {
   try {
-    const result = runDriver(driver, "health", releaseRoot, null, {
+    const result = options.replay
+      ? runReplayAdapter(
+        options.replayAdapter,
+        driver,
+        "health",
+        releaseRoot,
+        null,
+        options.replay,
+        {
+          capture: options.capture,
+          e2eName: PROMOTION_REVISION_E2E,
+          driverSha256: options.driverSha256,
+          sequenceAllocator: options.sequenceAllocator,
+          captureArtifact: expectedArtifact,
+          adapterRoot: options.replayAdapterRoot,
+        },
+      )
+      : runDriver(driver, "health", releaseRoot, null, {
       capture: options.capture,
       e2eName: PROMOTION_REVISION_E2E,
-      replay: options.replay,
       driverSha256: options.driverSha256,
-    });
-    const liveProcesses = assertLiveReleaseProcesses(releaseRoot, expectedArtifact, phase);
+      sequenceAllocator: options.sequenceAllocator,
+      captureArtifact: expectedArtifact,
+      });
+    const liveProcesses = assertLiveReleaseProcesses(releaseRoot, expectedArtifact, phase, result.payload?.health);
     options.onLiveProcesses?.(liveProcesses);
     assertRealHttpReadiness(result.payload?.health, phase, liveProcesses, {
       expectHealthy: true,
       uiUrl: options.uiUrl,
+      expectedArtifact,
     });
     if (result.status !== 0) {
       healthBindingFailure("release_health_failed", `${phase}: real release health is not healthy`, {
@@ -1659,6 +2469,7 @@ function observePointerTransition(releaseRoot, before, after, phase, action) {
     let actionCompleted = false;
     const afterPointerEventsObserved = new Set();
     const canonicalPointerNames = new Set(["current", "previous"]);
+    const transactionPointerName = "pointer-state";
     const canonicalWatcherEvents = new Set(["rename", "change"]);
     const events = [];
 
@@ -1702,9 +2513,20 @@ function observePointerTransition(releaseRoot, before, after, phase, action) {
             observed,
           });
         }
-        if (actionStarted && canonicalWatcherEvents.has(event) && canonicalPointerNames.has(filename)) {
+        if (
+          actionStarted
+          && canonicalWatcherEvents.has(event)
+          && (canonicalPointerNames.has(filename) || filename === transactionPointerName)
+        ) {
           events.push({ source, event, filename, state: isAfter ? "after" : "before" });
-          if (isAfter) afterPointerEventsObserved.add(filename);
+          if (isAfter) {
+            if (filename === transactionPointerName) {
+              afterPointerEventsObserved.add("current");
+              afterPointerEventsObserved.add("previous");
+            } else {
+              afterPointerEventsObserved.add(filename);
+            }
+          }
         }
         if (actionCompleted && afterPointerEventsObserved.size === 2) {
           finish(null, { observed });
@@ -1747,6 +2569,75 @@ function observePointerTransition(releaseRoot, before, after, phase, action) {
         finish(null, { observed: pointerState(root) });
       })
       .catch((error) => fail(error, "browser-action"));
+  });
+}
+
+function observeStablePointerState(releaseRoot, expected, phase, action) {
+  const root = assertReleaseRoot(releaseRoot);
+  const initial = pointerSnapshot(root);
+  if (JSON.stringify(initial) !== JSON.stringify(expected)) {
+    throw new BehaviorFailure("stage_pointer_precondition", `${phase}: release pointers were not stable before staging`, {
+      e2e_name: PROMOTION_REVISION_E2E,
+      phase,
+    });
+  }
+  return new Promise((resolvePromise, rejectPromise) => {
+    let watcher;
+    let timer;
+    let settled = false;
+    const events = [];
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      watcher?.close();
+    };
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      rejectPromise(error instanceof BehaviorFailure ? error : new BehaviorFailure("stage_pointer_watch_failed", `${phase}: pointer watcher failed`, {
+        e2e_name: PROMOTION_REVISION_E2E,
+        phase,
+        error: String(error),
+      }));
+    };
+    const inspect = (event, filename) => {
+      if (settled || !["current", "previous"].includes(filename) || !["rename", "change"].includes(event)) return;
+      events.push({ event, filename });
+      fail(new BehaviorFailure("stage_pointer_mutated", `${phase}: staging emitted a current/previous filesystem event`, {
+        e2e_name: PROMOTION_REVISION_E2E,
+        phase,
+        event,
+        filename,
+        events,
+      }));
+    };
+    try {
+      watcher = watch(root, { persistent: false }, (event, filename) => inspect(event, filename ? String(filename) : null));
+    } catch (error) {
+      fail(error);
+      return;
+    }
+    timer = setTimeout(() => fail(new BehaviorFailure("stage_pointer_watch_timeout", `${phase}: staging did not finish within the bounded watcher timeout`, {
+      e2e_name: PROMOTION_REVISION_E2E,
+      phase,
+    })), 120_000);
+    Promise.resolve()
+      .then(action)
+      .then(() => {
+        if (settled) return;
+        const final = pointerSnapshot(root);
+        if (JSON.stringify(final) !== JSON.stringify(expected)) {
+          fail(new BehaviorFailure("stage_pointer_mutated", `${phase}: staging changed current/previous`, {
+            e2e_name: PROMOTION_REVISION_E2E,
+            phase,
+          }));
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolvePromise({ expected, observed: final, filesystem_events: events });
+      })
+      .catch(fail);
   });
 }
 
@@ -1821,8 +2712,11 @@ async function e2e_release_promotion_never_mixes_server_and_ui_revision({
   baselineArtifact,
   candidateArtifact,
   healthCheck,
+  promoteRelease,
+  rollbackRelease,
   replay,
   exchangeSequenceOffset = 0,
+  sequenceAllocator,
 }) {
   const playwright = resolvePlaywright();
   const executablePath = process.env.ZODE_RELEASE_BROWSER_EXECUTABLE
@@ -1831,15 +2725,29 @@ async function e2e_release_promotion_never_mixes_server_and_ui_revision({
     executablePath: existsSync(executablePath) ? executablePath : undefined,
     headless: process.env.ZODE_RELEASE_HEADFUL !== "1",
   });
-  const context = await browser.newContext();
+  const accessAssertion = process.env.ZODE_RELEASE_ACCESS_ASSERTION
+    || process.env.ZODE_RELEASE_ACCESS_JWT_ASSERTION;
+  if (!accessAssertion) {
+    await browser.close();
+    throw new Blocked("browser_auth_missing", "the real management browser requires a test-channel Access assertion", {
+      required_env: "ZODE_RELEASE_ACCESS_ASSERTION",
+    });
+  }
+  const context = await browser.newContext({
+    extraHTTPHeaders: { "Cf-Access-Jwt-Assertion": accessAssertion },
+  });
   const page = await context.newPage();
   const exchanges = new Map();
   const exchangeList = [];
   const pendingResponses = new Set();
+  const browserSystemResponses = [];
+  const browserManagementResponses = new Map();
   page.on("request", (request) => {
     const key = `${request.method()} ${safeUrl(request.url())} ${exchangeList.length}`;
     const entry = {
-      sequence: exchangeSequenceOffset + exchangeList.length,
+      sequence: sequenceAllocator
+        ? sequenceAllocator()
+        : exchangeSequenceOffset + exchangeList.length,
       request: {
         method: request.method(),
         path: safeUrl(request.url()),
@@ -1860,12 +2768,35 @@ async function e2e_release_promotion_never_mixes_server_and_ui_revision({
         entry.response = {
           status: response.status(),
           headers: safeHeaders(await response.allHeaders()),
-          body: boundedBuffer(await response.body()),
+          body: boundedBuffer(await Promise.race([
+            response.body(),
+            sleep(10_000).then(() => { throw new Error("response_body_timeout"); }),
+          ])),
           completed: prior?.request_failed === true ? false : true,
           request_failed: prior?.request_failed === true,
           disconnected: prior?.disconnected === true,
           failure: prior?.failure ?? null,
         };
+        try {
+          const responseUrl = new URL(response.url());
+          if (responseUrl.pathname === "/v1/system") {
+            let parsed = null;
+            try { parsed = JSON.parse(entry.response.body?.base64 ? Buffer.from(entry.response.body.base64, "base64").toString("utf8") : ""); } catch { /* invalid body is reported below */ }
+            browserSystemResponses.push({
+              status: entry.response.status,
+              body_sha256: entry.response.body?.sha256 ?? null,
+              parsed,
+              exchange: entry,
+            });
+          }
+          if (responseUrl.pathname === "/v1/endpoints" || responseUrl.pathname === "/v1/providers") {
+            let parsed = null;
+            try { parsed = JSON.parse(entry.response.body?.base64 ? Buffer.from(entry.response.body.base64, "base64").toString("utf8") : ""); } catch { /* invalid body is reported below */ }
+            const values = browserManagementResponses.get(responseUrl.pathname) ?? [];
+            values.push({ status: entry.response.status, body_sha256: entry.response.body?.sha256 ?? null, parsed, exchange: entry });
+            browserManagementResponses.set(responseUrl.pathname, values);
+          }
+        } catch { /* malformed URLs are recorded as ordinary browser exchanges */ }
       } catch (error) {
         const prior = entry.response;
         entry.response = {
@@ -1899,6 +2830,60 @@ async function e2e_release_promotion_never_mixes_server_and_ui_revision({
   });
 
   try {
+    const browserObservationCounts = () => ({
+      system: browserSystemResponses.length,
+      management: Object.fromEntries([...browserManagementResponses.entries()].map(([pathname, values]) => [pathname, values.length])),
+    });
+    const assertBrowserSystem = async (phase, since = { system: 0 }) => {
+      await Promise.allSettled([...pendingResponses]);
+      const observation = browserSystemResponses.slice(since.system ?? 0).at(-1);
+      if (
+        !observation
+        || observation.status < 200
+        || observation.status >= 300
+        || observation.parsed?.schema !== "zode.system.v1"
+        || observation.parsed?.deployment !== "all_in_one"
+        || typeof observation.parsed?.local_endpoint_id !== "string"
+        || !observation.parsed.local_endpoint_id
+      ) {
+        throw new BehaviorFailure("browser_server_path_invalid", `${phase}: browser did not receive a valid Access-protected all-in-one system response`, {
+          e2e_name: PROMOTION_REVISION_E2E,
+          phase,
+          observed: observation ?? null,
+          first_failure: observation?.exchange ? exchangeIdentity(observation.exchange) : undefined,
+        });
+      }
+      return observation.parsed;
+    };
+    const assertBrowserManagementApis = async (phase, expectedEndpointId, since = { management: {} }) => {
+      await Promise.allSettled([...pendingResponses]);
+      for (const [pathname, schema] of [["/v1/endpoints", "zode.endpoints.v1"], ["/v1/providers", "zode.providers.v1"]]) {
+        const start = since.management?.[pathname] ?? 0;
+        const observation = browserManagementResponses.get(pathname)?.slice(start).at(-1);
+        if (!observation || observation.status < 200 || observation.status >= 300 || observation.parsed?.schema !== schema) {
+          throw new BehaviorFailure("browser_management_api_invalid", `${phase}: browser did not complete the normal ${pathname} management request`, {
+            e2e_name: PROMOTION_REVISION_E2E,
+            phase,
+            pathname,
+            observed: observation ?? null,
+            first_failure: observation?.exchange ? exchangeIdentity(observation.exchange) : undefined,
+          });
+        }
+      }
+      const endpointStart = since.management?.["/v1/endpoints"] ?? 0;
+      const endpoints = browserManagementResponses.get("/v1/endpoints")?.slice(endpointStart).at(-1)?.parsed?.endpoints;
+      if (!Array.isArray(endpoints) || !endpoints.some((endpoint) => endpoint?.endpoint_id === expectedEndpointId)) {
+        throw new BehaviorFailure("browser_local_endpoint_missing", `${phase}: the Server endpoint catalog does not contain the built-in Endpoint identity`, {
+          e2e_name: PROMOTION_REVISION_E2E,
+          phase,
+          expected_endpoint_id: expectedEndpointId,
+          observed_endpoint_ids: Array.isArray(endpoints) ? endpoints.map((endpoint) => endpoint?.endpoint_id ?? null) : null,
+          first_failure: browserManagementResponses.get("/v1/endpoints")?.slice(endpointStart).at(-1)?.exchange
+            ? exchangeIdentity(browserManagementResponses.get("/v1/endpoints").slice(endpointStart).at(-1).exchange)
+            : undefined,
+        });
+      }
+    };
     const response = await page.goto(uiUrl, { waitUntil: "domcontentloaded", timeout: 10_000 });
     const status = response?.status() ?? 0;
     if (status < 200 || status >= 300) {
@@ -1914,132 +2899,106 @@ async function e2e_release_promotion_never_mixes_server_and_ui_revision({
       });
     }
 
-    const state = async () => page.evaluate(() => {
-      const marker = (selector) => {
-        const node = document.querySelector(selector);
-        if (!node) return null;
-        return node.getAttribute(selector.slice(1, -1))?.trim() || node.textContent?.trim() || null;
-      };
-      return {
-        current: marker("[data-zode-release-current-revision]"),
-        previous: marker("[data-zode-release-previous-revision]"),
-        staged: marker("[data-zode-release-staged-revision]"),
-        runtime: {
-          revision: marker("[data-zode-release-runtime-revision]"),
-          ui_revision: marker("[data-zode-release-ui-revision]"),
-          server_revision: marker("[data-zode-release-server-revision]"),
-          endpoint_revision: marker("[data-zode-release-endpoint-revision]"),
-          ui_tree_sha256: marker("[data-zode-release-ui-tree-sha256]"),
-          server_binary_sha256: marker("[data-zode-release-server-binary-sha256]"),
-          endpoint_binary_sha256: marker("[data-zode-release-endpoint-binary-sha256]"),
-        },
-      };
-    });
+    const state = async () => page.evaluate(() => ({
+      body_text: document.body?.innerText?.slice(0, 2_000) ?? "",
+      title: document.title ?? "",
+    }));
     const initial = await state();
-    if (!initial.current || initial.current !== baselineArtifact.revision) {
-      throw new BehaviorFailure("browser_current_mismatch", "browser did not show the baseline current revision", {
+    // The browser is intentionally not a release-control or release-metadata
+    // client.  Pointer/manifest/process/digest binding is performed by this
+    // harness outside the product.  The browser proves only the real,
+    // Access-protected UI -> Server -> built-in Endpoint path is usable.
+    if (!initial.body_text.trim()) {
+      throw new BehaviorFailure("browser_empty_document", "browser returned an empty management document", {
         e2e_name: PROMOTION_REVISION_E2E,
-        expected: baselineArtifact.revision,
         observed: initial,
       });
     }
-    if (initial.staged !== candidateArtifact.revision) {
-      throw new BehaviorFailure("browser_staged_mismatch", "browser did not show the staged candidate revision", {
-        e2e_name: PROMOTION_REVISION_E2E,
-        expected: candidateArtifact.revision,
-        observed: initial,
-      });
-    }
-    const initialRuntime = assertRuntimeBinding(initial.runtime, baselineArtifact, "before browser promotion", "browser");
-    const initialHealth = await healthCheck(baselineArtifact, "before browser promotion");
-    if (JSON.stringify(initialRuntime) !== JSON.stringify(initialHealth)) {
-      healthBindingFailure("release_browser_health_mismatch", "browser and real health disagree before promotion", {
-        phase: "before browser promotion",
-        browser: initialRuntime,
-        health: initialHealth,
-      });
-    }
+    // No browser observation exists before the first navigation; keep the
+    // zero baseline explicit so the first response cannot be mistaken for a
+    // stale response from an earlier phase.
+    const initialObservation = { system: 0, management: {} };
+    const initialSystem = await assertBrowserSystem("before browser promotion", initialObservation);
+    await assertBrowserManagementApis("before browser promotion", initialSystem.local_endpoint_id, initialObservation);
+    await healthCheck(baselineArtifact, "before browser promotion");
 
+    let promotionObservation;
     await observePointerTransition(
       releaseRoot,
       expectedPointerState(baselineArtifact, null),
       expectedPointerState(candidateArtifact, baselineArtifact),
       "promotion",
       async () => {
-        await page.getByRole("button", { name: "Promote staged release", exact: true }).click();
-        await page.waitForFunction(
-          (expected) => {
-            const marker = (selector) => {
-              const node = document.querySelector(selector);
-              return node?.getAttribute(selector.slice(1, -1))?.trim() || node?.textContent?.trim() || null;
-            };
-            return marker("[data-zode-release-current-revision]") === expected.current
-              && marker("[data-zode-release-previous-revision]") === expected.previous;
-          },
-          { current: candidateArtifact.revision, previous: baselineArtifact.revision },
-          { timeout: 10_000 },
-        );
+        promotionObservation = browserObservationCounts();
+        const promotion = await promoteRelease();
+        if (promotion.status !== 0) {
+          throw new BehaviorFailure("release_promote_failed", "operator promotion did not complete successfully", {
+            e2e_name: PROMOTION_REVISION_E2E,
+            status: promotion.status,
+          });
+        }
+        await page.reload({ waitUntil: "domcontentloaded", timeout: 10_000 });
       },
     );
-    const promoted = await state();
-    if (promoted.current !== candidateArtifact.revision || promoted.previous !== baselineArtifact.revision) {
-      throw new BehaviorFailure("browser_promotion_mismatch", "browser promotion did not produce current/previous atomically", {
+    const promotedSystem = await assertBrowserSystem("after browser promotion", promotionObservation);
+    await assertBrowserManagementApis("after browser promotion", initialSystem.local_endpoint_id, promotionObservation);
+    if (promotedSystem.local_endpoint_id !== initialSystem.local_endpoint_id) {
+      throw new BehaviorFailure("release_local_endpoint_identity_changed", "promotion replaced the persistent built-in Endpoint identity", {
         e2e_name: PROMOTION_REVISION_E2E,
-        expected: { current: candidateArtifact.revision, previous: baselineArtifact.revision },
+        phase: "after browser promotion",
+        expected: initialSystem.local_endpoint_id,
+        observed: promotedSystem.local_endpoint_id,
+      });
+    }
+    const promoted = await state();
+    if (!promoted.body_text.trim()) {
+      throw new BehaviorFailure("browser_empty_document", "browser returned an empty document after promotion", {
+        e2e_name: PROMOTION_REVISION_E2E,
         observed: promoted,
       });
     }
-    assertRuntimeBinding(promoted.runtime, candidateArtifact, "after browser promotion", "browser");
     const promotedHealth = await healthCheck(candidateArtifact, "after browser promotion");
-    if (JSON.stringify(promoted.runtime) !== JSON.stringify(promotedHealth)) {
-      healthBindingFailure("release_browser_health_mismatch", "browser and real health disagree after promotion", {
-        phase: "after browser promotion",
-        browser: promoted.runtime,
-        health: promotedHealth,
-      });
-    }
     assertReleaseState(releaseRoot, candidateArtifact, baselineArtifact, "after browser promotion");
 
+    let rollbackObservation;
     await observePointerTransition(
       releaseRoot,
       expectedPointerState(candidateArtifact, baselineArtifact),
       expectedPointerState(baselineArtifact, candidateArtifact),
       "rollback",
       async () => {
-        await page.getByRole("button", { name: "Rollback current release", exact: true }).click();
-        await page.waitForFunction(
-          (expected) => {
-            const marker = (selector) => {
-              const node = document.querySelector(selector);
-              return node?.getAttribute(selector.slice(1, -1))?.trim() || node?.textContent?.trim() || null;
-            };
-            return marker("[data-zode-release-current-revision]") === expected.current
-              && marker("[data-zode-release-previous-revision]") === expected.previous;
-          },
-          { current: baselineArtifact.revision, previous: candidateArtifact.revision },
-          { timeout: 10_000 },
-        );
+        rollbackObservation = browserObservationCounts();
+        const rollback = await rollbackRelease();
+        if (rollback.status !== 0) {
+          throw new BehaviorFailure("release_rollback_failed", "operator rollback did not complete successfully", {
+            e2e_name: PROMOTION_REVISION_E2E,
+            status: rollback.status,
+          });
+        }
+        await page.reload({ waitUntil: "domcontentloaded", timeout: 10_000 });
       },
     );
-    const rolledBack = await state();
-    if (rolledBack.current !== baselineArtifact.revision || rolledBack.previous !== candidateArtifact.revision) {
-      throw new BehaviorFailure("browser_rollback_mismatch", "browser rollback did not restore the previous release", {
+    const rolledBackSystem = await assertBrowserSystem("after browser rollback", rollbackObservation);
+    await assertBrowserManagementApis("after browser rollback", initialSystem.local_endpoint_id, rollbackObservation);
+    if (rolledBackSystem.local_endpoint_id !== initialSystem.local_endpoint_id) {
+      throw new BehaviorFailure("release_local_endpoint_identity_changed", "rollback replaced the persistent built-in Endpoint identity", {
         e2e_name: PROMOTION_REVISION_E2E,
-        expected: { current: baselineArtifact.revision, previous: candidateArtifact.revision },
+        phase: "after browser rollback",
+        expected: initialSystem.local_endpoint_id,
+        observed: rolledBackSystem.local_endpoint_id,
+      });
+    }
+    const rolledBack = await state();
+    if (!rolledBack.body_text.trim()) {
+      throw new BehaviorFailure("browser_empty_document", "browser returned an empty document after rollback", {
+        e2e_name: PROMOTION_REVISION_E2E,
         observed: rolledBack,
       });
     }
-    assertRuntimeBinding(rolledBack.runtime, baselineArtifact, "after browser rollback", "browser");
     const rolledBackHealth = await healthCheck(baselineArtifact, "after browser rollback");
-    if (JSON.stringify(rolledBack.runtime) !== JSON.stringify(rolledBackHealth)) {
-      healthBindingFailure("release_browser_health_mismatch", "browser and real health disagree after rollback", {
-        phase: "after browser rollback",
-        browser: rolledBack.runtime,
-        health: rolledBackHealth,
-      });
-    }
     assertReleaseState(releaseRoot, baselineArtifact, candidateArtifact, "after browser rollback");
 
+    const reloadObservation = browserObservationCounts();
     const reloadResponse = await page.reload({ waitUntil: "domcontentloaded", timeout: 10_000 });
     const reloadStatus = reloadResponse?.status() ?? 0;
     if (reloadStatus < 200 || reloadStatus >= 300) {
@@ -2048,38 +3007,27 @@ async function e2e_release_promotion_never_mixes_server_and_ui_revision({
         status: reloadStatus,
       });
     }
-    await page.waitForFunction(
-      (expected) => {
-        const marker = (selector) => {
-          const node = document.querySelector(selector);
-          return node?.getAttribute(selector.slice(1, -1))?.trim() || node?.textContent?.trim() || null;
-        };
-        return marker("[data-zode-release-current-revision]") === expected.current
-          && marker("[data-zode-release-previous-revision]") === expected.previous;
-      },
-      { current: baselineArtifact.revision, previous: candidateArtifact.revision },
-      { timeout: 10_000 },
-    );
     const reloaded = await state();
-    if (reloaded.current !== baselineArtifact.revision || reloaded.previous !== candidateArtifact.revision) {
-      throw new BehaviorFailure("browser_rollback_reload_mismatch", "browser reload did not retain the rolled-back release pointers", {
+    if (!reloaded.body_text.trim()) {
+      throw new BehaviorFailure("browser_empty_document", "browser returned an empty document after rollback reload", {
         e2e_name: PROMOTION_REVISION_E2E,
-        expected: { current: baselineArtifact.revision, previous: candidateArtifact.revision },
         observed: reloaded,
       });
     }
-    assertRuntimeBinding(reloaded.runtime, baselineArtifact, "after browser rollback reload", "browser");
-    const reloadedHealth = await healthCheck(baselineArtifact, "after browser rollback reload");
-    if (JSON.stringify(reloaded.runtime) !== JSON.stringify(reloadedHealth)) {
-      healthBindingFailure("release_browser_health_mismatch", "browser reload and real health disagree after rollback", {
+    const reloadedSystem = await assertBrowserSystem("after browser rollback reload", reloadObservation);
+    await assertBrowserManagementApis("after browser rollback reload", initialSystem.local_endpoint_id, reloadObservation);
+    if (reloadedSystem.local_endpoint_id !== initialSystem.local_endpoint_id) {
+      throw new BehaviorFailure("release_local_endpoint_identity_changed", "rollback reload changed the persistent built-in Endpoint identity", {
+        e2e_name: PROMOTION_REVISION_E2E,
         phase: "after browser rollback reload",
-        browser: reloaded.runtime,
-        health: reloadedHealth,
+        expected: initialSystem.local_endpoint_id,
+        observed: reloadedSystem.local_endpoint_id,
       });
     }
+    const reloadedHealth = await healthCheck(baselineArtifact, "after browser rollback reload");
     assertReleaseState(releaseRoot, baselineArtifact, candidateArtifact, "after browser rollback reload");
     await Promise.allSettled([...pendingResponses]);
-    return { exchanges: exchangeList, browser: { initial, promoted, rolledBack, reloaded }, replay };
+    return { exchanges: exchangeList, browser: { initial, promoted, rolledBack, reloaded }, system: { initial: initialSystem, promoted: promotedSystem, rolledBack: rolledBackSystem, reloaded: reloadedSystem }, replay };
   } catch (error) {
     await Promise.allSettled([...pendingResponses]);
     if (!(error instanceof BehaviorFailure)) {
@@ -2131,6 +3079,29 @@ function sanitizeValue(value, knownValues) {
   return value;
 }
 
+function replaceKnownSecretBytes(bytes, knownValues) {
+  let result = Buffer.from(bytes);
+  for (const [index, secret] of knownValues.entries()) {
+    if (!secret) continue;
+    const needle = Buffer.from(secret, "utf8");
+    if (!needle.length) continue;
+    const replacement = Buffer.from(`{{SYNTHETIC_SECRET_${index + 1}}}`, "utf8");
+    const chunks = [];
+    let start = 0;
+    while (start <= result.length - needle.length) {
+      const found = result.indexOf(needle, start);
+      if (found < 0) break;
+      chunks.push(result.subarray(start, found), replacement);
+      start = found + needle.length;
+    }
+    if (chunks.length) {
+      chunks.push(result.subarray(start));
+      result = Buffer.concat(chunks);
+    }
+  }
+  return result;
+}
+
 function decodeCanonicalBase64(value, label) {
   if (typeof value !== "string" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
     cassetteSecurityFailure(`${label} is not canonical base64`);
@@ -2147,10 +3118,10 @@ function safeIncident(raw, knownValues) {
     if (!body) return body;
     const originalBytes = decodeCanonicalBase64(body.base64, "incident body");
     const originalSha256 = body.sha256;
-    const safeBytes = Buffer.from(
-      sanitizeText(originalBytes.toString("utf8"), knownValues),
-      "utf8",
-    );
+    // Preserve exact bytes for binary/opaque responses.  Only configured
+    // secret values are replaced in a body; broad UTF-8 regex rewriting would
+    // corrupt assets or change the failure being recorded.
+    const safeBytes = replaceKnownSecretBytes(originalBytes, knownValues);
     return {
       ...body,
       base64: safeBytes.toString("base64"),
@@ -2187,7 +3158,12 @@ function safeIncident(raw, knownValues) {
     boundary: raw.binding?.boundary ?? "management-browser-release-entry",
     first_observed: sanitizeValue(raw.first_observed, knownValues),
     binding: sanitizeValue(raw.binding, knownValues),
-    synthetic_secret_slots: ["SYNTHETIC_ACCESS_TOKEN", "SYNTHETIC_SECRET"],
+    provenance: raw.provenance,
+    synthetic_secret_slots: [
+      "SYNTHETIC_ACCESS_TOKEN",
+      "SYNTHETIC_SECRET",
+      ...knownValues.map((_, index) => `SYNTHETIC_SECRET_${index + 1}`),
+    ],
     exchanges,
   };
 }
@@ -2269,7 +3245,9 @@ function exchangeIdentity(exchange) {
 
 function failedExchange(exchange) {
   if (!exchange?.response) return false;
-  if (exchange.request?.method === "CLI") return exchange.response.status !== 0;
+  if (exchange.request?.method === "CLI") {
+    return exchange.response.expected_failure !== true && exchange.response.status !== 0;
+  }
   return exchange.response.request_failed === true
     || exchange.response.disconnected === true
     || exchange.response.status >= 400
@@ -2352,6 +3330,11 @@ function selectFirstFailureExchange(exchanges, failure) {
   }
   const firstFailedDriver = firstFailedRecordedExchange(exchanges);
   if (firstFailedDriver) return firstFailedDriver;
+  // A semantic browser assertion can fail after a successful 2xx document
+  // (for example, an empty or wrong shell).  Preserve the earliest browser
+  // exchange rather than downgrading that public failure to an unrecordable
+  // harness error.
+  if (failure instanceof BehaviorFailure && browserExchanges.length) return browserExchanges[0];
   throw new Blocked("first_failure_exchange_missing", "the release failure has no captured exchange to bind to", {
     e2e_name: failure.details?.e2e_name ?? PROMOTION_REVISION_E2E,
     expected_path: expectedPath,
@@ -2363,6 +3346,7 @@ function selectFirstFailureExchange(exchanges, failure) {
 
 function assertCassetteBinding(cassette, label = "cassette") {
   const binding = cassette.binding;
+  const provenance = cassette.provenance;
   const firstObserved = cassette.first_observed?.first_exchange;
   if (
     cassette.e2e_name !== PROMOTION_REVISION_E2E
@@ -2380,6 +3364,14 @@ function assertCassetteBinding(cassette, label = "cassette") {
     || typeof binding.request_failed !== "boolean"
     || typeof binding.disconnected !== "boolean"
     || !firstObserved
+    || !provenance
+    || !/^[a-f0-9]{40}$/.test(provenance.baseline_revision ?? "")
+    || !/^[a-f0-9]{40}$/.test(provenance.candidate_revision ?? "")
+    || !/^[a-f0-9]{40}$/.test(provenance.failed_revision ?? "")
+    || !/^[a-f0-9]{64}$/.test(provenance.baseline_manifest_sha256 ?? "")
+    || !/^[a-f0-9]{64}$/.test(provenance.candidate_manifest_sha256 ?? "")
+    || !/^[a-f0-9]{64}$/.test(provenance.failed_manifest_sha256 ?? "")
+    || !/^[a-f0-9]{64}$/.test(provenance.driver_sha256 ?? "")
   ) {
     throw new Blocked("cassette_binding_mismatch", `${label} is not bound to the exact promotion browser failure`);
   }
@@ -2387,8 +3379,9 @@ function assertCassetteBinding(cassette, label = "cassette") {
   if (
     sequenceValues.some((sequence) => !Number.isSafeInteger(sequence) || sequence < 0)
     || new Set(sequenceValues).size !== sequenceValues.length
+    || sequenceValues.some((sequence, index) => index > 0 && sequence <= sequenceValues[index - 1])
   ) {
-    throw new Blocked("cassette_binding_mismatch", `${label} does not contain unique exact exchange sequences`);
+    throw new Blocked("cassette_binding_mismatch", `${label} does not contain strictly ordered exact exchange sequences`);
   }
   const matches = (cassette.exchanges ?? []).filter((entry) => entry.sequence === binding.exchange_sequence);
   if (matches.length !== 1) throw new Blocked("cassette_binding_mismatch", `${label} does not contain one exact bound first exchange`);
@@ -2448,6 +3441,7 @@ function assertReplayFailureBinding(cassette, failure) {
     || identity.response_completed !== binding.response_completed
     || identity.request_failed !== binding.request_failed
     || identity.disconnected !== binding.disconnected
+    || identity.response_failure !== (binding.response_failure ?? null)
     || (binding.request_sha256
     && identity.request_sha256 !== binding.request_sha256
     )
@@ -2463,7 +3457,7 @@ function assertReplayFailureBinding(cassette, failure) {
   }
 }
 
-function writeIncident(exchanges, failure, quarantineRoot, cassetteRoot, promote, knownValues = null) {
+function writeIncident(exchanges, failure, quarantineRoot, cassetteRoot, promote, knownValues = null, provenance = null) {
   const recordingId = `${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${randomUUID()}`;
   const rawRoot = join(quarantineRoot, recordingId);
   ensureDirectory(rawRoot, 0o700);
@@ -2479,6 +3473,24 @@ function writeIncident(exchanges, failure, quarantineRoot, cassetteRoot, promote
     });
   }
   const e2eName = failure.details?.e2e_name ?? PROMOTION_REVISION_E2E;
+  const truncated = normalizedExchanges.some((exchange) => exchange.request?.body?.truncated || exchange.response?.body?.truncated);
+  if (truncated) {
+    // A bounded capture is useful diagnostics but is not a replayable first
+    // occurrence.  Keep it only in ignored quarantine and fail closed before
+    // any immutable cassette can be promoted.
+    const raw = {
+      schema: INCIDENT_SCHEMA,
+      recording_id: recordingId,
+      owner: OWNER,
+      e2e_name: e2eName,
+      first_observed: { code: failure.code, message: failure.message, details: publicFailureDetails(failure.details) },
+      provenance,
+      recording_blocked: "body_truncated",
+      exchanges: normalizedExchanges,
+    };
+    writeExclusive(rawPath, jsonBytes(raw), 0o600);
+    throw new Blocked("recording_body_truncated", `${failure.message}; raw capture is bounded and cannot be promoted`, { rawPath });
+  }
   let firstExchange;
   try {
     firstExchange = selectFirstFailureExchange(normalizedExchanges, failure);
@@ -2493,6 +3505,7 @@ function writeIncident(exchanges, failure, quarantineRoot, cassetteRoot, promote
         message: failure.message,
         details: publicFailureDetails(failure.details),
       },
+      provenance,
       exchanges: normalizedExchanges,
     };
     writeExclusive(rawPath, jsonBytes(raw), 0o600);
@@ -2509,6 +3522,7 @@ function writeIncident(exchanges, failure, quarantineRoot, cassetteRoot, promote
     recording_id: recordingId,
     owner: OWNER,
     e2e_name: e2eName,
+    provenance,
     exchanges: normalizedExchanges,
   };
   const firstObserved = exchangeIdentity(firstExchange);
@@ -2579,9 +3593,19 @@ function publicFailureDetails(details) {
   return safe;
 }
 
-function bindDriverOperationFailure(failure, exchanges, operation) {
+function bindDriverOperationFailure(failure, exchanges, operation, artifact = null) {
   if (!(failure instanceof BehaviorFailure) || failure.details?.first_failure) return failure;
-  const exchange = exchanges.find((entry) => entry.request?.path === `release-driver/${operation}`);
+  const expectedRevision = artifact?.manifest?.revision ?? null;
+  const exchange = [...exchanges].reverse().find((entry) => {
+    if (entry.request?.path !== `release-driver/${operation}`) return false;
+    if (!expectedRevision) return true;
+    try {
+      const body = entry.request?.body?.base64 ? JSON.parse(Buffer.from(entry.request.body.base64, "base64").toString("utf8")) : null;
+      return body?.artifact_revision === expectedRevision;
+    } catch {
+      return false;
+    }
+  });
   if (exchange) {
     failure.details = {
       ...failure.details,
@@ -2593,17 +3617,26 @@ function bindDriverOperationFailure(failure, exchanges, operation) {
 }
 
 function normalizeIncidentEvidence(recordedExchanges, browserExchanges, failure) {
-  const recorded = recordedExchanges.map((exchange) => ({ ...exchange }));
+  // Every boundary allocates from the same monotonic sequence while the live
+  // scenario is running.  Preserve those exact values and merge by sequence;
+  // rewriting all browser exchanges after the CLI list would turn an
+  // interleaved first occurrence into a different causal order (and can
+  // create duplicate sequence numbers).
+  const recorded = recordedExchanges.map((exchange, index) => ({
+    ...exchange,
+    sequence: Number.isSafeInteger(exchange.sequence) ? exchange.sequence : index,
+  }));
   const browser = (browserExchanges ?? []).map((exchange, index) => ({
     ...exchange,
-    sequence: recorded.length + index,
+    sequence: Number.isSafeInteger(exchange.sequence)
+      ? exchange.sequence
+      : recorded.length + index,
   }));
+  const merged = [...recorded, ...browser].sort((left, right) => left.sequence - right.sequence);
   let firstFailure = failure.details?.first_failure;
   if (firstFailure?.boundary === "management-browser-release-entry") {
-    const local = (browserExchanges ?? []).find((exchange) => exchange.sequence === firstFailure.sequence);
-    if (local) {
-      firstFailure = { ...firstFailure, sequence: recorded.length + ((browserExchanges ?? []).indexOf(local)) };
-    }
+    const local = browser.find((exchange) => exchange.sequence === firstFailure.sequence);
+    if (local) firstFailure = { ...firstFailure, sequence: local.sequence };
   }
   if (!firstFailure) {
     const browserFailure = firstFailedBrowserExchange(browser);
@@ -2616,11 +3649,11 @@ function normalizeIncidentEvidence(recordedExchanges, browserExchanges, failure)
   if (firstFailure && firstFailure !== failure.details?.first_failure) {
     failure.details = { ...failure.details, first_failure: firstFailure };
   }
-  return { exchanges: [...recorded, ...browser], failure };
+  return { exchanges: merged, failure };
 }
 
 async function buildRevision({ repoRoot, commit, workRoot, label, driverRelativePath }) {
-  const missing = requiredSurface(repoRoot, commit);
+  const missing = requiredSurface(repoRoot, commit, driverRelativePath);
   if (missing.length) {
     throw new Blocked("missing_build_surface", `${label} frozen revision has no complete UI+Server+Endpoint build surface`, {
       revision: commit,
@@ -2631,17 +3664,23 @@ async function buildRevision({ repoRoot, commit, workRoot, label, driverRelative
   }
   const checkout = join(workRoot, `${label}-checkout`);
   extractCommit(repoRoot, commit, checkout);
+  const sourceTreeSha256 = sourceTreeDigest(checkout);
   const logs = join(workRoot, `${label}-logs`);
   ensureDirectory(logs, 0o700);
+  runChecked("vp", ["install", "--frozen-lockfile"], join(checkout, "web"), join(logs, "ui-install.log"));
   runChecked("vp", ["build"], join(checkout, "web"), join(logs, "ui.log"));
   runChecked("vp", ["exec", "cargo", "build", "--release", "--locked", "--manifest-path", join(checkout, "Cargo.toml")], checkout, join(logs, "endpoint.log"));
   runChecked("vp", ["exec", "cargo", "build", "--release", "--locked", "--manifest-path", join(checkout, "server", "Cargo.toml")], checkout, join(logs, "server.log"));
   const driverSource = selectDriverSource(checkout, driverRelativePath);
-  return packageArtifact(checkout, commit, join(workRoot, "artifacts"), logs, driverSource);
+  return packageArtifact(checkout, commit, join(workRoot, "artifacts"), logs, driverSource, sourceTreeSha256);
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const replayExpectation = args.replay ? process.env.ZODE_RELEASE_REPLAY_EXPECTATION : null;
+  if (args.replay && !new Set(["red", "green"]).has(replayExpectation)) {
+    throw new Blocked("replay_expectation_missing", "--replay requires ZODE_RELEASE_REPLAY_EXPECTATION=red or green");
+  }
   const repoRoot = commandOutput("git", ["rev-parse", "--show-toplevel"], process.cwd());
   const baselineInput = process.env.ZODE_RELEASE_BASELINE_REVISION;
   const candidateInput = process.env.ZODE_RELEASE_CANDIDATE_REVISION;
@@ -2667,7 +3706,10 @@ async function main() {
     });
   }
 
-  const workRoot = resolve(mkdtempSync(join(tmpdir(), "zode-release-e2e-")));
+  // macOS commonly exposes tmpdir through /var -> /private/var.  Resolve the
+  // fresh directory once so the driver and harness share the same canonical
+  // release-root spelling without relaxing the no-symlink boundary.
+  const workRoot = resolve(realpathSync(mkdtempSync(join(tmpdir(), "zode-release-e2e-"))));
   let incident = null;
   let driver = null;
   let driverRecord = null;
@@ -2682,6 +3724,12 @@ async function main() {
   // This set must outlive the inner scenario try so the outer finally can
   // recheck every independently observed PID after teardown.
   const observedReleasePids = new Set();
+  const observedReleaseInstances = new Set();
+  const observedReleaseEvidence = new Map();
+  let stopReports = [];
+  const recordedExchanges = [];
+  let browserExchangesForIncident = [];
+  let recordingProvenance = null;
   try {
     artifacts = {};
     for (const [label, commit] of Object.entries(revisions)) {
@@ -2689,6 +3737,15 @@ async function main() {
     }
     artifactSnapshots = snapshotArtifacts(artifacts);
     driverRecord = artifacts.baseline.driver;
+    recordingProvenance = {
+      baseline_revision: revisions.baseline,
+      candidate_revision: revisions.candidate,
+      failed_revision: revisions.failed,
+      baseline_manifest_sha256: sha256(readFileSync(artifacts.baseline.manifestPath)),
+      candidate_manifest_sha256: sha256(readFileSync(artifacts.candidate.manifestPath)),
+      failed_manifest_sha256: sha256(readFileSync(artifacts.failed.manifestPath)),
+      driver_sha256: driverRecord.binary_sha256,
+    };
     driver = artifacts.baseline.driverPath;
     assertExecutableDigest(driver, driverRecord.binary_sha256, "release driver", "immutable checkout selection");
     const uiUrl = process.env.ZODE_RELEASE_UI_URL;
@@ -2697,18 +3754,72 @@ async function main() {
     releaseRoot = join(workRoot, "release-root");
     ensureDirectory(releaseRoot, 0o700);
     assertReleaseRoot(releaseRoot);
-    const recordedExchanges = [];
-    let browserExchangesForIncident = [];
+    let nextExchangeSequenceValue = 0;
+    const nextExchangeSequence = () => nextExchangeSequenceValue++;
+    const replayAdapterPath = args.replay
+      ? resolve(process.env.ZODE_RELEASE_REPLAY_ADAPTER || "")
+      : null;
+    if (args.replay && !process.env.ZODE_RELEASE_REPLAY_ADAPTER) {
+      throw new Blocked("replay_adapter_missing", "--replay requires a test-owned replay adapter; production driver receives no cassette");
+    }
+    let replayPassed = false;
     const invokeDriver = (operation, artifact, options = {}) => runDriver(
       driver,
       operation,
       releaseRoot,
       artifact,
-      { ...options, driverSha256: driverRecord.binary_sha256 },
+      {
+        ...options,
+        driverSha256: driverRecord.binary_sha256,
+        sequenceAllocator: nextExchangeSequence,
+        captureArtifact: options.captureArtifact ?? artifact,
+        adapterRoot: repoRoot,
+      },
+    );
+    const invokeDriverAsync = (operation, artifact, options = {}) => runDriverAsync(
+      driver,
+      operation,
+      releaseRoot,
+      artifact,
+      {
+        ...options,
+        driverSha256: driverRecord.binary_sha256,
+        sequenceAllocator: nextExchangeSequence,
+        captureArtifact: options.captureArtifact ?? artifact,
+        adapterRoot: repoRoot,
+      },
+    );
+    const invokeReplayDriver = (operation, artifact, cassette, options = {}) => runReplayAdapter(
+      replayAdapterPath,
+      driver,
+      operation,
+      releaseRoot,
+      artifact,
+      cassette,
+      {
+        ...options,
+        driverSha256: driverRecord.binary_sha256,
+        sequenceAllocator: nextExchangeSequence,
+        captureArtifact: options.captureArtifact ?? artifact,
+        adapterRoot: repoRoot,
+      },
     );
     const recordReleaseProcesses = (processes) => {
+      if (processes.instance_id) observedReleaseInstances.add(processes.instance_id);
       for (const pid of processes.pids ?? [processes.server.pid, processes.endpoint.pid]) {
         observedReleasePids.add(pid);
+      }
+      for (const role of ["server", "endpoint"]) {
+        const process = processes[role];
+        if (!process) continue;
+        observedReleaseEvidence.set(process.pid, {
+          role,
+          started_at_unix_ms: process.locator.started_at_unix_ms,
+          process_group_id: process.locator.process_group_id,
+          session_id: process.locator.session_id,
+          executable: process.executable,
+          executable_sha256: process.locator.executable_sha256,
+        });
       }
     };
     const healthCheck = (expectedArtifact, phase, options = {}) => readReleaseHealth(
@@ -2720,10 +3831,22 @@ async function main() {
         capture: recordedExchanges,
         replay: options.replay,
         driverSha256: driverRecord.binary_sha256,
+        sequenceAllocator: nextExchangeSequence,
+        captureArtifact: expectedArtifact,
+        replayAdapter: replayAdapterPath,
+        replayAdapterRoot: repoRoot,
         uiUrl,
         onLiveProcesses: recordReleaseProcesses,
       },
     );
+    const promoteRelease = () => invokeDriverAsync("promote", null, {
+      capture: recordedExchanges,
+      e2eName: PROMOTION_REVISION_E2E,
+    });
+    const rollbackRelease = () => invokeDriverAsync("rollback", null, {
+      capture: recordedExchanges,
+      e2eName: PROMOTION_REVISION_E2E,
+    });
 
     try {
       if (args.replay) {
@@ -2748,6 +3871,12 @@ async function main() {
         }
         const replayExchangeSequenceOffset = cassette.binding.exchange_sequence - cassetteBrowserIndex;
         scanCassette(cassette, knownSecretValues({ required: true }));
+        if (JSON.stringify(cassette.provenance) !== JSON.stringify(recordingProvenance)) {
+          throw new Blocked("cassette_provenance_mismatch", "replay cassette was recorded for different immutable revisions or driver digest", {
+            expected: recordingProvenance,
+            observed: cassette.provenance ?? null,
+          });
+        }
         if ((cassetteStat.mode & 0o222) !== 0) {
           throw new Blocked("cassette_not_immutable", "replay cassette is writable");
         }
@@ -2755,11 +3884,16 @@ async function main() {
         if (!envelopeDigest || sha256(jsonBytes(withoutDigest)) !== envelopeDigest) {
           throw new Blocked("cassette_integrity", "replay cassette envelope digest does not match");
         }
-        const replayBootstrap = invokeDriver("bootstrap", artifacts.baseline.artifact, { replay: cassettePath, capture: recordedExchanges });
-        const replayStage = invokeDriver("stage", artifacts.candidate.artifact, { replay: cassettePath, capture: recordedExchanges });
-        if (replayBootstrap.status !== 0 || replayStage.status !== 0) {
+        const replayBootstrap = invokeReplayDriver("bootstrap", artifacts.baseline.artifact, cassettePath, { capture: recordedExchanges });
+        const replayFailedStage = invokeReplayDriver("stage", artifacts.failed.artifact, cassettePath, {
+          capture: recordedExchanges,
+          expectedFailure: true,
+        });
+        const replayStage = invokeReplayDriver("stage", artifacts.candidate.artifact, cassettePath, { capture: recordedExchanges });
+        if (replayBootstrap.status !== 0 || replayFailedStage.status === 0 || replayStage.status !== 0) {
           throw new Blocked("replay_setup_failed", "the immutable cassette could not reach the same browser setup", {
             bootstrap_status: replayBootstrap.status,
+            failed_stage_status: replayFailedStage.status,
             stage_status: replayStage.status,
           });
         }
@@ -2774,8 +3908,15 @@ async function main() {
               baselineArtifact: artifacts.baseline,
               candidateArtifact: artifacts.candidate,
               healthCheck: (expectedArtifact, phase) => healthCheck(expectedArtifact, phase, { replay: cassettePath }),
+              promoteRelease: () => invokeReplayDriver("promote", null, cassettePath, { capture: recordedExchanges }),
+              rollbackRelease: () => invokeReplayDriver("rollback", null, cassettePath, { capture: recordedExchanges }),
               replay: cassettePath,
               exchangeSequenceOffset: replayExchangeSequenceOffset,
+              // Replay browser requests use the cassette's browser-relative
+              // sequence offset.  A fresh live allocator would silently
+              // override that mapping and make an otherwise exact cassette
+              // appear to bind to the wrong exchange.
+              sequenceAllocator: null,
             });
             browserExchangesForIncident = replayResult.exchanges;
           } catch (failure) {
@@ -2790,10 +3931,27 @@ async function main() {
             }
             throw failure;
           }
-          throw new BehaviorFailure("replay_did_not_red", "the immutable cassette did not reproduce its recorded failure");
+          if (replayExpectation === "red") {
+            throw new BehaviorFailure("replay_did_not_red", "the immutable cassette did not reproduce its recorded failure");
+          }
+          replayPassed = true;
         } finally {
           assertArtifactsUnchanged(artifacts, artifactSnapshots, "after replay promotion and rollback");
         }
+      }
+
+      if (replayPassed) {
+        runSucceeded = true;
+        successReport = {
+          ok: true,
+          owner: OWNER,
+          mode: "replay-green",
+          e2e_names: [ARTIFACT_BINDING_E2E, PROMOTION_REVISION_E2E],
+          revisions,
+          driver_sha256: driverRecord.binary_sha256,
+          workRoot: args.keepWorkdir ? workRoot : undefined,
+        };
+        return;
       }
 
       const capture = { capture: recordedExchanges };
@@ -2807,14 +3965,23 @@ async function main() {
         assertReleaseState(releaseRoot, artifacts.baseline, null, "after baseline bootstrap");
         healthCheck(artifacts.baseline, "after baseline bootstrap");
       } catch (error) {
-        throw bindDriverOperationFailure(error, recordedExchanges, "bootstrap");
+        throw bindDriverOperationFailure(error, recordedExchanges, "bootstrap", artifacts.baseline);
       }
 
       const beforeFailedStage = pointerSnapshot(releaseRoot);
-      const failed = invokeDriver("stage", artifacts.failed.artifact, {
-        ...capture,
-        e2eName: PROMOTION_REVISION_E2E,
-      });
+      let failed;
+      await observeStablePointerState(
+        releaseRoot,
+        beforeFailedStage,
+        "failed health gate",
+        async () => {
+          failed = await invokeDriverAsync("stage", artifacts.failed.artifact, {
+            ...capture,
+            e2eName: PROMOTION_REVISION_E2E,
+            expectedFailure: true,
+          });
+        },
+      );
       try {
         assertFailedStageIndependentObservation(failed, artifacts.failed, releaseRoot, "failed health gate", {
           uiUrl,
@@ -2826,22 +3993,32 @@ async function main() {
         assertSnapshotEqual(beforeFailedStage, pointerSnapshot(releaseRoot), "after failed health gate");
         healthCheck(artifacts.baseline, "after failed health gate");
       } catch (error) {
-        throw bindDriverOperationFailure(error, recordedExchanges, "stage");
+        throw bindDriverOperationFailure(error, recordedExchanges, "stage", artifacts.failed);
       }
 
       const beforeCandidateStage = pointerSnapshot(releaseRoot);
-      const staged = invokeDriver("stage", artifacts.candidate.artifact, {
-        ...capture,
-        e2eName: PROMOTION_REVISION_E2E,
-      });
-      if (staged.status !== 0) throw new Blocked("candidate_stage_failed", "candidate did not reach the browser promotion stage", { status: staged.status });
+      let staged;
+      await observeStablePointerState(
+        releaseRoot,
+        beforeCandidateStage,
+        "candidate staging",
+        async () => {
+          staged = await invokeDriverAsync("stage", artifacts.candidate.artifact, {
+            ...capture,
+            e2eName: PROMOTION_REVISION_E2E,
+          });
+        },
+      );
       try {
+        assertCandidateStageIndependentObservation(staged, artifacts.candidate, releaseRoot, "candidate staging", {
+          uiUrl,
+          onLiveProcesses: recordReleaseProcesses,
+        });
         assertArtifactsUnchanged(artifacts, artifactSnapshots, "after candidate staging");
         assertReleaseState(releaseRoot, artifacts.baseline, null, "before browser promotion");
         assertSnapshotEqual(beforeCandidateStage, pointerSnapshot(releaseRoot), "before browser promotion");
-        healthCheck(artifacts.baseline, "before browser promotion");
       } catch (error) {
-        throw bindDriverOperationFailure(error, recordedExchanges, "stage");
+        throw bindDriverOperationFailure(error, recordedExchanges, "stage", artifacts.candidate);
       }
 
       try {
@@ -2851,16 +4028,22 @@ async function main() {
           baselineArtifact: artifacts.baseline,
           candidateArtifact: artifacts.candidate,
           healthCheck,
+          promoteRelease,
+          rollbackRelease,
           replay: null,
+          sequenceAllocator: nextExchangeSequence,
         });
         browserExchangesForIncident = liveResult.exchanges;
       } finally {
         assertArtifactsUnchanged(artifacts, artifactSnapshots, "after promotion and rollback");
       }
     } catch (failure) {
-      if (failure instanceof BehaviorFailure && !args.replay) {
-        const quarantineRoot = resolve(process.env.ZODE_RELEASE_QUARANTINE || join(repoRoot, "tests", "release_e2e", "quarantine"));
-        const cassetteRoot = resolve(process.env.ZODE_RELEASE_CASSETTES || join(repoRoot, "tests", "release_e2e", "cassettes"));
+      if (failure instanceof BehaviorFailure && !args.replay && recordingProvenance) {
+        // Keep raw captures in the ignored test-recording area.  Reviewed
+        // cassettes belong to this owning suite's immutable fixture tree;
+        // neither default is a tracked-looking output directory.
+        const quarantineRoot = resolve(process.env.ZODE_RELEASE_QUARANTINE || join(repoRoot, "target", "test-recordings", "quarantine"));
+        const cassetteRoot = resolve(process.env.ZODE_RELEASE_CASSETTES || join(repoRoot, "tests", "release_e2e", "fixtures", "incidents"));
         const browserExchanges = failure.details?.exchanges || browserExchangesForIncident;
         const evidence = normalizeIncidentEvidence(recordedExchanges, browserExchanges, failure);
         incident = writeIncident(
@@ -2869,6 +4052,8 @@ async function main() {
           quarantineRoot,
           cassetteRoot,
           args.promote,
+          knownSecretValues({ required: args.promote }),
+          recordingProvenance,
         );
         throw new BehaviorFailure(
           evidence.failure.code,
@@ -2893,6 +4078,16 @@ async function main() {
         const teardown = runDriver(driver, "teardown", releaseRoot, null, {
           driverSha256: driverRecord?.binary_sha256,
         });
+        stopReports = stopReportsFromPayload(teardown.payload, "after teardown");
+        const stoppedInstances = new Set(stopReports.map((report) => report.instance_id));
+        for (const instanceId of observedReleaseInstances) {
+          if (!stoppedInstances.has(instanceId)) {
+            throw new BehaviorFailure("release_process_stop_missing", "teardown did not report every observed release instance", {
+              e2e_name: PROMOTION_REVISION_E2E,
+              instance_id: instanceId,
+            });
+          }
+        }
         if (teardown.status !== 0) {
           teardownFailure = new BehaviorFailure("teardown_failed", "release teardown returned a non-zero exit status", {
             e2e_name: PROMOTION_REVISION_E2E,
@@ -2908,7 +4103,7 @@ async function main() {
     }
     if (releaseRoot) {
       try {
-        assertReleaseProcessesReaped(releaseRoot, "after teardown", [...observedReleasePids]);
+        assertReleaseProcessesReaped(releaseRoot, "after teardown", [...observedReleasePids], stopReports, observedReleaseEvidence);
       } catch (error) {
         reapFailure = error instanceof BehaviorFailure
           ? error
