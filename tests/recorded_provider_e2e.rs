@@ -24,13 +24,15 @@ use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use support::process_capture::ProcessCaptureSet;
 use support::{
     authenticated_as, canonical_json, http_client, new_llm_recording_run_dir,
     persist_public_http_gap_exchange, run_provider_attempt_until_cancel, run_provider_failure,
-    run_provider_roundtrip_and_restart, scan_llm_recording_tree, sqlite_contains_secret,
-    write_endpoint_config, HttpFixture, LlmHttpAttemptPlan, LlmHttpObservedRequest, LlmHttpProxy,
-    LlmHttpRecording, LlmHttpRecordingMetadata, LlmHttpResponseOutcome, ModelFixture, ModelHold,
-    ModelScript, ProviderRoundtripSpec, PublicHttpGapExchange, TempDatabase, TestResult, TestZode,
+    run_provider_failure_with_process_capture, run_provider_roundtrip_and_restart,
+    scan_llm_recording_tree, sqlite_contains_secret, write_endpoint_config, HttpFixture,
+    LlmHttpAttemptPlan, LlmHttpObservedRequest, LlmHttpProxy, LlmHttpRecording,
+    LlmHttpRecordingMetadata, LlmHttpResponseOutcome, ModelFixture, ModelHold, ModelScript,
+    ProviderRoundtripSpec, PublicHttpGapExchange, TempDatabase, TestResult, TestZode,
     LLM_HTTP_RECORDING_SCHEMA, MAX_LLM_CHUNK_DELAY_US, MAX_LLM_RESPONSE_BYTES,
     TEST_CONTROLLER_AUTHORITY, TEST_CONTROLLER_SECRET,
 };
@@ -1884,6 +1886,93 @@ async fn e2e_llm_recorder_terminal_flush_failure_fails_live_stream() -> TestResu
         .into());
     }
     scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    Ok(())
+}
+
+/// Later reproduction of the retained full-suite terminal-flush hang.  The
+/// process capture is armed before Endpoint spawn and records the relation in
+/// first_observed; the original Management raw remains the historical first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_later_test_reproduction_of_terminal_flush_gap_is_bounded_and_captured(
+) -> TestResult<()> {
+    const E2E_NAME: &str =
+        "e2e_later_test_reproduction_of_terminal_flush_gap_is_bounded_and_captured";
+    let mut provider =
+        ModelFixture::start(vec![ModelScript::final_text("terminal flush later gap")]).await?;
+    let (mut recorder, run_directory) = start_synthetic_recorder(
+        provider.origin(),
+        "later_test_reproduction_of_gap",
+        E2E_NAME,
+    )
+    .await?;
+    let occupied_exchange = run_directory.join("exchange-00000000000000000000.json");
+    fs::write(&occupied_exchange, b"test-owned terminal flush collision")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&occupied_exchange, fs::Permissions::from_mode(0o600))?;
+    }
+
+    let database = TempDatabase::new("recording-terminal-flush-later-gap")?;
+    let config = config_for_replay(database.path(), &recorder.base_url("/v1"))?;
+    let process_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-recordings")
+        .join("quarantine");
+    let mut process_capture = ProcessCaptureSet::new(
+        process_root,
+        E2E_NAME,
+        &[REPLAY_SECRET, TEST_CONTROLLER_SECRET],
+    )?;
+
+    let failure = run_provider_failure_with_process_capture(
+        synthetic_spec(
+            &database,
+            config,
+            recorder.base_url("/v1"),
+            "recording-terminal-flush-later-gap",
+        ),
+        &mut process_capture,
+        "endpoint-terminal-flush-later-gap",
+    )
+    .await;
+    let recorder_requests = recorder.observed_requests();
+    let provider_requests = provider.request_count();
+    let recorder_stop = recorder.stop().await;
+    let provider_stop = provider.stop().await;
+    let raw_process = process_capture.flush(
+        "RECORDER_TERMINAL_FLUSH_FAILURE",
+        "later_test_reproduction_of_gap",
+    )?;
+    recorder_stop?;
+    provider_stop?;
+    failure?;
+    if provider_requests != 1 || recorder_requests.len() != 1 {
+        return Err(Error::other(format!(
+            "terminal flush later reproduction crossed provider boundary unexpectedly (recorder={}, provider={provider_requests})",
+            recorder_requests.len()
+        ))
+        .into());
+    }
+    let flush_error = recorder
+        .flush_error()
+        .ok_or_else(|| Error::other("later terminal flush failure was not retained"))?;
+    if !flush_error.contains("recording exchange flush failed") {
+        return Err(Error::other(format!(
+            "later terminal flush failure had the wrong class: {flush_error}"
+        ))
+        .into());
+    }
+    if recorder.recording().is_ok() {
+        return Err(
+            Error::other("later terminal flush failure produced a promotable recording").into(),
+        );
+    }
+    scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    eprintln!(
+        "later_test_reproduction_of_gap retained process observation at {}",
+        raw_process.display()
+    );
     Ok(())
 }
 
