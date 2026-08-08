@@ -3080,18 +3080,26 @@ function endpointConfig({ root, database, providerOrigin, controllerSecret, auth
   });
 }
 
-async function buildUiAssets(directory, { ledger } = {}) {
-  ensureDirectory(directory);
-  const configured = process.env.ZODE_UI_ASSETS_DIRECTORY;
+async function buildUiAssets(directory, { ledger, sourceDirectory } = {}) {
+  const configured = sourceDirectory || process.env.ZODE_UI_ASSETS_DIRECTORY;
   if (configured) {
     const source = path.resolve(configured);
     if (source !== path.resolve(directory)) {
-      throw new HarnessFailure('UI_ASSETS_DIRECTORY_UNWIRED', 'configured UI assets directory did not match the harness release tree', {
-        expected: directory,
-        actual: source,
-      });
+      ensureDirectory(path.dirname(directory));
+      try {
+        fs.cpSync(source, directory, { recursive: true, force: false, errorOnExist: true });
+      } catch (error) {
+        throw new HarnessFailure('UI_ASSETS_DIRECTORY_UNWIRED', 'configured UI release tree could not be materialized beside the Server config', {
+          source,
+          destination: directory,
+          cause: error instanceof Error ? error.message : String(error),
+        });
+      }
+    } else {
+      ensureDirectory(directory);
     }
   } else {
+    ensureDirectory(directory);
     try {
       await execFileAsync('vp', ['build', '--outDir', directory], {
         cwd: path.join(ROOT, 'web'),
@@ -3441,7 +3449,10 @@ async function createWebE2EHarness(options = {}) {
     const uiMode = options.uiMode || process.env.ZODE_WEB_E2E_UI_MODE
       || (process.env.ZODE_UI_ASSETS_DIRECTORY ? 'assets' : 'api_only');
     const uiAssetsDirectory = uiMode === 'assets'
-      ? await buildUiAssets(options.uiAssetsDirectory || process.env.ZODE_UI_ASSETS_DIRECTORY || path.join(runRoot, 'ui'), { ledger })
+      ? await buildUiAssets(path.join(serverRoot, 'ui'), {
+        ledger,
+        sourceDirectory: options.uiAssetsDirectory || process.env.ZODE_UI_ASSETS_DIRECTORY,
+      })
       : undefined;
     const serverConfigPath = serverConfig({
       root: serverRoot,

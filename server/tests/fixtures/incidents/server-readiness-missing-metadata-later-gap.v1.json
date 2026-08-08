@@ -1,0 +1,56 @@
+{
+  "schema": "zode.process-incident-recording.v1",
+  "version": 1,
+  "recording_id": "process-84613-1786142907966215000-0",
+  "e2e_name": "e2e_initialized_server_missing_metadata_never_reinitializes",
+  "classification": "CONTROL_STORE_METADATA_DAMAGE_MUTATED_PERSISTENT_FILES__later_test_reproduction_of_gap",
+  "first_observed": "relation=later_test_reproduction_of_gap; startup=non_ready_bind_failure_after_metadata_recreation; singleton_row_store_unchanged=false; metadata_table_store_unchanged=false",
+  "config": {
+    "label": "server-readiness-metadata-damage",
+    "bytes_hex": "7b2264616d616765223a5b226d697373696e675f6d657461646174615f73696e676c65746f6e5f726f77222c226d697373696e675f6d657461646174615f7461626c65225d2c22653265223a226532655f696e697469616c697a65645f7365727665725f6d697373696e675f6d657461646174615f6e657665725f7265696e697469616c697a6573222c22656e747279223a227265616c207a6f64652d736572766572202d2d636f6e66696720776974682061207072652d64616d6167656420696e697469616c697a656420636f6e74726f6c2073746f7265222c2265787065637465645f61667465725f666978223a7b2270657273697374656e745f73746f72655f756e6368616e676564223a747275652c227265616479223a66616c73652c22737461727475705f6661696c757265223a22636f64653d636f6e74726f6c5f73746f72655f696e746567726974792070686173653d636f6e74726f6c5f73746f7265227d2c2272656c6174696f6e223a226c617465725f746573745f726570726f64756374696f6e5f6f665f676170222c22736368656d61223a227a6f64652e7365727665722d72656164696e6573732d6d657461646174612d6761702d7265706c61792e7631227d",
+    "sha256": "193a8dec0575d09403246809a5b4792dc83245646ab0f8e8415985f5c233dea6"
+  },
+  "processes": [
+    {
+      "name": "zode-server-missing-metadata-singleton-row",
+      "stdout_hex": "",
+      "stderr_hex": "7365727665722073746f707065643a204164647265737320616c726561647920696e2075736520286f73206572726f72203438290a",
+      "exit_code": 1,
+      "signal": null,
+      "termination": "natural_exit_after_control_store_integrity_rejection",
+      "stop": {
+        "observed_pids": [
+          84619
+        ],
+        "reaped_pids": [
+          84619
+        ],
+        "leaked_pids": [],
+        "timed_out": false,
+        "flush_status": "ok",
+        "proof": true
+      }
+    },
+    {
+      "name": "zode-server-missing-metadata-table",
+      "stdout_hex": "",
+      "stderr_hex": "7365727665722073746f707065643a204164647265737320616c726561647920696e2075736520286f73206572726f72203438290a",
+      "exit_code": 1,
+      "signal": null,
+      "termination": "natural_exit_after_control_store_integrity_rejection",
+      "stop": {
+        "observed_pids": [
+          84624
+        ],
+        "reaped_pids": [
+          84624
+        ],
+        "leaked_pids": [],
+        "timed_out": false,
+        "flush_status": "ok",
+        "proof": true
+      }
+    }
+  ],
+  "integrity_sha256": "35fe236c155581d5fa1569bcd161d8d69b98dc0c1affd7c55ad380e38ea4f638"
+}

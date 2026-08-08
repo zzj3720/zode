@@ -1,0 +1,52 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "0004-2952afcc-96c4-4a55-bff0-c52774e1f714-027b06e4-94fc-4e68-8683-3092aeb27622",
+  "e2e_name": "e2e_server_forwards_and_endpoint_persists_provider_execution_options",
+  "boundary": "browser-capture-set",
+  "first_observed": "relation=later_test_reproduction_of_gap; non-empty safe provider_execution.options were absent after a real Endpoint restart",
+  "classification": "PROVIDER_EXECUTION_OPTIONS_DROPPED__later_test_reproduction_of_gap",
+  "source_digest": "8d3ef8c57ae08c055c6d6ee8aae950dc2c76c6c055160dfb406340d889b59e54",
+  "first_failure_recording_id": "000012-6ee48d29-3cae-489e-aa02-0b4a6e61f07b",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000012-6ee48d29-3cae-489e-aa02-0b4a6e61f07b",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/endpoints/01KZF9NA368GPZZ8FEFYF5EDFZ/sessions/01KZF9NAXYYQ09S7155PXBAE0S",
+      "request_headers": {
+        "accept": "application/json",
+        "user-agent": "node",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 4510.542,
+            "data_base64": "eyJhY3RpdmVfYWN0aXZhdGlvbiI6bnVsbCwiYWN0aXZlX21vZGVsX3JvdW5kIjpudWxsLCJkZWxpdmVyeSI6eyJhY2tub3dsZWRnZWRfdGhyb3VnaCI6MCwicGVuZGluZyI6W119LCJsYXN0X21vZGVsX2F0dGVtcHRzX2V4aGF1c3RlZCI6bnVsbCwibW9kZWwiOnsiYXV0aF9hdXRob3JpdHlfaWQiOiJ3ZWItZTJlLW9wdGlvbnMtYXV0aG9yaXR5IiwiYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS1kMGIxMjBmNjc3ODU3Mjg3NmZhODI4MGQwMTk2MDNmNyIsImF1dGhfcmV2aXNpb24iOjEsIm1vZGVsIjoib3B0aW9ucy1tb2RlbCIsInByb3ZpZGVyIjoib3B0aW9ucy1maXh0dXJlIiwicHJvdmlkZXJfZXhlY3V0aW9uX2Jhc2VfdXJsIjoiaHR0cDovLzEyNy4wLjAuMTo2NDk5My92MSIsInByb3ZpZGVyX2V4ZWN1dGlvbl9raW5kIjoib3BlbmFpX2NvbXBhdGlibGUiLCJwcm92aWRlcl9leGVjdXRpb25fcmV2aXNpb24iOjEsInByb3ZpZGVyX2V4ZWN1dGlvbl9zY2hlbWEiOiJ6b2RlLnByb3ZpZGVyLWV4ZWN1dGlvbi52MSJ9LCJzY2hlbWEiOiJ6b2RlLnNlc3Npb24udjEiLCJzZXNzaW9uX2lkIjoiMDFLWkY5TkFYWVlRMDlTNzE1NVBYQkFFMFMiLCJzdGF0dXMiOiJpZGxlIiwidG9vbF9jYWxscyI6W10sInRyYW5zY3JpcHQiOltdLCJ2ZXJzaW9uIjoxLCJ3YWl0IjpudWxsfQ=="
+          }
+        ],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>",
+    "<secret:access_assertion_4>"
+  ],
+  "integrity_sha256": "c287c7c9d8cd0359ac082c4c6c6977f2b9a12a5eb530deefb931ea88ee1449a1"
+}

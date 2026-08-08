@@ -484,8 +484,11 @@ fn write_server_config(
     let config = json!({
         "schema": "zode.server-config.v1",
         "listen": "127.0.0.1:0",
+        "management_origin": "http://127.0.0.1:41001",
+        "callback_origin": "http://127.0.0.1:41002",
         "server_authority_id": SERVER_AUTHORITY,
         "deployment": "server_only",
+        "ui_mode": "api_only",
         "control_database": database,
         "secret_directory": secrets,
         "access": {

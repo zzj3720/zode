@@ -1,0 +1,44 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "0002-a1aa5193-b6a6-4f0d-a576-cf1e49c9d96d-b66501aa-d607-4b82-b51c-590c12fc55bb",
+  "e2e_name": "e2e_browser_management_route_missing_returns_typed_json",
+  "boundary": "browser-capture-set",
+  "first_observed": "an unknown management /v1 route returned a bare fallback 404 instead of the typed public route-missing error",
+  "classification": "MANAGEMENT_ROUTE_MISSING_BARE_FALLBACK",
+  "source_digest": "7891787742f4cf460674bc03054f28a65b54b8d18889823585180cd7f029fc0e",
+  "first_failure_recording_id": "000003-98797739-4f2f-4b7e-885d-1fa6b56cd6de",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000003-98797739-4f2f-4b7e-885d-1fa6b56cd6de",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/__route_missing_classifier__",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 404,
+        "headers": {},
+        "chunks": [],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>"
+  ],
+  "integrity_sha256": "d57ab0e9d4205268fa848c217d905dfe76a37d7c44f2f2fcf1ec7217878e6654"
+}

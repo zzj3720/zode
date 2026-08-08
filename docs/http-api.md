@@ -186,7 +186,8 @@ an HTTP tool.
       "schema": "zode.provider-execution.v1",
       "revision": 2,
       "kind": "openai_compatible",
-      "base_url": "http://127.0.0.1:41000/v1"
+      "base_url": "http://127.0.0.1:41000/v1",
+      "options": {}
     },
     "model": "fixture-model",
     "auth_authority_id": "authority-opaque",
@@ -205,7 +206,9 @@ and response. `model` and `tools` are optional. A supplied model requires an
 explicit bounded `provider_execution` descriptor, `auth_authority_id`, and
 `auth_profile_id`; Endpoint never resolves a management default or per-device
 user configuration. The descriptor kind must be enabled and its destination
-allowed by Endpoint outbound policy.
+allowed by Endpoint outbound policy. `options` is a bounded, credential-free
+map persisted as part of the exact session selection and passed to aimux as
+provider options. Existing explicit `options: {}` selections remain unchanged.
 `minimum_auth_revision` is optional and otherwise resolves to the newest ready
 installed revision at admission. A controller that distributed credentials
 should send the revision it verified. Omitting `model` creates a durable session
@@ -292,7 +295,11 @@ rather than silently restarting pagination.
   "status": "idle",
   "model": {
     "provider": "fixture-compatible",
+    "provider_execution_schema": "zode.provider-execution.v1",
     "provider_execution_revision": 2,
+    "provider_execution_kind": "openai_compatible",
+    "provider_execution_base_url": "http://127.0.0.1:41000/v1",
+    "provider_execution_options": {},
     "model": "fixture-model",
     "auth_authority_id": "authority-opaque",
     "auth_profile_id": "profile-opaque",
@@ -341,7 +348,8 @@ duplicate the message.
     "schema": "zode.provider-execution.v1",
     "revision": 2,
     "kind": "openai_compatible",
-    "base_url": "http://127.0.0.1:41000/v1"
+    "base_url": "http://127.0.0.1:41000/v1",
+    "options": {}
   },
   "model": "fixture-model",
   "auth_authority_id": "authority-opaque",

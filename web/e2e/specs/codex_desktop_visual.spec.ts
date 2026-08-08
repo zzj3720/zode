@@ -255,8 +255,14 @@ if (!configPath || !realBinary || !assetsDirectory) {
   throw new Error("visual E2E Server wrapper requires --config, real binary, and UI assets directory");
 }
 const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+const confinedAssetsDirectory = path.join(path.dirname(configPath), ".zode-visual-ui-" + process.pid);
+fs.cpSync(assetsDirectory, confinedAssetsDirectory, {
+  recursive: true,
+  force: false,
+  errorOnExist: true,
+});
 config.ui_mode = "assets";
-config.ui_assets_directory = path.relative(path.dirname(configPath), assetsDirectory) || ".";
+config.ui_assets_directory = path.basename(confinedAssetsDirectory);
 fs.writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
 fs.chmodSync(configPath, 0o600);
 const child = spawn(realBinary, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });

@@ -1,0 +1,36 @@
+{
+  "schema": "zode.process-incident-recording.v1",
+  "version": 1,
+  "recording_id": "process-90724-1786150882078281000-0",
+  "e2e_name": "e2e_server_ui_delivery_hardening_rejects_asset_tree_symlink_and_path_escape_before_ready",
+  "classification": "UI_ASSET_DIRECTORY_PATH_ESCAPE_REACHED_READY__later_test_reproduction_of_gap",
+  "first_observed": "relation=later_test_reproduction_of_gap; ui_assets_directory=../ui-dist; expected=pre_ready_rejection; actual=ready",
+  "config": {
+    "label": "ui-assets-directory-parent-escape",
+    "bytes_hex": "7b22653265223a226532655f7365727665725f75695f64656c69766572795f68617264656e696e675f72656a656374735f61737365745f747265655f73796d6c696e6b5f616e645f706174685f6573636170655f6265666f72655f7265616479222c22656e747279223a227265616c207a6f64652d736572766572202d2d636f6e666967207769746820616e206573636170696e672075695f6173736574735f6469726563746f7279222c2265787065637465645f61667465725f666978223a7b227068617365223a22636f6e666967222c227265616479223a66616c73657d2c2272656c6174696f6e223a226c617465725f746573745f726570726f64756374696f6e5f6f665f676170222c22736368656d61223a227a6f64652e7365727665722d75692d6173736574732d706174682d6761702d7265706c61792e7631222c2275695f6173736574735f6469726563746f7279223a222e2e2f75692d64697374227d",
+    "sha256": "0336a977f9a0785c33fd13fd8fdf561ce3803cc59196e42d3bfeb3f3794abd13"
+  },
+  "processes": [
+    {
+      "name": "zode-server",
+      "stdout_hex": "5a4f44455f5345525645525f524541445920687474703a2f2f3132372e302e302e313a35333937380a",
+      "stderr_hex": "",
+      "exit_code": null,
+      "signal": "9",
+      "termination": "test_stop_after_ready_observation",
+      "stop": {
+        "observed_pids": [
+          90746
+        ],
+        "reaped_pids": [
+          90746
+        ],
+        "leaked_pids": [],
+        "timed_out": false,
+        "flush_status": "ok",
+        "proof": true
+      }
+    }
+  ],
+  "integrity_sha256": "4796805317517a44e2f5da3aaa12dcc579f00002546dec432984a031a9248b64"
+}
