@@ -584,6 +584,7 @@ async function main() {
     return;
   }
   const root = persistentMode ? path.resolve(persistentRoot) : mkdtempSync(path.join(os.tmpdir(), 'zode-installed-browser-smoke-'));
+  if (persistentMode) mkdirSync(root, { recursive: true, mode: 0o700 });
   const persistentLockPath = acquirePersistentSmokeLock(root);
   let fixtures;
   try {
