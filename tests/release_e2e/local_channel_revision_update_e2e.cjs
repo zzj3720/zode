@@ -120,7 +120,22 @@ function main() {
     const liveInstances = readdirSync(path.join(channelRoot, 'instances'))
       .filter((name) => existsSync(path.join(channelRoot, 'instances', name, 'state.json')));
     if (liveInstances.length !== 1) throw new Error(`update left ${liveInstances.length} stateful instances instead of one current`);
-    process.stdout.write(JSON.stringify({ status: 'PASS', operation: 'update', base_revision: JSON.parse(readFileSync(path.join(path.resolve(baseArtifact), 'manifest.json'), 'utf8')).revision, current_revision: currentManifest.revision }) + '\n');
+    const previousBeforeRestart = JSON.parse(readFileSync(path.join(channelRoot, 'previous', 'manifest.json'), 'utf8'));
+    const stopped = run(['stop', '--channel-root', channelRoot]);
+    operations.push({ operation: 'stop_before_restart', status: stopped.status, stdout: stopped.stdout, stderr: stopped.stderr });
+    if (stopped.status !== 0 || json(stopped.stdout)?.ok !== true) throw new Error(`stop before restart failed: ${stopped.stdout}${stopped.stderr}`);
+    const restarted = run(['start', '--channel-root', channelRoot]);
+    operations.push({ operation: 'start_after_restart', status: restarted.status, stdout: restarted.stdout, stderr: restarted.stderr });
+    if (restarted.status !== 0 || json(restarted.stdout)?.ok !== true) throw new Error(`start after restart failed: ${restarted.stdout}${restarted.stderr}`);
+    const currentAfterRestart = JSON.parse(readFileSync(path.join(channelRoot, 'current', 'manifest.json'), 'utf8'));
+    const previousAfterRestart = JSON.parse(readFileSync(path.join(channelRoot, 'previous', 'manifest.json'), 'utf8'));
+    if (currentAfterRestart.revision !== currentManifest.revision) {
+      throw new Error(`restart changed current revision: ${currentAfterRestart.revision}`);
+    }
+    if (previousAfterRestart.revision !== previousBeforeRestart.revision) {
+      throw new Error(`restart changed previous revision: ${previousAfterRestart.revision} (expected ${previousBeforeRestart.revision})`);
+    }
+    process.stdout.write(JSON.stringify({ status: 'PASS', operation: 'update_restart', base_revision: JSON.parse(readFileSync(path.join(path.resolve(baseArtifact), 'manifest.json'), 'utf8')).revision, current_revision: currentAfterRestart.revision, previous_revision: previousAfterRestart.revision }) + '\n');
   } catch (error) {
     preserveFailure(error, operations);
     process.stderr.write(JSON.stringify({ status: 'RED', error: String(error.message || error), operations }) + '\n');
