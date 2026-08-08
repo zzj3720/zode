@@ -39,6 +39,9 @@ const liveProviderBaseUrl = process.env.ZODE_RELEASE_LIVE_PROVIDER_BASE_URL || n
 const liveProviderApiKey = process.env.ZODE_RELEASE_LIVE_PROVIDER_API_KEY || null;
 const liveProviderMode = Boolean(liveProviderBaseUrl || liveProviderApiKey);
 const expectedAssistant = liveProviderMode ? 'ZODE_E2_LIVE_OK' : 'ZODE_INSTALLED_BROWSER_OK';
+const expectedAssistantPattern = liveProviderMode
+  ? /^ZODE_E2_LIVE_OK[.!?]?$/
+  : /^ZODE_INSTALLED_BROWSER_OK$/;
 // A persistent user channel may retain earlier smoke profiles.  Each live
 // run owns a fresh provider descriptor/profile so the browser cannot select a
 // stale revision while still exercising the same configured adapter.
@@ -378,10 +381,10 @@ async function main() {
     await page.getByRole('button', { name: 'Start session' }).click();
     await page.getByPlaceholder('Message Zode').fill(smokePrompt);
     await page.getByRole('button', { name: 'Send' }).click();
-    await page.getByText(expectedAssistant, { exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByText(expectedAssistantPattern).waitFor({ timeout: 20_000 });
     streamMarkerVisible = true;
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.getByText(expectedAssistant, { exact: true }).waitFor({ timeout: 20_000 });
+    await page.getByText(expectedAssistantPattern).waitFor({ timeout: 20_000 });
     durableFinalVisible = true;
     const edge = new URL(browserOrigin);
     const managementRequests = browserRequests.filter((item) => new URL(item.url).origin === edge.origin);

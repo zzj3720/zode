@@ -95,7 +95,7 @@ vp exec cargo test --test installed_channel_live_browser_e2e \
 
 该正向 E2E 在安装版浏览器中配置 `opencode-go`/`deepseek-v4-flash` provider
 及共享 API-key profile，创建 Endpoint session，发送精确 marker 提示词，断言
-stream marker、Server/Endpoint 管理请求、provider 200/SSE `[DONE]`，再 reload
+stream marker（允许模型在 marker 后追加一个终止标点）、Server/Endpoint 管理请求、provider 200/SSE `[DONE]`，再 reload
 确认最终回复仍由 durable session 恢复。真实 provider 请求数量必须为 1；失败时
 先保留首遇 browser/quarantine 证据并完成 recorder flush。另有
 `installed_channel_live_provider_contract_e2e.cjs` 作为本地 loopback provider

@@ -101,6 +101,14 @@ fn recorded_assistant_text(exchange: &support::LlmHttpRecordingExchange) -> Test
     Ok(text)
 }
 
+fn recorded_reply_matches(value: &str) -> bool {
+    let value = value.trim();
+    value == EXPECTED_REPLY
+        || [".", "!", "?"]
+            .iter()
+            .any(|suffix| value.strip_suffix(suffix) == Some(EXPECTED_REPLY))
+}
+
 fn assert_recording(recording: &LlmHttpRecording, secret: &str) -> TestResult<()> {
     if recording.requests.len() != 1 {
         return Err(Error::other(format!(
@@ -128,7 +136,7 @@ fn assert_recording(recording: &LlmHttpRecording, secret: &str) -> TestResult<()
         || request["model"] != MODEL
         || !prompt_present
         || exchange.response.status != Some(200)
-        || response_text != EXPECTED_REPLY
+        || !recorded_reply_matches(&response_text)
         || exchange.response.chunks.len() < 2
         || !matches!(
             &exchange.response.outcome,
