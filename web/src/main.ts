@@ -47,7 +47,7 @@ const state: {
   panelProvider: string | null;
   busy: boolean;
   notice: string | null;
-  deletingProfile: AuthProfile | null;
+  deletingProfile: { profile: AuthProfile; idempotencyKey: string } | null;
   connection: "Connecting" | "Live" | "Reconnecting" | "Disconnected";
 } = {
   system: null,
@@ -365,7 +365,7 @@ function providerCard(provider: Provider): HTMLElement {
     for (const profile of profiles) list.append(profileRow(profile));
     card.append(list);
   }
-  if (state.deletingProfile?.provider === provider.provider) {
+  if (state.deletingProfile?.profile.provider === provider.provider) {
     card.append(profileDeleteDialog(state.deletingProfile));
   }
   return card;
@@ -463,7 +463,7 @@ function profileRow(profile: AuthProfile): HTMLElement {
     controls.append(makeDefault);
   }
   const remove = action("Delete profile", "trash", () => {
-    state.deletingProfile = profile;
+    state.deletingProfile = { profile, idempotencyKey: crypto.randomUUID() };
     state.notice = null;
     render();
   });
@@ -479,7 +479,8 @@ function profileRow(profile: AuthProfile): HTMLElement {
   return row;
 }
 
-function profileDeleteDialog(profile: AuthProfile): HTMLElement {
+function profileDeleteDialog(entry: { profile: AuthProfile; idempotencyKey: string }): HTMLElement {
+  const profile = entry.profile;
   const dialog = node("section", "dialog-panel");
   dialog.setAttribute("role", "dialog");
   dialog.setAttribute("aria-modal", "true");
@@ -508,7 +509,11 @@ function profileDeleteDialog(profile: AuthProfile): HTMLElement {
   });
   const confirm = action("Delete profile permanently", "trash", async () => {
     await withBusy(async () => {
-      const result = await deleteProfile(profile.provider, profile.profile_id);
+      const result = await deleteProfile(
+        profile.provider,
+        profile.profile_id,
+        entry.idempotencyKey,
+      );
       state.deletingProfile = null;
       state.notice =
         result.status === "deleted"

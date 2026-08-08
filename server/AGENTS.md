@@ -311,6 +311,9 @@ Maintain positive E2Es for:
   a provider call until successful same-profile replacement;
 - profile delete/sharing removal retains a higher tombstone across Server and
   Endpoint restarts and cannot resurrect an older replica;
+- `e2e_browser_provider_profile_delete_replays_original_result_after_response_loss`
+  drops the first browser response after deletion commit and proves the same
+  command key replays its stored safe result while the UI confirmation closes;
 - Endpoint-generated ULID create and stable forwarding across Server crash;
 - Endpoint identity/capability mismatch;
 - same Endpoint added twice cannot create a second device ID/catalog row;

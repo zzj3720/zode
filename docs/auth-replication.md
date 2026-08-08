@@ -374,6 +374,10 @@ Endpoint aimux.
   the older credential cannot resurrect;
 - retry after Server crashes before distribution acknowledgement and replay the
   original outcome;
+- `e2e_browser_provider_profile_delete_replays_original_result_after_response_loss`
+  proves a committed profile tombstone keeps a safe response receipt: a lost
+  browser response can be retried with the same idempotency key and cannot turn
+  into a new-key `not_found` after the UI confirmation remains open;
 - corrupt only a stopped test-owned replica secret, restart, and expose a safe
   typed unavailable state rather than credential content;
 - verify Server UI/API lists every Endpoint holding a profile and accurately

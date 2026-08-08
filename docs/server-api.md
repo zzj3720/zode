@@ -669,6 +669,11 @@ provider/tool/OAuth fixtures.
 - after Endpoint commits create but Server loses the response, delete/unshare
   the profile and prove same-key retry replays the original ULID while a new key
   is rejected by current policy;
+- `e2e_browser_provider_profile_delete_replays_original_result_after_response_loss`
+  drops the first real browser DELETE response after the Server commits the
+  tombstone, then proves the still-open confirmation reuses the same key,
+  replays the exact safe deletion result, and converges the UI without a new
+  deletion operation;
 - after Endpoint admits a message/model/tool mutation but Server loses the
   response, change the profile/action state and prove same-key replay returns
   the original result while a new key follows current policy;

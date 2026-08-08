@@ -232,6 +232,7 @@ export function setDefaultProfile(provider: string, profileId: string): Promise<
 export function deleteProfile(
   provider: string,
   profileId: string,
+  idempotencyKey: string,
 ): Promise<{
   auth_profile_id: string;
   provider: string;
@@ -245,7 +246,7 @@ export function deleteProfile(
     distribution: Replica[];
   }>(
     `/v1/providers/${encodeURIComponent(provider)}/auth-profiles/${encodeURIComponent(profileId)}`,
-    { method: "DELETE", headers: { "Idempotency-Key": crypto.randomUUID() } },
+    { method: "DELETE", headers: { "Idempotency-Key": idempotencyKey } },
   );
 }
 

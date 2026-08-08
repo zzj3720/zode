@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS auth_profile_delete_operations (
     request_fingerprint BLOB NOT NULL CHECK (length(request_fingerprint) = 32),
     tombstone_revision INTEGER NOT NULL CHECK (tombstone_revision > 0),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    response_json TEXT,
     PRIMARY KEY (actor_key, provider, command_key)
 ) WITHOUT ROWID, STRICT;
 
@@ -1566,14 +1567,22 @@ impl ControlStore {
     pub(crate) fn begin_profile_delete(
         &self,
         write: ProfileDeleteWrite,
-    ) -> Result<(u64, AuthProfileRecord, Vec<AuthTombstoneRecord>), StoreError> {
+    ) -> Result<
+        (
+            u64,
+            AuthProfileRecord,
+            Vec<AuthTombstoneRecord>,
+            Option<String>,
+        ),
+        StoreError,
+    > {
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| StoreError::Internal)?;
         let existing = transaction
             .query_row(
-                "SELECT request_fingerprint, profile_id, tombstone_revision
+                "SELECT request_fingerprint, profile_id, tombstone_revision, response_json
                  FROM auth_profile_delete_operations
                  WHERE actor_key = ?1 AND provider = ?2 AND command_key = ?3",
                 params![
@@ -1586,12 +1595,13 @@ impl ControlStore {
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()
             .map_err(|_| StoreError::Internal)?;
-        if let Some((fingerprint, profile_id, revision)) = existing {
+        if let Some((fingerprint, profile_id, revision, response_json)) = existing {
             if !equal_digest(&fingerprint, &write.request_fingerprint)
                 || profile_id != write.profile_id
             {
@@ -1604,7 +1614,7 @@ impl ControlStore {
             let tombstones = read_auth_profile_tombstones_connection(&transaction, &profile_id)?;
             let revision = u64::try_from(revision).map_err(|_| StoreError::Integrity)?;
             transaction.commit().map_err(|_| StoreError::Internal)?;
-            return Ok((revision, record, tombstones));
+            return Ok((revision, record, tombstones, response_json));
         }
 
         let record = read_auth_profile_optional(&transaction, &write.profile_id)?
@@ -1686,8 +1696,8 @@ impl ControlStore {
             .execute(
                 "INSERT INTO auth_profile_delete_operations (
                     actor_key, provider, profile_id, command_key,
-                    request_fingerprint, tombstone_revision, created_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    request_fingerprint, tombstone_revision, created_at_ms, response_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
                 params![
                     &write.actor_key[..],
                     &write.provider,
@@ -1703,7 +1713,41 @@ impl ControlStore {
         let tombstones = read_auth_profile_tombstones_connection(&transaction, &write.profile_id)?;
         let revision = u64::try_from(tombstone_revision).map_err(|_| StoreError::Integrity)?;
         transaction.commit().map_err(|_| StoreError::Internal)?;
-        Ok((revision, record, tombstones))
+        Ok((revision, record, tombstones, None))
+    }
+
+    pub(crate) fn complete_profile_delete(
+        &self,
+        actor_key: &[u8; DIGEST_BYTES],
+        provider: &str,
+        command_key: &[u8; DIGEST_BYTES],
+        response_json: &str,
+    ) -> Result<String, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        transaction
+            .execute(
+                "UPDATE auth_profile_delete_operations
+                 SET response_json = ?4
+                 WHERE actor_key = ?1 AND provider = ?2 AND command_key = ?3
+                   AND response_json IS NULL",
+                params![&actor_key[..], provider, &command_key[..], response_json],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        let stored = transaction
+            .query_row(
+                "SELECT response_json
+                 FROM auth_profile_delete_operations
+                 WHERE actor_key = ?1 AND provider = ?2 AND command_key = ?3",
+                params![&actor_key[..], provider, &command_key[..]],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|_| StoreError::Internal)?
+            .ok_or(StoreError::Integrity)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok(stored)
     }
 
     pub(crate) fn mark_profile_tombstone(
@@ -2223,6 +2267,15 @@ fn ensure_auth_profile_columns(connection: &Connection) -> Result<(), StartupErr
         connection
             .execute(
                 "ALTER TABLE auth_profiles ADD COLUMN deleted_at_ms INTEGER",
+                [],
+            )
+            .map_err(|_| StartupError::StoreUnavailable)?;
+    }
+    let columns = table_columns(connection, "auth_profile_delete_operations")?;
+    if !columns.iter().any(|value| value == "response_json") {
+        connection
+            .execute(
+                "ALTER TABLE auth_profile_delete_operations ADD COLUMN response_json TEXT",
                 [],
             )
             .map_err(|_| StartupError::StoreUnavailable)?;

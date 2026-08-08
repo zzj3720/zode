@@ -487,8 +487,9 @@ impl ProviderAuthority {
             b"auth-profile-delete-request-v1",
             &[provider.as_bytes(), profile_id.as_bytes()],
         );
+        let actor_key = *actor.actor_key();
         let write = ProfileDeleteWrite {
-            actor_key: *actor.actor_key(),
+            actor_key,
             provider: provider.to_owned(),
             profile_id: profile_id.to_owned(),
             command_key,
@@ -496,11 +497,14 @@ impl ProviderAuthority {
             created_at_ms: unix_millis()?,
         };
         let store = Arc::clone(&self.store);
-        let (_operation, profile, tombstones) =
+        let (_revision, profile, tombstones, receipt) =
             tokio::task::spawn_blocking(move || store.begin_profile_delete(write))
                 .await
                 .map_err(|_| ProviderError::Internal)?
                 .map_err(map_store_error)?;
+        if let Some(receipt) = receipt {
+            return serde_json::from_str(&receipt).map_err(|_| ProviderError::Internal);
+        }
         let store = Arc::clone(&self.store);
         let secret_ref = profile.secret_ref.clone();
         tokio::task::spawn_blocking(move || store.remove_provider_secret(&secret_ref))
@@ -516,13 +520,24 @@ impl ProviderAuthority {
                 .map_err(|_| ProviderError::Internal)?
                 .map_err(map_store_error)?;
         let pending = replicas.iter().any(|replica| replica.status != "removed");
-        Ok(json!({
+        let response = json!({
             "schema": "zode.auth-profile-delete.v1",
             "provider": provider,
             "auth_profile_id": profile_id,
             "status": if pending { "removal_pending" } else { "deleted" },
             "distribution": replica_list_value(&replicas, self.store.authority_id()),
-        }))
+        });
+        let response_json =
+            serde_json::to_string(&response).map_err(|_| ProviderError::Internal)?;
+        let store = Arc::clone(&self.store);
+        let provider_owned = provider.to_owned();
+        let persisted = tokio::task::spawn_blocking(move || {
+            store.complete_profile_delete(&actor_key, &provider_owned, &command_key, &response_json)
+        })
+        .await
+        .map_err(|_| ProviderError::Internal)?
+        .map_err(map_store_error)?;
+        serde_json::from_str(&persisted).map_err(|_| ProviderError::Internal)
     }
 
     pub(crate) async fn list_replicas(&self, profile_id: &str) -> Result<Value, ProviderError> {
