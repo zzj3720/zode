@@ -1,0 +1,262 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "0002-c94d58e8-cb8f-4558-8b32-3842c3ba0fd0-cf6d23eb-2e5e-4bee-9747-1d58bbaa3e78",
+  "e2e_name": "e2e_browser_endpoint_unavailable_disables_new_session_command",
+  "boundary": "browser-capture-set",
+  "first_observed": "the real Endpoint stopped responding, but the Sessions page kept the New session command enabled instead of disabling commands for an unavailable Endpoint",
+  "classification": "ENDPOINT_UNAVAILABLE_SESSION_COMMAND_ENABLED",
+  "source_digest": "db28086155769e87ca18ee9bd5e962dd33fe70bf6935867abbef24e952e9d64e",
+  "first_failure_recording_id": "000029-2da13689-3c06-4636-ad76-c3dc05e9677a",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000023-f3296dc7-6092-4abb-8cf9-23307682b39b",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/",
+      "request_headers": {
+        "cache-control": "max-age=0",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-cache"
+        },
+        "chunks": [
+          {
+            "offset_us": 4394.625,
+            "data_base64": "PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KICA8aGVhZD4KICAgIDxtZXRhIGNoYXJzZXQ9IlVURi04IiAvPgogICAgPG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xLjAiIC8+CiAgICA8dGl0bGU+Wm9kZTwvdGl0bGU+CiAgICA8c2NyaXB0IHR5cGU9Im1vZHVsZSIgY3Jvc3NvcmlnaW4gc3JjPSIvYXNzZXRzL2luZGV4LWJPUDA0M2g3QzhBRS5qcyI+PC9zY3JpcHQ+CiAgICA8bGluayByZWw9InN0eWxlc2hlZXQiIGNyb3Nzb3JpZ2luIGhyZWY9Ii9hc3NldHMvaW5kZXgtQ1VxZmZSakVoNEVHLmNzcyI+CiAgPC9oZWFkPgogIDxib2R5PgogICAgPGRpdiBpZD0iYXBwIj48L2Rpdj4KICA8L2JvZHk+CjwvaHRtbD4K"
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000002",
+      "recording_id": "000024-27fff550-217e-4694-a57a-072214a06a23",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/system",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "chunks": [
+          {
+            "offset_us": 7626.125,
+            "data_base64": "eyJkZXBsb3ltZW50Ijoic2VydmVyX29ubHkiLCJmZWF0dXJlcyI6eyJwcm92aWRlcl9hdXRoIjp0cnVlLCJyZW1vdGVfZW5kcG9pbnRzIjp0cnVlfSwiaW5ncmVzcyI6eyJjYWxsYmFja19vcmlnaW4iOiJzZXBhcmF0ZSIsIm1hbmFnZW1lbnRfYXV0aCI6ImNsb3VkZmxhcmVfYWNjZXNzIn0sImxvY2FsX2VuZHBvaW50X2lkIjpudWxsLCJzY2hlbWEiOiJ6b2RlLnN5c3RlbS52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000003",
+      "recording_id": "000025-3bda7246-974d-4658-882a-c5d8f7cd4bb0",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/endpoints",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 9547.416,
+            "data_base64": "eyJpdGVtcyI6W3siYXV0aF9yZXBsaWNhX3N1bW1hcnkiOnsicGVuZGluZyI6MCwicmVhZHkiOjAsInN0YWxlIjowfSwiY2FwYWJpbGl0aWVzIjp7InByb3RvY29sX3ZlcnNpb24iOiJ6b2RlLmVuZHBvaW50LnYxIiwicHJvdmlkZXJzIjpbIm9wZW5haV9jb21wYXRpYmxlIl0sInRvb2xzIjpbXX0sImNvbnRyb2xsZXJfYXV0aG9yaXR5X2lkIjoid2ViLWUyZS1lbmRwb2ludC1jb21tYW5kLWdhdGluZyIsImNvbnRyb2xsZXJfY3JlZGVudGlhbF9yZXZpc2lvbiI6MSwiZGlzYWJsZWQiOmZhbHNlLCJlbmRwb2ludF9pZCI6IjAxS1pHTUFSMkY4UDdZTVJQNzZLMUI0WkVLIiwia2luZCI6InJlbW90ZSIsImxhYmVsIjoiQ29tbWFuZCBnYXRpbmcgRW5kcG9pbnQiLCJsYXN0X29ic2VydmVkX2F0X21zIjoxNzg2MTkwODQ5MzQ5LCJzY2hlbWEiOiJ6b2RlLmVuZHBvaW50LnYxIiwic3RhdHVzIjoib25saW5lIn1dLCJzY2hlbWEiOiJ6b2RlLmVuZHBvaW50cy52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000004",
+      "recording_id": "000026-1b67f816-16be-417c-b4c6-0d1b6aab721a",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/providers",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 7583.041,
+            "data_base64": "eyJwcm92aWRlcnMiOlt7ImF1dGhfcHJvZmlsZV9jb3VudCI6MSwiYXV0aF9zdGF0dXMiOiJyZWFkeSIsImRlZmF1bHRfcHJvZmlsZV9pZCI6InByb2ZpbGUtZDhlYzk4Yzc5ZGQxYzBiNDg1NzNkNGM1MjVkNWMzZmYiLCJkZXNjcmlwdG9yIjp7ImJhc2VfdXJsIjoiaHR0cDovLzEyNy4wLjAuMTo1NDQxMS92MSIsImtpbmQiOiJvcGVuYWlfY29tcGF0aWJsZSIsIm1vZGVscyI6WyJzZXNzaW9uLWNvbW1hbmQtZ2F0aW5nLW1vZGVsIl0sIm9wdGlvbnMiOnt9LCJyZXZpc2lvbiI6MX0sInByb3ZpZGVyIjoic2Vzc2lvbi1jb21tYW5kLWdhdGluZy1maXh0dXJlIn1dLCJzY2hlbWEiOiJ6b2RlLnByb3ZpZGVycy52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000005",
+      "recording_id": "000027-0ebaec4e-df02-43df-9a7d-d596129eccb4",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/providers",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 6342.375,
+            "data_base64": "eyJwcm92aWRlcnMiOlt7ImF1dGhfcHJvZmlsZV9jb3VudCI6MSwiYXV0aF9zdGF0dXMiOiJyZWFkeSIsImRlZmF1bHRfcHJvZmlsZV9pZCI6InByb2ZpbGUtZDhlYzk4Yzc5ZGQxYzBiNDg1NzNkNGM1MjVkNWMzZmYiLCJkZXNjcmlwdG9yIjp7ImJhc2VfdXJsIjoiaHR0cDovLzEyNy4wLjAuMTo1NDQxMS92MSIsImtpbmQiOiJvcGVuYWlfY29tcGF0aWJsZSIsIm1vZGVscyI6WyJzZXNzaW9uLWNvbW1hbmQtZ2F0aW5nLW1vZGVsIl0sIm9wdGlvbnMiOnt9LCJyZXZpc2lvbiI6MX0sInByb3ZpZGVyIjoic2Vzc2lvbi1jb21tYW5kLWdhdGluZy1maXh0dXJlIn1dLCJzY2hlbWEiOiJ6b2RlLnByb3ZpZGVycy52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000006",
+      "recording_id": "000028-241a2c1a-abd4-4ad9-b587-163f1ecff482",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/providers/session-command-gating-fixture/auth-profiles",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 5373.542,
+            "data_base64": "eyJpdGVtcyI6W3siYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS1kOGVjOThjNzlkZDFjMGI0ODU3M2Q0YzUyNWQ1YzNmZiIsImRlc2NyaXB0b3JfcmV2aXNpb24iOjEsImRpc3RyaWJ1dGlvbiI6W3siYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS1kOGVjOThjNzlkZDFjMGI0ODU3M2Q0YzUyNWQ1YzNmZiIsImF1dGhvcml0eV9pZCI6IndlYi1lMmUtZW5kcG9pbnQtY29tbWFuZC1nYXRpbmciLCJlbmRwb2ludF9pZCI6IjAxS1pHTUFSMkY4UDdZTVJQNzZLMUI0WkVLIiwiaW5zdGFsbGVkX3JldmlzaW9uIjoxLCJvYnNlcnZlZF9yZXZpc2lvbiI6MSwicHJvdmlkZXIiOiJzZXNzaW9uLWNvbW1hbmQtZ2F0aW5nLWZpeHR1cmUiLCJyZXZpc2lvbiI6MSwic3RhdHVzIjoicmVhZHkifV0sImV4cGlyZXNfYXRfbXMiOm51bGwsImlzX2RlZmF1bHQiOnRydWUsImtpbmQiOiJhcGlfa2V5IiwibGFiZWwiOiJDb21tYW5kIGdhdGluZyBwcm9maWxlIiwicHJvZmlsZV9pZCI6InByb2ZpbGUtZDhlYzk4Yzc5ZGQxYzBiNDg1NzNkNGM1MjVkNWMzZmYiLCJwcm92aWRlciI6InNlc3Npb24tY29tbWFuZC1nYXRpbmctZml4dHVyZSIsInJldmlzaW9uIjoxLCJzY2hlbWEiOiJ6b2RlLmF1dGgtcHJvZmlsZS52MSIsInNoYXJpbmciOnsiZW5kcG9pbnRfaWRzIjpbIjAxS1pHTUFSMkY4UDdZTVJQNzZLMUI0WkVLIl0sIm1vZGUiOiJzZWxlY3RlZCJ9LCJzdGF0dXMiOiJyZWFkeSJ9XSwic2NoZW1hIjoiem9kZS5hdXRoLXByb2ZpbGVzLnYxIn0="
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000007",
+      "recording_id": "000029-2da13689-3c06-4636-ad76-c3dc05e9677a",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/endpoints/01KZGMAR2F8P7YMRP76K1B4ZEK/sessions",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "chunks": [
+          {
+            "offset_us": 7516.25,
+            "data_base64": "eyJlcnJvciI6eyJjb2RlIjoiZW5kcG9pbnRfdW5hdmFpbGFibGUiLCJtZXNzYWdlIjoiRW5kcG9pbnQgaXMgdW5hdmFpbGFibGUiLCJyZXRyeWFibGUiOnRydWV9fQ=="
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000008",
+      "recording_id": "000030-ddfbc7c5-208e-49c8-873e-7bfec37fcb3b",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/endpoints/01KZGMAR2F8P7YMRP76K1B4ZEK/sessions",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "chunks": [
+          {
+            "offset_us": 6237.209,
+            "data_base64": "eyJlcnJvciI6eyJjb2RlIjoiZW5kcG9pbnRfdW5hdmFpbGFibGUiLCJtZXNzYWdlIjoiRW5kcG9pbnQgaXMgdW5hdmFpbGFibGUiLCJyZXRyeWFibGUiOnRydWV9fQ=="
+          }
+        ],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>",
+    "<secret:access_assertion_9>",
+    "<secret:access_assertion_15>",
+    "<secret:access_assertion_22>"
+  ],
+  "integrity_sha256": "8752c714ccd790fd25aacf44ee2a7e1ddc9e7ddace641ba544914dad4da6278b"
+}

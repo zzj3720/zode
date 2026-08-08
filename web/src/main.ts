@@ -37,6 +37,7 @@ const state: {
   providers: Provider[];
   profiles: Map<string, AuthProfile[]>;
   sessions: Map<string, Session[]>;
+  sessionErrors: Map<string, string>;
   activeSession: Session | null;
   activeEndpointId: string | null;
   view: View;
@@ -51,6 +52,7 @@ const state: {
   providers: [],
   profiles: new Map(),
   sessions: new Map(),
+  sessionErrors: new Map(),
   activeSession: null,
   activeEndpointId: null,
   view: "sessions",
@@ -583,36 +585,53 @@ function endpointDialog(): HTMLElement {
 function renderSessions(): void {
   const page = node("section", "content-page");
   const toolbar = node("div", "page-toolbar");
+  const allEndpointsUnavailable =
+    state.endpoints.length > 0 &&
+    state.endpoints.every((endpoint) => state.sessionErrors.has(endpoint.endpoint_id));
+  const newSession = action(
+    "New session",
+    "plus",
+    () => {
+      state.panel = "session";
+      state.notice = null;
+      render();
+    },
+    "primary",
+  );
+  newSession.disabled = allEndpointsUnavailable;
   toolbar.append(
     node(
       "p",
       "page-intro",
       "Sessions stay on their creating Endpoint and stream durable state here.",
     ),
-    action(
-      "New session",
-      "plus",
-      () => {
-        state.panel = "session";
-        state.notice = null;
-        render();
-      },
-      "primary",
-    ),
+    newSession,
   );
   page.append(toolbar);
   const message = notice();
   if (message) page.append(message);
   if (state.panel === "session") page.append(sessionForm());
   let count = 0;
+  let hasUnavailableEndpoint = false;
   for (const endpoint of state.endpoints) {
     const sessions = state.sessions.get(endpoint.endpoint_id) ?? [];
+    const errorCode = state.sessionErrors.get(endpoint.endpoint_id);
+    if (errorCode) hasUnavailableEndpoint = true;
     count += sessions.length;
-    if (sessions.length === 0) continue;
+    if (sessions.length === 0 && !errorCode) continue;
     const group = node("section", "session-group");
     group.append(
       node("h2", undefined, endpoint.kind === "local" ? "This machine" : endpoint.label),
     );
+    if (errorCode) {
+      group.append(
+        emptyState(
+          "warning",
+          "Endpoint unavailable",
+          "Session history is non-authoritative until the Endpoint reconnects.",
+        ),
+      );
+    }
     for (const session of sessions) {
       const row = node("a", "session-row");
       row.href = `/endpoints/${encodeURIComponent(endpoint.endpoint_id)}/sessions/${encodeURIComponent(session.session_id)}`;
@@ -639,7 +658,7 @@ function renderSessions(): void {
     }
     page.append(group);
   }
-  if (count === 0 && state.panel !== "session") {
+  if (count === 0 && !hasUnavailableEndpoint && state.panel !== "session") {
     page.append(
       emptyState(
         "chats-circle",
@@ -700,7 +719,10 @@ function sessionForm(): HTMLFormElement {
     profileHint.hidden = availableProfiles.length > 0;
     profileHint.textContent =
       availableProfiles.length > 0 ? "" : "No shared profile is available for this Endpoint.";
-    if (submit) submit.disabled = state.busy || availableProfiles.length === 0;
+    if (submit) {
+      submit.disabled =
+        state.busy || availableProfiles.length === 0 || state.sessionErrors.has(endpoint.value);
+    }
   };
   provider.addEventListener("change", updateChoices);
   endpoint.addEventListener("change", updateChoices);
@@ -919,16 +941,23 @@ async function refreshProviders(): Promise<void> {
 }
 
 async function refreshSessions(): Promise<void> {
+  const nextSessions = new Map<string, Session[]>();
+  const nextErrors = new Map<string, string>();
   const sessions = await Promise.all(
     state.endpoints.map(async (endpoint) => {
       try {
         return [endpoint.endpoint_id, await listSessions(endpoint.endpoint_id)] as const;
-      } catch {
-        return [endpoint.endpoint_id, [] as Session[]] as const;
+      } catch (error) {
+        const code = error instanceof ServerClientError ? error.code : "network_error";
+        nextErrors.set(endpoint.endpoint_id, code);
+        return [endpoint.endpoint_id, state.sessions.get(endpoint.endpoint_id) ?? []] as const;
       }
     }),
   );
-  state.sessions = new Map(sessions);
+  for (const [endpointId, endpointSessions] of sessions)
+    nextSessions.set(endpointId, endpointSessions);
+  state.sessions = nextSessions;
+  state.sessionErrors = nextErrors;
 }
 
 async function openSession(endpointId: string, sessionId: string): Promise<void> {
