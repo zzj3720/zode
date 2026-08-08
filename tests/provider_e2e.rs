@@ -25,8 +25,8 @@ use serde_json::{json, Value};
 use support::{
     assert_response_headers_secret_free, authenticated, install_test_replica, response_text,
     sqlite_contains_secret, write_endpoint_config, ConfiguredServer, HttpFixture, HttpRequestExt,
-    ModelFixture, ModelHold, ModelScript, TempDatabase, TestResult, TestZode,
-    TEST_CONTROLLER_SECRET,
+    ModelFixture, ModelHold, ModelScript, TempDatabase, TestResult, TestZode, ToolFixture,
+    ToolScript, TEST_CONTROLLER_SECRET,
 };
 
 const PROFILE_A: &str = "profile-provider-a";
@@ -42,6 +42,7 @@ struct AnthropicFixtureState {
     requests: Arc<Mutex<Vec<Value>>>,
     headers: Arc<Mutex<Vec<Value>>>,
     fail_first: bool,
+    tool_round: bool,
 }
 
 struct AnthropicFixture {
@@ -53,6 +54,18 @@ impl AnthropicFixture {
     async fn start(fail_first: bool) -> TestResult<Self> {
         let state = AnthropicFixtureState {
             fail_first,
+            ..AnthropicFixtureState::default()
+        };
+        let router = Router::new()
+            .route("/v1/messages", post(anthropic_messages))
+            .with_state(state.clone());
+        let server = HttpFixture::start(router).await?;
+        Ok(Self { server, state })
+    }
+
+    async fn start_tool_round() -> TestResult<Self> {
+        let state = AnthropicFixtureState {
+            tool_round: true,
             ..AnthropicFixtureState::default()
         };
         let router = Router::new()
@@ -128,7 +141,30 @@ async fn anthropic_messages(
             .body(Body::from("anthropic fixture pre-stream overload"))
             .expect("Anthropic fixture retry response builds");
     }
-    let body = concat!(
+    let tool_round = state.tool_round
+        && state
+            .requests
+            .lock()
+            .expect("Anthropic fixture request mutex poisoned")
+            .len()
+            == 1;
+    let body = if tool_round {
+        concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_native_tool_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-native\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"native-tool-call\",\"name\":\"fixture_tool\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"value\\\":\\\"native\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":4}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        )
+    } else {
+        concat!(
         "event: message_start\n",
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_native_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-native\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
         "event: content_block_start\n",
@@ -141,7 +177,8 @@ async fn anthropic_messages(
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":4}}\n\n",
         "event: message_stop\n",
         "data: {\"type\":\"message_stop\"}\n\n"
-    );
+        )
+    };
     AxumResponse::builder()
         .status(AxumStatusCode::OK)
         .header("content-type", "text/event-stream")
@@ -267,7 +304,16 @@ fn config_with_adapter(
     adapter_kind: &str,
     origin: &str,
 ) -> TestResult<PathBuf> {
-    let path = write_endpoint_config(database.path(), Vec::new(), 1)?;
+    config_with_adapter_and_tools(database, adapter_kind, origin, Vec::new())
+}
+
+fn config_with_adapter_and_tools(
+    database: &TempDatabase,
+    adapter_kind: &str,
+    origin: &str,
+    tools: Vec<Value>,
+) -> TestResult<PathBuf> {
+    let path = write_endpoint_config(database.path(), tools, 1)?;
     let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
     config["provider_execution"]["adapter_kinds"] = json!([adapter_kind]);
     config["provider_execution"]["allowed_base_url_origins"] = json!([origin]);
@@ -318,6 +364,12 @@ fn native_anthropic_model_body_for_profile(base_url: &str, profile: &str) -> Val
 
 fn native_anthropic_model_body(base_url: &str) -> Value {
     native_anthropic_model_body_for_profile(base_url, "anthropic-profile")
+}
+
+fn native_anthropic_tool_model_body(base_url: &str) -> Value {
+    let mut body = native_anthropic_model_body(base_url);
+    body["tools"] = json!(["fixture_tool"]);
+    body
 }
 
 async fn install_native_anthropic_replica(
@@ -743,6 +795,108 @@ async fn e2e_native_anthropic_messages_stream_uses_exact_replica_and_sse() -> Te
     assert!(read_body.contains("native anthropic response"));
     assert!(!read_body.contains(ANTHROPIC_SECRET));
     server.stop().await?;
+    provider.stop().await?;
+    Ok(())
+}
+
+/// Native continuation must round-trip through the public tool path: an
+/// Anthropic tool_use response is dispatched by Endpoint, and the next native
+/// request contains the provider-shaped tool_use/tool_result conversation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_native_anthropic_tool_continuation_preserves_call_and_result() -> TestResult<()> {
+    let database = TempDatabase::new("provider-native-anthropic-tool")?;
+    let mut provider = AnthropicFixture::start_tool_round().await?;
+    let mut tool = ToolFixture::start(vec![ToolScript::Response(json!({
+        "value": "native tool result"
+    }))])
+    .await?;
+    let config = config_with_adapter_and_tools(
+        &database,
+        "anthropic",
+        &provider.base_url(),
+        vec![json!({
+            "name": "fixture_tool",
+            "description": "native continuation fixture",
+            "input_schema": {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "additionalProperties": false
+            },
+            "completion_mode": "response",
+            "auto_wait_timeout_seconds": 20,
+            "recovery": {
+                "on_running_restart": "unknown_outcome",
+                "retry_dispatch": "never"
+            },
+            "adapter": {"kind": "http", "url": tool.adapter_url()}
+        })],
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    install_native_anthropic_replica(&client, &server).await?;
+
+    let model = native_anthropic_tool_model_body(&provider.base_url());
+    let (status, body) =
+        create_model(&client, &server, "create-native-anthropic-tool", &model).await?;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "native tool create failed: {body}"
+    );
+    let session_id = session_id_from_create(&body)?;
+    let mut events = open_profile_events(
+        &client,
+        &server.url(""),
+        &session_id,
+        &[ANTHROPIC_SECRET, TEST_CONTROLLER_SECRET],
+    )
+    .await?;
+    let message_status = post_message_at(
+        &client,
+        &server.url(""),
+        &session_id,
+        "native-anthropic-tool-message",
+        "use the native fixture tool",
+    )
+    .await?;
+    assert_eq!(message_status, StatusCode::ACCEPTED);
+    wait_profile_assistant(&mut events, &session_id, "native anthropic response").await?;
+
+    assert_eq!(tool.invocation_count(), 1);
+    assert_eq!(provider.request_count(), 2);
+    let requests = provider
+        .state
+        .requests
+        .lock()
+        .expect("Anthropic fixture request mutex poisoned")
+        .clone();
+    let second_messages = requests
+        .get(1)
+        .and_then(|request| request["messages"].as_array())
+        .ok_or_else(|| IoError::other("native continuation request had no messages"))?;
+    assert!(second_messages.iter().any(|message| {
+        message["role"] == "assistant"
+            && message["content"].as_array().is_some_and(|content| {
+                content.iter().any(|part| {
+                    part["type"] == "tool_use"
+                        && part["id"] == "native-tool-call"
+                        && part["name"] == "fixture_tool"
+                })
+            })
+    }));
+    assert!(second_messages.iter().any(|message| {
+        message["role"] == "user"
+            && message["content"].as_array().is_some_and(|content| {
+                content.iter().any(|part| {
+                    part["type"] == "tool_result" && part["tool_use_id"] == "native-tool-call"
+                })
+            })
+    }));
+    let (_read_status, read_body) =
+        read_session_at(&client, &server.url(""), &session_id, &[ANTHROPIC_SECRET]).await?;
+    assert!(!read_body.contains(ANTHROPIC_SECRET));
+    server.stop().await?;
+    tool.stop().await?;
     provider.stop().await?;
     Ok(())
 }

@@ -214,3 +214,10 @@ Anthropic adapter advertises its matching credential schema, resolves the
 explicit Anthropic replica, sends the native `/v1/messages` SSE request with
 `x-api-key`, and projects the streamed final response through the ordinary
 Endpoint HTTP/SSE session path without exposing the secret.
+
+Native tool continuation is fixed by
+`e2e_native_anthropic_tool_continuation_preserves_call_and_result`: the same
+real Endpoint path dispatches an Anthropic `tool_use`, sends the configured
+HTTP tool through the production tool adapter, and the next native request
+contains the matching provider-shaped `tool_use` and `tool_result` identities.
+The assertion also verifies the final public session remains secret-free.
