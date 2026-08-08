@@ -2088,7 +2088,7 @@ fn read_auth_profile_tombstones_connection(
         )
         .map_err(|_| StoreError::Internal)?;
     let records = statement
-        .query_map([profile_id], |row| auth_tombstone_from_row(row))
+        .query_map([profile_id], auth_tombstone_from_row)
         .map_err(|_| StoreError::Internal)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|_| StoreError::Integrity)?;
