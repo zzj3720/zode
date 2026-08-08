@@ -740,6 +740,16 @@ async function main() {
     const persistentNeedsUpdate = persistentMode
       && persistentHasCurrent
       && currentManifest.revision !== artifactManifest?.revision;
+    // A persistent root may already have a healthy current instance whose
+    // Endpoint config was created without this run's recorder origin.  The
+    // live provider journey must exercise the recorder through the installed
+    // process, so recycle that run-owned channel instance before bootstrap;
+    // local-channel preserves the current artifact/data while the new config
+    // receives the non-secret allowlist from channelEnv.
+    const persistentLiveRestart = persistentMode
+      && liveProviderMode
+      && persistentHasCurrent
+      && !persistentNeedsUpdate;
     const installed = await command(
       process.execPath,
       persistentMode
@@ -747,6 +757,8 @@ async function main() {
           ? [localChannelEntry, 'install', '--artifact', path.resolve(artifact), '--channel-root', root]
           : persistentNeedsUpdate
             ? [localChannelEntry, 'update', '--artifact', path.resolve(artifact), '--channel-root', root]
+            : persistentLiveRestart
+              ? [localChannelEntry, 'stop', '--channel-root', root]
             : [localChannelEntry, 'start', '--channel-root', root]
         : [channelEntry, 'install', '--artifact', path.resolve(artifact), '--release-root', root],
       channelEnv,
