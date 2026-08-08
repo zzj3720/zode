@@ -494,6 +494,13 @@ impl ControlStore {
         Arc::clone(&self.keys)
     }
 
+    pub(crate) fn checkpoint_for_shutdown(&self) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|_| StoreError::Internal)
+    }
+
     pub(crate) fn authority_id(&self) -> &str {
         &self.authority_id
     }
