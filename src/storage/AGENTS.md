@@ -85,3 +85,7 @@ HTTP/SSE without allocating another session or event.
 boundary: if verified version-one events map one authority/subject/command
 scope to multiple streams, restart must reject readiness transactionally and
 must not choose, rewrite, or publish either receipt.
+
+`e2e_ownerless_session_history_fails_closed` anchors the owner-integrity
+boundary: a verified event whose immutable creation owner cannot be decoded
+must reject readiness without guessing, adopting, or rewriting ownership.
