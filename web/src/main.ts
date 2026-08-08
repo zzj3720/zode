@@ -943,13 +943,22 @@ async function refreshProviders(): Promise<void> {
 async function refreshSessions(): Promise<void> {
   const nextSessions = new Map<string, Session[]>();
   const nextErrors = new Map<string, string>();
+  let nextNotice: string | null = null;
   const sessions = await Promise.all(
     state.endpoints.map(async (endpoint) => {
       try {
         return [endpoint.endpoint_id, await listSessions(endpoint.endpoint_id)] as const;
       } catch (error) {
         const code = error instanceof ServerClientError ? error.code : "network_error";
-        nextErrors.set(endpoint.endpoint_id, code);
+        if (error instanceof ServerClientError && error.status === 401) throw error;
+        if (code === "endpoint_unavailable") {
+          nextErrors.set(endpoint.endpoint_id, code);
+        } else if (!nextNotice) {
+          nextNotice =
+            code === "network_error"
+              ? "Server unavailable. Session history is not authoritative."
+              : "The Server could not load session history. Try again when it is available.";
+        }
         return [endpoint.endpoint_id, state.sessions.get(endpoint.endpoint_id) ?? []] as const;
       }
     }),
@@ -958,6 +967,7 @@ async function refreshSessions(): Promise<void> {
     nextSessions.set(endpointId, endpointSessions);
   state.sessions = nextSessions;
   state.sessionErrors = nextErrors;
+  state.notice = nextNotice;
 }
 
 async function openSession(endpointId: string, sessionId: string): Promise<void> {
