@@ -102,8 +102,9 @@ session URL，再发送一次普通消息并 reload；两次真实 provider 请�
 recorder。录制完成前，测试入口只收敛本次 run-owned descriptor，并通过已有的
 session model-selection route 迁移该 session 的 concrete execution，避免退出的
 recorder 地址残留在用户通道；固定根上若同一身份不是带 ownership marker 的测试
-descriptor，测试会在任何写入前失败。当前 Server 没有 profile-delete 公共路由，既有
-profile 事实不会被测试入口伪造删除。失败时先保留首遇 browser/quarantine 证据并完成
+descriptor，测试会在任何写入前失败。收敛后，测试只通过现有
+`DELETE /v1/providers/{provider}/auth-profiles/{profile_id}` 删除带 ownership marker 的本次
+profile；既有用户 profile 不会被测试入口伪造删除。失败时先保留首遇 browser/quarantine 证据并完成
 recorder flush。另有
 `installed_channel_live_provider_contract_e2e.cjs` 作为本地 loopback provider
 边界的红绿 contract anchor，不替代真实 provider gate。

@@ -60,8 +60,9 @@ edge，避免把仍可用的 current 通道一并停掉。runtime 会记录启�
 锁阻止两个 smoke 同时改同一根。测试必须在 recorder 存活期间完成 stop/start、
 session 重开和 durable final 观察；recorder 退出前，通过既有 provider descriptor
 API 收敛测试 descriptor，并通过既有 session model-selection API 把已创建 session
-的 concrete provider execution 一并迁移到新 descriptor。当前 Server 没有
-profile-delete 公共路由，测试入口不伪造删除既有 profile 事实。生产
+的 concrete provider execution 一并迁移到新 descriptor。测试入口只会通过既有
+profile-delete 公共路由删除带 ownership marker 的本次测试 profile；遇到既有
+用户 descriptor 或未标记 profile 必须 fail closed，绝不伪造删除用户事实。生产
 driver/Server/Endpoint 不读取 recorder、cassette 或 replay 输入；上述收敛只属于
 测试入口，确保 recorder 退出后固定通道不保留失效地址或测试凭据。
 

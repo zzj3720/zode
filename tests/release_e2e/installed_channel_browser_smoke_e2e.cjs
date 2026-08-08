@@ -51,7 +51,9 @@ const testOwnedProviderId = 'zode-installed-live-test';
 const testOwnershipMarker = 'zode.installed-channel-live-test.v1';
 const providerId = liveProviderMode ? testOwnedProviderId : 'installed-e2e-provider';
 const modelId = liveProviderMode ? 'deepseek-v4-flash' : 'installed-e2e-model';
-const profileLabel = liveProviderMode ? 'Installed live smoke profile' : 'Installed smoke profile';
+const profileLabel = liveProviderMode
+  ? `Installed live smoke ${runId.slice(-8)}`
+  : 'Installed smoke profile';
 const smokePrompt = liveProviderMode
   ? 'Reply with exactly ZODE_E2_LIVE_OK.'
   : 'Reply with the installed-channel smoke marker.';
@@ -176,6 +178,39 @@ function acquirePersistentSmokeLock(root) {
       started_at_unix_ms: Date.now(),
     }) + '\n', { mode: 0o600, flag: 'wx' });
   } catch (error) {
+    if (error?.code === 'EEXIST') {
+      let lock;
+      try {
+        lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+      } catch (readError) {
+        fail('persistent channel has a malformed live-smoke lock', {
+          lock_path: lockPath,
+          error: String(readError?.message || readError),
+        });
+      }
+      if (lock?.schema !== 'zode.installed-channel-live-smoke-lock.v1'
+        || !Number.isInteger(lock.pid) || lock.pid <= 0) {
+        fail('persistent channel has a malformed live-smoke lock', { lock_path: lockPath });
+      }
+      try {
+        process.kill(lock.pid, 0);
+      } catch (probeError) {
+        if (probeError?.code !== 'ESRCH') {
+          fail('persistent channel live-smoke lock owner could not be verified', {
+            lock_path: lockPath,
+            pid: lock.pid,
+            error: String(probeError?.message || probeError),
+          });
+        }
+        try { unlinkSync(lockPath); } catch (removeError) {
+          fail('persistent channel stale live-smoke lock could not be reclaimed', {
+            lock_path: lockPath,
+            error: String(removeError?.message || removeError),
+          });
+        }
+        return acquirePersistentSmokeLock(root);
+      }
+    }
     fail('persistent channel is already reserved by another live smoke', {
       lock_path: lockPath,
       error: String(error?.message || error),
@@ -189,16 +224,18 @@ function releasePersistentSmokeLock(lockPath) {
   try { unlinkSync(lockPath); } catch { /* preserve the original test failure */ }
 }
 
-async function persistentProviderCleanup(page, { ownedProviderId, ownedBaseUrl }) {
+async function persistentProviderCleanup(page, { ownedProviderId, ownedBaseUrl, ownershipValidated }) {
   if (!persistentMode) return { updated: [], retained_profiles: [] };
-  return page.evaluate(async ({ approvedBaseUrl, cleanupKeyPrefix, ownedProviderId, ownedBaseUrl }) => {
+  return page.evaluate(async ({ approvedBaseUrl, cleanupKeyPrefix, ownedProviderId, ownedBaseUrl, ownershipMarker, ownershipValidated }) => {
     async function requestJson(method, pathname, body) {
       const response = await fetch(pathname, {
         method,
         headers: {
           accept: 'application/json',
           ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-          ...(method === 'PUT' ? { 'Idempotency-Key': `${cleanupKeyPrefix}-${pathname}` } : {}),
+          ...(['PUT', 'DELETE'].includes(method)
+            ? { 'Idempotency-Key': `${cleanupKeyPrefix}-${method}-${pathname}` }
+            : {}),
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
@@ -224,7 +261,8 @@ async function persistentProviderCleanup(page, { ownedProviderId, ownedBaseUrl }
     const testProviders = providers.filter((provider) => {
       const descriptor = provider.descriptor || {};
       return provider.provider === ownedProviderId
-        && normalizeUrl(descriptor.base_url) === normalizeUrl(ownedBaseUrl);
+        && ((ownershipValidated && normalizeUrl(descriptor.base_url) === normalizeUrl(ownedBaseUrl))
+          || descriptor.options?.zode_test_owner === ownershipMarker);
     });
     if (testProviders.length !== 1) {
       throw new Error(`persistent smoke did not find exactly its owned provider descriptor (${ownedProviderId})`);
@@ -236,12 +274,12 @@ async function persistentProviderCleanup(page, { ownedProviderId, ownedBaseUrl }
         kind: provider.descriptor?.kind,
         base_url: approvedBaseUrl,
         models: provider.descriptor?.models || [],
-        options: provider.descriptor?.options || {},
+        options: {
+          ...(provider.descriptor?.options || {}),
+          ...(ownershipValidated ? { zode_test_owner: ownershipMarker } : {}),
+        },
       });
       updated.push(provider.provider);
-      // The current Server surface intentionally has no profile-delete route;
-      // retain existing profile facts but never leave their test recorder URL
-      // in the provider descriptor or select them for a new smoke session.
       retainedProfiles.push(provider.auth_profile_count || 0);
     }
     return { updated, retained_profiles: retainedProfiles };
@@ -250,6 +288,44 @@ async function persistentProviderCleanup(page, { ownedProviderId, ownedBaseUrl }
     cleanupKeyPrefix: `persistent-provider-cleanup-${runId}`,
     ownedProviderId,
     ownedBaseUrl,
+    ownershipMarker: testOwnershipMarker,
+    ownershipValidated: Boolean(ownershipValidated),
+  });
+}
+
+async function persistentProfileCleanup(page, { ownedProviderId, profileId }) {
+  if (!persistentMode || !liveProviderMode || !profileId) return { status: 'not_applicable' };
+  return page.evaluate(async ({ cleanupKeyPrefix, ownedProviderId, profileId, ownershipMarker }) => {
+    const providersResponse = await fetch('/v1/providers', { headers: { accept: 'application/json' } });
+    if (!providersResponse.ok) throw new Error(`provider list returned ${providersResponse.status}`);
+    const provider = ((await providersResponse.json()).providers || [])
+      .find((item) => item.provider === ownedProviderId);
+    if (provider?.descriptor?.options?.zode_test_owner !== ownershipMarker) {
+      throw new Error(`refusing to delete profile from non-owned provider ${ownedProviderId}`);
+    }
+    const response = await fetch(
+      `/v1/providers/${encodeURIComponent(ownedProviderId)}/auth-profiles/${encodeURIComponent(profileId)}`,
+      {
+        method: 'DELETE',
+        headers: {
+          accept: 'application/json',
+          'Idempotency-Key': `${cleanupKeyPrefix}-DELETE-${ownedProviderId}-${profileId}`,
+        },
+      },
+    );
+    const text = await response.text();
+    let value = null;
+    try { value = text ? JSON.parse(text) : null; } catch { /* status is authoritative */ }
+    if (!response.ok) throw new Error(`DELETE owned profile returned ${response.status}`);
+    if (!['deleted', 'removal_pending'].includes(value?.status)) {
+      throw new Error(`owned profile delete returned unexpected status ${value?.status || 'missing'}`);
+    }
+    return value;
+  }, {
+    cleanupKeyPrefix: `persistent-profile-cleanup-${runId}`,
+    ownedProviderId,
+    profileId,
+    ownershipMarker: testOwnershipMarker,
   });
 }
 
@@ -305,7 +381,7 @@ async function findOrCreateProfile(page, providerCard, { providerId, profileLabe
       return ((await response.json()).items || []).find((item) => item.label === label) || null;
     }, { provider: providerId, label: profileLabel });
     if (profile) {
-      return profile.auth_profile_id || profile.profile_id || null;
+      throw new Error(`unexpected pre-existing profile label ${label}`);
     }
   }
   await providerCard.getByRole('button', { name: 'Add API key profile' }).click();
@@ -525,6 +601,7 @@ async function main() {
   let browserOrigin = null;
   let createdProfileId = null;
   let providerStateCleaned = false;
+  let persistentOwnershipValidated = false;
   const env = {
     ...process.env,
     ZODE_RELEASE_ACCESS_ASSERTION: fixtures.assertion,
@@ -643,6 +720,7 @@ async function main() {
     await page.getByText('All-in-one ready', { exact: true }).waitFor();
     await page.getByRole('link', { name: 'Providers' }).click();
     await preparePersistentProvider(page);
+    persistentOwnershipValidated = true;
     await page.getByRole('button', { name: 'Configure provider' }).click();
     await page.getByLabel('Provider ID').fill(providerId);
     await page.getByLabel('Base URL').fill(fixtures.providerBaseUrl);
@@ -722,6 +800,7 @@ async function main() {
       await persistentProviderCleanup(page, {
         ownedProviderId: providerId,
         ownedBaseUrl: fixtures.providerBaseUrl,
+        ownershipValidated: persistentOwnershipValidated,
       });
       const rebound = await rebindPersistentSession(page, {
         ownedProviderId: providerId,
@@ -750,6 +829,10 @@ async function main() {
           provider_execution_base_url: reboundBaseUrl,
         });
       }
+      await persistentProfileCleanup(page, {
+        ownedProviderId: providerId,
+        profileId: createdProfileId,
+      });
       providerStateCleaned = true;
     }
     const edge = new URL(browserOrigin);
@@ -808,10 +891,17 @@ async function main() {
     process.exitCode = 1;
   } finally {
     if (persistentMode && !providerStateCleaned && page) {
-      await persistentProviderCleanup(page, {
-        ownedProviderId: providerId,
-        ownedBaseUrl: fixtures.providerBaseUrl,
-      }).catch(() => {});
+      try {
+        await persistentProviderCleanup(page, {
+          ownedProviderId: providerId,
+          ownedBaseUrl: fixtures.providerBaseUrl,
+          ownershipValidated: persistentOwnershipValidated,
+        });
+        await persistentProfileCleanup(page, {
+          ownedProviderId: providerId,
+          profileId: createdProfileId,
+        });
+      } catch { /* preserve the original failure and quarantine */ }
     }
     if (browser) await browser.close().catch(() => {});
     if (started) {

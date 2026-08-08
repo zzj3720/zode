@@ -2,7 +2,8 @@ mod support;
 
 use std::{
     env, fs,
-    io::Error,
+    fs::OpenOptions,
+    io::{Error, Write},
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -84,72 +85,97 @@ async fn run_persistent_state_guard(
     repository: &PathBuf,
     channel_root: &PathBuf,
 ) -> TestResult<()> {
-    let local_channel = repository.join("release/local-channel.cjs");
-    let guard = repository.join("tests/release_e2e/installed_channel_persistent_state_e2e.cjs");
-    let mut start = Command::new("node");
-    start
-        .current_dir(repository)
-        .args([
-            local_channel.as_os_str(),
-            "start".as_ref(),
-            "--channel-root".as_ref(),
-            channel_root.as_os_str(),
-        ])
-        .env("ZODE_RELEASE_LOCAL_CHANNEL_ROOT", channel_root);
-    scrub_provider_environment(&mut start);
-    let start_output = timeout(Duration::from_secs(60), start.output())
-        .await
-        .map_err(|_| Error::other("persistent state guard channel start timed out"))??;
-    if !start_output.status.success() {
-        return Err(Error::other(format!(
-            "persistent state guard channel start failed: {}",
-            bounded_output(&start_output.stdout, &start_output.stderr)
-        ))
-        .into());
-    }
+    let lock_path = channel_root.join(".installed-channel-live-smoke.lock");
+    let mut lock = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+        .map_err(|error| {
+            Error::other(format!(
+                "persistent state guard could not reserve channel: {error}"
+            ))
+        })?;
+    write!(
+        lock,
+        "{{\"schema\":\"zode.installed-channel-live-smoke-lock.v1\",\"pid\":{},\"run_id\":\"persistent-state-guard\",\"started_at_unix_ms\":{}}}\n",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_millis())
+            .unwrap_or_default(),
+    )?;
+    drop(lock);
+    let result = async {
+        let local_channel = repository.join("release/local-channel.cjs");
+        let guard = repository.join("tests/release_e2e/installed_channel_persistent_state_e2e.cjs");
+        let mut start = Command::new("node");
+        start
+            .current_dir(repository)
+            .args([
+                local_channel.as_os_str(),
+                "start".as_ref(),
+                "--channel-root".as_ref(),
+                channel_root.as_os_str(),
+            ])
+            .env("ZODE_RELEASE_LOCAL_CHANNEL_ROOT", channel_root);
+        scrub_provider_environment(&mut start);
+        let start_output = timeout(Duration::from_secs(60), start.output())
+            .await
+            .map_err(|_| Error::other("persistent state guard channel start timed out"))??;
+        if !start_output.status.success() {
+            return Err(Error::other(format!(
+                "persistent state guard channel start failed: {}",
+                bounded_output(&start_output.stdout, &start_output.stderr)
+            ))
+            .into());
+        }
 
-    let mut guard_command = Command::new("node");
-    guard_command
-        .current_dir(repository)
-        .arg(guard)
-        .env("ZODE_RELEASE_LOCAL_CHANNEL_ROOT", channel_root)
-        .env("ZODE_RELEASE_TEST_PROVIDER_IDS", PROVIDER);
-    if let Ok(url) = env::var("ZODE_RELEASE_CHANNEL_URL") {
-        guard_command.env("ZODE_RELEASE_CHANNEL_URL", url);
-    }
-    scrub_provider_environment(&mut guard_command);
-    let guard_output = timeout(Duration::from_secs(90), guard_command.output())
-        .await
-        .map_err(|_| Error::other("persistent state guard timed out"))??;
+        let mut guard_command = Command::new("node");
+        guard_command
+            .current_dir(repository)
+            .arg(guard)
+            .env("ZODE_RELEASE_LOCAL_CHANNEL_ROOT", channel_root)
+            .env("ZODE_RELEASE_TEST_PROVIDER_IDS", PROVIDER);
+        if let Ok(url) = env::var("ZODE_RELEASE_CHANNEL_URL") {
+            guard_command.env("ZODE_RELEASE_CHANNEL_URL", url);
+        }
+        scrub_provider_environment(&mut guard_command);
+        let guard_output = timeout(Duration::from_secs(90), guard_command.output())
+            .await
+            .map_err(|_| Error::other("persistent state guard timed out"))??;
 
-    let mut stop = Command::new("node");
-    stop.current_dir(repository)
-        .args([
-            local_channel.as_os_str(),
-            "stop".as_ref(),
-            "--channel-root".as_ref(),
-            channel_root.as_os_str(),
-        ])
-        .env("ZODE_RELEASE_LOCAL_CHANNEL_ROOT", channel_root);
-    scrub_provider_environment(&mut stop);
-    let stop_output = timeout(Duration::from_secs(60), stop.output())
-        .await
-        .map_err(|_| Error::other("persistent state guard channel stop timed out"))??;
-    if !stop_output.status.success() {
-        return Err(Error::other(format!(
-            "persistent state guard channel stop failed: {}",
-            bounded_output(&stop_output.stdout, &stop_output.stderr)
-        ))
-        .into());
+        let mut stop = Command::new("node");
+        stop.current_dir(repository)
+            .args([
+                local_channel.as_os_str(),
+                "stop".as_ref(),
+                "--channel-root".as_ref(),
+                channel_root.as_os_str(),
+            ])
+            .env("ZODE_RELEASE_LOCAL_CHANNEL_ROOT", channel_root);
+        scrub_provider_environment(&mut stop);
+        let stop_output = timeout(Duration::from_secs(60), stop.output())
+            .await
+            .map_err(|_| Error::other("persistent state guard channel stop timed out"))??;
+        if !stop_output.status.success() {
+            return Err(Error::other(format!(
+                "persistent state guard channel stop failed: {}",
+                bounded_output(&stop_output.stdout, &stop_output.stderr)
+            ))
+            .into());
+        }
+        if !guard_output.status.success() {
+            return Err(Error::other(format!(
+                "persistent state guard failed: {}",
+                bounded_output(&guard_output.stdout, &guard_output.stderr)
+            ))
+            .into());
+        }
+        Ok(())
     }
-    if !guard_output.status.success() {
-        return Err(Error::other(format!(
-            "persistent state guard failed: {}",
-            bounded_output(&guard_output.stdout, &guard_output.stderr)
-        ))
-        .into());
-    }
-    Ok(())
+    .await;
+    let _ = fs::remove_file(&lock_path);
+    result
 }
 
 fn decode_hex(value: &str) -> TestResult<Vec<u8>> {
