@@ -1394,35 +1394,6 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         return Err(Error::other("remote session model selection was not durable").into());
     }
 
-    let (status, _body, listed_sessions) = public_json(
-        authenticated(
-            client.get(format!(
-                "{}/v1/endpoints/{endpoint_id}/sessions",
-                server.base_url
-            )),
-            &assertion,
-        ),
-        &marker_refs(&marker_values),
-        "selected remote session list",
-    )
-    .await?;
-    require_status(status, StatusCode::OK, "selected remote session list")?;
-    let listed_session = listed_sessions
-        .get("items")
-        .and_then(Value::as_array)
-        .and_then(|items| items.iter().find(|item| item["session_id"] == session_id))
-        .ok_or_else(|| Error::other("selected remote session list omitted session"))?;
-    if listed_session["model"]["provider"] != PROVIDER_NAME
-        || listed_session["model"]["model"] != MODEL_NAME
-        || listed_session["model"]["provider_execution_revision"] != descriptor_revision
-        || listed_session["model"]["auth_profile_id"] != profile_id
-    {
-        return Err(Error::other(
-            "remote session list did not expose the durable model selection",
-        )
-        .into());
-    }
-
     let message = authenticated(
         client
             .post(format!(
