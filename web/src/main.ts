@@ -15,6 +15,7 @@ import {
   listSessions,
   putProvider,
   probeEndpoint,
+  selectSessionModel,
   setDefaultProfile,
   sendMessage,
   ServerClientError,
@@ -893,6 +894,8 @@ function renderSession(): void {
     ),
   );
   workspace.append(meta);
+  const message = notice();
+  if (message) workspace.append(message);
   const transcript = node("div", "transcript");
   transcript.setAttribute("aria-live", "polite");
   if (session.transcript.length === 0) {
@@ -919,6 +922,7 @@ function renderSession(): void {
   workspace.append(
     transcript,
     runtimeActivity(session),
+    sessionExecutionRecovery(endpoint, session),
     composer(endpoint.endpoint_id, session.session_id),
   );
   renderShell(
@@ -926,6 +930,104 @@ function renderSession(): void {
     session.model?.model ?? "Session",
     `${endpoint.label} · ${session.status}`,
   );
+}
+
+function sessionExecutionRecovery(endpoint: Endpoint, session: Session): HTMLFormElement {
+  const form = node("form", "editor-panel session-execution-recovery");
+  const title = node("div", "panel-title");
+  title.append(
+    node("h2", undefined, "Recover session execution"),
+    node(
+      "p",
+      undefined,
+      "Keep this Endpoint-owned session and history, then choose a current provider, model, and profile for the next activation.",
+    ),
+  );
+  const endpointLabel = node("p", "selection-fact", `Endpoint: ${endpoint.label}`);
+  const provider = selectInput(
+    "Provider",
+    state.providers.map((item) => ({ value: item.provider, label: item.provider })),
+  );
+  const model = selectInput("Model", []);
+  const profile = selectInput("Auth profile", []);
+  const profileHint = node("p", "inline-empty");
+  let submit: HTMLButtonElement | undefined;
+  let preferredModel = session.model?.model;
+  let preferredProfileId = session.model?.auth_profile_id;
+
+  const updateChoices = (): void => {
+    const current = state.providers.find((item) => item.provider === provider.value);
+    const models = current?.descriptor.models ?? [];
+    const selectedModel =
+      preferredModel && models.includes(preferredModel) ? preferredModel : models[0];
+    model.replaceChildren(
+      ...models.map((value) => {
+        const option = node("option", undefined, value);
+        option.value = value;
+        option.selected = value === selectedModel;
+        return option;
+      }),
+    );
+    const availableProfiles = (state.profiles.get(provider.value) ?? []).filter(
+      (item) =>
+        item.status === "ready" &&
+        item.sharing.mode === "selected" &&
+        item.sharing.endpoint_ids.includes(endpoint.endpoint_id),
+    );
+    const selectedProfile =
+      availableProfiles.find((item) => item.profile_id === preferredProfileId) ??
+      availableProfiles.find((item) => item.is_default) ??
+      availableProfiles[0];
+    profile.replaceChildren(
+      ...availableProfiles.map((item) => {
+        const option = node("option", undefined, item.label);
+        option.value = item.profile_id;
+        option.selected = item.profile_id === selectedProfile?.profile_id;
+        return option;
+      }),
+    );
+    profileHint.hidden = availableProfiles.length > 0;
+    profileHint.textContent =
+      availableProfiles.length > 0
+        ? ""
+        : "No current shared profile is available for this Endpoint.";
+    if (submit) {
+      submit.disabled = state.busy || models.length === 0 || availableProfiles.length === 0;
+    }
+  };
+  provider.addEventListener("change", () => {
+    preferredModel = undefined;
+    preferredProfileId = undefined;
+    updateChoices();
+  });
+  endpointLabel.setAttribute("aria-label", "Selected Endpoint");
+  const grid = node("div", "form-grid");
+  grid.append(field("Provider", provider), field("Model", model), field("Auth profile", profile));
+  const actions = node("div", "panel-actions");
+  submit = submitButton("Apply execution", "arrows-clockwise");
+  actions.append(submit);
+  form.append(title, endpointLabel, grid, profileHint, actions);
+  updateChoices();
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void withBusy(async () => {
+      const selectedProvider = state.providers.find((item) => item.provider === provider.value);
+      const selectedProfile = (state.profiles.get(provider.value) ?? []).find(
+        (item) => item.profile_id === profile.value,
+      );
+      if (!selectedProvider || !selectedProfile || !model.value) {
+        throw new ServerClientError("invalid_request", 422);
+      }
+      await selectSessionModel(endpoint.endpoint_id, session.session_id, {
+        provider: selectedProvider,
+        model: model.value,
+        profile: selectedProfile,
+      });
+      state.notice = "Session execution updated. Existing history was preserved.";
+      await loadActiveSession();
+    });
+  });
+  return form;
 }
 
 function runtimeActivity(session: Session): HTMLElement {
