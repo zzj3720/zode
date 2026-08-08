@@ -57,6 +57,11 @@ SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
   same prepared model step under the configured zode budget, committing the
   classified retry decision and delay. Retry attempts do not absorb newer
   deliveries because they are not a new model round.
+- Apply the configured model stream idle timeout to the first provider chunk
+  and every later chunk. A dead or silent provider must become a typed bounded
+  model-attempt failure and terminal activation, never an indefinitely Working
+  session; a progressing long stream is not limited by a total wall-clock
+  deadline.
 - Resolve credentials only from the exact installed profile/authority and a
   ready revision satisfying the session minimum immediately before each aimux
   call. Commit the concrete revision in `ModelAttemptStarted`. Never use a
@@ -127,6 +132,7 @@ Stable executable anchors are:
 - model retry/recovery:
   `e2e_model_pre_stream_rate_limit_is_one_logical_request`,
   `e2e_model_partial_stream_retry_has_no_partial_tool_effect`,
+  `e2e_provider_process_exit_finishes_activation_without_stuck_working`,
   `e2e_tombstoned_replica_never_reaches_provider_before_or_after_restart`,
   `e2e_hard_crash_recovery_exhausts_one_model_attempt_and_keeps_delivery_runnable`,
   and `e2e_hard_crash_after_retry_fact_claims_one_scheduled_attempt`;

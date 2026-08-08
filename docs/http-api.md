@@ -109,7 +109,8 @@ The v0 configuration shape is conceptually:
     "max_rounds_per_activation": 32,
     "model_step_max_attempts": 3,
     "model_retry_base_ms": 500,
-    "model_retry_max_ms": 5000
+    "model_retry_max_ms": 5000,
+    "model_stream_idle_timeout_ms": 30000
   },
   "provider_execution": {
     "adapter_kinds": ["openai_compatible"],

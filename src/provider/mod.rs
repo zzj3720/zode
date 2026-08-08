@@ -12,7 +12,7 @@ use aimux_core::{
     language_model::LanguageModel,
     language_model_message::{LanguageModelPrompt, LanguageModelPromptMessage},
     message::Role,
-    options::CallOptions,
+    options::{CallOptions, TimeoutConfiguration},
     stream_part::StreamPart,
     tool::{FunctionTool, Tool},
     types::FinishReasonUnified,
@@ -556,6 +556,11 @@ impl AimuxProvider {
         let options = CallOptions {
             tools: Some(tools),
             provider_options,
+            timeout: Some(TimeoutConfiguration {
+                total_ms: None,
+                first_chunk_ms: Some(timeout_millis(request.stream_idle_timeout)),
+                chunk_ms: Some(timeout_millis(request.stream_idle_timeout)),
+            }),
             ..CallOptions::new(prompt)
         };
         let mut stream = match selection.provider_execution.kind.as_str() {
@@ -681,6 +686,10 @@ impl AimuxProvider {
             | FinishReasonUnified::Other => Err(ModelError::ProviderFailed),
         }
     }
+}
+
+fn timeout_millis(timeout: std::time::Duration) -> u64 {
+    timeout.as_millis().min(u64::MAX as u128) as u64
 }
 
 impl ModelExecutor for AimuxProvider {

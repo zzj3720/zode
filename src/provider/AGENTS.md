@@ -110,6 +110,10 @@ The system boundary is `docs/architecture.md`, the Endpoint API is
   events. Once aimux yields a stream, it must never conceal a mid-stream retry.
   Runtime may make a new aimux call as a higher-level model-step retry and
   records only that agent-visible decision.
+- Pass the runtime's configured first-chunk/chunk-idle stream timeout through
+  aimux for every model call. A dead provider connection must surface as a
+  typed stream failure; do not add a parallel HTTP watchdog or a total timeout
+  that would cancel a progressing long-running response.
 - Expose incremental `ToolInput*` parts for observation/assembly, but never
   dispatch a tool until the entire stream ends successfully, a valid finish is
   present, and the completed `ToolCall` batch validates.

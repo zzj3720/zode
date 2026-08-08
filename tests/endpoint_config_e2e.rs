@@ -328,6 +328,34 @@ async fn e2e_reserved_wait_for_tool_name_is_rejected_before_ready() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_model_stream_idle_timeout_zero_is_rejected_before_ready() -> TestResult<()> {
+    let database = TempDatabase::new("config-model-stream-idle-timeout")?;
+    let config = write_endpoint_config(&database, Vec::new(), 1)?;
+    let mut value: Value = serde_json::from_slice(&fs::read(&config)?)?;
+    value["runtime"]["model_stream_idle_timeout_ms"] = json!(0);
+    fs::write(&config, serde_json::to_vec_pretty(&value)?)?;
+
+    let result = ConfiguredServer::start(&database, &config).await;
+    match result {
+        Err(error) => {
+            assert_active_nonzero_failure("zero model stream idle timeout", error.as_ref())?;
+            assert!(
+                !database.path().exists(),
+                "invalid model stream timeout created the runtime SQLite path"
+            );
+            Ok(())
+        }
+        Ok(mut server) => {
+            server.stop().await?;
+            Err(
+                IoError::other("Endpoint became ready with a zero model stream idle timeout")
+                    .into(),
+            )
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_authority_id_over_control_bound_is_rejected_before_store_creation() -> TestResult<()> {
     let database = TempDatabase::new("config-authority-bound")?;
     let config = write_endpoint_config(&database, Vec::new(), 1)?;

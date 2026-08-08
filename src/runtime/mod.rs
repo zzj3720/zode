@@ -161,6 +161,7 @@ pub struct ModelRequest {
     pub selection: SessionModelSelection,
     pub transcript: Vec<TranscriptMessage>,
     pub tools: Vec<ToolDefinition>,
+    pub stream_idle_timeout: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +189,7 @@ pub struct RuntimeOptions {
     pub model_step_max_attempts: u32,
     pub model_retry_base: Duration,
     pub model_retry_max: Duration,
+    pub model_stream_idle_timeout: Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,6 +215,7 @@ impl RuntimeOptions {
             model_step_max_attempts: 3,
             model_retry_base: Duration::from_millis(500),
             model_retry_max: Duration::from_secs(5),
+            model_stream_idle_timeout: Duration::from_secs(30),
         }
     }
 
@@ -222,6 +225,9 @@ impl RuntimeOptions {
         self.tool_foreground = self.tool_foreground.min(Duration::from_secs(86_400));
         self.model_retry_max = self.model_retry_max.min(Duration::from_secs(3_600));
         self.model_retry_base = self.model_retry_base.min(self.model_retry_max);
+        self.model_stream_idle_timeout = self
+            .model_stream_idle_timeout
+            .clamp(Duration::from_millis(1), Duration::from_secs(86_400));
         self
     }
 }
@@ -982,6 +988,7 @@ impl Runtime {
             selection: selection.clone(),
             transcript: provider_transcript(state),
             tools: tools.clone(),
+            stream_idle_timeout: self.options.model_stream_idle_timeout,
         };
         let (prep_commits, _prepared_state, request_identity) = prepare_model_round(
             self.store.clone(),
