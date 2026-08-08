@@ -19,6 +19,7 @@ const {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  unlinkSync,
   readFileSync,
   writeFileSync,
 } = require('node:fs');
@@ -42,21 +43,42 @@ const expectedAssistant = liveProviderMode ? 'ZODE_E2_LIVE_OK' : 'ZODE_INSTALLED
 const expectedAssistantPattern = liveProviderMode
   ? /^ZODE_E2_LIVE_OK[.!?]?$/
   : /^ZODE_INSTALLED_BROWSER_OK$/;
-// A persistent user channel may retain earlier smoke profiles.  Each live
-// run owns a fresh provider descriptor/profile so the browser cannot select a
-// stale revision while still exercising the same configured adapter.
-const providerId = liveProviderMode ? `opencode-go-live-${randomUUID().slice(0, 8)}` : 'installed-e2e-provider';
+// The persistent smoke has one explicitly test-owned identity.  It never
+// takes over an existing provider with the same ID unless its descriptor
+// carries our non-secret ownership marker; a user-owned descriptor is a hard
+// failure before any PUT can mutate it.
+const testOwnedProviderId = 'zode-installed-live-test';
+const testOwnershipMarker = 'zode.installed-channel-live-test.v1';
+const providerId = liveProviderMode ? testOwnedProviderId : 'installed-e2e-provider';
 const modelId = liveProviderMode ? 'deepseek-v4-flash' : 'installed-e2e-model';
-const profileLabel = liveProviderMode ? `Installed live smoke profile ${runId.slice(-8)}` : 'Installed smoke profile';
+const profileLabel = liveProviderMode ? 'Installed live smoke profile' : 'Installed smoke profile';
 const smokePrompt = liveProviderMode
   ? 'Reply with exactly ZODE_E2_LIVE_OK.'
   : 'Reply with the installed-channel smoke marker.';
 const quarantine = path.join(repositoryRoot, 'target', 'test-recordings', 'quarantine', runId);
+const approvedProviderBaseUrl = 'https://opencode.ai/zen/go/v1';
+const approvedProviderOrigin = new URL(approvedProviderBaseUrl).origin;
 
 function fail(message, details = {}) {
   const error = new Error(message);
   error.details = details;
   throw error;
+}
+
+async function waitForAssistantMarkers(page, count, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const markerCount = await page.locator('article.message-assistant').evaluateAll(
+      (articles, marker) => articles.filter((article) => {
+        const text = article.querySelector('p')?.textContent?.trim() || '';
+        return text === marker || text === `${marker}.` || text === `${marker}!` || text === `${marker}?`;
+      }).length,
+      expectedAssistant,
+    );
+    if (markerCount >= count) return;
+    await page.waitForTimeout(250);
+  }
+  fail(`browser did not render ${count} durable assistant markers after restart`);
 }
 
 function jsonLine(stdout) {
@@ -141,6 +163,226 @@ function preserveFailure(error, context) {
     error: String(error?.message || error),
     details: error?.details || {},
   }, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+}
+
+function acquirePersistentSmokeLock(root) {
+  if (!persistentMode) return null;
+  const lockPath = path.join(root, '.installed-channel-live-smoke.lock');
+  try {
+    writeFileSync(lockPath, JSON.stringify({
+      schema: 'zode.installed-channel-live-smoke-lock.v1',
+      pid: process.pid,
+      run_id: runId,
+      started_at_unix_ms: Date.now(),
+    }) + '\n', { mode: 0o600, flag: 'wx' });
+  } catch (error) {
+    fail('persistent channel is already reserved by another live smoke', {
+      lock_path: lockPath,
+      error: String(error?.message || error),
+    });
+  }
+  return lockPath;
+}
+
+function releasePersistentSmokeLock(lockPath) {
+  if (!lockPath) return;
+  try { unlinkSync(lockPath); } catch { /* preserve the original test failure */ }
+}
+
+async function persistentProviderCleanup(page, { ownedProviderId, ownedBaseUrl }) {
+  if (!persistentMode) return { updated: [], retained_profiles: [] };
+  return page.evaluate(async ({ approvedBaseUrl, cleanupKeyPrefix, ownedProviderId, ownedBaseUrl }) => {
+    async function requestJson(method, pathname, body) {
+      const response = await fetch(pathname, {
+        method,
+        headers: {
+          accept: 'application/json',
+          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+          ...(method === 'PUT' ? { 'Idempotency-Key': `${cleanupKeyPrefix}-${pathname}` } : {}),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      });
+      const text = await response.text();
+      let value = null;
+      try { value = text ? JSON.parse(text) : null; } catch { /* status is enough for DELETE */ }
+      if (!response.ok) {
+        throw new Error(`${method} ${pathname} returned ${response.status}`);
+      }
+      return value;
+    }
+
+    const providers = (await requestJson('GET', '/v1/providers')).providers || [];
+    const normalizeUrl = (value) => {
+      try {
+        const parsed = new URL(String(value || ''));
+        parsed.hash = '';
+        return parsed.toString().replace(/\/$/, '');
+      } catch {
+        return '';
+      }
+    };
+    const testProviders = providers.filter((provider) => {
+      const descriptor = provider.descriptor || {};
+      return provider.provider === ownedProviderId
+        && normalizeUrl(descriptor.base_url) === normalizeUrl(ownedBaseUrl);
+    });
+    if (testProviders.length !== 1) {
+      throw new Error(`persistent smoke did not find exactly its owned provider descriptor (${ownedProviderId})`);
+    }
+    const updated = [];
+    const retainedProfiles = [];
+    for (const provider of testProviders) {
+      await requestJson('PUT', `/v1/providers/${encodeURIComponent(provider.provider)}`, {
+        kind: provider.descriptor?.kind,
+        base_url: approvedBaseUrl,
+        models: provider.descriptor?.models || [],
+        options: provider.descriptor?.options || {},
+      });
+      updated.push(provider.provider);
+      // The current Server surface intentionally has no profile-delete route;
+      // retain existing profile facts but never leave their test recorder URL
+      // in the provider descriptor or select them for a new smoke session.
+      retainedProfiles.push(provider.auth_profile_count || 0);
+    }
+    return { updated, retained_profiles: retainedProfiles };
+  }, {
+    approvedBaseUrl: approvedProviderBaseUrl,
+    cleanupKeyPrefix: `persistent-provider-cleanup-${runId}`,
+    ownedProviderId,
+    ownedBaseUrl,
+  });
+}
+
+async function preparePersistentProvider(page) {
+  if (!persistentMode || !liveProviderMode) return;
+  const existing = await page.evaluate(async (provider) => {
+    const response = await fetch('/v1/providers', { headers: { accept: 'application/json' } });
+    if (!response.ok) throw new Error(`provider list returned ${response.status}`);
+    return ((await response.json()).providers || []).find((item) => item.provider === provider) || null;
+  }, providerId);
+  const marker = existing?.descriptor?.options?.zode_test_owner;
+  if (existing && marker !== testOwnershipMarker) {
+    fail('persistent smoke found a user-owned provider at its reserved test identity', {
+      provider: providerId,
+      descriptor_revision: existing.descriptor?.revision,
+    });
+  }
+}
+
+async function retainProviderOwnershipMarker(page) {
+  if (!persistentMode || !liveProviderMode) return;
+  await page.evaluate(async ({ provider, marker }) => {
+    const response = await fetch('/v1/providers', { headers: { accept: 'application/json' } });
+    if (!response.ok) throw new Error(`provider list returned ${response.status}`);
+    const record = ((await response.json()).providers || []).find((item) => item.provider === provider);
+    if (!record?.descriptor) throw new Error(`provider ${provider} was not saved`);
+    const descriptor = record.descriptor;
+    const put = await fetch(`/v1/providers/${encodeURIComponent(provider)}`, {
+      method: 'PUT',
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json',
+        'Idempotency-Key': `persistent-provider-marker-${runId}`,
+      },
+      body: JSON.stringify({
+        kind: descriptor.kind,
+        base_url: descriptor.base_url,
+        models: descriptor.models || [],
+        options: { ...(descriptor.options || {}), zode_test_owner: marker },
+      }),
+    });
+    if (!put.ok) throw new Error(`provider ownership marker returned ${put.status}`);
+  }, { provider: providerId, marker: testOwnershipMarker });
+}
+
+async function findOrCreateProfile(page, providerCard, { providerId, profileLabel, providerKey }) {
+  if (persistentMode && liveProviderMode) {
+    const profile = await page.evaluate(async ({ provider, label }) => {
+      const response = await fetch(`/v1/providers/${encodeURIComponent(provider)}/auth-profiles`, {
+        headers: { accept: 'application/json' },
+      });
+      if (!response.ok) throw new Error(`profile list returned ${response.status}`);
+      return ((await response.json()).items || []).find((item) => item.label === label) || null;
+    }, { provider: providerId, label: profileLabel });
+    if (profile) {
+      return profile.auth_profile_id || profile.profile_id || null;
+    }
+  }
+  await providerCard.getByRole('button', { name: 'Add API key profile' }).click();
+  await providerCard.getByLabel('Profile label').fill(profileLabel);
+  await providerCard.getByLabel('API key').fill(providerKey);
+  const makeDefault = providerCard.getByLabel('Make this the default profile');
+  if (persistentMode && await makeDefault.isChecked()) await makeDefault.uncheck();
+  await providerCard.getByLabel('Share with this machine').check();
+  const [profileResponse] = await Promise.all([
+    page.waitForResponse((response) =>
+      response.request().method() === 'POST'
+        && new URL(response.url()).pathname === `/v1/providers/${encodeURIComponent(providerId)}/auth-profiles`),
+    providerCard.getByRole('button', { name: 'Create profile' }).click(),
+  ]);
+  if (profileResponse.status() !== 201) fail(`profile create returned ${profileResponse.status()}`);
+  const profilePayload = await profileResponse.json();
+  const profileId = profilePayload.auth_profile_id || profilePayload.profile_id || null;
+  if (!profileId) fail('profile create omitted auth profile id');
+  await page.getByText('Profile installed on the selected Endpoint.', { exact: true }).waitFor();
+  return profileId;
+}
+
+async function rebindPersistentSession(page, { ownedProviderId, modelId, profileId, requests }) {
+  const sessionRequest = requests.slice().reverse().find((request) => {
+    const pathname = new URL(request.url).pathname;
+    return request.method === 'GET'
+      && /^\/v1\/endpoints\/[^/]+\/sessions\/[^/]+$/.test(pathname);
+  });
+  if (!sessionRequest) fail('persistent smoke could not identify its durable session API path');
+  const match = new URL(sessionRequest.url).pathname.match(
+    /^\/v1\/endpoints\/([^/]+)\/sessions\/([^/]+)$/,
+  );
+  if (!match) fail('persistent smoke session API path was malformed');
+  const [endpointId, sessionId] = match.slice(1);
+  return page.evaluate(async ({ endpointId, sessionId, providerId, modelId, profileId }) => {
+    const providerResponse = await fetch('/v1/providers', { headers: { accept: 'application/json' } });
+    if (!providerResponse.ok) throw new Error(`provider list returned ${providerResponse.status}`);
+    const provider = ((await providerResponse.json()).providers || [])
+      .find((item) => item.provider === providerId);
+    const descriptor = provider?.descriptor;
+    if (!descriptor) throw new Error(`owned provider descriptor ${providerId} disappeared`);
+    const profilesResponse = await fetch(
+      `/v1/providers/${encodeURIComponent(providerId)}/auth-profiles`,
+      { headers: { accept: 'application/json' } },
+    );
+    if (!profilesResponse.ok) throw new Error(`profile list returned ${profilesResponse.status}`);
+    const profile = ((await profilesResponse.json()).items || [])
+      .find((item) => (item.auth_profile_id || item.profile_id) === profileId);
+    if (!profile) throw new Error(`owned profile ${profileId} disappeared`);
+    const response = await fetch(
+      `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}/model`,
+      {
+        method: 'PUT',
+        headers: {
+          accept: 'application/json',
+          'content-type': 'application/json',
+          'Idempotency-Key': `persistent-session-rebind-${providerId}-${sessionId}`,
+        },
+        body: JSON.stringify({
+          provider: providerId,
+          provider_execution: {
+            schema: 'zode.provider-execution.v1',
+            revision: descriptor.revision,
+            kind: descriptor.kind,
+            base_url: descriptor.base_url,
+            options: descriptor.options || {},
+          },
+          model: modelId,
+          auth_profile_id: profile.auth_profile_id || profile.profile_id,
+          minimum_auth_revision: profile.revision,
+        }),
+      },
+    );
+    const text = await response.text();
+    if (!response.ok) throw new Error(`persistent session model rebind returned ${response.status}: ${text}`);
+    return { endpoint_id: endpointId, session_id: sessionId, response: text };
+  }, { endpointId, sessionId, providerId: ownedProviderId, modelId, profileId });
 }
 
 async function startFixtures({ persistent = false } = {}) {
@@ -266,7 +508,14 @@ async function main() {
     return;
   }
   const root = persistentMode ? path.resolve(persistentRoot) : mkdtempSync(path.join(os.tmpdir(), 'zode-installed-browser-smoke-'));
-  const fixtures = await startFixtures({ persistent: persistentMode });
+  const persistentLockPath = acquirePersistentSmokeLock(root);
+  let fixtures;
+  try {
+    fixtures = await startFixtures({ persistent: persistentMode });
+  } catch (error) {
+    releasePersistentSmokeLock(persistentLockPath);
+    throw error;
+  }
   let started = false;
   let browser;
   let page;
@@ -274,6 +523,8 @@ async function main() {
   let browserResponses = [];
   let failure;
   let browserOrigin = null;
+  let createdProfileId = null;
+  let providerStateCleaned = false;
   const env = {
     ...process.env,
     ZODE_RELEASE_ACCESS_ASSERTION: fixtures.assertion,
@@ -301,17 +552,32 @@ async function main() {
     'XAI_API_KEY',
     'GROQ_API_KEY',
     'COHERE_API_KEY',
+    'ZODE_TEST_BLOCK_SECOND_ASSISTANT_EVENTS',
   ]) {
     delete channelEnv[key];
   }
-  if (persistentMode) channelEnv.ZODE_RELEASE_PROVIDER_ORIGINS = fixtures.providerOrigin;
+  if (persistentMode) {
+    channelEnv.ZODE_RELEASE_PROVIDER_ORIGINS = [fixtures.providerOrigin, approvedProviderOrigin].join(',');
+  }
   let streamMarkerVisible = false;
   let durableFinalVisible = false;
   try {
+    const currentManifest = persistentMode && existsSync(path.join(root, 'current', 'manifest.json'))
+      ? JSON.parse(readFileSync(path.join(root, 'current', 'manifest.json'), 'utf8'))
+      : null;
+    const artifactManifest = JSON.parse(readFileSync(path.join(path.resolve(artifact), 'manifest.json'), 'utf8'));
+    const persistentHasCurrent = Boolean(currentManifest?.revision);
+    const persistentNeedsUpdate = persistentMode
+      && persistentHasCurrent
+      && currentManifest.revision !== artifactManifest?.revision;
     const installed = await command(
       process.execPath,
       persistentMode
-        ? [localChannelEntry, 'install', '--artifact', path.resolve(artifact), '--channel-root', root]
+        ? !persistentHasCurrent
+          ? [localChannelEntry, 'install', '--artifact', path.resolve(artifact), '--channel-root', root]
+          : persistentNeedsUpdate
+            ? [localChannelEntry, 'update', '--artifact', path.resolve(artifact), '--channel-root', root]
+            : [localChannelEntry, 'start', '--channel-root', root]
         : [channelEntry, 'install', '--artifact', path.resolve(artifact), '--release-root', root],
       channelEnv,
     );
@@ -337,6 +603,25 @@ async function main() {
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext();
     page = await context.newPage();
+    let blockSecondAssistantEvents = false;
+    let blockedSessionPath = null;
+    let staleSession = null;
+    if (process.env.ZODE_TEST_BLOCK_SECOND_ASSISTANT_EVENTS === '1') {
+      await page.route('**/v1/endpoints/**', async (route) => {
+        const pathname = new URL(route.request().url()).pathname;
+        if (blockSecondAssistantEvents && pathname === blockedSessionPath && staleSession) {
+          await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify(staleSession),
+          });
+        } else if (blockSecondAssistantEvents && pathname.endsWith('/events')) {
+          await route.abort('failed');
+        } else {
+          await route.continue();
+        }
+      });
+    }
     browserRequests = [];
     browserResponses = [];
     page.on('request', (request) => {
@@ -357,21 +642,22 @@ async function main() {
     await page.getByRole('link', { name: 'Sessions', exact: true }).waitFor();
     await page.getByText('All-in-one ready', { exact: true }).waitFor();
     await page.getByRole('link', { name: 'Providers' }).click();
+    await preparePersistentProvider(page);
     await page.getByRole('button', { name: 'Configure provider' }).click();
     await page.getByLabel('Provider ID').fill(providerId);
     await page.getByLabel('Base URL').fill(fixtures.providerBaseUrl);
     await page.getByLabel('Models').fill(modelId);
     await page.getByRole('button', { name: 'Save provider' }).click();
     await page.getByText(`${providerId} is ready for an auth profile.`, { exact: true }).waitFor();
+    await retainProviderOwnershipMarker(page);
     const providerCard = page.locator('article.resource-card').filter({
       has: page.getByRole('heading', { name: providerId, exact: true }),
     });
-    await providerCard.getByRole('button', { name: 'Add API key profile' }).click();
-    await providerCard.getByLabel('Profile label').fill(profileLabel);
-    await providerCard.getByLabel('API key').fill(fixtures.providerKey);
-    await providerCard.getByLabel('Share with this machine').check();
-    await providerCard.getByRole('button', { name: 'Create profile' }).click();
-    await page.getByText('Profile installed on the selected Endpoint.', { exact: true }).waitFor();
+    createdProfileId = await findOrCreateProfile(page, providerCard, {
+      providerId,
+      profileLabel,
+      providerKey: fixtures.providerKey,
+    });
     await page.getByRole('link', { name: 'Sessions' }).click();
     await page.getByRole('button', { name: 'New session' }).click();
     await page.getByLabel('Provider').selectOption(providerId);
@@ -386,6 +672,86 @@ async function main() {
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.getByText(expectedAssistantPattern).waitFor({ timeout: 20_000 });
     durableFinalVisible = true;
+    if (persistentMode) {
+      const sessionUrl = page.url();
+      const stoppedForRestart = await command(
+        process.execPath,
+        [localChannelEntry, 'stop', '--channel-root', root],
+        channelEnv,
+      );
+      if (stoppedForRestart.status !== 0 || stoppedForRestart.payload?.ok !== true) {
+        fail('persistent channel stop before durable reopen failed', stoppedForRestart);
+      }
+      const restarted = await command(
+        process.execPath,
+        [localChannelEntry, 'start', '--channel-root', root],
+        channelEnv,
+      );
+      if (restarted.status !== 0 || restarted.payload?.ok !== true
+        || new URL(restarted.payload.url).origin !== new URL(browserOrigin).origin) {
+        fail('persistent channel restart did not preserve the installed browser origin', restarted);
+      }
+      await page.goto(sessionUrl, { waitUntil: 'domcontentloaded' });
+      await page.getByText(expectedAssistantPattern).waitFor({ timeout: 20_000 });
+      if (liveProviderMode) {
+        if (process.env.ZODE_TEST_BLOCK_SECOND_ASSISTANT_EVENTS === '1') {
+          const sessionApiRequest = browserRequests.slice().reverse().find((request) => {
+            const pathname = new URL(request.url).pathname;
+            return request.method === 'GET'
+              && /^\/v1\/endpoints\/[^/]+\/sessions\/[^/]+$/.test(pathname);
+          });
+          if (!sessionApiRequest) fail('test fault seam could not identify the real session API request');
+          blockedSessionPath = new URL(sessionApiRequest.url).pathname;
+          staleSession = await page.evaluate(async (pathname) => {
+            const response = await fetch(pathname, { headers: { accept: 'application/json' } });
+            if (!response.ok) throw new Error(`stale session snapshot returned ${response.status}`);
+            return response.json();
+          }, blockedSessionPath);
+          blockSecondAssistantEvents = true;
+          await page.reload({ waitUntil: 'domcontentloaded' });
+          await page.getByText(expectedAssistantPattern).waitFor({ timeout: 20_000 });
+        }
+        await page.getByPlaceholder('Message Zode').fill(smokePrompt);
+        await page.getByRole('button', { name: 'Send' }).click();
+        await waitForAssistantMarkers(page, 2);
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await waitForAssistantMarkers(page, 2);
+      }
+    }
+    if (persistentMode) {
+      await persistentProviderCleanup(page, {
+        ownedProviderId: providerId,
+        ownedBaseUrl: fixtures.providerBaseUrl,
+      });
+      const rebound = await rebindPersistentSession(page, {
+        ownedProviderId: providerId,
+        modelId,
+        profileId: createdProfileId,
+        requests: browserRequests,
+      });
+      const reboundSession = await page.evaluate(async ({ endpointId, sessionId }) => {
+        const response = await fetch(
+          `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}`,
+          { headers: { accept: 'application/json' } },
+        );
+        if (!response.ok) throw new Error(`rebound session read returned ${response.status}`);
+        return response.json();
+      }, rebound);
+      const reboundBaseUrl = reboundSession?.model?.provider_execution_base_url;
+      if (!reboundBaseUrl) {
+        fail('persistent cleanup left a durable session without a provider execution URL', {
+          session_id: rebound.sessionId,
+        });
+      }
+      const reboundHost = new URL(reboundBaseUrl).hostname;
+      if (['127.0.0.1', 'localhost', '::1'].includes(reboundHost)) {
+        fail('persistent cleanup left a durable session pointed at the recorder origin', {
+          session_id: rebound.sessionId,
+          provider_execution_base_url: reboundBaseUrl,
+        });
+      }
+      providerStateCleaned = true;
+    }
     const edge = new URL(browserOrigin);
     const managementRequests = browserRequests.filter((item) => new URL(item.url).origin === edge.origin);
     if (!managementRequests.some((item) => item.method === 'POST' && /\/v1\/endpoints\/[^/]+\/sessions$/.test(new URL(item.url).pathname))) {
@@ -419,6 +785,7 @@ async function main() {
       root,
       browser_origin: browserOrigin,
       live_provider: fixtures.live,
+      test_provider_id: persistentMode && liveProviderMode ? providerId : null,
       stream_marker_visible: streamMarkerVisible,
       durable_final_visible_after_reload: durableFinalVisible,
       provider_requests: fixtures.live ? null : fixtures.requests.length,
@@ -440,6 +807,12 @@ async function main() {
     process.stderr.write(`${JSON.stringify({ status: 'RED', error: String(error.message || error), details: error.details || {} })}\n`);
     process.exitCode = 1;
   } finally {
+    if (persistentMode && !providerStateCleaned && page) {
+      await persistentProviderCleanup(page, {
+        ownedProviderId: providerId,
+        ownedBaseUrl: fixtures.providerBaseUrl,
+      }).catch(() => {});
+    }
     if (browser) await browser.close().catch(() => {});
     if (started) {
       await command(
@@ -451,6 +824,7 @@ async function main() {
       ).catch(() => {});
     }
     await fixtures.close();
+    releasePersistentSmokeLock(persistentLockPath);
     if (!failure) process.exitCode = 0;
   }
 }

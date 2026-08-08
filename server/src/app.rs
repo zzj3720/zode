@@ -21,7 +21,9 @@ use crate::{
         CreateAuthProfileRequest, ProviderAuthority, ProviderError, PutProviderDescriptorRequest,
         SetDefaultAuthProfileRequest,
     },
-    session_proxy::{CreateSessionRequest, ProxyJson, SessionProxy, SessionProxyError},
+    session_proxy::{
+        CreateSessionRequest, ModelSelectionRequest, ProxyJson, SessionProxy, SessionProxyError,
+    },
     ui_assets::UiAssets,
 };
 
@@ -128,6 +130,10 @@ pub(crate) fn router(
         .route(
             "/v1/endpoints/{endpoint_id}/sessions/{session_id}/messages",
             post(append_message),
+        )
+        .route(
+            "/v1/endpoints/{endpoint_id}/sessions/{session_id}/model",
+            put(select_model),
         )
         .route(
             "/v1/endpoints/{endpoint_id}/sessions/{session_id}/events",
@@ -496,6 +502,32 @@ async fn append_message(
     state
         .sessions
         .append_message(&actor, &endpoint_id, &session_id, &idempotency_key, body)
+        .await
+        .map(proxy_json_response)
+        .map_err(ApiError::from_session_proxy)
+}
+
+async fn select_model(
+    State(state): State<AppState>,
+    Path((endpoint_id, session_id)): Path<(String, String)>,
+    Extension(actor): Extension<ActorContext>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let idempotency_key = one_header(request.headers(), "idempotency-key")?;
+    let body = to_bytes(request.into_body(), MAX_SESSION_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::payload_too_large())?;
+    let request: ModelSelectionRequest =
+        serde_json::from_slice(&body).map_err(|_| ApiError::invalid())?;
+    state
+        .sessions
+        .select_model(
+            &actor,
+            &endpoint_id,
+            &session_id,
+            &idempotency_key,
+            request,
+        )
         .await
         .map(proxy_json_response)
         .map_err(ApiError::from_session_proxy)

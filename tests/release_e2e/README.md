@@ -93,13 +93,27 @@ vp exec cargo test --test installed_channel_live_browser_e2e \
   e2e_installed_channel_live_browser_provider_roundtrip -- --exact --nocapture
 ```
 
-该正向 E2E 在安装版浏览器中配置 `opencode-go`/`deepseek-v4-flash` provider
+该正向 E2E 在安装版浏览器中配置 run-owned `zode-installed-live-test` /
+`deepseek-v4-flash` provider
 及共享 API-key profile，创建 Endpoint session，发送精确 marker 提示词，断言
 stream marker（允许模型在 marker 后追加一个终止标点）、Server/Endpoint 管理请求、provider 200/SSE `[DONE]`，再 reload
-确认最终回复仍由 durable session 恢复。真实 provider 请求数量必须为 1；失败时
-先保留首遇 browser/quarantine 证据并完成 recorder flush。另有
+确认最终回复仍由 durable session 恢复。固定持久根模式还会真实 stop→start，重开同一
+session URL，再发送一次普通消息并 reload；两次真实 provider 请求都必须经过
+recorder。录制完成前，测试入口只收敛本次 run-owned descriptor，并通过已有的
+session model-selection route 迁移该 session 的 concrete execution，避免退出的
+recorder 地址残留在用户通道；固定根上若同一身份不是带 ownership marker 的测试
+descriptor，测试会在任何写入前失败。当前 Server 没有 profile-delete 公共路由，既有
+profile 事实不会被测试入口伪造删除。失败时先保留首遇 browser/quarantine 证据并完成
+recorder flush。另有
 `installed_channel_live_provider_contract_e2e.cjs` 作为本地 loopback provider
 边界的红绿 contract anchor，不替代真实 provider gate。
+
+真实 provider smoke 结束后，Rust live E2E 会在同一根重新启动安装版通道并调用
+`installed_channel_persistent_state_e2e.cjs`；它用安装版 Chromium 和公开
+Providers/Sessions API 检查 run-owned descriptor、session concrete execution
+以及 durable assistant final。任何 test-owned loopback descriptor、session 仍指向
+recorder，或没有 durable assistant final 的 `Working` session 都会形成真实持久
+状态红，并把首遇安全写入 ignored quarantine；只看到 UI/health 200 不算通过。
 
 持久入口的失败清理与边界也由真实进程 E2E 固定：
 `local_channel_open_failure_e2e.cjs` 验证 fresh `open` 健康失败不会留下
