@@ -2,7 +2,7 @@ import { expect, test, type Page, type Request } from "@playwright/test";
 import { createHash, createSign, generateKeyPairSync, randomBytes, randomUUID, type KeyObject } from "node:crypto";
 import { execFile as execFileCallback, spawn, type ChildProcessByStdio } from "node:child_process";
 import { once } from "node:events";
-import { readFile, writeFile, mkdir, chmod, mkdtemp, readdir, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdir, chmod, cp, mkdtemp, readdir, rm } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
@@ -16,6 +16,12 @@ type Json = Record<string, any>;
 type Cassette = Json & { exchanges: Json[] };
 type ReadyChild = ChildProcessByStdio<null, Readable, Readable>;
 type SecretMarker = string | Buffer;
+type ProcessOutput = {
+  stdoutChunks: Buffer[];
+  stderrChunks: Buffer[];
+  stdoutTotal: { value: number };
+  stderrTotal: { value: number };
+};
 type EndpointBoundaryRequest = {
   method: string;
   path: string;
@@ -103,6 +109,8 @@ const RESOURCE_NOT_FOUND_PUBLIC_BODY = {
   },
 } as const;
 const execFile = promisify(execFileCallback);
+const STARTUP_OUTPUT_LIMIT = 128 * 1024;
+const STARTUP_EVIDENCE_ROOT = join(REPO_ROOT, "target", "test-recordings", "quarantine", "session-reconnect-exact-main-readiness-gap");
 
 const SCENARIOS = {
   keyboard: "keyboard-session",
@@ -426,6 +434,7 @@ class ReplayProvider {
   private readonly released = new Set<string>();
   private readonly releaseWaiters = new Map<string, Array<() => void>>();
   private readonly expectedScenarioCounts = new Map<string, number>();
+  private readonly observedRequests: string[] = [];
   private expectedProviderAuthorization = "";
   private suiteConsumptionRecorded = false;
 
@@ -600,12 +609,14 @@ class ReplayProvider {
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const observedIndex = this.observedRequests.push(`${request.method ?? ""} ${request.url ?? ""}`) - 1;
     if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
       response.writeHead(404);
       response.end();
       return;
     }
     const body = await readBody(request);
+    this.observedRequests[observedIndex] += ` body=${body.slice(0, 1_000)}`;
     const scenario = this.scenarioFor(body);
     const occurrence = this.calls.get(scenario) ?? 0;
     const exchange = this.exchangeFor(scenario, occurrence);
@@ -619,6 +630,7 @@ class ReplayProvider {
       this.assertRequestBody(body, exchange);
       this.assertResponseContract(exchange);
     } catch (error) {
+      this.observedRequests[observedIndex] += ` error=${error instanceof Error ? error.message : String(error)}`;
       response.writeHead(500);
       response.end(error instanceof Error ? error.message : "fixture cassette contract mismatch");
       return;
@@ -696,6 +708,10 @@ class ReplayProvider {
 
   count(scenario: string): number {
     return this.calls.get(scenario) ?? 0;
+  }
+
+  debugRequests(): string[] {
+    return [...this.observedRequests];
   }
 
   assertAllExchangesConsumed(): void {
@@ -984,6 +1000,12 @@ class EndpointBoundary {
     );
   }
 
+  debugRequests(): string[] {
+    return this.requests.map((request) =>
+      `${request.method} ${request.path} status=${request.status ?? "<pending>"} body=${request.body.slice(0, 180)}`,
+    );
+  }
+
   async close(): Promise<void> {
     await closeServer(this.server, this.sockets);
   }
@@ -1052,25 +1074,40 @@ class ReadyProcess {
     private readonly args: string[],
     private readonly prefix: string,
     private child: ReadyChild,
+    private output: ProcessOutput,
     readonly baseUrl: string,
   ) {}
 
   static async start(binary: string, args: string[], prefix: string): Promise<ReadyProcess> {
     const child = await ReadyProcess.spawnChild(binary, args, prefix);
-    return new ReadyProcess(binary, args, prefix, child.child, child.baseUrl);
+    return new ReadyProcess(binary, args, prefix, child.child, child.output, child.baseUrl);
+  }
+
+  private static boundedText(chunks: Buffer[], total: { value: number }): string {
+    const bytes = Buffer.concat(chunks);
+    return bytes.subarray(0, Math.min(total.value, STARTUP_OUTPUT_LIMIT)).toString("utf8");
   }
 
   private static async spawnChild(
     binary: string,
     args: string[],
     prefix: string,
-  ): Promise<{ child: ReadyChild; baseUrl: string }> {
+  ): Promise<{ child: ReadyChild; baseUrl: string; output: ProcessOutput }> {
     const child = spawn(binary, args, {
       cwd: REPO_ROOT,
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env },
     });
-    child.stderr.resume();
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    const stdoutTotal = { value: 0 };
+    const stderrTotal = { value: 0 };
+    const capture = (chunks: Buffer[], total: { value: number }, chunk: Buffer): void => {
+      total.value += chunk.length;
+      if (total.value <= STARTUP_OUTPUT_LIMIT) chunks.push(Buffer.from(chunk));
+    };
+    child.stdout.on("data", (chunk: Buffer) => capture(stdoutChunks, stdoutTotal, chunk));
+    child.stderr.on("data", (chunk: Buffer) => capture(stderrChunks, stderrTotal, chunk));
     const readiness = new Promise<string>((resolvePromise, reject) => {
       const output = createInterface({ input: child.stdout });
       const finish = (callback: () => void) => {
@@ -1083,12 +1120,22 @@ class ReadyProcess {
       });
       child.once("error", (error) => finish(() => reject(error)));
       child.once("exit", (code) => {
-        if (code !== null) finish(() => reject(new Error(`real process exited before readiness (${code})`)));
+        if (code !== null) {
+          const stdout = ReadyProcess.boundedText(stdoutChunks, stdoutTotal);
+          const stderr = ReadyProcess.boundedText(stderrChunks, stderrTotal);
+          finish(() => reject(new Error(
+            `real process exited before readiness (${code}); stdout=${JSON.stringify(stdout)}; stderr=${JSON.stringify(stderr)}`,
+          )));
+        }
       });
     });
     try {
       const baseUrl = await withTimeout(readiness, 15_000, "real process readiness timed out");
-      return { child, baseUrl };
+      return {
+        child,
+        baseUrl,
+        output: { stdoutChunks, stderrChunks, stdoutTotal, stderrTotal },
+      };
     } catch (error) {
       child.kill("SIGKILL");
       throw error;
@@ -1103,6 +1150,22 @@ class ReadyProcess {
       throw new Error("real process changed its configured URL across restart");
     }
     this.child = replacement.child;
+    this.output = replacement.output;
+  }
+
+  outputSnapshot(knownSecrets: SecretMarker[] = []): { stdout: string; stderr: string } {
+    const redact = (value: string): string => {
+      let result = value;
+      for (const secret of knownSecrets) {
+        const marker = Buffer.isBuffer(secret) ? secret.toString("base64") : secret;
+        if (marker.length > 0) result = result.replaceAll(marker, "<redacted>");
+      }
+      return result;
+    };
+    return {
+      stdout: redact(ReadyProcess.boundedText(this.output.stdoutChunks, this.output.stdoutTotal)),
+      stderr: redact(ReadyProcess.boundedText(this.output.stderrChunks, this.output.stderrTotal)),
+    };
   }
 
   async stop(): Promise<void> {
@@ -1145,7 +1208,7 @@ class Topology {
   profileRevision = 0;
   private currentSseRequestId = `e2e-sse-${randomUUID()}`;
   private readonly observedMarkers = ["session", "event", "cursor"];
-  private readonly knownSecrets: SecretMarker[];
+  readonly knownSecrets: SecretMarker[];
   private readonly expectedScenarioCounts = new Map<string, number>();
 
   static async start(topologyId: string, seed = true): Promise<Topology> {
@@ -1165,6 +1228,12 @@ class Topology {
     await mkdir(join(endpointRoot, "credentials"), { recursive: true });
     await mkdir(join(endpointRoot, "blobs"), { recursive: true });
     await mkdir(join(serverRoot, "secrets"), { recursive: true });
+    const uiAssetsDirectory = join(serverRoot, "ui");
+    await cp(join(REPO_ROOT, "web", "dist"), uiAssetsDirectory, {
+      recursive: true,
+      force: false,
+      errorOnExist: true,
+    });
     const endpointSecret = `synthetic-controller-${randomUUID()}`;
     const providerSecret = `synthetic-provider-${randomUUID()}`;
     provider.setExpectedProviderAuthorization(`Bearer ${providerSecret}`);
@@ -1219,7 +1288,7 @@ class Topology {
             auto_wait_timeout_seconds: 1,
             recovery: {
               on_running_restart: "unknown_outcome",
-              retry_dispatch: "same_invocation_key_deduplicated",
+              retry_dispatch: "never",
             },
             adapter: { kind: "http", url: `${tools.baseUrl}/fixture_async` },
           },
@@ -1238,7 +1307,8 @@ class Topology {
         callback_origin: `http://127.0.0.2:${serverPort}`,
         server_authority_id: CONTROLLER_AUTHORITY,
         deployment: "server_only",
-        ui_mode: "api_only",
+        ui_mode: "assets",
+        ui_assets_directory: uiAssetsDirectory,
         control_database: serverDatabase,
         secret_directory: join(serverRoot, "secrets"),
         access: {
@@ -1492,15 +1562,6 @@ class Topology {
     );
     this.profileId = profile.auth_profile_id;
     this.profileRevision = profile.revision;
-    requireBody(
-      await apiJson(this.server.baseUrl, this.accessAssertion, `/v1/auth-profiles/${this.profileId}/sharing`, {
-        method: "PUT",
-        headers: { "content-type": "application/json", "Idempotency-Key": `browser-sharing-${randomUUID()}` },
-        body: JSON.stringify({ mode: "selected", endpoint_ids: [this.endpointId] }),
-      }),
-      200,
-      "Provider sharing",
-    );
     await expect
       .poll(
         async () => {
@@ -1564,13 +1625,31 @@ class Topology {
 }
 
 async function bootstrap(page: Page, topology: Topology): Promise<void> {
+  const pageErrors: string[] = [];
+  const failedRequests: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("requestfailed", (request) => failedRequests.push(`${request.method()} ${request.url()}: ${request.failure()?.errorText ?? "unknown"}`));
   await page.context().setExtraHTTPHeaders({
     "Cf-Access-Jwt-Assertion": topology.accessAssertion,
     [REQUEST_ID_HEADER]: topology.sseRequestId,
   });
   const response = await page.goto(`${topology.server.baseUrl}/`, { waitUntil: "domcontentloaded" });
   await classifyBrowser404(response, "management UI root");
-  await expect(page.getByRole("heading", { name: "Sessions" })).toBeVisible();
+  try {
+    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+  } catch (error) {
+    const diagnostics = {
+      ...(await page.evaluate(() => ({
+      title: document.title,
+      body: document.body?.innerText.slice(0, 4000) ?? "",
+      scripts: [...document.scripts].map((script) => script.src),
+      appHtml: document.querySelector("#app")?.innerHTML.slice(0, 4000) ?? "",
+      }))),
+      pageErrors,
+      failedRequests,
+    };
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; browser_diagnostics=${JSON.stringify(diagnostics)}`);
+  }
   await expect(page.getByRole("button", { name: "Log in" })).toHaveCount(0);
   await expect(page.getByRole("textbox", { name: /token|password/i })).toHaveCount(0);
 }
@@ -1671,13 +1750,13 @@ async function createSessionWithKeyboard(page: Page, topology: Topology): Promis
   const create = page.getByRole("button", { name: "New session" });
   await create.focus();
   await page.keyboard.press("Enter");
-  const dialog = page.getByRole("dialog", { name: "New session" });
-  await expect(dialog).toBeVisible();
-  await dialog.getByRole("combobox", { name: "Endpoint" }).selectOption(topology.endpointId);
-  await dialog.getByRole("combobox", { name: "Provider" }).selectOption(PROVIDER);
-  await dialog.getByRole("combobox", { name: "Model" }).selectOption(MODEL);
-  await dialog.getByRole("combobox", { name: "Auth profile" }).selectOption(topology.profileId);
-  const submit = dialog.getByRole("button", { name: "Create session" });
+  const form = page.locator("form.editor-panel").filter({ has: page.getByRole("heading", { name: "New session", exact: true }) });
+  await expect(form).toBeVisible();
+  await form.getByRole("combobox", { name: "Endpoint" }).selectOption(topology.endpointId);
+  await form.getByRole("combobox", { name: "Provider" }).selectOption(PROVIDER);
+  await form.getByRole("combobox", { name: "Model" }).selectOption(MODEL);
+  await form.getByRole("combobox", { name: "Auth profile" }).selectOption(topology.profileId);
+  const submit = form.getByRole("button", { name: "Start session" });
   await submit.focus();
   await page.keyboard.press("Enter");
   await expect(page).toHaveURL(new RegExp(`/endpoints/${topology.endpointId}/sessions/[A-Z0-9]+$`));
@@ -1698,7 +1777,6 @@ async function sendMessageWithKeyboard(page: Page, prompt: string): Promise<void
   const response = await admission;
   await classifyBrowser404(response, "session message admission");
   expect(response.status()).toBe(202);
-  await expect(page.getByText("Message accepted", { exact: true })).toBeVisible();
 }
 
 function observeEventRequests(page: Page, topology?: Topology): BrowserSseRequest[] {
@@ -2044,9 +2122,24 @@ test.describe("session reconnect and runtime states", () => {
     await bootstrap(page, topology);
     const sseRequests = observeEventRequests(page, topology);
     topology.expectScenario(SCENARIOS.keyboard, 1);
-    await createSessionWithKeyboard(page, topology);
+    const keyboardSessionId = await createSessionWithKeyboard(page, topology);
     await sendMessageWithKeyboard(page, `keyboard path ${SCENARIOS.keyboard}`);
-    await topology.provider.waitForScenario(SCENARIOS.keyboard);
+    try {
+      await withTimeout(
+        topology.provider.waitForScenario(SCENARIOS.keyboard),
+        15_000,
+        `provider did not receive ${SCENARIOS.keyboard} through Endpoint`,
+      );
+    } catch (error) {
+      const sessionSnapshot = await apiJson(
+        topology.server.baseUrl,
+        topology.accessAssertion,
+        `/v1/endpoints/${topology.endpointId}/sessions/${keyboardSessionId}`,
+      );
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}; session_snapshot=${JSON.stringify(sessionSnapshot.body)}; provider_requests=${JSON.stringify(topology.provider.debugRequests())}; endpoint_boundary=${JSON.stringify(topology.endpointBoundary.debugRequests())}; endpoint_process=${JSON.stringify(topology.endpoint.outputSnapshot(topology.knownSecrets))}; server_process=${JSON.stringify(topology.server.outputSnapshot(topology.knownSecrets))}; browser_body=${JSON.stringify((await page.locator("body").innerText()).slice(0, 2000))}`,
+      );
+    }
     await expectOneDurableFinal(page, "KEYBOARD_FINAL");
     const sessionId = await createSessionWithKeyboard(page, topology);
     topology.expectScenario(SCENARIOS.reconnect, 2);

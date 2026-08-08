@@ -130,21 +130,37 @@ async function main() {
         );
         if (!sessionResponse.ok) throw new Error('session list returned ' + sessionResponse.status);
         for (const session of (await sessionResponse.json()).items || []) {
-          sessions.push({ endpoint_id: endpoint.endpoint_id, ...session });
+          const currentResponse = await fetch(
+            '/v1/endpoints/' + encodeURIComponent(endpoint.endpoint_id)
+              + '/sessions/' + encodeURIComponent(session.session_id),
+            { headers: { accept: 'application/json' } },
+          );
+          if (!currentResponse.ok) throw new Error('session read returned ' + currentResponse.status);
+          const current = await currentResponse.json();
+          sessions.push({
+            endpoint_id: endpoint.endpoint_id,
+            ...session,
+            listed_model: session.model || null,
+            model: current.model || null,
+          });
         }
       }
       return sessions;
     });
     const staleRecorderSessions = durableSessions.filter((session) => {
-      const baseUrl = session.model?.provider_execution_base_url;
-      if (!ownedProviderIds.has(session.model?.provider)) return false;
-      return ownedRecorderBases.size > 0
-        ? ownedRecorderBases.has(normalizeUrl(baseUrl))
-        : loopback(baseUrl);
+      const models = [session.listed_model, session.model];
+      return models.some((model) => {
+        const baseUrl = model?.provider_execution_base_url;
+        if (!ownedProviderIds.has(model?.provider)) return false;
+        return ownedRecorderBases.size > 0
+          ? ownedRecorderBases.has(normalizeUrl(baseUrl))
+          : loopback(baseUrl);
+      });
     });
     details.durable_sessions = durableSessions.map((session) => ({
       endpoint_id: session.endpoint_id,
       session_id: session.session_id,
+      listed_provider_execution_base_url: session.listed_model?.provider_execution_base_url || null,
       provider_execution_base_url: session.model?.provider_execution_base_url || null,
     }));
     if (staleRecorderSessions.length > 0) {
