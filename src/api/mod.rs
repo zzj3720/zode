@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     convert::Infallible,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -195,6 +196,8 @@ struct CreateProviderExecutionSelection {
     revision: u64,
     kind: String,
     base_url: String,
+    #[serde(default)]
+    options: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1531,6 +1534,7 @@ async fn stream_events(
         .map_err(ApiError::from_service)?;
 
     let stream = async_stream::stream! {
+        yield Ok::<SseEvent, Infallible>(SseEvent::default().comment("stream-open"));
         let mut last_position = after.unwrap_or(0);
         for record in replay {
             if record.global_position > last_position {
@@ -1639,6 +1643,7 @@ fn model_selection_from_request(model: CreateModelSelection) -> SessionModelSele
             revision: model.provider_execution.revision,
             kind: model.provider_execution.kind,
             base_url: model.provider_execution.base_url,
+            options: model.provider_execution.options,
         },
         model: model.model,
         auth_authority_id: model.auth_authority_id,
@@ -2019,6 +2024,7 @@ fn public_model(model: SessionModelSelection) -> Value {
         "provider_execution_revision": model.provider_execution.revision,
         "provider_execution_kind": model.provider_execution.kind,
         "provider_execution_base_url": model.provider_execution.base_url,
+        "provider_execution_options": model.provider_execution.options,
         "model": model.model,
         "auth_authority_id": model.auth_authority_id,
         "auth_profile_id": model.auth_profile_id,

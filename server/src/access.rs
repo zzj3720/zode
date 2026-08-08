@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     extract::{Request, State},
@@ -29,6 +33,8 @@ const KEY_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 #[derive(Clone)]
 pub(crate) struct ActorContext {
     actor_key: [u8; 32],
+    endpoint_subject: String,
+    assertion_expires_at_ms: i64,
 }
 
 impl ActorContext {
@@ -36,6 +42,21 @@ impl ActorContext {
         &self.actor_key
     }
 
+    pub(crate) fn endpoint_subject(&self) -> &str {
+        &self.endpoint_subject
+    }
+
+    pub(crate) fn assertion_expiry_deadline(&self) -> Instant {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+            .unwrap_or(i64::MAX);
+        let remaining_ms = self.assertion_expires_at_ms.saturating_sub(now_ms).max(0) as u64;
+        // Leave a small scheduling guard so the public stream cannot cross the
+        // JWT's wall-clock expiry when the runtime is under load.
+        Instant::now() + Duration::from_millis(remaining_ms.saturating_sub(50))
+    }
 }
 
 pub(crate) struct AccessVerifier {
@@ -149,8 +170,24 @@ impl AccessVerifier {
             (true, Some(name)) if valid_text(name, MAX_ACTOR_BYTES) => ("service", name),
             _ => return Err(()),
         };
+        let expires_at_seconds = claims
+            .get("exp")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                claims
+                    .get("exp")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| i64::try_from(value).ok())
+            })
+            .filter(|value| *value >= 0)
+            .ok_or(())?;
+        let assertion_expires_at_ms = expires_at_seconds.checked_mul(1_000).ok_or(())?;
         let actor_key = self.subject_keys.actor_key(kind, actor);
-        Ok(ActorContext { actor_key })
+        Ok(ActorContext {
+            endpoint_subject: self.subject_keys.endpoint_subject(&actor_key),
+            actor_key,
+            assertion_expires_at_ms,
+        })
     }
 
     async fn key_for(&self, kid: &str) -> Result<CachedKey, ()> {

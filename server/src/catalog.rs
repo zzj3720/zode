@@ -11,14 +11,13 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use url::{Host, Url};
-use zode_protocol::{
-    negotiate_endpoint_protocol, EndpointCapabilities, EndpointIdentity,
-};
+use zode_protocol::{negotiate_endpoint_protocol, EndpointCapabilities, EndpointIdentity};
 
 use crate::{
     access::ActorContext,
     store::{
-        hex, BeginEndpointCreate, ControlStore, EndpointCreateOperation, EndpointRecord, StoreError,
+        hex, BeginEndpointCreate, ControlStore, EndpointCreateCompletion, EndpointCreateOperation,
+        EndpointRecord, StoreError,
     },
 };
 
@@ -32,6 +31,8 @@ const MAX_ENDPOINT_RESPONSE_BYTES: usize = 64 * 1024;
 pub(crate) enum CatalogError {
     #[error("invalid Endpoint request")]
     Invalid,
+    #[error("Endpoint was not found")]
+    NotFound,
     #[error("Endpoint request is too large")]
     PayloadTooLarge,
     #[error("Endpoint command conflicts with an existing operation")]
@@ -156,7 +157,7 @@ impl Catalog {
             &keys,
             &operation,
             &request.control_auth.secret,
-            replay.as_ref(),
+            replay.as_deref(),
         )?;
         if let Some(record) = replay {
             return Ok(public_endpoint(&record));
@@ -175,33 +176,29 @@ impl Catalog {
         .map_err(map_store_error)?;
 
         let probe = self
-            .probe_endpoint(
-                &operation.base_url,
-                &request.control_auth.secret,
-            )
+            .probe_endpoint(&operation.base_url, &request.control_auth.secret)
             .await?;
         let store = Arc::clone(&self.store);
         let operation = Arc::new(operation);
         let completion = Arc::clone(&operation);
-        let record = tokio::task::spawn_blocking(move || {
-            store.complete_endpoint_create(
-                &completion,
-                &probe.identity.endpoint_id,
-                &probe.identity.authority_id,
-                probe.identity.revision,
-                &probe.identity.protocol_version,
-                &probe.capabilities.provider_adapter_kinds,
-                &probe
-                    .capabilities
-                    .tools
-                    .iter()
-                    .map(|tool| tool.name.clone())
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .await
-        .map_err(|_| CatalogError::Internal)?
-        .map_err(map_store_error)?;
+        let probe = EndpointCreateCompletion {
+            endpoint_id: probe.identity.endpoint_id,
+            controller_authority_id: probe.identity.authority_id,
+            controller_credential_revision: probe.identity.revision,
+            protocol_version: probe.identity.protocol_version,
+            provider_adapter_kinds: probe.capabilities.provider_adapter_kinds,
+            tools: probe
+                .capabilities
+                .tools
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect(),
+        };
+        let record =
+            tokio::task::spawn_blocking(move || store.complete_endpoint_create(&completion, probe))
+                .await
+                .map_err(|_| CatalogError::Internal)?
+                .map_err(map_store_error)?;
         Ok(public_endpoint(&record))
     }
 
@@ -233,6 +230,44 @@ impl Catalog {
         Ok(record.as_ref().map(public_endpoint))
     }
 
+    pub(crate) async fn probe_endpoint_by_id(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<Value, CatalogError> {
+        if !validate_text(endpoint_id, 256) {
+            return Err(CatalogError::Invalid);
+        }
+        let store = Arc::clone(&self.store);
+        let endpoint_id_owned = endpoint_id.to_owned();
+        let (record, secret) = tokio::task::spawn_blocking(move || {
+            let record = store
+                .get_endpoint(&endpoint_id_owned)
+                .map_err(map_store_error)?
+                .ok_or(CatalogError::NotFound)?;
+            let secret = store
+                .load_endpoint_secret(&record.secret_ref)
+                .map_err(map_store_error)?
+                .ok_or(CatalogError::Internal)?;
+            Ok::<_, CatalogError>((record, secret))
+        })
+        .await
+        .map_err(|_| CatalogError::Internal)??;
+        let secret = std::str::from_utf8(&secret).map_err(|_| CatalogError::Internal)?;
+        let probe = self.probe_endpoint(&record.base_url, secret).await?;
+        if probe.identity.endpoint_id != record.endpoint_id
+            || probe.identity.authority_id != record.controller_authority_id
+            || probe.identity.revision != record.controller_credential_revision
+            || probe.identity.protocol_version != record.protocol_version
+        {
+            return Err(CatalogError::EndpointUnavailable);
+        }
+        Ok(public_endpoint_observation(
+            &record,
+            "online",
+            unix_millis()?,
+        ))
+    }
+
     pub(crate) async fn probe_local_endpoint(
         &self,
         base_url: &str,
@@ -241,10 +276,58 @@ impl Catalog {
         self.probe_endpoint(base_url, secret).await
     }
 
-    async fn probe_endpoint(&self, base_url: &str, secret: &str) -> Result<EndpointProbe, CatalogError> {
-        let identity: EndpointIdentity = self
-            .probe_json(base_url, "/v1/identity", secret)
-            .await?;
+    pub(crate) async fn install_auth_replica(
+        &self,
+        endpoint_id: &str,
+        profile_id: &str,
+        operation_id: &str,
+        body: Value,
+    ) -> Result<Value, CatalogError> {
+        if !validate_text(endpoint_id, 256)
+            || !validate_text(profile_id, 256)
+            || !validate_text(operation_id, MAX_IDEMPOTENCY_KEY_BYTES)
+        {
+            return Err(CatalogError::Invalid);
+        }
+        let store = Arc::clone(&self.store);
+        let endpoint_id = endpoint_id.to_owned();
+        let (endpoint, secret) = tokio::task::spawn_blocking(move || {
+            let endpoint = store
+                .get_endpoint(&endpoint_id)?
+                .ok_or(StoreError::Integrity)?;
+            let secret = store
+                .load_endpoint_secret(&endpoint.secret_ref)?
+                .ok_or(StoreError::Integrity)?;
+            Ok::<_, StoreError>((endpoint, secret))
+        })
+        .await
+        .map_err(|_| CatalogError::Internal)?
+        .map_err(map_store_error)?;
+        let bearer = std::str::from_utf8(&secret).map_err(|_| CatalogError::Internal)?;
+        let response = self
+            .client
+            .put(format!(
+                "{}/v1/auth-replicas/{profile_id}",
+                endpoint.base_url
+            ))
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("idempotency-key", operation_id)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| CatalogError::EndpointUnavailable)?;
+        if !response.status().is_success() {
+            return Err(CatalogError::EndpointUnavailable);
+        }
+        read_json_response(response).await
+    }
+
+    async fn probe_endpoint(
+        &self,
+        base_url: &str,
+        secret: &str,
+    ) -> Result<EndpointProbe, CatalogError> {
+        let identity: EndpointIdentity = self.probe_json(base_url, "/v1/identity", secret).await?;
         let capabilities: EndpointCapabilities = self
             .probe_json(base_url, "/v1/capabilities", secret)
             .await?;
@@ -269,24 +352,36 @@ impl Catalog {
             .send()
             .await
             .map_err(|_| CatalogError::EndpointUnavailable)?;
-        if !response.status().is_success()
-            || response
-                .content_length()
-                .is_some_and(|length| length > MAX_ENDPOINT_RESPONSE_BYTES as u64)
-        {
+        if !response.status().is_success() {
             return Err(CatalogError::EndpointUnavailable);
         }
-        let mut stream = response.bytes_stream();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| CatalogError::EndpointUnavailable)?;
-            if bytes.len().saturating_add(chunk.len()) > MAX_ENDPOINT_RESPONSE_BYTES {
-                return Err(CatalogError::EndpointUnavailable);
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        serde_json::from_slice(&bytes).map_err(|_| CatalogError::EndpointUnavailable)
+        read_typed_json_response(response).await
     }
+}
+
+async fn read_json_response(response: reqwest::Response) -> Result<Value, CatalogError> {
+    read_typed_json_response(response).await
+}
+
+async fn read_typed_json_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, CatalogError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_ENDPOINT_RESPONSE_BYTES as u64)
+    {
+        return Err(CatalogError::EndpointUnavailable);
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| CatalogError::EndpointUnavailable)?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_ENDPOINT_RESPONSE_BYTES {
+            return Err(CatalogError::EndpointUnavailable);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| CatalogError::EndpointUnavailable)
 }
 
 fn request_fingerprint(
@@ -328,12 +423,20 @@ fn verify_operation(
 }
 
 fn public_endpoint(record: &EndpointRecord) -> Value {
+    public_endpoint_observation(record, "online", record.created_at_ms)
+}
+
+fn public_endpoint_observation(
+    record: &EndpointRecord,
+    status: &str,
+    observed_at_ms: i64,
+) -> Value {
     json!({
         "schema": "zode.endpoint.v1",
         "endpoint_id": record.endpoint_id,
         "label": record.label,
         "kind": record.kind,
-        "status": "online",
+        "status": status,
         "disabled": false,
         "controller_authority_id": record.controller_authority_id,
         "controller_credential_revision": record.controller_credential_revision,
@@ -342,7 +445,7 @@ fn public_endpoint(record: &EndpointRecord) -> Value {
             "tools": record.tools,
             "protocol_version": record.protocol_version,
         },
-        "last_observed_at_ms": record.created_at_ms,
+        "last_observed_at_ms": observed_at_ms,
         "auth_replica_summary": {
             "ready": 0,
             "pending": 0,

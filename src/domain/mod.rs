@@ -23,6 +23,7 @@ pub const MAX_WAIT_TOOL_CALLS: usize = 128;
 pub const MAX_SELECTED_TOOLS: usize = 256;
 pub const MAX_OPAQUE_CONTINUATION_BYTES: usize = 64 * 1024;
 pub const MAX_OPAQUE_CONTINUATIONS: usize = 8;
+pub const MAX_PROVIDER_EXECUTION_OPTIONS_BYTES: usize = 64 * 1024;
 pub const MAX_MODEL_ROUNDS_PER_ACTIVATION: u32 = 64;
 pub const MAX_MODEL_ATTEMPTS_PER_STEP: u32 = 32;
 pub const MAX_MODEL_FINGERPRINT_BYTES: usize = 512;
@@ -168,6 +169,8 @@ pub struct ProviderExecutionSelection {
     pub revision: u64,
     pub kind: String,
     pub base_url: String,
+    #[serde(default)]
+    pub options: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -208,6 +211,18 @@ impl SessionSelection {
                 "provider execution base_url",
                 &model.provider_execution.base_url,
             )?;
+            let options_bytes = serde_json::to_vec(&model.provider_execution.options)
+                .map_err(|_| {
+                    DomainError::InvalidState("provider execution options are invalid".into())
+                })?
+                .len();
+            if options_bytes > MAX_PROVIDER_EXECUTION_OPTIONS_BYTES {
+                return Err(DomainError::TextTooLarge {
+                    field: "provider execution options",
+                    bytes: options_bytes,
+                    max: MAX_PROVIDER_EXECUTION_OPTIONS_BYTES,
+                });
+            }
             validate_identifier("model", &model.model)?;
             validate_identifier("auth_authority_id", &model.auth_authority_id)?;
             validate_identifier("auth_profile_id", &model.auth_profile_id)?;

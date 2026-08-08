@@ -1,0 +1,29 @@
+{
+  "schema": "zode.http-incident-evidence-gap.v1",
+  "version": 1,
+  "recording_id": "access-ingress-auth-boundary-first-401-gap-20260808",
+  "owning_e2e": "e2e_replay_access_ingress_initial_404_cassette",
+  "command": "cargo test --locked --manifest-path server/Cargo.toml --test access_ingress_e2e e2e_replay_access_ingress_initial_404_cassette -- --exact --nocapture",
+  "first_observed": [
+    {
+      "slot": "human-valid",
+      "status": 401
+    },
+    {
+      "slot": "unknown-kid-singleflight",
+      "status": 401,
+      "count": 4
+    }
+  ],
+  "raw_exchange_retained": false,
+  "request_fingerprint": null,
+  "response_fingerprint": null,
+  "second_run_passed": true,
+  "second_run_is_evidence": false,
+  "do_not_relabel_later_capture": true,
+  "future_capture": {
+    "recording_id": "must_be_new",
+    "relation": "later_test_reproduction_of_gap"
+  },
+  "reason": "The replay case had no recorder attached, so its first management and JWKS exchanges are unrecoverable. Any later reproduction must use a new recording_id and relation=later_test_reproduction_of_gap."
+}

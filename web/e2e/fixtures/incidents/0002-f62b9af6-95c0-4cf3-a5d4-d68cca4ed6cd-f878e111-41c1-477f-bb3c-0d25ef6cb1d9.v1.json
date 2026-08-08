@@ -1,0 +1,52 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "0002-f62b9af6-95c0-4cf3-a5d4-d68cca4ed6cd-f878e111-41c1-477f-bb3c-0d25ef6cb1d9",
+  "e2e_name": "e2e_browser_management_surface_authority_accepts_default_port_alias",
+  "boundary": "browser-capture-set",
+  "first_observed": "the canonical HTTP management origin rejected its explicit default-port Host alias",
+  "classification": "MANAGEMENT_SURFACE_DEFAULT_PORT_ALIAS_REJECTED",
+  "source_digest": "670c58a31b395cfdadda63ef9aaec7d096379b8bc4443af4fbb6b82db72ffce3",
+  "first_failure_recording_id": "000003-4f230e9b-1c50-4a49-a4ba-5e7d13bcc97a",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000003-4f230e9b-1c50-4a49-a4ba-5e7d13bcc97a",
+      "boundary": "management-authority-edge",
+      "method": "GET",
+      "path": "/v1/system",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1:80"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "content-type": "application/json",
+          "cache-control": "no-store"
+        },
+        "chunks": [
+          {
+            "offset_us": 4510.958,
+            "data_base64": "eyJlcnJvciI6eyJjb2RlIjoibm90X2ZvdW5kIiwibWVzc2FnZSI6InJlc291cmNlIHdhcyBub3QgZm91bmQiLCJyZXRyeWFibGUiOmZhbHNlfX0="
+          }
+        ],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>"
+  ],
+  "integrity_sha256": "2de746fd39dc033b55addcd5d4a0d26f0d81c8721fc28321ceeb0fa78e91b5ba"
+}

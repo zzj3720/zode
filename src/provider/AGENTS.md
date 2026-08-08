@@ -161,6 +161,10 @@ Descriptor admission is fixed by
 and `e2e_credential_bearing_model_base_url_is_rejected_without_side_effects`:
 the schema is exact, the positive descriptor revision is controller-assigned
 and round-trips unchanged, and credential-bearing URLs have no side effects.
+`e2e_server_forwards_and_endpoint_persists_provider_execution_options` fixes
+the complete descriptor handoff: bounded credential-free options remain part
+of the Endpoint-owned selection across a real restart and feed the single
+aimux call path rather than a parallel execution adapter.
 Replica operation history and expiry metadata are fixed by
 `e2e_auth_replica_history_receipt_binds_original_revision` and
 `e2e_auth_replica_expiry_and_historical_receipt_survive_restart`; the former

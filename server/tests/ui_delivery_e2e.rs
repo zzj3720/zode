@@ -1,10 +1,14 @@
+#[path = "../../tests/support/process_capture.rs"]
+mod process_capture;
+
 use std::{
+    cell::RefCell,
     env,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Condvar, Mutex,
@@ -14,7 +18,12 @@ use std::{
 };
 
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use process_capture::{
+    ProcessCaptureSet, ProcessIncidentReplay, ProcessObservation, ProcessReplayProof,
+    ProcessStopObservation,
+};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -58,6 +67,22 @@ const CALLBACK_TOOL_NAME: &str = "callback_tool";
 const CALLBACK_PROVIDER_NAME: &str = "fixture-provider";
 const CALLBACK_MODEL_NAME: &str = "fixture-model";
 const CALLBACK_PROVIDER_KEY: &str = "ui-delivery-provider-key";
+const CALLBACK_LATER_E2E: &str =
+    "e2e_callback_origin_accepts_only_real_bearer_callback_and_never_management";
+const CALLBACK_LATER_RELATION: &str = "later_test_reproduction_of_gap";
+const CALLBACK_LATER_CLASSIFICATION: &str =
+    "CALLBACK_LIFECYCLE_NONBLOCKING_READ_BARRIER__later_test_reproduction_of_gap";
+const CALLBACK_LATER_QUARANTINE_DIR: &str =
+    "target/test-recordings/quarantine/callback-lifecycle-later-gap";
+const UI_ASSET_PATH_CAPTURE_ENV: &str = "ZODE_CAPTURE_UI_ASSET_PATH_LATER_GAP";
+const UI_ASSET_PATH_E2E: &str =
+    "e2e_server_ui_delivery_hardening_rejects_asset_tree_symlink_and_path_escape_before_ready";
+const UI_ASSET_PATH_RELATION: &str = "later_test_reproduction_of_gap";
+const UI_ASSET_PATH_CLASSIFICATION: &str =
+    "UI_ASSET_DIRECTORY_PATH_ESCAPE_REACHED_READY__later_test_reproduction_of_gap";
+const UI_ASSET_PATH_FIRST_OBSERVED: &str = "relation=later_test_reproduction_of_gap; ui_assets_directory=../ui-dist; expected=pre_ready_rejection; actual=ready";
+const UI_ASSET_PATH_CASSETTE: &str =
+    "tests/fixtures/incidents/server-ui-assets-path-escape-later-gap.v1.json";
 
 const ACCESS_PRIVATE_KEY: &str = r#"-----BEGIN RSA PRIVATE KEY-----
 MIIEpAIBAAKCAQEArXMZzRpkHwtdgWw+vPxg8LKx71TV9jIqaLp3v1vZAGOf+0U1
@@ -131,11 +156,15 @@ fn e2e_server_ui_delivery_serves_access_protected_management_assets_and_isolates
     let root = management_request_with_first_post_bootstrap_recording(
         &edge,
         &jwks,
-        "GET",
-        "/",
-        "text/html",
-        Some(&assertion),
-        &[],
+        HttpRequestSpec {
+            method: "GET",
+            path: "/",
+            host: MANAGEMENT_HOST,
+            accept: "text/html",
+            assertion: Some(&assertion),
+            extra_headers: &[],
+            body: &[],
+        },
         &mut first_post_bootstrap,
     )?;
     let shallow_root_404 = root.status == 404;
@@ -401,13 +430,15 @@ fn e2e_server_ui_delivery_serves_access_protected_management_assets_and_isolates
 
         let access_response = origin_request_with_headers(
             &edge.callback_url(),
-            "GET",
-            path,
-            CALLBACK_AUTHORITY,
-            "text/html",
-            Some(&assertion),
-            &[],
-            &[],
+            HttpRequestSpec {
+                method: "GET",
+                path,
+                host: CALLBACK_AUTHORITY,
+                accept: "text/html",
+                assertion: Some(&assertion),
+                extra_headers: &[],
+                body: &[],
+            },
         )?;
         check_safe_callback_404_surface(
             &format!("{label} with valid Access"),
@@ -433,16 +464,18 @@ fn e2e_server_ui_delivery_serves_access_protected_management_assets_and_isolates
     );
     let forwarded_surface_probe = origin_request_with_headers(
         &edge.callback_url(),
-        "GET",
-        "/v1/system",
-        CALLBACK_AUTHORITY,
-        "application/json",
-        Some(&assertion),
-        &[
-            ("Forwarded", "host=management.ui-delivery.test"),
-            ("X-Forwarded-Host", MANAGEMENT_AUTHORITY),
-        ],
-        &[],
+        HttpRequestSpec {
+            method: "GET",
+            path: "/v1/system",
+            host: CALLBACK_AUTHORITY,
+            accept: "application/json",
+            assertion: Some(&assertion),
+            extra_headers: &[
+                ("Forwarded", "host=management.ui-delivery.test"),
+                ("X-Forwarded-Host", MANAGEMENT_AUTHORITY),
+            ],
+            body: &[],
+        },
     )?;
     check_safe_callback_404_surface(
         "callback Forwarded/X-Forwarded-Host surface probe",
@@ -505,6 +538,19 @@ fn e2e_server_ui_delivery_hardening_rejects_invalid_ui_mode_combinations_before_
 #[test]
 fn e2e_server_ui_delivery_hardening_rejects_asset_tree_symlink_and_path_escape_before_ready(
 ) -> TestResult {
+    let cassette = Path::new(env!("CARGO_MANIFEST_DIR")).join(UI_ASSET_PATH_CASSETTE);
+    if env::var(UI_ASSET_PATH_CAPTURE_ENV).ok().as_deref() == Some("1") {
+        if cassette.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "UI asset path later-gap cassette is immutable",
+            )
+            .into());
+        }
+        return capture_ui_asset_path_escape_later_gap(&cassette);
+    }
+    assert_ui_asset_path_cassette_identity(&cassette)?;
+
     let jwks = JwksFixture::start()?;
     let temp = tempfile::tempdir()?;
     let ui_dist = build_test_owned_ui_dist(temp.path())?;
@@ -523,6 +569,486 @@ fn e2e_server_ui_delivery_hardening_rejects_asset_tree_symlink_and_path_escape_b
     assert_server_rejected_before_ready(&symlink_config, "symlinked asset directory")
 }
 
+fn ui_asset_path_replay_config() -> TestResult<Vec<u8>> {
+    Ok(serde_json::to_vec(&json!({
+        "schema": "zode.server-ui-assets-path-gap-replay.v1",
+        "e2e": UI_ASSET_PATH_E2E,
+        "relation": UI_ASSET_PATH_RELATION,
+        "entry": "real zode-server --config with an escaping ui_assets_directory",
+        "ui_assets_directory": "../ui-dist",
+        "expected_after_fix": {
+            "ready": false,
+            "phase": "config"
+        }
+    }))?)
+}
+
+fn ui_asset_path_quarantine() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/test-recordings/quarantine/server-ui-assets-path-later-gap")
+}
+
+fn assert_ui_asset_path_cassette_identity(cassette: &Path) -> TestResult {
+    let replay = ProcessIncidentReplay::load(cassette, UI_ASSET_PATH_E2E, &[])?;
+    let config: Value = serde_json::from_slice(replay.config_bytes())?;
+    if replay.config_label() != "ui-assets-directory-parent-escape"
+        || replay.classification() != UI_ASSET_PATH_CLASSIFICATION
+        || replay.first_observed() != UI_ASSET_PATH_FIRST_OBSERVED
+        || replay.config_bytes() != ui_asset_path_replay_config()?
+        || config["schema"] != "zode.server-ui-assets-path-gap-replay.v1"
+        || config["e2e"] != UI_ASSET_PATH_E2E
+        || config["relation"] != UI_ASSET_PATH_RELATION
+        || config["ui_assets_directory"] != "../ui-dist"
+        || config["expected_after_fix"]["ready"] != false
+    {
+        return Err(io::Error::other(
+            "UI asset path later-gap cassette changed identity or relation",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+thread_local! {
+    static CALLBACK_LATER_CAPTURE: RefCell<Option<Arc<Mutex<CallbackLaterCapture>>>> =
+        const { RefCell::new(None) };
+}
+
+struct CallbackHttpRecord {
+    boundary: String,
+    file: String,
+    sha256: String,
+}
+
+struct CallbackLaterCapture {
+    root: PathBuf,
+    recording_id: String,
+    http_directory: PathBuf,
+    http_records: Vec<CallbackHttpRecord>,
+    process_capture: ProcessCaptureSet,
+    process_capture_error: Option<String>,
+}
+
+impl CallbackLaterCapture {
+    fn new() -> TestResult<Self> {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or_else(|| io::Error::other("server manifest has no repository parent"))?;
+        let quarantine_root = repository_root.join(CALLBACK_LATER_QUARANTINE_DIR);
+        fs::create_dir_all(&quarantine_root)?;
+        set_permissions(&quarantine_root, 0o700)?;
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let recording_id = format!("callback-lifecycle-later-{}-{nonce}", std::process::id());
+        let root = quarantine_root.join(&recording_id);
+        fs::create_dir(&root)?;
+        set_permissions(&root, 0o700)?;
+        let http_directory = root.join("http");
+        fs::create_dir(&http_directory)?;
+        set_permissions(&http_directory, 0o700)?;
+        let mut process_capture = ProcessCaptureSet::new(
+            root.join("process"),
+            CALLBACK_LATER_E2E,
+            &[CALLBACK_ENDPOINT_SECRET, CALLBACK_PROVIDER_KEY],
+        )?;
+        process_capture.capture_config(
+            "callback-lifecycle-later-reproduction",
+            &serde_json::to_vec(&json!({
+                "schema": "zode.callback-lifecycle-gap-replay.v1",
+                "e2e": CALLBACK_LATER_E2E,
+                "relation": CALLBACK_LATER_RELATION,
+                "entry": "real zode-server + real zode Endpoint + callback HTTP/SSE boundary",
+                "known_fixture_seam": "accepted_stream_blocking_read_barrier"
+            }))?,
+        )?;
+        sync_directory(&root)?;
+        sync_directory(&quarantine_root)?;
+        Ok(Self {
+            root,
+            recording_id,
+            http_directory,
+            http_records: Vec::new(),
+            process_capture,
+            process_capture_error: None,
+        })
+    }
+
+    fn record_http(&mut self, boundary: &str, exchange: &RawHttpExchange) -> TestResult<()> {
+        let sequence = self.http_records.len();
+        let file = format!("http-{sequence:04}.raw.json");
+        let path = self.http_directory.join(&file);
+        let envelope = raw_exchange_envelope_with_boundary(
+            &self.recording_id,
+            CALLBACK_LATER_E2E,
+            boundary,
+            "later test reproduction; raw exchange retained before classification",
+            exchange,
+        );
+        write_restricted_new_json(&path, &envelope)?;
+        let sha256 = sha256_hex(&fs::read(&path)?)?;
+        self.http_records.push(CallbackHttpRecord {
+            boundary: boundary.to_owned(),
+            file,
+            sha256,
+        });
+        sync_directory(&self.http_directory)?;
+        Ok(())
+    }
+
+    fn record_jwks(&mut self, exchanges: &[JwksExchange]) -> TestResult<()> {
+        for exchange in exchanges {
+            let response = exchange.response_wire.clone().unwrap_or_default();
+            let response_chunks = if response.is_empty() {
+                Vec::new()
+            } else {
+                vec![RawResponseChunk {
+                    offset_us: 0,
+                    bytes: response.clone(),
+                }]
+            };
+            let raw = terminal_raw_exchange(
+                &exchange.request,
+                &response,
+                &response_chunks,
+                Instant::now(),
+                0,
+                None,
+                if exchange.response_write_succeeded {
+                    TransportTermination::Complete
+                } else {
+                    TransportTermination::Disconnect
+                },
+            );
+            self.record_http("access-jwks", &raw)?;
+        }
+        Ok(())
+    }
+
+    fn record_process(&mut self, name: &str, capture: &ServerCapture) {
+        let observation = ProcessObservation {
+            name: name.to_owned(),
+            stdout: capture.stdout.clone(),
+            stderr: capture.stderr.clone(),
+            exit_code: capture.status.code(),
+            signal: ui_asset_exit_signal(&capture.status).map(|signal| signal.to_string()),
+            termination: "test_stop_after_callback_lifecycle_observation".to_owned(),
+            stop: Some(ProcessStopObservation {
+                observed_pids: vec![capture.pid],
+                reaped_pids: vec![capture.pid],
+                leaked_pids: Vec::new(),
+                timed_out: false,
+                flush_status: "ok".to_owned(),
+                proof: true,
+            }),
+        };
+        if let Err(error) = self.process_capture.capture_process(observation) {
+            self.process_capture_error = Some(error.to_string());
+        }
+    }
+
+    fn finalize(&mut self, classification: &str, first_observed: &str) -> TestResult<PathBuf> {
+        if let Some(error) = self.process_capture_error.take() {
+            return Err(io::Error::other(format!(
+                "callback process capture failed closed: {error}"
+            ))
+            .into());
+        }
+        if self.http_records.is_empty() {
+            return Err(io::Error::other(
+                "callback later capture contained no durable HTTP exchange",
+            )
+            .into());
+        }
+        let process_path = self
+            .process_capture
+            .flush(classification.to_owned(), first_observed.to_owned())?;
+        let process_sha256 = sha256_hex(&fs::read(&process_path)?)?;
+        let manifest = json!({
+            "schema": "zode.callback-lifecycle-later-capture.v1",
+            "version": 1,
+            "recording_id": self.recording_id,
+            "e2e_name": CALLBACK_LATER_E2E,
+            "relation": CALLBACK_LATER_RELATION,
+            "classification": classification,
+            "first_observed": first_observed,
+            "http": {
+                "directory": "http",
+                "records": self.http_records.iter().map(|record| json!({
+                    "boundary": record.boundary,
+                    "file": record.file,
+                    "sha256": record.sha256,
+                })).collect::<Vec<_>>()
+            },
+            "process_capture": {
+                "path": process_path.to_string_lossy(),
+                "sha256": process_sha256,
+            },
+            "historical_gap": "callback-lifecycle-access-edge-wouldblock-first-gap.v1.json",
+            "do_not_relabel_later_capture": true,
+        });
+        let manifest_path = self.root.join("later-reproduction.v1.json");
+        write_restricted_new_json(&manifest_path, &manifest)?;
+        sync_directory(&self.root)?;
+        let parent = self
+            .root
+            .parent()
+            .ok_or_else(|| io::Error::other("callback capture root has no parent"))?;
+        sync_directory(parent)?;
+        Ok(manifest_path)
+    }
+}
+
+fn with_callback_later_capture<T>(
+    capture: Arc<Mutex<CallbackLaterCapture>>,
+    run: impl FnOnce() -> T,
+) -> T {
+    CALLBACK_LATER_CAPTURE.with(|slot| {
+        let previous = slot.replace(Some(capture));
+        let result = run();
+        slot.replace(previous);
+        result
+    })
+}
+
+fn record_active_callback_http(boundary: &str, exchange: &RawHttpExchange) -> TestResult<()> {
+    CALLBACK_LATER_CAPTURE.with(|slot| {
+        let Some(capture) = slot.borrow().as_ref().cloned() else {
+            return Ok(());
+        };
+        let result = capture
+            .lock()
+            .map_err(|_| io::Error::other("callback later capture mutex poisoned"))?
+            .record_http(boundary, exchange);
+        result
+    })
+}
+
+fn record_active_callback_jwks(exchanges: &[JwksExchange]) -> TestResult<()> {
+    CALLBACK_LATER_CAPTURE.with(|slot| {
+        let Some(capture) = slot.borrow().as_ref().cloned() else {
+            return Ok(());
+        };
+        let result = capture
+            .lock()
+            .map_err(|_| io::Error::other("callback later capture mutex poisoned"))?
+            .record_jwks(exchanges);
+        result
+    })
+}
+
+fn record_active_callback_process(name: &str, capture: &ServerCapture) {
+    CALLBACK_LATER_CAPTURE.with(|slot| {
+        let Some(active) = slot.borrow().as_ref().cloned() else {
+            return;
+        };
+        if let Ok(mut capture_set) = active.lock() {
+            capture_set.record_process(name, capture);
+        };
+    });
+}
+
+fn is_nonblocking_read_barrier(error: &(dyn std::error::Error + 'static)) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("wouldblock")
+        || text.contains("resource temporarily unavailable")
+        || text.contains("os error 35")
+        || text.contains("operation would block")
+}
+
+fn capture_ui_asset_path_escape_later_gap(cassette: &Path) -> TestResult {
+    let descriptor = ui_asset_path_replay_config()?;
+    let mut capture = ProcessCaptureSet::new(ui_asset_path_quarantine(), UI_ASSET_PATH_E2E, &[])?;
+    capture.capture_config("ui-assets-directory-parent-escape", &descriptor)?;
+    let first = observe_ui_asset_path_escape()?;
+    capture.capture_process(first.process_observation())?;
+    let classification = if first.ready {
+        UI_ASSET_PATH_CLASSIFICATION
+    } else {
+        "HARNESS_UI_ASSET_PATH_DID_NOT_REPRODUCE_READY__later_test_reproduction_of_gap"
+    };
+    let first_observed = if first.ready {
+        UI_ASSET_PATH_FIRST_OBSERVED
+    } else {
+        "relation=later_test_reproduction_of_gap; ui_assets_directory=../ui-dist; target_ready_red_not_observed"
+    };
+    let raw = capture.flush(classification, first_observed)?;
+    if !first.ready {
+        return Err(io::Error::other(format!(
+            "UI asset path later reproduction stopped before the typed READY red; raw={}",
+            raw.display()
+        ))
+        .into());
+    }
+
+    let replay = ProcessIncidentReplay::load(&raw, UI_ASSET_PATH_E2E, &[])?;
+    if replay.config_bytes() != descriptor
+        || replay.classification() != UI_ASSET_PATH_CLASSIFICATION
+        || replay.first_observed() != UI_ASSET_PATH_FIRST_OBSERVED
+    {
+        return Err(io::Error::other("UI asset path retained source did not reload safely").into());
+    }
+    let repeated = observe_ui_asset_path_escape()?;
+    if !repeated.ready {
+        return Err(io::Error::other(
+            "same-entry UI asset path replay did not reproduce the typed READY red",
+        )
+        .into());
+    }
+    let fingerprint = format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{}\0{}\0same-public-entry-ready-red-reproduced",
+                replay.classification(),
+                replay.first_observed()
+            )
+            .as_bytes()
+        )
+    );
+    capture.promote_immutable(
+        cassette,
+        &ProcessReplayProof {
+            matched: true,
+            fingerprint,
+            source_digest: replay.source_digest().to_owned(),
+        },
+    )?;
+    Err(io::Error::other(format!(
+        "UI asset path escape later reproduction retained before repair; relation={UI_ASSET_PATH_RELATION}; raw={}; cassette={}",
+        raw.display(),
+        cassette.display()
+    ))
+    .into())
+}
+
+struct UiAssetPathObservation {
+    ready: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    status: ExitStatus,
+    pid: u32,
+    killed_by_test: bool,
+}
+
+impl UiAssetPathObservation {
+    fn process_observation(&self) -> ProcessObservation {
+        ProcessObservation {
+            name: "zode-server".to_owned(),
+            stdout: self.stdout.clone(),
+            stderr: self.stderr.clone(),
+            exit_code: self.status.code(),
+            signal: ui_asset_exit_signal(&self.status).map(|signal| signal.to_string()),
+            termination: if self.killed_by_test {
+                "test_stop_after_ready_observation"
+            } else {
+                "process_exit_before_ready"
+            }
+            .to_owned(),
+            stop: Some(ProcessStopObservation {
+                observed_pids: vec![self.pid],
+                reaped_pids: vec![self.pid],
+                leaked_pids: Vec::new(),
+                timed_out: false,
+                flush_status: "ok".to_owned(),
+                proof: true,
+            }),
+        }
+    }
+}
+
+fn observe_ui_asset_path_escape() -> TestResult<UiAssetPathObservation> {
+    let jwks = JwksFixture::start()?;
+    let temp = tempfile::tempdir()?;
+    let _ui_dist = build_test_owned_ui_dist(temp.path())?;
+    let config_root = temp.path().join("config-path-escape");
+    fs::create_dir_all(&config_root)?;
+    let config_path = write_server_config(&config_root, &jwks, UiMode::Assets, Some("../ui-dist"))?;
+    let stdout_path = temp.path().join("server.stdout");
+    let stderr_path = temp.path().join("server.stderr");
+    let stdout = private_ui_asset_log(&stdout_path)?;
+    let stderr = private_ui_asset_log(&stderr_path)?;
+    let binary = env::var_os("CARGO_BIN_EXE_zode-server")
+        .or_else(|| env::var_os("CARGO_BIN_EXE_zode_server"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "zode-server binary missing"))?;
+    let mut child = Command::new(binary)
+        .current_dir(&config_root)
+        .arg("--config")
+        .arg(&config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()?;
+    let pid = child.id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut ready = false;
+    let mut killed_by_test = false;
+    loop {
+        if fs::read(&stdout_path)?
+            .windows(b"ZODE_SERVER_READY ".len())
+            .any(|window| window == b"ZODE_SERVER_READY ")
+        {
+            ready = true;
+            child.kill()?;
+            killed_by_test = true;
+            break;
+        }
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            killed_by_test = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let status = child.wait()?;
+    File::open(&stdout_path)?.sync_all()?;
+    File::open(&stderr_path)?.sync_all()?;
+    let stdout = read_ui_asset_log(&stdout_path)?;
+    let stderr = read_ui_asset_log(&stderr_path)?;
+    Ok(UiAssetPathObservation {
+        ready,
+        stdout,
+        stderr,
+        status,
+        pid,
+        killed_by_test,
+    })
+}
+
+fn private_ui_asset_log(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn read_ui_asset_log(path: &Path) -> TestResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take((4 * 1024 * 1024 + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err(io::Error::other("UI asset startup output exceeded its bound").into());
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn ui_asset_exit_signal(status: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn ui_asset_exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
+}
+
 #[test]
 fn e2e_server_ui_delivery_hardening_rejects_unbounded_asset_tree_before_ready() -> TestResult {
     let jwks = JwksFixture::start()?;
@@ -538,6 +1064,68 @@ fn e2e_server_ui_delivery_hardening_rejects_unbounded_asset_tree_before_ready() 
 
 #[test]
 fn e2e_callback_origin_accepts_only_real_bearer_callback_and_never_management() -> TestResult {
+    let capture = Arc::new(Mutex::new(CallbackLaterCapture::new()?));
+    let result = with_callback_later_capture(Arc::clone(&capture), callback_lifecycle_body);
+    let mut capture = capture
+        .lock()
+        .map_err(|_| io::Error::other("callback later capture mutex poisoned"))?;
+    let classification = if let Some(error) = result.as_ref().err() {
+        let text = error.to_string().to_ascii_lowercase();
+        if is_nonblocking_read_barrier(error.as_ref()) {
+            CALLBACK_LATER_CLASSIFICATION.to_owned()
+        } else if text.contains("did not accept the real callback bearer")
+            || text.contains("callback bearer")
+        {
+            "CALLBACK_BEARER_REJECTED__later_test_reproduction_of_gap".to_owned()
+        } else {
+            "CALLBACK_LIFECYCLE_UNCLASSIFIED__later_test_reproduction_of_gap".to_owned()
+        }
+    } else {
+        "CALLBACK_LIFECYCLE_COMPLETED__later_test_reproduction_of_gap".to_owned()
+    };
+    let first_observed = result.as_ref().err().map_or_else(
+        || {
+            format!(
+                "relation={CALLBACK_LATER_RELATION}; callback bearer reached Server→Endpoint durable SSE"
+            )
+        },
+        |error| {
+            format!(
+                "relation={CALLBACK_LATER_RELATION}; callback lifecycle later reproduction error classified as {}",
+                if is_nonblocking_read_barrier(error.as_ref()) {
+                    "known_nonblocking_accepted_stream_read_barrier"
+                } else if error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("callback bearer")
+                {
+                    "callback_bearer_rejected_by_management_proxy"
+                } else {
+                    "unclassified"
+                }
+            )
+        },
+    );
+    let flushed = capture.finalize(&classification, &first_observed);
+    match (result, flushed) {
+        (Ok(()), Ok(path)) => {
+            eprintln!("callback later reproduction flushed: {}", path.display());
+            Ok(())
+        }
+        (Err(error), Ok(path)) => Err(io::Error::other(format!(
+            "{error}; callback later reproduction relation={CALLBACK_LATER_RELATION} flushed={}",
+            path.display()
+        ))
+        .into()),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(flush_error)) => Err(io::Error::other(format!(
+            "callback lifecycle red: {error}; capture flush failed: {flush_error}"
+        ))
+        .into()),
+    }
+}
+
+fn callback_lifecycle_body() -> TestResult {
     let jwks = JwksFixture::start()?;
     let boundary = CallbackBoundaryFixture::start()?;
     let temp = tempfile::tempdir()?;
@@ -599,16 +1187,18 @@ fn e2e_callback_origin_accepts_only_real_bearer_callback_and_never_management() 
     });
     let endpoint_create = origin_request_with_headers(
         &edge.management_url(),
-        "POST",
-        "/v1/endpoints",
-        MANAGEMENT_AUTHORITY,
-        "application/json",
-        Some(&assertion),
-        &[
-            ("Content-Type", "application/json"),
-            ("Idempotency-Key", "ui-delivery-callback-endpoint-create"),
-        ],
-        &serde_json::to_vec(&endpoint_create_body)?,
+        HttpRequestSpec {
+            method: "POST",
+            path: "/v1/endpoints",
+            host: MANAGEMENT_AUTHORITY,
+            accept: "application/json",
+            assertion: Some(&assertion),
+            extra_headers: &[
+                ("Content-Type", "application/json"),
+                ("Idempotency-Key", "ui-delivery-callback-endpoint-create"),
+            ],
+            body: &serde_json::to_vec(&endpoint_create_body)?,
+        },
     )?;
     if endpoint_create.status == 404 {
         return Err(io::Error::other(
@@ -641,21 +1231,23 @@ fn e2e_callback_origin_accepts_only_real_bearer_callback_and_never_management() 
 
     let descriptor = origin_request_with_headers(
         &edge.management_url(),
-        "PUT",
-        &format!("/v1/providers/{CALLBACK_PROVIDER_NAME}"),
-        MANAGEMENT_AUTHORITY,
-        "application/json",
-        Some(&assertion),
-        &[
-            ("Content-Type", "application/json"),
-            ("Idempotency-Key", "ui-delivery-callback-provider"),
-        ],
-        &serde_json::to_vec(&json!({
-            "kind": "openai_compatible",
-            "base_url": boundary.provider_base_url(),
-            "models": [CALLBACK_MODEL_NAME],
-            "options": {}
-        }))?,
+        HttpRequestSpec {
+            method: "PUT",
+            path: &format!("/v1/providers/{CALLBACK_PROVIDER_NAME}"),
+            host: MANAGEMENT_AUTHORITY,
+            accept: "application/json",
+            assertion: Some(&assertion),
+            extra_headers: &[
+                ("Content-Type", "application/json"),
+                ("Idempotency-Key", "ui-delivery-callback-provider"),
+            ],
+            body: &serde_json::to_vec(&json!({
+                "kind": "openai_compatible",
+                "base_url": boundary.provider_base_url(),
+                "models": [CALLBACK_MODEL_NAME],
+                "options": {}
+            }))?,
+        },
     )?;
     if descriptor.status == 404 {
         return Err(io::Error::other(
@@ -677,22 +1269,24 @@ fn e2e_callback_origin_accepts_only_real_bearer_callback_and_never_management() 
 
     let profile = origin_request_with_headers(
         &edge.management_url(),
-        "POST",
-        &format!("/v1/providers/{CALLBACK_PROVIDER_NAME}/auth-profiles"),
-        MANAGEMENT_AUTHORITY,
-        "application/json",
-        Some(&assertion),
-        &[
-            ("Content-Type", "application/json"),
-            ("Idempotency-Key", "ui-delivery-callback-profile"),
-        ],
-        &serde_json::to_vec(&json!({
-            "kind": "api_key",
-            "label": "ui-delivery callback profile",
-            "api_key": "ui-delivery-provider-key",
-            "make_default": true,
-            "sharing": {"mode": "selected", "endpoint_ids": [endpoint_id]}
-        }))?,
+        HttpRequestSpec {
+            method: "POST",
+            path: &format!("/v1/providers/{CALLBACK_PROVIDER_NAME}/auth-profiles"),
+            host: MANAGEMENT_AUTHORITY,
+            accept: "application/json",
+            assertion: Some(&assertion),
+            extra_headers: &[
+                ("Content-Type", "application/json"),
+                ("Idempotency-Key", "ui-delivery-callback-profile"),
+            ],
+            body: &serde_json::to_vec(&json!({
+                "kind": "api_key",
+                "label": "ui-delivery callback profile",
+                "api_key": "ui-delivery-provider-key",
+                "make_default": true,
+                "sharing": {"mode": "selected", "endpoint_ids": [endpoint_id]}
+            }))?,
+        },
     )?;
     if profile.status == 404 {
         return Err(io::Error::other(
@@ -719,31 +1313,33 @@ fn e2e_callback_origin_accepts_only_real_bearer_callback_and_never_management() 
     let session_create_path = format!("/v1/endpoints/{endpoint_id}/sessions");
     let session_create = origin_request_with_headers(
         &edge.management_url(),
-        "POST",
-        &session_create_path,
-        MANAGEMENT_AUTHORITY,
-        "application/json",
-        Some(&assertion),
-        &[
-            ("Content-Type", "application/json"),
-            ("Idempotency-Key", "ui-delivery-callback-session"),
-        ],
-        &serde_json::to_vec(&json!({
-            "model": {
-                "provider": CALLBACK_PROVIDER_NAME,
-                "model": CALLBACK_MODEL_NAME,
-                "provider_execution": {
-                    "schema": "zode.provider-execution.v1",
-                    "revision": descriptor_revision,
-                    "kind": "openai_compatible",
-                    "base_url": boundary.provider_base_url(),
-                    "options": {}
+        HttpRequestSpec {
+            method: "POST",
+            path: &session_create_path,
+            host: MANAGEMENT_AUTHORITY,
+            accept: "application/json",
+            assertion: Some(&assertion),
+            extra_headers: &[
+                ("Content-Type", "application/json"),
+                ("Idempotency-Key", "ui-delivery-callback-session"),
+            ],
+            body: &serde_json::to_vec(&json!({
+                "model": {
+                    "provider": CALLBACK_PROVIDER_NAME,
+                    "model": CALLBACK_MODEL_NAME,
+                    "provider_execution": {
+                        "schema": "zode.provider-execution.v1",
+                        "revision": descriptor_revision,
+                        "kind": "openai_compatible",
+                        "base_url": boundary.provider_base_url(),
+                        "options": {}
+                    },
+                    "auth_profile_id": profile_id,
+                    "minimum_auth_revision": profile_revision
                 },
-                "auth_profile_id": profile_id,
-                "minimum_auth_revision": profile_revision
-            },
-            "tools": [CALLBACK_TOOL_NAME]
-        }))?,
+                "tools": [CALLBACK_TOOL_NAME]
+            }))?,
+        },
     )?;
     if session_create.status == 404 {
         return Err(io::Error::other(
@@ -778,21 +1374,25 @@ fn run_real_callback_exchange(
         &events_path,
         MANAGEMENT_AUTHORITY,
         assertion,
-    )?;
+    )
+    .map_err(|error| io::Error::other(format!("open_sse_connection: {error}")))?;
     let message_path = format!("/v1/endpoints/{endpoint_id}/sessions/{session_id}/messages");
     let message = origin_request_with_headers(
         &edge.management_url(),
-        "POST",
-        &message_path,
-        MANAGEMENT_AUTHORITY,
-        "application/json",
-        Some(assertion),
-        &[
-            ("Content-Type", "application/json"),
-            ("Idempotency-Key", "ui-delivery-callback-message"),
-        ],
-        br#"{"content":"start callback"}"#,
-    )?;
+        HttpRequestSpec {
+            method: "POST",
+            path: &message_path,
+            host: MANAGEMENT_AUTHORITY,
+            accept: "application/json",
+            assertion: Some(assertion),
+            extra_headers: &[
+                ("Content-Type", "application/json"),
+                ("Idempotency-Key", "ui-delivery-callback-message"),
+            ],
+            body: br#"{"content":"start callback"}"#,
+        },
+    )
+    .map_err(|error| io::Error::other(format!("callback message request: {error}")))?;
     if message.status != 202 {
         let _ = boundary.release();
         return Err(io::Error::other(format!(
@@ -802,7 +1402,9 @@ fn run_real_callback_exchange(
         .into());
     }
 
-    let invocation = boundary.wait_for_invocation()?;
+    let invocation = boundary
+        .wait_for_invocation()
+        .map_err(|error| io::Error::other(format!("callback invocation barrier: {error}")))?;
     let callback_url = find_value_string(&invocation.body, "callback_url").ok_or_else(|| {
         io::Error::other(
             "real external tool invocation omitted callback_url; this is a behavior mismatch, not a first-occurrence replay",
@@ -856,13 +1458,15 @@ fn run_real_callback_exchange(
         );
         let response = origin_request_with_headers(
             &edge.callback_url(),
-            "GET",
-            path,
-            CALLBACK_AUTHORITY,
-            "text/html",
-            Some(assertion),
-            &[],
-            &[],
+            HttpRequestSpec {
+                method: "GET",
+                path,
+                host: CALLBACK_AUTHORITY,
+                accept: "text/html",
+                assertion: Some(assertion),
+                extra_headers: &[],
+                body: &[],
+            },
         )?;
         check_safe_callback_404_surface(
             &format!("callback valid-Access route {path}"),
@@ -893,16 +1497,18 @@ fn run_real_callback_exchange(
     );
     let forwarded_api = origin_request_with_headers(
         &edge.callback_url(),
-        "GET",
-        "/v1/system",
-        CALLBACK_AUTHORITY,
-        "application/json",
-        Some(assertion),
-        &[
-            ("Forwarded", "host=management.ui-delivery.test"),
-            ("X-Forwarded-Host", MANAGEMENT_AUTHORITY),
-        ],
-        &[],
+        HttpRequestSpec {
+            method: "GET",
+            path: "/v1/system",
+            host: CALLBACK_AUTHORITY,
+            accept: "application/json",
+            assertion: Some(assertion),
+            extra_headers: &[
+                ("Forwarded", "host=management.ui-delivery.test"),
+                ("X-Forwarded-Host", MANAGEMENT_AUTHORITY),
+            ],
+            body: &[],
+        },
     )?;
     check_safe_callback_404_surface(
         "callback Forwarded/X-Forwarded-Host lifecycle probe",
@@ -915,18 +1521,20 @@ fn run_real_callback_exchange(
     }
     let management_callback = origin_request_with_headers(
         &edge.management_url(),
-        "POST",
-        &callback_path,
-        MANAGEMENT_AUTHORITY,
-        "application/json",
-        Some(assertion),
-        &[
-            ("Authorization", format!("Bearer {bearer}").as_str()),
-            ("Forwarded", "host=callback.ui-delivery.test"),
-            ("X-Forwarded-Host", CALLBACK_AUTHORITY),
-            ("Content-Type", "application/json"),
-        ],
-        br#"{"status":"completed","result":{"content":"callback terminal"}}"#,
+        HttpRequestSpec {
+            method: "POST",
+            path: &callback_path,
+            host: MANAGEMENT_AUTHORITY,
+            accept: "application/json",
+            assertion: Some(assertion),
+            extra_headers: &[
+                ("Authorization", format!("Bearer {bearer}").as_str()),
+                ("Forwarded", "host=callback.ui-delivery.test"),
+                ("X-Forwarded-Host", CALLBACK_AUTHORITY),
+                ("Content-Type", "application/json"),
+            ],
+            body: br#"{"status":"completed","result":{"content":"callback terminal"}}"#,
+        },
     )?;
     if (200..300).contains(&management_callback.status) {
         return Err(
@@ -936,16 +1544,18 @@ fn run_real_callback_exchange(
 
     let callback = origin_request_with_headers(
         &edge.callback_url(),
-        "POST",
-        &callback_path,
-        CALLBACK_AUTHORITY,
-        "application/json",
-        None,
-        &[
-            ("Authorization", format!("Bearer {bearer}").as_str()),
-            ("Content-Type", "application/json"),
-        ],
-        br#"{"status":"completed","result":{"content":"callback terminal"}}"#,
+        HttpRequestSpec {
+            method: "POST",
+            path: &callback_path,
+            host: CALLBACK_AUTHORITY,
+            accept: "application/json",
+            assertion: None,
+            extra_headers: &[
+                ("Authorization", format!("Bearer {bearer}").as_str()),
+                ("Content-Type", "application/json"),
+            ],
+            body: br#"{"status":"completed","result":{"content":"callback terminal"}}"#,
+        },
     )?;
     if !(200..300).contains(&callback.status) {
         return Err(io::Error::other(format!(
@@ -1403,6 +2013,8 @@ fn write_server_config(
     let mut config = json!({
         "schema": "zode.server-config.v1",
         "listen": "127.0.0.1:0",
+        "management_origin": format!("https://{MANAGEMENT_AUTHORITY}"),
+        "callback_origin": format!("https://{CALLBACK_AUTHORITY}"),
         "server_authority_id": SERVER_AUTHORITY,
         "deployment": "server_only",
         "ui_mode": ui_mode.as_str(),
@@ -1584,26 +2196,24 @@ fn management_request(
     )
 }
 
+#[derive(Clone, Copy)]
+struct HttpRequestSpec<'a> {
+    method: &'a str,
+    path: &'a str,
+    host: &'a str,
+    accept: &'a str,
+    assertion: Option<&'a str>,
+    extra_headers: &'a [(&'a str, &'a str)],
+    body: &'a [u8],
+}
+
 fn management_request_with_first_post_bootstrap_recording(
     edge: &AccessEdge,
     jwks: &JwksFixture,
-    method: &str,
-    path: &str,
-    accept: &str,
-    assertion: Option<&str>,
-    body: &[u8],
+    request: HttpRequestSpec<'_>,
     recorder: &mut FirstPostBootstrapRecorder,
 ) -> TestResult<HttpResponse> {
-    let raw = raw_request_with_headers(
-        &edge.management_url(),
-        method,
-        path,
-        MANAGEMENT_HOST,
-        accept,
-        assertion,
-        &[],
-        body,
-    )?;
+    let raw = raw_request_with_headers(&edge.management_url(), request)?;
     recorder.record(&raw, jwks)?;
     parse_http_response(&raw.response)
 }
@@ -1635,29 +2245,26 @@ fn origin_request(
     assertion: Option<&str>,
     body: &[u8],
 ) -> TestResult<HttpResponse> {
-    origin_request_with_headers(base_url, method, path, host, accept, assertion, &[], body)
+    origin_request_with_headers(
+        base_url,
+        HttpRequestSpec {
+            method,
+            path,
+            host,
+            accept,
+            assertion,
+            extra_headers: &[],
+            body,
+        },
+    )
 }
 
 fn origin_request_with_headers(
     base_url: &str,
-    method: &str,
-    path: &str,
-    host: &str,
-    accept: &str,
-    assertion: Option<&str>,
-    extra_headers: &[(&str, &str)],
-    body: &[u8],
+    request: HttpRequestSpec<'_>,
 ) -> TestResult<HttpResponse> {
-    let raw = raw_request_with_headers(
-        base_url,
-        method,
-        path,
-        host,
-        accept,
-        assertion,
-        extra_headers,
-        body,
-    )?;
+    let raw = raw_request_with_headers(base_url, request)?;
+    record_active_callback_http("management-or-callback-http", &raw)?;
     parse_http_response(&raw.response)
 }
 
@@ -1670,19 +2277,33 @@ fn raw_request(
     assertion: Option<&str>,
     body: &[u8],
 ) -> TestResult<RawHttpExchange> {
-    raw_request_with_headers(base_url, method, path, host, accept, assertion, &[], body)
+    raw_request_with_headers(
+        base_url,
+        HttpRequestSpec {
+            method,
+            path,
+            host,
+            accept,
+            assertion,
+            extra_headers: &[],
+            body,
+        },
+    )
 }
 
 fn raw_request_with_headers(
     base_url: &str,
-    method: &str,
-    path: &str,
-    host: &str,
-    accept: &str,
-    assertion: Option<&str>,
-    extra_headers: &[(&str, &str)],
-    body: &[u8],
+    request_spec: HttpRequestSpec<'_>,
 ) -> TestResult<RawHttpExchange> {
+    let HttpRequestSpec {
+        method,
+        path,
+        host,
+        accept,
+        assertion,
+        extra_headers,
+        body,
+    } = request_spec;
     let exchange_started = Instant::now();
     let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}\r\nAccept: {accept}\r\nConnection: close\r\n"
@@ -1840,6 +2461,7 @@ fn raw_request_with_headers(
 struct SseConnection {
     stream: TcpStream,
     buffered: Vec<u8>,
+    request: Vec<u8>,
 }
 
 fn open_sse_connection(
@@ -1861,7 +2483,8 @@ fn open_sse_connection(
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: text/event-stream\r\nCf-Access-Jwt-Assertion: {assertion}\r\nConnection: keep-alive\r\n\r\n"
     );
-    stream.write_all(request.as_bytes())?;
+    let request = request.into_bytes();
+    stream.write_all(&request)?;
     let mut buffered = Vec::new();
     let header_end = loop {
         let mut chunk = [0_u8; 4096];
@@ -1900,6 +2523,7 @@ fn open_sse_connection(
     Ok(SseConnection {
         stream,
         buffered: buffered[header_end..].to_vec(),
+        request,
     })
 }
 
@@ -1912,6 +2536,24 @@ impl SseConnection {
                 .windows(b"completed".len())
                 .any(|window| window == b"completed")
             {
+                let response_chunks = if bytes.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![RawResponseChunk {
+                        offset_us: 0,
+                        bytes: bytes.clone(),
+                    }]
+                };
+                let exchange = terminal_raw_exchange(
+                    &self.request,
+                    &bytes,
+                    &response_chunks,
+                    Instant::now(),
+                    0,
+                    None,
+                    TransportTermination::Complete,
+                );
+                record_active_callback_http("management-sse", &exchange)?;
                 return Ok(bytes);
             }
             if SystemTime::now() >= deadline {
@@ -2552,7 +3194,7 @@ fn decode_chunked(mut bytes: &[u8]) -> TestResult<Vec<u8>> {
                     }
                     return Ok(decoded);
                 }
-                if !trailer.iter().any(|byte| *byte == b':') {
+                if !trailer.contains(&b':') {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "chunk trailer malformed",
@@ -2663,16 +3305,41 @@ fn proxy_connection(
         return edge_reject(client);
     }
     let mut upstream = TcpStream::connect(target)?;
-    upstream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    // The listener is a nonblocking fixture, but every accepted stream is
+    // restored to blocking mode before this function. Keep that barrier
+    // explicit for the upstream side as well: otherwise a platform may
+    // surface EAGAIN (os error 35) while the Server is still writing SSE
+    // headers, which is exactly the historical callback gap.
+    upstream.set_nonblocking(false)?;
+    upstream.set_read_timeout(Some(Duration::from_millis(250)))?;
     upstream.set_write_timeout(Some(Duration::from_secs(5)))?;
     upstream.write_all(&request)?;
     let mut response = Vec::new();
-    match upstream.read_to_end(&mut response) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::ConnectionReset && !response.is_empty() => {}
-        Err(error) => return Err(error),
+    let mut response_started = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match upstream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                response_started = true;
+                response.extend_from_slice(&buffer[..read]);
+                client.write_all(&buffer[..read])?;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset && response_started => {
+                break;
+            }
+            Err(error) => return Err(error),
+        }
     }
-    client.write_all(&response)
+    Ok(())
 }
 
 struct AccessEdge {
@@ -2680,6 +3347,7 @@ struct AccessEdge {
     callback_address: SocketAddr,
     stop: Arc<AtomicBool>,
     joins: Vec<JoinHandle<()>>,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl AccessEdge {
@@ -2692,15 +3360,29 @@ impl AccessEdge {
         let management_address = management_listener.local_addr()?;
         let callback_address = callback_listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(Mutex::new(Vec::new()));
         let joins = vec![
-            spawn_edge_listener(management_listener, target, true, Arc::clone(&stop)),
-            spawn_edge_listener(callback_listener, target, false, Arc::clone(&stop)),
+            spawn_edge_listener(
+                management_listener,
+                target,
+                true,
+                Arc::clone(&stop),
+                Arc::clone(&connections),
+            ),
+            spawn_edge_listener(
+                callback_listener,
+                target,
+                false,
+                Arc::clone(&stop),
+                Arc::clone(&connections),
+            ),
         ];
         Ok(Self {
             management_address,
             callback_address,
             stop,
             joins,
+            connections,
         })
     }
 
@@ -2721,6 +3403,11 @@ impl Drop for AccessEdge {
         for join in self.joins.drain(..) {
             let _ = join.join();
         }
+        if let Ok(mut connections) = self.connections.lock() {
+            for join in connections.drain(..) {
+                let _ = join.join();
+            }
+        }
     }
 }
 
@@ -2729,12 +3416,30 @@ fn spawn_edge_listener(
     target: SocketAddr,
     require_access: bool,
     stop: Arc<AtomicBool>,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         while !stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let _ = proxy_connection(stream, target, require_access);
+                    // Keep the accepted listener responsive while an SSE
+                    // connection remains open. A single inline proxy would
+                    // starve the following message/callback request and
+                    // report a misleading timeout instead of exercising the
+                    // product path.
+                    let connection = thread::spawn(move || {
+                        let _ = (|| -> io::Result<()> {
+                            // TcpStream inherits the listener's nonblocking
+                            // mode on this platform; restore blocking before
+                            // the first request read so the fixture has an
+                            // explicit barrier.
+                            stream.set_nonblocking(false)?;
+                            proxy_connection(stream, target, require_access)
+                        })();
+                    });
+                    if let Ok(mut active) = connections.lock() {
+                        active.push(connection);
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
@@ -2782,7 +3487,10 @@ impl CallbackBoundaryFixture {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let _ = serve_callback_boundary(stream, &thread_state);
+                        let _ = (|| -> io::Result<()> {
+                            stream.set_nonblocking(false)?;
+                            serve_callback_boundary(stream, &thread_state)
+                        })();
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -2976,7 +3684,10 @@ impl JwksFixture {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let _ = serve_jwks(stream, &thread_exchanges);
+                        let _ = (|| -> io::Result<()> {
+                            stream.set_nonblocking(false)?;
+                            serve_jwks(stream, &thread_exchanges)
+                        })();
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -3015,6 +3726,9 @@ impl Drop for JwksFixture {
         let _ = TcpStream::connect(self.address);
         if let Some(join) = self.join.take() {
             let _ = join.join();
+        }
+        if let Ok(exchanges) = self.exchanges.lock() {
+            let _ = record_active_callback_jwks(&exchanges);
         }
     }
 }
@@ -3153,6 +3867,22 @@ fn raw_exchange_envelope(
     purpose: &str,
     exchange: &RawHttpExchange,
 ) -> Value {
+    raw_exchange_envelope_with_boundary(
+        recording_id,
+        e2e_name,
+        "management_http",
+        purpose,
+        exchange,
+    )
+}
+
+fn raw_exchange_envelope_with_boundary(
+    recording_id: &str,
+    e2e_name: &str,
+    boundary: &str,
+    purpose: &str,
+    exchange: &RawHttpExchange,
+) -> Value {
     json!({
         "schema": "zode.http-incident-recording.v1",
         "version": 1,
@@ -3160,7 +3890,7 @@ fn raw_exchange_envelope(
         "e2e_name": e2e_name,
         "capture_class": "raw_quarantine",
         "purpose": purpose,
-        "boundary": "management_http",
+        "boundary": boundary,
         "test_only": true,
         "bootstrap_barrier": "ZODE_SERVER_READY",
         "request_wire_hex": bytes_hex(&exchange.request),
@@ -3583,6 +4313,8 @@ struct HttpResponse {
 
 struct ServerProcess {
     child: Option<Child>,
+    pid: u32,
+    process_name: String,
     base_url: String,
     stdout: Arc<Mutex<Vec<u8>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
@@ -3590,6 +4322,8 @@ struct ServerProcess {
 }
 
 struct ServerCapture {
+    pid: u32,
+    status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -3625,6 +4359,7 @@ impl ServerProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+        let pid = child.id();
         let stdout = Arc::new(Mutex::new(Vec::new()));
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -3681,6 +4416,8 @@ impl ServerProcess {
         };
         Ok(Self {
             child: Some(child),
+            pid,
+            process_name: label.to_owned(),
             base_url,
             stdout,
             stderr,
@@ -3689,14 +4426,18 @@ impl ServerProcess {
     }
 
     fn stop(&mut self) -> TestResult<ServerCapture> {
-        if let Some(mut child) = self.child.take() {
+        let status = if let Some(mut child) = self.child.take() {
             let _ = child.kill();
-            let _ = child.wait()?;
-        }
+            Some(child.wait()?)
+        } else {
+            None
+        };
         for reader in self.readers.drain(..) {
             let _ = reader.join();
         }
-        Ok(ServerCapture {
+        let capture = ServerCapture {
+            pid: self.pid,
+            status: status.ok_or_else(|| io::Error::other("process was already stopped"))?,
             stdout: self
                 .stdout
                 .lock()
@@ -3707,18 +4448,39 @@ impl ServerProcess {
                 .lock()
                 .map_err(|_| "stderr lock poisoned")?
                 .clone(),
-        })
+        };
+        record_active_callback_process(&self.process_name, &capture);
+        Ok(capture)
     }
 }
 
 impl Drop for ServerProcess {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
+        let status = if let Some(mut child) = self.child.take() {
             let _ = child.kill();
-            let _ = child.wait();
-        }
+            child.wait().ok()
+        } else {
+            None
+        };
         for reader in self.readers.drain(..) {
             let _ = reader.join();
+        }
+        if let Some(status) = status {
+            let capture = ServerCapture {
+                pid: self.pid,
+                status,
+                stdout: self
+                    .stdout
+                    .lock()
+                    .map(|bytes| bytes.clone())
+                    .unwrap_or_default(),
+                stderr: self
+                    .stderr
+                    .lock()
+                    .map(|bytes| bytes.clone())
+                    .unwrap_or_default(),
+            };
+            record_active_callback_process(&self.process_name, &capture);
         }
     }
 }

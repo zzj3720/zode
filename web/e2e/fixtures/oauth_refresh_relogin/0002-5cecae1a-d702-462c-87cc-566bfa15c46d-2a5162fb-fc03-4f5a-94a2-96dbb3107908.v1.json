@@ -1,0 +1,111 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "0002-5cecae1a-d702-462c-87cc-566bfa15c46d-2a5162fb-fc03-4f5a-94a2-96dbb3107908",
+  "e2e_name": "e2e_server_provider_descriptor_round_trips_non_secret_revision",
+  "boundary": "browser-capture-set",
+  "first_observed": "/v1/providers/descriptor-roundtrip-provider returned HTTP 404",
+  "classification": "PRODUCT_ROUTE_MISSING",
+  "source_digest": "51b0e11c8202cf816ca185a1907ca5af3154e93f695e66a034a07e1c680f408e",
+  "first_failure_recording_id": "000003-e62fd2af-9d7c-4602-98e7-dddc29fed4d4",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000001-5854c77f-4270-45d0-8e46-ffedfbafb886",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/system",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "host": "127.0.0.1:59661"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 3672.125,
+            "data_base64": "eyJkZXBsb3ltZW50Ijoic2VydmVyX29ubHkiLCJmZWF0dXJlcyI6eyJwcm92aWRlcl9hdXRoIjp0cnVlLCJyZW1vdGVfZW5kcG9pbnRzIjp0cnVlfSwiaW5ncmVzcyI6eyJjYWxsYmFja19vcmlnaW4iOiJzZXBhcmF0ZSIsIm1hbmFnZW1lbnRfYXV0aCI6ImNsb3VkZmxhcmVfYWNjZXNzIn0sImxvY2FsX2VuZHBvaW50X2lkIjpudWxsLCJzY2hlbWEiOiJ6b2RlLnN5c3RlbS52MSJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000002",
+      "recording_id": "000002-0a37c1b4-e82f-43ab-b842-15e33ea0e3c9",
+      "boundary": "access-jwks-fixture",
+      "method": "GET",
+      "path": "/jwks",
+      "request_headers": {
+        "accept": "*/*",
+        "host": "127.0.0.1:59660"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-store",
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 0,
+            "data_base64": "eyJrZXlzIjpbeyJrdHkiOiJSU0EiLCJuIjoiPHNlY3JldDpwcm92aWRlcl9kZXNjcmlwdG9yX2p3a3NfbW9kdWx1cz4iLCJlIjoiQVFBQiIsImtpZCI6Im9hdXRoLXJlZnJlc2gtYnJvd3Nlci1hY2Nlc3MiLCJ1c2UiOiJzaWciLCJhbGciOiJSUzI1NiJ9XX0="
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000003",
+      "recording_id": "000003-e62fd2af-9d7c-4602-98e7-dddc29fed4d4",
+      "boundary": "management-access-edge",
+      "method": "PUT",
+      "path": "/v1/providers/descriptor-roundtrip-provider",
+      "request_headers": {
+        "content-type": "application/json",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "*/*",
+        "origin": "http://127.0.0.1:59661",
+        "host": "127.0.0.1:59661"
+      },
+      "request_body": {
+        "raw_base64": "eyJraW5kIjoib3BlbmFpX2NvbXBhdGlibGUiLCJiYXNlX3VybCI6Imh0dHBzOi8vbW9kZWxzLmRlc2NyaXB0b3Itcm91bmR0cmlwLnRlc3QvdjEiLCJtb2RlbHMiOlsiZGVzY3JpcHRvci1tb2RlbC1hIiwiZGVzY3JpcHRvci1tb2RlbC1iIl0sIm9wdGlvbnMiOnsib3JnYW5pemF0aW9uIjoiZGVzY3JpcHRvci1vcmcifX0=",
+        "canonical_json": {
+          "kind": "openai_compatible",
+          "base_url": "https://models.descriptor-roundtrip.test/v1",
+          "models": [
+            "descriptor-model-a",
+            "descriptor-model-b"
+          ],
+          "options": {
+            "organization": "descriptor-org"
+          }
+        },
+        "sha256": "8d703a413b92c5492a3bf121e222438e1e1f49931edce23508ad8802ff186ebb"
+      },
+      "response": {
+        "status": 404,
+        "headers": {},
+        "chunks": [],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:provider_descriptor_access_assertion_1>",
+    "<secret:provider_descriptor_jwks_modulus>"
+  ],
+  "integrity_sha256": "012e212fe1127e2117ea3b9dd70407361bf72862b2fa1359287b8c921471e1e9"
+}

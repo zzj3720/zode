@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "dependencies": {
+    "@phosphor-icons/web": "^2.1.2"
+  },
   "devDependencies": {
     "typescript": "5.9.3",
     "vite": "catalog:",
