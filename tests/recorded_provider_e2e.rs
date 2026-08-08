@@ -25,13 +25,14 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use support::{
-    canonical_json, http_client, new_llm_recording_run_dir, run_provider_attempt_until_cancel,
-    run_provider_failure, run_provider_roundtrip_and_restart, scan_llm_recording_tree,
-    sqlite_contains_secret, write_endpoint_config, HttpFixture, LlmHttpAttemptPlan,
-    LlmHttpObservedRequest, LlmHttpProxy, LlmHttpRecording, LlmHttpRecordingMetadata,
-    LlmHttpResponseOutcome, ModelFixture, ModelHold, ModelScript, ProviderRoundtripSpec,
-    TempDatabase, TestResult, LLM_HTTP_RECORDING_SCHEMA, MAX_LLM_CHUNK_DELAY_US,
-    MAX_LLM_RESPONSE_BYTES, TEST_CONTROLLER_SECRET,
+    authenticated_as, canonical_json, http_client, new_llm_recording_run_dir,
+    persist_public_http_gap_exchange, run_provider_attempt_until_cancel, run_provider_failure,
+    run_provider_roundtrip_and_restart, scan_llm_recording_tree, sqlite_contains_secret,
+    write_endpoint_config, HttpFixture, LlmHttpAttemptPlan, LlmHttpObservedRequest, LlmHttpProxy,
+    LlmHttpRecording, LlmHttpRecordingMetadata, LlmHttpResponseOutcome, ModelFixture, ModelHold,
+    ModelScript, ProviderRoundtripSpec, PublicHttpGapExchange, TempDatabase, TestResult, TestZode,
+    LLM_HTTP_RECORDING_SCHEMA, MAX_LLM_CHUNK_DELAY_US, MAX_LLM_RESPONSE_BYTES,
+    TEST_CONTROLLER_AUTHORITY, TEST_CONTROLLER_SECRET,
 };
 use tokio::{sync::Notify, time::timeout};
 
@@ -345,7 +346,13 @@ fn legacy_hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
-fn config_for_replay(database: &Path, provider_origin: &str) -> TestResult<PathBuf> {
+fn config_for_replay(database: &Path, provider_base_url: &str) -> TestResult<PathBuf> {
+    // The public policy is an origin allowlist, while the model descriptor
+    // carries the recorder's `/v1` base URL.  Normalize the test input here
+    // so every recorder call exercises the same production exact-origin rule.
+    let provider_origin = url::Url::parse(provider_base_url)?
+        .origin()
+        .ascii_serialization();
     let path = write_endpoint_config(database, Vec::new(), 1)?;
     let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
     config["provider_execution"]["adapter_kinds"] = json!(["openai_compatible"]);
@@ -750,7 +757,7 @@ async fn e2e_llm_recorder_redacts_authorization_into_named_synthetic_slot() -> T
     )
     .await?;
     let database = TempDatabase::new("recording-authorization-slot")?;
-    let config = config_for_replay(database.path(), &provider.origin())?;
+    let config = config_for_replay(database.path(), &recorder.base_url("/v1"))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -885,7 +892,7 @@ async fn e2e_llm_recorder_explicit_authorization_requirement_covers_custom_slot(
     )
     .await?;
     let database = TempDatabase::new("recording-custom-auth-slot")?;
-    let config = config_for_replay(database.path(), &provider.origin())?;
+    let config = config_for_replay(database.path(), &recorder.base_url("/v1"))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -1086,6 +1093,108 @@ async fn finish_synthetic_recorder(
     Ok(recording)
 }
 
+/// Retain the first post-adoption reproduction of the exact-origin fixture
+/// gap.  The intentionally mismatched allowlist makes the real Endpoint
+/// reject session admission before any provider-boundary recorder exchange;
+/// the public 422 request/response is durably captured in its own quarantine
+/// run and is explicitly related to (rather than relabelled as) the retained
+/// historical gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_later_test_reproduction_of_exact_origin_gap() -> TestResult<()> {
+    let mut provider =
+        ModelFixture::start(vec![ModelScript::final_text("unreachable provider")]).await?;
+    let (mut recorder, recorder_directory) = start_synthetic_recorder(
+        provider.origin(),
+        "later_exact_origin_gap_reproduction",
+        "later_test_reproduction_of_gap",
+    )
+    .await?;
+    let evidence_directory = new_llm_recording_run_dir()?;
+    let database = TempDatabase::new("later-exact-origin-gap")?;
+    // Deliberately preserve the pre-fix fixture mismatch: the policy allows
+    // the upstream fixture origin while the model descriptor names the test
+    // recorder origin.  Production compares complete URL origins exactly.
+    let config = config_for_replay(database.path(), &provider.origin())?;
+    let mut endpoint = TestZode::start(
+        database.path(),
+        &config,
+        &[REPLAY_SECRET, TEST_CONTROLLER_SECRET],
+    )
+    .await?;
+    let request_body = json!({
+        "model": {
+            "provider": PROVIDER,
+            "provider_execution": {
+                "schema": "zode.provider-execution.v1",
+                "revision": 1,
+                "kind": "openai_compatible",
+                "base_url": recorder.base_url("/v1")
+            },
+            "model": MODEL,
+            "auth_authority_id": TEST_CONTROLLER_AUTHORITY,
+            "auth_profile_id": PROFILE,
+            "minimum_auth_revision": 1
+        }
+    });
+    let request_bytes = serde_json::to_vec(&request_body)?;
+    let response = authenticated_as(http_client()?.post(endpoint.url("/v1/sessions")), SUBJECT)
+        .header("Idempotency-Key", "later-test-reproduction-of-gap")
+        .json(&request_body)
+        .send()
+        .await?;
+    let status = response.status();
+    let response_body = response.bytes().await?;
+    let evidence_path = persist_public_http_gap_exchange(
+        &evidence_directory,
+        PublicHttpGapExchange {
+            e2e_name: "later_test_reproduction_of_gap",
+            relation: "later_test_reproduction_of_gap",
+            boundary: "public.session_create",
+            method: "POST",
+            path: "/v1/sessions",
+            request_body: &request_bytes,
+            response_status: status.as_u16(),
+            response_body: &response_body,
+        },
+    )?;
+    let recorder_requests = recorder.observed_requests();
+    let provider_requests = provider.request_count();
+    let endpoint_stop = endpoint
+        .stop(&[REPLAY_SECRET, TEST_CONTROLLER_SECRET])
+        .await;
+    let recorder_stop = recorder.stop().await;
+    let provider_stop = provider.stop().await;
+    endpoint_stop?;
+    recorder_stop?;
+    provider_stop?;
+    if status != reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+        return Err(Error::other(format!(
+            "later exact-origin reproduction returned HTTP {status}, expected 422"
+        ))
+        .into());
+    }
+    if !recorder_requests.is_empty() || provider_requests != 0 {
+        return Err(Error::other(format!(
+            "session-create 422 unexpectedly reached provider boundary (recorder={}, provider={provider_requests})",
+            recorder_requests.len()
+        ))
+        .into());
+    }
+    scan_llm_recording_tree(
+        &evidence_directory,
+        &[REPLAY_SECRET, TEST_CONTROLLER_SECRET],
+    )?;
+    scan_llm_recording_tree(
+        &recorder_directory,
+        &[REPLAY_SECRET, TEST_CONTROLLER_SECRET],
+    )?;
+    eprintln!(
+        "later_test_reproduction_of_gap retained public 422 evidence at {} (recorder barrier: 0 exchanges)",
+        evidence_path.display()
+    );
+    Ok(())
+}
+
 async fn capture_stream_error_recording() -> TestResult<(LlmHttpRecording, PathBuf)> {
     let hold = ModelHold::new();
     let mut provider =
@@ -1097,7 +1206,7 @@ async fn capture_stream_error_recording() -> TestResult<(LlmHttpRecording, PathB
     )
     .await?;
     let database = TempDatabase::new("recording-aborted-terminal-stream")?;
-    let config = config_for_replay(database.path(), &provider.origin())?;
+    let config = config_for_replay(database.path(), &recorder.base_url("/v1"))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -1183,7 +1292,7 @@ async fn capture_complete_recording_for(owner: &str) -> TestResult<(LlmHttpRecor
         start_synthetic_recorder(provider.origin(), "synthetic_complete_terminal_hold", owner)
             .await?;
     let database = TempDatabase::new("recording-complete-terminal-hold")?;
-    let config = config_for_replay(database.path(), &provider.origin())?;
+    let config = config_for_replay(database.path(), &recorder.base_url("/v1"))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -1743,7 +1852,7 @@ async fn e2e_llm_recorder_terminal_flush_failure_fails_live_stream() -> TestResu
         fs::set_permissions(&occupied_exchange, fs::Permissions::from_mode(0o600))?;
     }
     let database = TempDatabase::new("recording-terminal-flush-failure")?;
-    let config = config_for_replay(database.path(), &provider.origin())?;
+    let config = config_for_replay(database.path(), &recorder.base_url("/v1"))?;
     run_provider_failure(synthetic_spec(
         &database,
         config,
@@ -1789,7 +1898,7 @@ async fn e2e_llm_recorder_stream_capture_bound_fails_closed() -> TestResult<()> 
     )
     .await?;
     let database = TempDatabase::new("recording-stream-capture-bound")?;
-    let config = config_for_replay(database.path(), &provider.origin())?;
+    let config = config_for_replay(database.path(), &recorder.base_url("/v1"))?;
     run_provider_failure(synthetic_spec(
         &database,
         config,
@@ -1837,7 +1946,7 @@ async fn e2e_llm_recording_promotion_is_private_then_immutable_0444() -> TestRes
     )
     .await?;
     let database = TempDatabase::new("recording-promotion-modes")?;
-    let config = config_for_replay(database.path(), &provider.origin())?;
+    let config = config_for_replay(database.path(), &recorder.base_url("/v1"))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(
@@ -2169,7 +2278,7 @@ async fn e2e_llm_recorder_done_then_transport_disconnect_replays_as_complete() -
     )
     .await?;
     let database = TempDatabase::new("recording-done-then-disconnect")?;
-    let config = config_for_replay(database.path(), &provider.origin())?;
+    let config = config_for_replay(database.path(), &recorder.base_url("/v1"))?;
     let cancel = Arc::new(Notify::new());
     let attempt = tokio::spawn(run_provider_attempt_until_cancel(
         synthetic_spec(

@@ -1335,10 +1335,16 @@ impl Drop for HttpFixture {
 
 pub const LLM_HTTP_RECORDING_SCHEMA: &str = "zode.llm-http-recording.v1";
 pub const HTTP_INCIDENT_RECORDING_SCHEMA: &str = "zode.http-incident-recording.v1";
+/// Schema for an ignored, test-only public-boundary exchange retained while
+/// reproducing a recorder evidence gap.  This is never linked from
+/// production code and is intentionally separate from the LLM cassette
+/// envelope.
+pub const PUBLIC_HTTP_GAP_RECORDING_SCHEMA: &str = "zode.public-http-gap-recording.v1";
 const MAX_LLM_RECORDING_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_LLM_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LLM_RESPONSE_CHUNKS: usize = 4_096;
 pub const MAX_LLM_CHUNK_DELAY_US: u64 = 60_000_000;
+const MAX_PUBLIC_HTTP_GAP_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -2256,6 +2262,100 @@ fn write_restricted_json_new<T: Serialize>(path: &Path, value: &T) -> TestResult
         .ok_or_else(|| IoError::other("recording fact path has no parent"))?;
     fs::File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct PublicHttpGapRequest {
+    method: String,
+    path: String,
+    body_hex: String,
+    body_sha256: String,
+    authorization: String,
+}
+
+#[derive(Serialize)]
+struct PublicHttpGapResponse {
+    status: u16,
+    body_hex: String,
+    body_sha256: String,
+}
+
+#[derive(Serialize)]
+struct PublicHttpGapRecording {
+    schema: &'static str,
+    version: u32,
+    recording_id: String,
+    e2e_name: String,
+    relation: String,
+    boundary: String,
+    first_observed: String,
+    request: PublicHttpGapRequest,
+    response: PublicHttpGapResponse,
+    envelope_sha256: String,
+}
+
+/// Input to one public HTTP request/response evidence-gap capture.
+pub struct PublicHttpGapExchange<'a> {
+    pub e2e_name: &'a str,
+    pub relation: &'a str,
+    pub boundary: &'a str,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub request_body: &'a [u8],
+    pub response_status: u16,
+    pub response_body: &'a [u8],
+}
+
+/// Persist one public HTTP request/response observed while reproducing a
+/// test-only evidence gap. Authorization is represented only by its named
+/// synthetic slot; body bytes are bounded and the file is create-new,
+/// restrictive, and fsync'd before the path is returned.
+pub fn persist_public_http_gap_exchange(
+    run_directory: &Path,
+    exchange: PublicHttpGapExchange<'_>,
+) -> TestResult<PathBuf> {
+    if exchange.request_body.len() > MAX_PUBLIC_HTTP_GAP_BODY_BYTES
+        || exchange.response_body.len() > MAX_PUBLIC_HTTP_GAP_BODY_BYTES
+    {
+        return Err(IoError::other("public HTTP gap exchange exceeded body bound").into());
+    }
+    let metadata = fs::symlink_metadata(run_directory)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(IoError::other("public HTTP gap run directory was not a directory").into());
+    }
+    let recording_id = run_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| IoError::other("public HTTP gap run directory had no recording id"))?
+        .to_owned();
+    let mut recording = PublicHttpGapRecording {
+        schema: PUBLIC_HTTP_GAP_RECORDING_SCHEMA,
+        version: 1,
+        recording_id,
+        e2e_name: exchange.e2e_name.to_owned(),
+        relation: exchange.relation.to_owned(),
+        boundary: exchange.boundary.to_owned(),
+        first_observed: "session_create_http_422_before_provider_exchange".to_owned(),
+        request: PublicHttpGapRequest {
+            method: exchange.method.to_owned(),
+            path: exchange.path.to_owned(),
+            body_hex: hex_encode(exchange.request_body),
+            body_sha256: sha256_hex(exchange.request_body),
+            authorization: "SLOT_CONTROLLER_AUTHORIZATION_HEADER".to_owned(),
+        },
+        response: PublicHttpGapResponse {
+            status: exchange.response_status,
+            body_hex: hex_encode(exchange.response_body),
+            body_sha256: sha256_hex(exchange.response_body),
+        },
+        envelope_sha256: String::new(),
+    };
+    let preimage = serde_json::to_vec(&recording)?;
+    recording.envelope_sha256 = sha256_hex(&preimage);
+    let path = run_directory.join("public-http-gap.json");
+    write_restricted_json_new(&path, &recording)?;
+    Ok(path)
 }
 
 fn sync_directory(path: &Path) -> TestResult<()> {
