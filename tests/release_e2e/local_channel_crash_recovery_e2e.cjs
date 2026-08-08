@@ -54,7 +54,12 @@ if (!artifact) {
       try { state = JSON.parse(readFileSync(statePath, 'utf8')); } catch { continue; }
       if (!Array.isArray(state.roles)) continue;
       const executable = join(state.artifact.installPath, 'zode-server');
-      const config = join(state.directory, 'server.json');
+      // The installed driver keeps the all-in-one config in the immutable
+      // releases parent so Management's relative UI/config containment gate
+      // is satisfied.  Bind the process observation to the exact persisted
+      // path rather than reconstructing the old instance-local location.
+      const config = state.server_config_path;
+      if (typeof config !== 'string' || !config.startsWith(`${state.server_config_directory}/`)) continue;
       const pids = exactProcess(executable, config);
       if (pids.length === 1) return { state, pid: pids[0], executable, config };
     }

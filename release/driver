@@ -887,6 +887,7 @@ function endpointConfig(instance, endpointPort, secretPath, persistent) {
     schema: "zode.config.v1",
     listen: `127.0.0.1:${endpointPort}`,
     runtime_store: { kind: "sqlite", path: persistent.endpoint_store },
+    credential_replica_store: { kind: "files", directory: persistent.credential_replica_store },
     controller_auth: [{ authority_id: persistent.authority_id, revision: 1, kind: "bearer_secret_file", secret_file: secretPath }],
   };
 }
@@ -1130,6 +1131,11 @@ function persistentReleaseState(root, instanceId, kind) {
   }
   const subjectKeyPath = join(directory, "subject.key");
   privateFile(subjectKeyPath, randomBytes(32));
+  // Endpoint provider replicas use a separate private files store. Without
+  // this explicit store the Endpoint correctly rejects controller writes as
+  // disabled, so the installed management flow cannot create a profile.
+  const credentialReplicaStore = ensureDirectory(join(directory, "credentials"), 0o700);
+  validatePrivateTree(credentialReplicaStore);
   const serverSecrets = ensureDirectory(join(directory, "server-secrets"), 0o700);
   validatePrivateTree(serverSecrets);
   for (const databasePath of [join(directory, "endpoint.sqlite3"), join(directory, "server.sqlite3")]) {
@@ -1143,6 +1149,7 @@ function persistentReleaseState(root, instanceId, kind) {
     authority_id: metadata.authority_id,
     endpoint_secret_path: endpointSecretPath,
     endpoint_store: join(directory, "endpoint.sqlite3"),
+    credential_replica_store: credentialReplicaStore,
     server_database: join(directory, "server.sqlite3"),
     server_secrets: serverSecrets,
     subject_key: subjectKeyPath,

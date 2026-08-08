@@ -210,6 +210,8 @@ async function main() {
   const fixtures = await startFixtures();
   let started = false;
   let browser;
+  let page;
+  let browserResponses = [];
   let failure;
   const env = {
     ...process.env,
@@ -230,11 +232,19 @@ async function main() {
     fixtures.setTarget(new URL(serverUrl).origin);
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext();
-    const page = await context.newPage();
+    page = await context.newPage();
     const browserRequests = [];
+    browserResponses = [];
     page.on('request', (request) => browserRequests.push({ method: request.method(), url: request.url() }));
+    page.on('response', (response) => {
+      const entry = { status: response.status(), url: response.url() };
+      browserResponses.push(entry);
+      if (entry.status >= 400) {
+        void response.text().then((body) => { entry.body = body.slice(0, 4096); }).catch(() => {});
+      }
+    });
     await page.goto(`${fixtures.edgeOrigin}/`, { waitUntil: 'domcontentloaded' });
-    await page.getByText('Sessions', { exact: true }).waitFor();
+    await page.getByRole('link', { name: 'Sessions', exact: true }).waitFor();
     await page.getByText('All-in-one ready', { exact: true }).waitFor();
     await page.getByRole('link', { name: 'Providers' }).click();
     await page.getByRole('button', { name: 'Configure provider' }).click();
@@ -281,7 +291,15 @@ async function main() {
     process.stdout.write(JSON.stringify({ status: 'PASS', root, browser_origin: fixtures.edgeOrigin, provider_requests: fixtures.requests.length, browser_management_requests: managementRequests.length }) + '\n');
   } catch (error) {
     failure = error;
-    preserveFailure(error, { artifact: path.resolve(artifact), root });
+    const browserState = page
+      ? { url: page.url(), body_text: await page.locator('body').innerText().catch(() => '') }
+      : {};
+    preserveFailure(error, {
+      artifact: path.resolve(artifact),
+      root,
+      browser: browserState,
+      responses: browserResponses,
+    });
     process.stderr.write(`${JSON.stringify({ status: 'RED', error: String(error.message || error), details: error.details || {} })}\n`);
     process.exitCode = 1;
   } finally {
