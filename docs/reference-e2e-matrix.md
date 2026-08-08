@@ -1,6 +1,6 @@
 # Approved common-user E2E matrix
 
-Status: approved Zode behavior map, current protected main `213cc28ce883567b9c726f79f0106eea3c230218`.
+Status: approved Zode behavior map, current protected main `2beff070a6cdbe67c2422f564c285264c5d7c496`.
 
 This document turns the approved outside-repository adoption baseline into
 Zode-owned black-box anchors. It is a traceability document, not a claim that
@@ -84,3 +84,27 @@ repeatable browser smoke, and the long-running row proves browser close,
 navigation, reload, SSE reconnect, Server restart, and Endpoint restart before
 observing the same durable final. A build, health page, test count, or lower-
 level fixture alone cannot change a row from PARTIAL/BLOCKED to complete.
+
+## CI signal contract
+
+`locked-build-and-e2e` is the shared protocol/recorder/process evidence job. Its
+green result is deliberately not a product-acceptance result. The separate
+`approved-common-browser-e2e` job checks out the exact merge revision, builds
+the Endpoint, Server, and UI from that checkout, and executes every tracked
+file under `web/e2e/specs/` through Chromium and real child processes. Its
+collection audit is pinned by
+`scripts/ci/approved-product-playwright-manifest.json` to 24 files and 53 test
+identities; any missing/extra file or test, failure, skip, or unrun test fails
+the job. It never reads live-provider credentials. `approved-product-merge-gate`
+requires both jobs, so a shared-only green cannot make a product merge appear
+green. Repository protection must require that aggregate context after its
+first run; the workflow cannot make an unconfigured GitHub branch-protection
+rule required by itself.
+
+The current exact-main product gate is expected to expose real fixture or
+product blockers rather than hide them. For example, the session-reconnect
+fixture currently reaches the Endpoint public startup boundary and fails closed
+on the typed HTTP-tool recovery configuration error
+`Invalid("HTTP tools cannot claim deduplicated retry dispatch")`; that is a
+test-fixture drift to repair in the owning E2E, not permission to change the
+approved HTTP recovery contract or production behavior.
