@@ -180,19 +180,25 @@ async fn run_live(artifact: PathBuf, secret: Secret, persistent: bool) -> TestRe
 
     let recorder_base_url = recorder.base_url("/zen/go/v1");
     let script = repository.join("tests/release_e2e/installed_channel_browser_smoke_e2e.cjs");
-    let channel_root = if persistent {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|value| value.as_nanos())
-            .unwrap_or_default();
-        let root = env::temp_dir().join(format!(
-            "zode-local-channel-live-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root)?;
-        Some(root)
+    let (channel_root, cleanup_channel_root) = if persistent {
+        if let Ok(existing) = env::var("ZODE_RELEASE_LOCAL_CHANNEL_ROOT") {
+            let root = PathBuf::from(existing);
+            fs::create_dir_all(&root)?;
+            (Some(root), false)
+        } else {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default();
+            let root = env::temp_dir().join(format!(
+                "zode-local-channel-live-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root)?;
+            (Some(root), true)
+        }
     } else {
-        None
+        (None, false)
     };
     let mut command = Command::new("node");
     command
@@ -291,8 +297,10 @@ async fn run_live(artifact: PathBuf, secret: Secret, persistent: bool) -> TestRe
         .into())
     };
 
-    if let Some(root) = channel_root {
-        let _ = fs::remove_dir_all(root);
+    if cleanup_channel_root {
+        if let Some(root) = channel_root {
+            let _ = fs::remove_dir_all(root);
+        }
     }
     result
 }
