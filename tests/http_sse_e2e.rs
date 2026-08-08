@@ -730,7 +730,7 @@ async fn e2e_conflicting_create_receipt_projection_fails_closed(
 
     server.stop().await?;
     let database_file = database.path().to_owned();
-    db_blocking(move || {
+    let before_restart = db_blocking(move || {
         let mut connection = Connection::open(database_file)?;
         let transaction = connection.transaction()?;
         let (command_id, command_fingerprint): (String, Vec<u8>) = transaction.query_row(
@@ -800,7 +800,7 @@ async fn e2e_conflicting_create_receipt_projection_fails_closed(
             return Err(rusqlite::Error::InvalidQuery);
         }
         transaction.commit()?;
-        Ok::<(), rusqlite::Error>(())
+        receipt_recovery_snapshot(&connection)
     })
     .await?;
 
@@ -809,20 +809,17 @@ async fn e2e_conflicting_create_receipt_projection_fails_closed(
         restart.is_err(),
         "conflicting verified create receipt projection must fail before READY"
     );
-    db_blocking(move || {
-        let connection = Connection::open(database.path())?;
-        let event_count: i64 =
-            connection.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
-        let receipt_count: i64 =
-            connection.query_row("SELECT COUNT(*) FROM session_create_receipts", [], |row| {
-                row.get(0)
-            })?;
-        if event_count != 2 || receipt_count != 2 {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        Ok::<(), rusqlite::Error>(())
+    let expected = before_restart.clone();
+    let database_file = database.path().to_owned();
+    let after_restart = db_blocking(move || {
+        let connection = Connection::open(database_file)?;
+        receipt_recovery_snapshot(&connection)
     })
     .await?;
+    assert_eq!(
+        after_restart, expected,
+        "failed repair changed receipt facts"
+    );
     Ok(())
 }
 
@@ -856,7 +853,7 @@ async fn e2e_ownerless_session_history_fails_closed(
     server.stop().await?;
     let database_file = database.path().to_owned();
     let session_for_db = session_id.clone();
-    db_blocking(move || {
+    let before_restart = db_blocking(move || {
         let mut connection = Connection::open(database_file)?;
         let transaction = connection.transaction()?;
         let (event_id, event_schema_version, command_id, event_type, payload, event_version): (
@@ -914,7 +911,7 @@ async fn e2e_ownerless_session_history_fails_closed(
             [],
         )?;
         transaction.commit()?;
-        Ok::<(), rusqlite::Error>(())
+        receipt_recovery_snapshot(&connection)
     })
     .await?;
 
@@ -923,21 +920,142 @@ async fn e2e_ownerless_session_history_fails_closed(
         restart.is_err(),
         "ownerless history must fail before READY rather than guessing an owner"
     );
-    db_blocking(move || {
-        let connection = Connection::open(database.path())?;
-        let event_count: i64 =
-            connection.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
-        let receipt_count: i64 =
-            connection.query_row("SELECT COUNT(*) FROM session_create_receipts", [], |row| {
-                row.get(0)
-            })?;
-        if event_count != 1 || receipt_count != 1 {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        Ok::<(), rusqlite::Error>(())
+    let expected = before_restart.clone();
+    let database_file = database.path().to_owned();
+    let after_restart = db_blocking(move || {
+        let connection = Connection::open(database_file)?;
+        receipt_recovery_snapshot(&connection)
     })
     .await?;
+    assert_eq!(
+        after_restart, expected,
+        "failed repair changed ownerless facts"
+    );
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReceiptEventSnapshot {
+    global_position: i64,
+    stream_id: String,
+    stream_version: i64,
+    event_id: String,
+    command_id: String,
+    command_fingerprint_version: i64,
+    command_fingerprint: Vec<u8>,
+    event_schema_version: i64,
+    event_type: String,
+    payload: Vec<u8>,
+    event_fingerprint_version: i64,
+    event_fingerprint: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReceiptIndexSnapshot {
+    authority_id: String,
+    subject: String,
+    command_id: String,
+    fingerprint_version: i64,
+    request_hash: Vec<u8>,
+    stream_id: String,
+    stream_version: i64,
+    creation_global_position: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReceiptAnchorSnapshot {
+    stream_id: String,
+    stream_version: i64,
+    event_prefix_digest_version: i64,
+    event_prefix_digest: Vec<u8>,
+    state_schema_version: i64,
+    reducer_schema_version: i64,
+    state_digest_version: i64,
+    state_digest: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReceiptRecoverySnapshot {
+    events: Vec<ReceiptEventSnapshot>,
+    receipts: Vec<ReceiptIndexSnapshot>,
+    anchors: Vec<ReceiptAnchorSnapshot>,
+}
+
+fn receipt_recovery_snapshot(
+    connection: &Connection,
+) -> Result<ReceiptRecoverySnapshot, rusqlite::Error> {
+    let mut events_statement = connection.prepare(
+        "SELECT global_position, stream_id, stream_version, event_id, command_id,
+                command_fingerprint_version, command_fingerprint, event_schema_version,
+                event_type, payload, event_fingerprint_version, event_fingerprint
+         FROM events ORDER BY global_position",
+    )?;
+    let events = events_statement
+        .query_map([], |row| {
+            Ok(ReceiptEventSnapshot {
+                global_position: row.get(0)?,
+                stream_id: row.get(1)?,
+                stream_version: row.get(2)?,
+                event_id: row.get(3)?,
+                command_id: row.get(4)?,
+                command_fingerprint_version: row.get(5)?,
+                command_fingerprint: row.get(6)?,
+                event_schema_version: row.get(7)?,
+                event_type: row.get(8)?,
+                payload: row.get(9)?,
+                event_fingerprint_version: row.get(10)?,
+                event_fingerprint: row.get(11)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut receipts_statement = connection.prepare(
+        "SELECT authority_id, subject, command_id, fingerprint_version, request_hash,
+                stream_id, stream_version, creation_global_position
+         FROM session_create_receipts
+         ORDER BY authority_id, subject, command_id",
+    )?;
+    let receipts = receipts_statement
+        .query_map([], |row| {
+            Ok(ReceiptIndexSnapshot {
+                authority_id: row.get(0)?,
+                subject: row.get(1)?,
+                command_id: row.get(2)?,
+                fingerprint_version: row.get(3)?,
+                request_hash: row.get(4)?,
+                stream_id: row.get(5)?,
+                stream_version: row.get(6)?,
+                creation_global_position: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut anchors_statement = connection.prepare(
+        "SELECT stream_id, stream_version, event_prefix_digest_version,
+                event_prefix_digest, state_schema_version, reducer_schema_version,
+                state_digest_version, state_digest
+         FROM integrity_anchors ORDER BY stream_id, stream_version",
+    )?;
+    let anchors = anchors_statement
+        .query_map([], |row| {
+            Ok(ReceiptAnchorSnapshot {
+                stream_id: row.get(0)?,
+                stream_version: row.get(1)?,
+                event_prefix_digest_version: row.get(2)?,
+                event_prefix_digest: row.get(3)?,
+                state_schema_version: row.get(4)?,
+                reducer_schema_version: row.get(5)?,
+                state_digest_version: row.get(6)?,
+                state_digest: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ReceiptRecoverySnapshot {
+        events,
+        receipts,
+        anchors,
+    })
 }
 
 fn receipt_hash_field(hasher: &mut Sha256, bytes: &[u8]) {
