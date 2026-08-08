@@ -149,7 +149,11 @@ recording, fixture promotion, and replay.
   e2e_live_opencode_provider_roundtrip_and_restart -- --exact --nocapture` is
   the opt-in real-provider gate when its supported credential exists in the
   caller environment. It supplements, never replaces, deterministic provider
-  fixtures and must not print the credential.
+  fixtures and must not print the credential. When enabled, the newly promoted
+  immutable recording is reloaded, then replayed three times with immediate
+  timing and three times with captured timing; non-secret elapsed samples are written to the ignored
+  `replay-benchmark.v1.json` artifact without imposing a machine-specific
+  latency threshold.
 - `cargo test --test recorded_provider_e2e
   e2e_recorded_opencode_provider_roundtrip_and_restart -- --exact --nocapture`
   is the offline replay gate once the reviewed recording exists. Captured
