@@ -21,6 +21,10 @@ The system boundary is `docs/architecture.md`, the Endpoint API is
 - Preserve native provider protocols. OpenAI-compatible is one explicit
   provider shape, not an intermediate representation imposed on native
   providers.
+- The shipped native adapter kind `anthropic` uses the Anthropic Messages
+  endpoint and `anthropic.api-key.v1` replicas; it remains a separate wire
+  path with `x-api-key` authentication. `openai_compatible` uses
+  `openai-compatible.api-key.v1` and the OpenAI chat-completions path.
 - Endpoint configuration enables adapter kinds, retry limits, and outbound
   policy. The concrete session carries a controller-supplied, versioned,
   credential-free execution descriptor with provider type, base URL when
@@ -186,13 +190,13 @@ test-environment request to a real LLM is recorded, including retries and
 partial failures. Any problem observed in such a recording must become a
 tracked secret-safe cassette and named real-process replay E2E before its fix.
 
-The remaining independent provider decisions require
+The completed provider execution matrix includes
 `e2e_two_profiles_one_provider_resolve_exact_replica`,
 `e2e_replica_rotation_keeps_inflight_and_updates_next_request`,
-`e2e_bad_replica_never_falls_back_to_environment`, and
-`e2e_endpoint_aimux_calls_provider_directly_without_server_hop`. These cases
-must be real Endpoint-to-network-provider paths through aimux; a direct aimux
-test or replica-route-only assertion does not satisfy them.
+`e2e_bad_replica_never_falls_back_to_environment`, and the reviewed live
+direct-provider roundtrip. These cases are real Endpoint-to-network-provider
+paths through aimux; a direct aimux test or replica-route-only assertion does
+not satisfy them.
 
 The complete public multi-profile lifecycle is fixed by
 `e2e_multiple_profiles_selection_isolated_across_replace_tombstone_restart`:
@@ -203,3 +207,10 @@ is observed through the real SSE path. The scenario also proves missing or
 tombstoned profile selection fails before provider admission and that profile
 secrets never reach HTTP/SSE responses, headers, process output, or session
 SQLite.
+
+Native aimux execution is fixed by
+`e2e_native_anthropic_messages_stream_uses_exact_replica_and_sse`: an enabled
+Anthropic adapter advertises its matching credential schema, resolves the
+explicit Anthropic replica, sends the native `/v1/messages` SSE request with
+`x-api-key`, and projects the streamed final response through the ordinary
+Endpoint HTTP/SSE session path without exposing the secret.

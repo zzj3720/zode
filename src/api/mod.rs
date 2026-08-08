@@ -22,9 +22,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use zode_protocol::{
     encode_json_bounded, CapabilityTool as WireCapabilityTool, EndpointCapabilities,
-    EndpointHealth, AUTH_REPLICA_CREDENTIAL_SCHEMA_V1, EXTERNAL_CALLBACK_CAPABILITY,
-    MAX_CAPABILITIES_BODY_BYTES, MAX_HEALTH_BODY_BYTES, PROVIDER_HTTP_CAPABILITY,
-    TOOL_HTTP_CAPABILITY, WAIT_FOR_TOOL,
+    EndpointHealth, AUTH_REPLICA_CREDENTIAL_SCHEMA_ANTHROPIC_V1, AUTH_REPLICA_CREDENTIAL_SCHEMA_V1,
+    EXTERNAL_CALLBACK_CAPABILITY, MAX_CAPABILITIES_BODY_BYTES, MAX_HEALTH_BODY_BYTES,
+    PROVIDER_HTTP_CAPABILITY, TOOL_HTTP_CAPABILITY, WAIT_FOR_TOOL,
 };
 
 use crate::{
@@ -39,8 +39,9 @@ use crate::{
         TranscriptMessage, MAX_ERROR_MESSAGE_BYTES, MAX_IDENTIFIER_BYTES,
     },
     provider::{
-        ProviderExecutionPolicy, ReplicaError, ReplicaInstallRequest, ReplicaMutation,
-        ReplicaStore, ReplicaTombstoneRequest, MAX_REPLICA_REQUEST_BYTES,
+        credential_schema_for_adapter, ProviderExecutionPolicy, ReplicaError,
+        ReplicaInstallRequest, ReplicaMutation, ReplicaStore, ReplicaTombstoneRequest,
+        MAX_REPLICA_REQUEST_BYTES,
     },
     runtime::{CallbackCompletion, Runtime, RuntimeCommandError},
     storage::{
@@ -119,6 +120,19 @@ pub fn build_capabilities_body_with_callback(
     }
     provider_adapter_kinds.sort_unstable();
     tools.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    let mut credential_schemas = Vec::new();
+    if provider_adapter_kinds
+        .iter()
+        .any(|kind| kind == "openai_compatible")
+    {
+        credential_schemas.push(AUTH_REPLICA_CREDENTIAL_SCHEMA_V1.to_owned());
+    }
+    if provider_adapter_kinds
+        .iter()
+        .any(|kind| kind == "anthropic")
+    {
+        credential_schemas.push(AUTH_REPLICA_CREDENTIAL_SCHEMA_ANTHROPIC_V1.to_owned());
+    }
     let mut outbound_capabilities = Vec::new();
     if !provider_adapter_kinds.is_empty() {
         outbound_capabilities.push(PROVIDER_HTTP_CAPABILITY.to_owned());
@@ -136,7 +150,7 @@ pub fn build_capabilities_body_with_callback(
     let body = EndpointCapabilities::v1(
         endpoint_id.to_owned(),
         provider_adapter_kinds,
-        vec![AUTH_REPLICA_CREDENTIAL_SCHEMA_V1.to_owned()],
+        credential_schemas,
         outbound_capabilities,
         vec![WAIT_FOR_TOOL.to_owned()],
         tools,
@@ -758,7 +772,7 @@ async fn create_session(
             provider_policy
                 .validate(&model.provider_execution)
                 .map_err(|_| ServiceError::Invalid("invalid provider execution".into()))?;
-            replicas
+            let credential = replicas
                 .resolve(
                     &model.auth_authority_id,
                     &model.auth_profile_id,
@@ -774,6 +788,11 @@ async fn create_session(
                     }
                     _ => ServiceError::Backend,
                 })?;
+            if credential_schema_for_adapter(&model.provider_execution.kind)
+                != Some(credential.credential_schema.as_str())
+            {
+                return Err(ServiceError::AuthReplicaUnavailable);
+            }
         }
         store
             .create_session(&SessionCreate {
@@ -1067,7 +1086,7 @@ async fn select_model(
         provider_policy
             .validate(&model.provider_execution)
             .map_err(|_| ServiceError::Invalid("invalid provider execution".into()))?;
-        replicas
+        let credential = replicas
             .resolve(
                 &model.auth_authority_id,
                 &model.auth_profile_id,
@@ -1083,6 +1102,11 @@ async fn select_model(
                 }
                 _ => ServiceError::Backend,
             })?;
+        if credential_schema_for_adapter(&model.provider_execution.kind)
+            != Some(credential.credential_schema.as_str())
+        {
+            return Err(ServiceError::AuthReplicaUnavailable);
+        }
         let mut selection = current.selection;
         selection.model = Some(model);
         let append = store

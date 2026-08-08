@@ -139,8 +139,9 @@ The v0 configuration shape is conceptually:
 ```
 
 Exact config parsing may use typed version fields, but E2Es rely only on the
-documented semantics. Endpoint configuration enables provider adapter kinds and
-enforces outbound policy; users do not repeat provider base URLs, models, auth
+documented semantics. Endpoint configuration enables provider adapter kinds
+(`openai_compatible` and the native `anthropic` Messages adapter in this
+release) and enforces outbound policy; users do not repeat provider base URLs, models, auth
 profiles, or defaults on every device. A controller supplies the concrete
 non-secret execution descriptor in session selection. Aimux retains its bounded
 transport retry before a stream is established. `model_step_max_attempts`
@@ -573,6 +574,13 @@ require another reviewed contract rather than leaking adapter configuration:
   }
 }
 ```
+
+When `anthropic` is enabled, the capability projection includes
+`"anthropic"` and `"anthropic.api-key.v1"`. An Anthropic session selection
+uses `provider_execution.kind: "anthropic"`, an origin-only `base_url` (the
+adapter appends `/v1/messages`), and an explicitly installed replica whose
+credential schema is `anthropic.api-key.v1`; the native request uses
+`x-api-key` and Anthropic SSE rather than the OpenAI-compatible wire shape.
 
 All arrays use ascending UTF-8 byte order. The values above illustrate an
 Endpoint whose effective composition has one response-mode HTTP tool and no

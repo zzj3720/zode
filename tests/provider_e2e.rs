@@ -6,17 +6,27 @@ use std::{
     fs,
     io::{Error as IoError, ErrorKind},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
+use axum::{
+    body::Body,
+    extract::State,
+    http::{HeaderMap, StatusCode as AxumStatusCode},
+    response::Response as AxumResponse,
+    routing::post,
+    Router,
+};
 use bytes::Bytes;
 use futures_util::{stream::BoxStream, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use support::{
     assert_response_headers_secret_free, authenticated, install_test_replica, response_text,
-    sqlite_contains_secret, write_endpoint_config, ConfiguredServer, HttpRequestExt, ModelFixture,
-    ModelHold, ModelScript, TempDatabase, TestResult, TestZode, TEST_CONTROLLER_SECRET,
+    sqlite_contains_secret, write_endpoint_config, ConfiguredServer, HttpFixture, HttpRequestExt,
+    ModelFixture, ModelHold, ModelScript, TempDatabase, TestResult, TestZode,
+    TEST_CONTROLLER_SECRET,
 };
 
 const PROFILE_A: &str = "profile-provider-a";
@@ -25,6 +35,119 @@ const SECRET_A: &str = "provider-profile-a-secret";
 const SECRET_B: &str = "provider-profile-b-secret";
 const SECRET_C: &str = "provider-profile-c-secret";
 const EXPIRED_SECRET: &str = "provider-expired-secret";
+const ANTHROPIC_SECRET: &str = "anthropic-profile-secret";
+
+#[derive(Clone, Default)]
+struct AnthropicFixtureState {
+    requests: Arc<Mutex<Vec<Value>>>,
+    headers: Arc<Mutex<Vec<Value>>>,
+    fail_first: bool,
+}
+
+struct AnthropicFixture {
+    server: HttpFixture,
+    state: AnthropicFixtureState,
+}
+
+impl AnthropicFixture {
+    async fn start(fail_first: bool) -> TestResult<Self> {
+        let state = AnthropicFixtureState {
+            fail_first,
+            ..AnthropicFixtureState::default()
+        };
+        let router = Router::new()
+            .route("/v1/messages", post(anthropic_messages))
+            .with_state(state.clone());
+        let server = HttpFixture::start(router).await?;
+        Ok(Self { server, state })
+    }
+
+    fn base_url(&self) -> String {
+        self.server.url("")
+    }
+
+    fn request_count(&self) -> usize {
+        self.state
+            .requests
+            .lock()
+            .expect("Anthropic fixture request mutex poisoned")
+            .len()
+    }
+
+    fn request_headers(&self, index: usize) -> Option<Value> {
+        self.state
+            .headers
+            .lock()
+            .expect("Anthropic fixture header mutex poisoned")
+            .get(index)
+            .cloned()
+    }
+
+    async fn stop(&mut self) -> TestResult<()> {
+        self.server.stop().await
+    }
+}
+
+async fn anthropic_messages(
+    State(state): State<AnthropicFixtureState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AxumResponse {
+    let request = serde_json::from_slice::<Value>(&body)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned()));
+    state
+        .requests
+        .lock()
+        .expect("Anthropic fixture request mutex poisoned")
+        .push(request);
+    state
+        .headers
+        .lock()
+        .expect("Anthropic fixture header mutex poisoned")
+        .push(Value::Object(
+            headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    Some((
+                        name.as_str().to_owned(),
+                        Value::String(value.to_str().ok()?.to_owned()),
+                    ))
+                })
+                .collect(),
+        ));
+    if state.fail_first
+        && state
+            .requests
+            .lock()
+            .expect("Anthropic fixture request mutex poisoned")
+            .len()
+            == 1
+    {
+        return AxumResponse::builder()
+            .status(AxumStatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from("anthropic fixture pre-stream overload"))
+            .expect("Anthropic fixture retry response builds");
+    }
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_native_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-native\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"native anthropic response\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":4}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    AxumResponse::builder()
+        .status(AxumStatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(body))
+        .expect("Anthropic fixture response builds")
+}
 
 struct ReplicaInstall<'a> {
     profile: &'a str,
@@ -139,6 +262,19 @@ fn config_with_origins(database: &TempDatabase, origins: &[String]) -> TestResul
     Ok(path)
 }
 
+fn config_with_adapter(
+    database: &TempDatabase,
+    adapter_kind: &str,
+    origin: &str,
+) -> TestResult<PathBuf> {
+    let path = write_endpoint_config(database.path(), Vec::new(), 1)?;
+    let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    config["provider_execution"]["adapter_kinds"] = json!([adapter_kind]);
+    config["provider_execution"]["allowed_base_url_origins"] = json!([origin]);
+    fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    Ok(path)
+}
+
 fn model_body(base_url: &str) -> Value {
     model_body_for_profile(base_url, "profile-e2e", 1)
 }
@@ -159,6 +295,79 @@ fn model_body_for_profile(base_url: &str, profile: &str, minimum_revision: u64) 
             "minimum_auth_revision": minimum_revision
         }
     })
+}
+
+fn native_anthropic_model_body_for_profile(base_url: &str, profile: &str) -> Value {
+    json!({
+        "model": {
+            "provider": "anthropic",
+            "provider_execution": {
+                "schema": "zode.provider-execution.v1",
+                "revision": 1,
+                "kind": "anthropic",
+                "base_url": base_url,
+                "options": {}
+            },
+            "model": "claude-native",
+            "auth_authority_id": "controller-e2e",
+            "auth_profile_id": profile,
+            "minimum_auth_revision": 1
+        }
+    })
+}
+
+fn native_anthropic_model_body(base_url: &str) -> Value {
+    native_anthropic_model_body_for_profile(base_url, "anthropic-profile")
+}
+
+async fn install_native_anthropic_replica(
+    client: &reqwest::Client,
+    server: &ConfiguredServer,
+) -> TestResult<()> {
+    install_native_anthropic_replica_with_schema(
+        client,
+        server,
+        "anthropic-profile",
+        "install-native-anthropic",
+        "anthropic.api-key.v1",
+    )
+    .await
+}
+
+async fn install_native_anthropic_replica_with_schema(
+    client: &reqwest::Client,
+    server: &ConfiguredServer,
+    profile: &str,
+    idempotency_key: &str,
+    credential_schema: &str,
+) -> TestResult<()> {
+    let response =
+        authenticated(client.put(format!("{}/v1/auth-replicas/{profile}", server.url(""))))
+            .header("Idempotency-Key", idempotency_key)
+            .json(&json!({
+                "schema": "zode.auth-replica.install.v1",
+                "authority_id": "controller-e2e",
+                "provider": "anthropic",
+                "kind": "api_key",
+                "revision": 1,
+                "credential_schema": credential_schema,
+                "secret": {
+                    "encoding": "application/zode-secret-envelope",
+                    "payload": ANTHROPIC_SECRET
+                }
+            }))
+            .send_with_timeout()
+            .await?;
+    let status = response.status();
+    let body = response_text(response).await?;
+    assert_secret_free(&body, &[ANTHROPIC_SECRET, TEST_CONTROLLER_SECRET])?;
+    if !status.is_success() {
+        return Err(IoError::other(format!(
+            "native Anthropic replica install failed: {status} {body}"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 async fn create_model(
@@ -435,6 +644,107 @@ async fn read_replica_at(
     let body = response_text(response).await?;
     assert_secret_free(&body, forbidden)?;
     Ok((status, body))
+}
+
+/// Native adapters must keep their own wire protocol and auth header rather
+/// than routing through the OpenAI-compatible chat-completions shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_native_anthropic_messages_stream_uses_exact_replica_and_sse() -> TestResult<()> {
+    let database = TempDatabase::new("provider-native-anthropic")?;
+    let mut provider = AnthropicFixture::start(true).await?;
+    let config = config_with_adapter(&database, "anthropic", &provider.base_url())?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let capabilities_response = authenticated(client.get(server.url("/v1/capabilities")))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(capabilities_response.status(), StatusCode::OK);
+    let capabilities_body = response_text(capabilities_response).await?;
+    let capabilities: Value = serde_json::from_str(&capabilities_body)?;
+    assert_eq!(capabilities["provider_adapter_kinds"], json!(["anthropic"]));
+    assert_eq!(
+        capabilities["auth_replica_credential_schemas"],
+        json!(["anthropic.api-key.v1"])
+    );
+
+    install_native_anthropic_replica_with_schema(
+        &client,
+        &server,
+        "anthropic-wrong-schema",
+        "install-native-anthropic-wrong-schema",
+        "openai-compatible.api-key.v1",
+    )
+    .await?;
+    let (wrong_status, wrong_body) = create_model(
+        &client,
+        &server,
+        "create-native-anthropic-wrong-schema",
+        &native_anthropic_model_body_for_profile(&provider.base_url(), "anthropic-wrong-schema"),
+    )
+    .await?;
+    assert_eq!(wrong_status, StatusCode::SERVICE_UNAVAILABLE);
+    let wrong_error: Value = serde_json::from_str(&wrong_body)?;
+    assert_eq!(wrong_error["error"]["code"], "auth_replica_unavailable");
+    assert_eq!(provider.request_count(), 0);
+
+    install_native_anthropic_replica(&client, &server).await?;
+
+    let (status, body) = create_model(
+        &client,
+        &server,
+        "create-native-anthropic",
+        &native_anthropic_model_body(&provider.base_url()),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "native model create failed: {body}"
+    );
+    let session_id = session_id_from_create(&body)?;
+    let mut events = open_profile_events(
+        &client,
+        &server.url(""),
+        &session_id,
+        &[ANTHROPIC_SECRET, TEST_CONTROLLER_SECRET],
+    )
+    .await?;
+    let message_status = post_message_at(
+        &client,
+        &server.url(""),
+        &session_id,
+        "native-anthropic-message",
+        "native provider request",
+    )
+    .await?;
+    assert_eq!(message_status, StatusCode::ACCEPTED);
+    wait_profile_assistant(&mut events, &session_id, "native anthropic response").await?;
+
+    assert_eq!(provider.request_count(), 2);
+    let request = provider
+        .state
+        .requests
+        .lock()
+        .expect("Anthropic fixture request mutex poisoned")
+        .get(1)
+        .cloned()
+        .ok_or_else(|| IoError::other("native Anthropic request body was not captured"))?;
+    assert_eq!(request["model"], "claude-native");
+    assert_eq!(request["stream"], true);
+    assert!(request["messages"].is_array());
+    let headers = provider
+        .request_headers(1)
+        .ok_or_else(|| IoError::other("native Anthropic request headers were not captured"))?;
+    assert_eq!(headers["x-api-key"], ANTHROPIC_SECRET);
+    assert!(headers["authorization"].is_null());
+
+    let (_read_status, read_body) =
+        read_session_at(&client, &server.url(""), &session_id, &[ANTHROPIC_SECRET]).await?;
+    assert!(read_body.contains("native anthropic response"));
+    assert!(!read_body.contains(ANTHROPIC_SECRET));
+    server.stop().await?;
+    provider.stop().await?;
+    Ok(())
 }
 
 /// A host-only allowlist entry is the origin on the default port, not a
