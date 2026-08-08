@@ -99,7 +99,9 @@ the job. It never reads live-provider credentials. `approved-product-merge-gate`
 requires both jobs, so a shared-only green cannot make a product merge appear
 green. Repository protection must require that aggregate context after its
 first run; the workflow cannot make an unconfigured GitHub branch-protection
-rule required by itself.
+rule required by itself. The product job also uploads a line-progress log next
+to its JSON report; a timeout therefore retains the last real test boundary
+even when Playwright has not reached its final JSON flush.
 
 The current exact-main product gate is expected to expose real fixture or
 product blockers rather than hide them. For example, the session-reconnect

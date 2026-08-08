@@ -51,6 +51,7 @@ done < <(find "$ROOT/web/e2e/specs" -type f \( -name '*.spec.cjs' -o -name '*.sp
 
 PRODUCT_LIST="$ROOT/target/ci/approved-product-playwright-list.txt"
 PRODUCT_REPORT="$ROOT/target/ci/approved-product-playwright-results.json"
+PRODUCT_PROGRESS="$ROOT/target/ci/approved-product-playwright-progress.log"
 mkdir -p "$(dirname "$PRODUCT_LIST")"
 
 printf '%s\n' '== approved product collection (all specs, no silent subset) =='
@@ -69,12 +70,15 @@ node "$ROOT/scripts/ci/assert-product-playwright-list.cjs" \
   "$PRODUCT_LIST" "$ROOT/web/e2e/specs" "$ROOT/scripts/ci/approved-product-playwright-manifest.json"
 
 printf '%s\n' '== approved product real-browser/process E2E =='
+: >"$PRODUCT_REPORT"
+: >"$PRODUCT_PROGRESS"
 set +e
 (
   cd "$ROOT/web/e2e"
-  "$PLAYWRIGHT" test --config="$ROOT/web/e2e/playwright.config.cjs" \
-    --project=chromium "${PRODUCT_FILES[@]}" --reporter=json
-) >"$PRODUCT_REPORT"
+  PLAYWRIGHT_JSON_OUTPUT_FILE="$PRODUCT_REPORT" "$PLAYWRIGHT" test \
+    --config="$ROOT/web/e2e/playwright.config.cjs" \
+    --project=chromium "${PRODUCT_FILES[@]}" --reporter=line,json
+) >"$PRODUCT_PROGRESS" 2>&1
 playwright_status=$?
 set -e
 
