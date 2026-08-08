@@ -49,8 +49,9 @@ Handshake compatibility does not create a second session or event protocol.
 The existing black-box E2Es remain the compatibility anchors for the other
 versioned boundaries:
 
-- `tests/http_sse_e2e.rs::e2e_create_message_sse_reconnect_get_restart_and_snapshot_cursor`
-  covers durable event IDs, reconnect, and restart replay.
+- `tests/http_sse_e2e.rs::e2e_create_message_sse_reconnect_get_restart` covers
+  durable event IDs, reconnect, and restart replay; SQLite snapshot/cursor
+  checks are isolated in `tests/sqlite_storage_e2e.rs`.
 - `tests/endpoint_control_e2e.rs::e2e_auth_replica_revision_tombstone_and_restart_are_secret_free`
   covers authenticated credential-replica revision and tombstone behavior.
 

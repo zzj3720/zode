@@ -9,8 +9,12 @@ recording, fixture promotion, and replay.
 
 ## Product boundary
 
-- Every test starts the real Endpoint `CARGO_BIN_EXE_zode` binary on an isolated port,
-  uses public HTTP/SSE, and uses a fresh temporary real SQLite database.
+- Every default Endpoint E2E starts the real `CARGO_BIN_EXE_zode` binary on an
+  isolated port, uses public HTTP/SSE, and uses a fresh temporary real SQLite
+  database. The backend-neutral storage conformance profile may select another
+  real Endpoint binary with `ZODE_CONFORMANCE_ENDPOINT_BIN`; it must provide
+  the same public contract without making the generic suite depend on SQLite
+  internals.
 - Never import `zode`, call Rust domain/storage/runtime/API functions, expose a
   hidden test endpoint, or select fake production behavior through `cfg(test)`.
 - Local fake model/tool/OAuth servers are allowed only across the same network
@@ -135,6 +139,9 @@ recording, fixture promotion, and replay.
 ## Canonical gates
 
 - `cargo test --test http_sse_e2e`
+- `scripts/ci/storage-conformance.sh` (the backend-neutral HTTP/SSE suite with
+  an explicit backend label and selectable real Endpoint binary; the SQLite
+  profile additionally runs `sqlite_storage_e2e` adapter recovery cases)
 - `cargo test --test endpoint_control_e2e`
 - `cargo test --test runtime_model_e2e`
 - `cargo test --test reviewer_findings_e2e`

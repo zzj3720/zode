@@ -649,15 +649,31 @@ On startup zode:
    consistent.
 
 Replacing SQLite, blob, credential, timer, provider, or tool adapters cannot
-change public HTTP/SSE semantics. Every replacement must pass the same E2E
-suite. Storage adapters must provide consistent reads and the transaction
-boundary described above, not merely individual CRUD methods.
+change public HTTP/SSE semantics. Every replacement must pass the same
+backend-neutral HTTP/SSE E2E suite. Storage adapters must provide consistent
+reads and the transaction boundary described above, not merely individual CRUD
+methods. Adapter-specific corruption and catalog checks remain in a separate
+profile and never narrow the shared public contract.
+
+The canonical backend-neutral entry is
+`scripts/ci/storage-conformance.sh`. It runs the real-process
+`tests/http_sse_e2e.rs` suite without importing the Endpoint library or calling
+storage handlers directly. The default profile is `ZODE_CONFORMANCE_BACKEND=sqlite`
+and uses the repository's `zode` binary. A future storage adapter supplies its
+own compatible real Endpoint binary through `ZODE_CONFORMANCE_ENDPOINT_BIN` and
+selects a stable profile label; the shared suite covers HTTP/SSE commands,
+ordered reconnect, restart, idempotency, ownership, and durable event
+semantics. SQLite-only snapshot corruption, cursor, and catalog/index repair
+checks run from `tests/sqlite_storage_e2e.rs` only for the sqlite profile. The
+script writes only a non-secret run manifest under `target/ci` and fails if the
+selected binary is missing or not executable.
 
 ## 13. E2E specification and implementation workflow
 
 The E2E suite is the executable product specification. It always starts the
-real Endpoint binary, uses public Endpoint HTTP/SSE, a real temporary SQLite
-database, and network fake providers/tools reached through production adapters.
+real Endpoint binary, uses public Endpoint HTTP/SSE, a real temporary backend
+store (SQLite for the default profile), and network fake providers/tools
+reached through production adapters.
 There are no unit, doctest, in-process handler, direct-domain, or hidden-route
 tests. Server, all-in-one, credential-distribution, and browser E2Es are owned
 by the suites described in `docs/architecture.md`; they reuse this Endpoint
@@ -675,8 +691,8 @@ The main scenario groups are:
 
 | Area | Required public scenario | Current executable anchors |
 | --- | --- | --- |
-| HTTP/event store | create, message, semantic idempotency, GET/list ownership, ordered SSE reconnect, restart | `e2e_create_message_sse_reconnect_get_restart_and_snapshot_cursor`; `e2e_create_generates_ulid_and_binds_idempotency_payload`; `e2e_concurrent_create_receipt_and_event_are_atomic`; `e2e_session_ownership_safe_not_found_and_ordered_sse` |
-| Snapshot/recovery | bounded snapshot-plus-tail restore, every configured runtime/API snapshot cadence point, corrupt fallback, dirty-index repair, healthy read-only startup | `e2e_snapshot_cannot_override_event_stream`; `e2e_corrupt_latest_snapshot_falls_back`; `e2e_runtime_commits_honor_snapshot_cadence_and_restart`; `e2e_sqlite_restart_rebuilds_derived_indexes_and_allows_harmless_extra_index`; storage-corruption cases in `reviewer_findings_e2e` |
+| HTTP/event store | create, message, semantic idempotency, GET/list ownership, ordered SSE reconnect, restart | `e2e_create_message_sse_reconnect_get_restart`; `e2e_create_generates_ulid_and_binds_idempotency_payload`; `e2e_concurrent_create_receipt_and_event_are_atomic`; `e2e_session_ownership_safe_not_found_and_ordered_sse` |
+| Snapshot/recovery | bounded snapshot-plus-tail restore, every configured runtime/API snapshot cadence point, corrupt fallback, dirty-index repair, healthy read-only startup | `sqlite_storage_e2e::e2e_sqlite_snapshot_cursor_follows_public_commits`; `sqlite_storage_e2e::e2e_snapshot_cannot_override_event_stream`; `sqlite_storage_e2e::e2e_corrupt_latest_snapshot_falls_back`; `e2e_runtime_commits_honor_snapshot_cadence_and_restart`; `sqlite_storage_e2e::e2e_sqlite_restart_rebuilds_derived_indexes_and_allows_harmless_extra_index`; storage-corruption cases in `reviewer_findings_e2e` |
 | Model activation | real aimux fake provider, final assistant event, input/completion arriving mid-request steers the next round when one exists, otherwise wakes the next activation; active model change remains deferred to the next activation; every accepted input and assistant round remains durably ordered online and after restart without a new client command | `e2e_golden_assembled_model_tool_loop_survives_restart`; `e2e_round_boundary_steering_waits_for_the_next_model_round`; `e2e_round_boundary_final_defers_steering_to_next_activation`; `e2e_concurrent_inputs_preserve_both_assistant_rounds`; `e2e_restart_recovers_queued_input_without_another_command` |
 | Model retry | aimux bounded pre-stream retry remains one logical runtime request; after stream establishment zode owns bounded step retry; no partial assistant/tool effect; hard-crash interrupted-attempt recovery | `e2e_model_pre_stream_rate_limit_is_one_logical_request`; `e2e_model_partial_stream_retry_has_no_partial_tool_effect`; `e2e_hard_crash_recovery_exhausts_one_model_attempt_and_keeps_delivery_runnable`; `e2e_hard_crash_after_retry_fact_claims_one_scheduled_attempt` |
 | Tool batch | fast/slow/failing concurrent calls, provider-order results, one shared foreground window | `e2e_mixed_tool_batch_is_concurrent_ordered_and_waits_once` |
