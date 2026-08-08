@@ -698,6 +698,13 @@ demonstrates the red scenario before the corresponding production change. If
 one anchor covers multiple decisions, its assertions must prove each one
 independently.
 
+The approved mature-product common-user adoption map, including current
+red/partial status, deliberate Zode differences, and separately gated public
+semantics, lives in [`docs/reference-e2e-matrix.md`](reference-e2e-matrix.md).
+That map is the browser/install traceability companion to this Endpoint
+behavior index; it does not turn a lower-level row or health check into an
+installed-product completion claim.
+
 The main scenario groups are:
 
 | Area | Required public scenario | Current executable anchors |
