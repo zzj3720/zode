@@ -758,6 +758,13 @@ function readState(path, root, instanceName) {
   ownedPath(root, serverConfigPath, "Server config", { privateFile: true });
   value.server_config_directory = serverConfigDirectory;
   value.server_config_path = serverConfigPath;
+  const expectedEndpointConfigPath = join(serverConfigDirectory, `.zode-endpoint-${instanceName}.json`);
+  const endpointConfigPath = value.endpoint_config_path || join(value.directory, "endpoint.json");
+  if (value.endpoint_config_path && resolve(endpointConfigPath) !== resolve(expectedEndpointConfigPath)) {
+    fail("release_state_invalid", "Endpoint config is not in the installed releases root", { path: endpointConfigPath });
+  }
+  ownedPath(root, endpointConfigPath, "Endpoint config", { privateFile: true });
+  value.endpoint_config_path = endpointConfigPath;
   const checkedArtifact = validateManifest(artifactPath);
   if (checkedArtifact.manifest.revision !== value.artifact.manifest.revision || checkedArtifact.digest !== value.artifact.digest) {
     fail("release_state_invalid", "instance state artifact does not match its immutable install");
@@ -936,7 +943,7 @@ async function recoverInstanceRoles(instance) {
   const serverExecutable = join(artifactRoot, "zode-server");
   const endpointExecutable = join(artifactRoot, "zode");
   const serverConfig = instance.server_config_path || join(instance.directory, "server.json");
-  const endpointConfig = join(instance.directory, "endpoint.json");
+  const endpointConfig = instance.endpoint_config_path || join(instance.directory, "endpoint.json");
   const roles = [];
   const candidates = [
     { role: "server", executablePath: serverExecutable, args: ["--config", serverConfig] },
@@ -1160,12 +1167,13 @@ async function createInstance(root, artifact, kind, addresses = null) {
     // symlinking the UI into the instance state.
     server_config_directory: dirname(artifact.installPath),
     server_config_path: join(dirname(artifact.installPath), `.zode-server-${instanceId}.json`),
+    endpoint_config_path: join(dirname(artifact.installPath), `.zode-endpoint-${instanceId}.json`),
     authority_id: persistent.authority_id,
     persistent_directory: persistent.directory,
     probes: { server_url: `http://${serverAddress.host}:${serverPort}/v1/system`, endpoint_url: `http://${endpointAddress.host}:${endpointPort}/v1/health`, ui_url: `http://${serverAddress.host}:${serverPort}/` },
     roles: [],
   };
-  const endpointConfigPath = join(directory, "endpoint.json");
+  const endpointConfigPath = instance.endpoint_config_path;
   const serverConfigPath = instance.server_config_path;
   exclusiveJson(endpointConfigPath, endpointConfig(instance, endpointPort, endpointSecretPath, persistent), 0o600);
   const installedEndpointPath = join(artifact.installPath, "zode");
@@ -1340,6 +1348,7 @@ async function stopInstance(instance) {
   if (!report.timed_out && report.flush_status === "success" && report.exit_status === 0) {
     const state = statePath(root, instance.instance_id);
     removeIfExists(instance.server_config_path || join(dirname(instance.artifact.installPath), `.zode-server-${instance.instance_id}.json`));
+    removeIfExists(instance.endpoint_config_path || join(instance.directory, "endpoint.json"));
     const directory = statOrNull(instance.directory);
     if (basename(instancesRoot) === "instances" && directory?.isDirectory() && !directory.isSymbolicLink()) {
       removeIfExists(state);
