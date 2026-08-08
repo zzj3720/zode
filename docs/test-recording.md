@@ -23,6 +23,14 @@ responses, provider errors, pre-stream retries, partial streams, disconnects,
 and requests made before or after Endpoint restart. Failure to flush one
 exchange fails the live test; an unrecorded direct real-LLM test is forbidden.
 
+Terminal recorder-flush failures are also bounded at the public SSE boundary.
+`e2e_later_test_reproduction_of_terminal_flush_gap_is_bounded_and_captured`
+arms the shared process capture before spawning Endpoint, waits at most the
+test failure bound for `model_attempt_failed`, and durably flushes the child
+stdout/stderr/exit/stop proof before cleanup. Its
+`later_test_reproduction_of_gap` observation is a later reproduction and does
+not replace an earlier retained full-suite hang.
+
 Provider-boundary tests should use
 `LlmHttpProxy::record_with_attempt_plan_and_authorization(..., true)` when the
 wire contract requires authorization; the flag is authoritative and

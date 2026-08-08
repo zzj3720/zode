@@ -3,6 +3,8 @@
 #[path = "process_capture.rs"]
 pub mod process_capture;
 
+use process_capture::{ProcessCaptureSet, ProcessObservation, ProcessStopObservation};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -65,6 +67,7 @@ type ChildOutputTask = JoinHandle<std::io::Result<Vec<u8>>>;
 /// live and replay is the transport URL injected into the endpoint config.
 pub struct TestZode {
     child: Option<Child>,
+    pid: Option<u32>,
     base_url: String,
     stdout_drain: Option<ChildOutputTask>,
     stderr_drain: Option<ChildOutputTask>,
@@ -112,6 +115,9 @@ impl TestZode {
             command.env(name, value);
         }
         let mut child = command.spawn()?;
+        let pid = child
+            .id()
+            .ok_or_else(|| IoError::other("zode process did not expose a pid"))?;
         let stdout = child
             .stdout
             .take()
@@ -187,6 +193,7 @@ impl TestZode {
         let stdout_drain = tokio::spawn(drain_child_output(stdout_reader));
         Ok(Self {
             child: Some(child),
+            pid: Some(pid),
             base_url,
             stdout_drain: Some(stdout_drain),
             stderr_drain: Some(stderr_drain),
@@ -198,12 +205,55 @@ impl TestZode {
     }
 
     pub async fn stop(&mut self, forbidden: &[&str]) -> TestResult<()> {
+        self.stop_inner(forbidden).await.map(|_| ())
+    }
+
+    pub async fn stop_with_process_capture(
+        &mut self,
+        capture: &mut ProcessCaptureSet,
+        process_name: &str,
+        forbidden: &[&str],
+    ) -> TestResult<()> {
+        let stopped = self.stop_inner(forbidden).await?;
+        let pid = stopped
+            .pid
+            .ok_or_else(|| IoError::other("zode process observation had no pid"))?;
+        capture.capture_process(ProcessObservation {
+            name: process_name.to_owned(),
+            stdout: stopped.stdout,
+            stderr: stopped.stderr,
+            exit_code: stopped.status.code(),
+            signal: process_signal(stopped.status),
+            termination: if stopped.status.code().is_some() {
+                "natural_exit".to_owned()
+            } else {
+                "signal_termination".to_owned()
+            },
+            stop: Some(ProcessStopObservation {
+                observed_pids: vec![pid],
+                reaped_pids: vec![pid],
+                leaked_pids: Vec::new(),
+                timed_out: false,
+                flush_status: "ok".to_owned(),
+                proof: true,
+            }),
+        })
+    }
+
+    async fn stop_inner(&mut self, forbidden: &[&str]) -> TestResult<TestZodeStop> {
         let mut errors = Vec::new();
-        if let Some(child) = self.child.take() {
-            if let Err(error) = kill_and_reap(child).await {
-                errors.push(format!("child reap failed: {error}"));
+        let status = if let Some(child) = self.child.take() {
+            match kill_and_reap(child).await {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    errors.push(format!("child reap failed: {error}"));
+                    None
+                }
             }
-        }
+        } else {
+            None
+        };
+        let pid = self.pid.take();
         let stdout = match self.stdout_drain.take() {
             Some(task) => match collect_child_output(task).await {
                 Ok(output) => output,
@@ -230,10 +280,42 @@ impl TestZode {
             errors.push("child output contained credential material".to_owned());
         }
         if errors.is_empty() {
-            Ok(())
+            status
+                .map(|status| TestZodeStop {
+                    pid,
+                    status,
+                    stdout,
+                    stderr,
+                })
+                .ok_or_else(|| IoError::other("zode process had no exit status").into())
         } else {
             Err(IoError::other(errors.join("; ")).into())
         }
+    }
+}
+
+struct TestZodeStop {
+    pid: Option<u32>,
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn process_signal(status: std::process::ExitStatus) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map(|signal| match signal {
+            2 => "SIGINT".to_owned(),
+            9 => "SIGKILL".to_owned(),
+            15 => "SIGTERM".to_owned(),
+            other => format!("SIG{other}"),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
     }
 }
 
@@ -413,23 +495,35 @@ pub async fn run_provider_roundtrip_and_restart(spec: ProviderRoundtripSpec) -> 
 }
 
 pub async fn run_provider_failure(spec: ProviderRoundtripSpec) -> TestResult<()> {
-    run_provider_failure_or_cancel(spec, None).await
+    run_provider_failure_or_cancel(spec, None, None).await
 }
 
 pub async fn run_provider_attempt_until_cancel(
     spec: ProviderRoundtripSpec,
     cancel: std::sync::Arc<Notify>,
 ) -> TestResult<()> {
-    run_provider_failure_or_cancel(spec, Some(cancel)).await
+    run_provider_failure_or_cancel(spec, Some(cancel), None).await
+}
+
+pub async fn run_provider_failure_with_process_capture(
+    spec: ProviderRoundtripSpec,
+    capture: &mut ProcessCaptureSet,
+    process_name: &str,
+) -> TestResult<()> {
+    run_provider_failure_or_cancel(spec, None, Some((capture, process_name))).await
 }
 
 async fn run_provider_failure_or_cancel(
     spec: ProviderRoundtripSpec,
     cancel: Option<std::sync::Arc<Notify>>,
+    mut process_capture: Option<(&mut ProcessCaptureSet, &str)>,
 ) -> TestResult<()> {
     let client = http_client()?;
     let mut server = None;
     let primary = async {
+        if let Some((capture, _)) = process_capture.as_mut() {
+            capture.capture_config("endpoint-runtime-config", &fs::read(&spec.config)?)?;
+        }
         server = Some(start_roundtrip_zode(&spec).await?);
         let current = server
             .as_ref()
@@ -460,7 +554,13 @@ async fn run_provider_failure_or_cancel(
             wait_for_roundtrip_failure(&mut events).await?;
         }
         let mut current = server.take().expect("provider failure zode was installed");
-        current.stop(&roundtrip_forbidden(&spec)).await?;
+        if let Some((capture, process_name)) = process_capture.as_mut() {
+            current
+                .stop_with_process_capture(capture, process_name, &roundtrip_forbidden(&spec))
+                .await?;
+        } else {
+            current.stop(&roundtrip_forbidden(&spec)).await?;
+        }
         assert_provider_secret_absent_from_sqlite(&spec).await?;
         Ok::<(), Box<dyn Error + Send + Sync>>(())
     }
@@ -468,7 +568,14 @@ async fn run_provider_failure_or_cancel(
 
     let mut cleanup_errors = Vec::new();
     if let Some(mut current) = server.take() {
-        if let Err(error) = current.stop(&roundtrip_forbidden(&spec)).await {
+        let stop = if let Some((capture, process_name)) = process_capture.as_mut() {
+            current
+                .stop_with_process_capture(capture, process_name, &roundtrip_forbidden(&spec))
+                .await
+        } else {
+            current.stop(&roundtrip_forbidden(&spec)).await
+        };
+        if let Err(error) = stop {
             cleanup_errors.push(error.to_string());
         }
     }
@@ -612,7 +719,7 @@ async fn read_roundtrip_session(
     Ok(serde_json::from_str(&body)?)
 }
 
-struct ProviderRoundtripSse {
+pub(crate) struct ProviderRoundtripSse {
     stream: futures_util::stream::BoxStream<'static, Result<Bytes, reqwest::Error>>,
     buffer: Vec<u8>,
     forbidden: Vec<String>,
@@ -661,19 +768,23 @@ async fn wait_for_roundtrip_assistant(
     }
 }
 
-async fn wait_for_roundtrip_failure(events: &mut ProviderRoundtripSse) -> TestResult<()> {
-    for _ in 0..128 {
-        let frame = events.next().await?;
-        if frame.0 == "model_attempt_failed" || frame.1["kind"] == "model_attempt_failed" {
-            if frame.1["data"]["error"]["class"].as_str().is_none() {
-                return Err(
-                    IoError::other("provider failure event omitted its error class").into(),
-                );
+pub async fn wait_for_roundtrip_failure(events: &mut ProviderRoundtripSse) -> TestResult<()> {
+    timeout(Duration::from_secs(30), async {
+        for _ in 0..128 {
+            let frame = events.next().await?;
+            if frame.0 == "model_attempt_failed" || frame.1["kind"] == "model_attempt_failed" {
+                if frame.1["data"]["error"]["class"].as_str().is_none() {
+                    return Err(
+                        IoError::other("provider failure event omitted its error class").into(),
+                    );
+                }
+                return Ok(());
             }
-            return Ok(());
         }
-    }
-    Err(IoError::other("provider failure event was not observed").into())
+        Err(IoError::other("provider failure event was not observed").into())
+    })
+    .await
+    .map_err(|_| IoError::new(ErrorKind::TimedOut, "provider failure event timed out"))?
 }
 
 impl ProviderRoundtripSse {
@@ -3129,6 +3240,9 @@ async fn record_llm_http_request(
     capture.response_headers = response_headers;
     let stream = stream! {
         let mut capture = capture;
+        let mut pending_sse_tail = Vec::new();
+        let mut deferred_terminal_chunks = Vec::new();
+        let mut terminal_deferred = false;
         while let Some(chunk) = upstream_stream.next().await {
             match chunk {
                 Ok(bytes) => {
@@ -3162,7 +3276,46 @@ async fn record_llm_http_request(
                         bytes_hex: hex_encode(&bytes),
                     });
                     capture.sink.note_chunk();
-                    yield Ok::<Bytes, std::io::Error>(bytes);
+                    if is_event_stream_content_type(capture.content_type.as_deref()) {
+                        // Keep a short rolling suffix so a transport split in
+                        // `data: [DONE]` cannot expose the terminal marker
+                        // before the complete exchange is durably sealed.
+                        if terminal_deferred {
+                            deferred_terminal_chunks.push(bytes);
+                        } else {
+                            let mut candidate = Vec::with_capacity(
+                                pending_sse_tail.len().saturating_add(bytes.len()),
+                            );
+                            candidate.extend_from_slice(&pending_sse_tail);
+                            candidate.extend_from_slice(&bytes);
+                            pending_sse_tail.clear();
+                            let marker = b"data: [DONE]";
+                            if let Some(start) = candidate
+                                .windows(marker.len())
+                                .position(|window| window == marker)
+                            {
+                                if start > 0 {
+                                    yield Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(
+                                        &candidate[..start],
+                                    ));
+                                }
+                                terminal_deferred = true;
+                                deferred_terminal_chunks
+                                    .push(Bytes::copy_from_slice(&candidate[start..]));
+                            } else {
+                                let suffix_len = marker.len().saturating_sub(1);
+                                let split = candidate.len().saturating_sub(suffix_len);
+                                if split > 0 {
+                                    yield Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(
+                                        &candidate[..split],
+                                    ));
+                                }
+                                pending_sse_tail.extend_from_slice(&candidate[split..]);
+                            }
+                        }
+                    } else {
+                        yield Ok::<Bytes, std::io::Error>(bytes);
+                    }
                 }
                 Err(_) => {
                     capture.stream_error = true;
@@ -3184,6 +3337,16 @@ async fn record_llm_http_request(
         }) {
             yield Err(std::io::Error::other(error.to_string()));
             return;
+        }
+        if !bound_exceeded && !stream_failed {
+            if !pending_sse_tail.is_empty() {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(std::mem::take(
+                    &mut pending_sse_tail,
+                )));
+            }
+            for bytes in deferred_terminal_chunks {
+                yield Ok::<Bytes, std::io::Error>(bytes);
+            }
         }
         if bound_exceeded {
             yield Err(std::io::Error::other("recording response capture bound exceeded"));

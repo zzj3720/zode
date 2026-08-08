@@ -93,6 +93,12 @@ recording, fixture promotion, and replay.
   `tests/fixtures/provider_recordings/`, bind it to a named real-process E2E,
   replay the original failure red, and use that exact cassette for the green
   regression after repair.
+- Terminal recorder-flush failures use
+  `e2e_later_test_reproduction_of_terminal_flush_gap_is_bounded_and_captured`:
+  arm `ProcessCaptureSet` before Endpoint spawn, bound the public SSE failure
+  wait, and durably flush the child observation before assertions or cleanup.
+  Its `later_test_reproduction_of_gap` relation is distinct from the retained
+  historical full-suite hang; it must never overwrite that first occurrence.
 
 ## First-occurrence incident replay
 
