@@ -13,7 +13,7 @@ use chacha20poly1305::{
 use fs2::FileExt;
 use getrandom::fill as fill_random;
 use hmac::{Hmac, Mac};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -274,10 +274,13 @@ impl KeyMaterial {
 
 pub(crate) struct ControlStore {
     database: Mutex<Connection>,
+    database_path: PathBuf,
+    database_identity: [u8; 16],
     secret_directory: PathBuf,
     authority_id: String,
     keys: Arc<KeyMaterial>,
     _secret_ownership: File,
+    _database_ownership: File,
 }
 
 pub(crate) enum BeginEndpointCreate {
@@ -424,16 +427,24 @@ impl ControlStore {
         validate_secret_directory(config.secret_directory())?;
         let secret_ownership = acquire_secret_ownership(config.secret_directory())?;
         let keys = Arc::new(read_key_material(config.access().subject_key_file())?);
-        let database_state = inspect_control_database(config.control_database())?;
-        let database = acquire_database_ownership(config.control_database())?;
+        let database = acquire_database_ownership(
+            config.control_database(),
+            config.secret_directory(),
+            config.access().subject_key_version(),
+            config.server_authority_id(),
+            &keys,
+        )?;
         let store = Self {
-            database: Mutex::new(database),
+            database: Mutex::new(database.connection),
+            database_path: database.path,
+            database_identity: database.database_identity,
             secret_directory: config.secret_directory().to_path_buf(),
             authority_id: config.server_authority_id().to_owned(),
             keys,
             _secret_ownership: secret_ownership,
+            _database_ownership: database.lock,
         };
-        store.initialize(config.access().subject_key_version(), database_state)?;
+        store.initialize(config.access().subject_key_version(), database.state)?;
         Ok(store)
     }
 
@@ -1448,6 +1459,9 @@ impl ControlStore {
         subject_key_version: u64,
         database_state: ControlDatabaseState,
     ) -> Result<(), StartupError> {
+        if !self.database_path_matches_owner() {
+            return Err(StartupError::StoreIntegrity);
+        }
         let connection = self
             .database
             .lock()
@@ -1488,7 +1502,18 @@ impl ControlStore {
     }
 
     fn connection(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
+        if !self.database_path_matches_owner() {
+            return Err(StoreError::Internal);
+        }
         self.database.lock().map_err(|_| StoreError::Internal)
+    }
+
+    fn database_path_matches_owner(&self) -> bool {
+        fs::symlink_metadata(&self.database_path)
+            .map(|metadata| {
+                metadata.file_type().is_file() && lock_identity(&metadata) == self.database_identity
+            })
+            .unwrap_or(false)
     }
 
     fn read_endpoint(
@@ -1750,20 +1775,6 @@ fn ensure_endpoint_capability_columns(connection: &Connection) -> Result<(), Sta
     Ok(())
 }
 
-fn inspect_control_database(path: &Path) -> Result<ControlDatabaseState, StartupError> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ControlDatabaseState::New);
-        }
-        Err(_) => return Err(StartupError::StoreUnavailable),
-    };
-    if !metadata.is_file() {
-        return Err(StartupError::StoreUnavailable);
-    }
-    Ok(ControlDatabaseState::Initialized)
-}
-
 fn validate_server_metadata(
     connection: &Connection,
     authority_id: &str,
@@ -1872,8 +1883,353 @@ fn acquire_secret_ownership(secret_directory: &Path) -> Result<File, StartupErro
     Ok(file)
 }
 
-fn acquire_database_ownership(path: &Path) -> Result<Connection, StartupError> {
-    let connection = Connection::open(path).map_err(|_| StartupError::StoreUnavailable)?;
+struct DatabaseOwnership {
+    connection: Connection,
+    path: PathBuf,
+    database_identity: [u8; 16],
+    lock: File,
+    state: ControlDatabaseState,
+}
+
+fn acquire_database_ownership(
+    path: &Path,
+    marker_directory: &Path,
+    subject_key_version: u64,
+    authority_id: &str,
+    keys: &KeyMaterial,
+) -> Result<DatabaseOwnership, StartupError> {
+    if matches!(
+        fs::symlink_metadata(path),
+        Ok(metadata) if metadata.file_type().is_symlink()
+    ) {
+        return Err(StartupError::StoreUnavailable);
+    }
+    let state = if fs::symlink_metadata(path).is_ok() {
+        validate_existing_database(
+            path,
+            marker_directory,
+            subject_key_version,
+            authority_id,
+            keys,
+        )?;
+        ControlDatabaseState::Initialized
+    } else {
+        ControlDatabaseState::New
+    };
+    let database_file = open_private_rw(path).map_err(|_| StartupError::StoreUnavailable)?;
+    let database_metadata = database_file
+        .metadata()
+        .map_err(|_| StartupError::StoreUnavailable)?;
+    if !database_metadata.is_file() {
+        return Err(StartupError::StoreUnavailable);
+    }
+    #[cfg(unix)]
+    if std::os::unix::fs::MetadataExt::nlink(&database_metadata) != 1 {
+        return Err(StartupError::AlreadyOwned);
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| StartupError::StoreUnavailable)?;
+    let file_name = canonical
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or(StartupError::StoreUnavailable)?;
+    let lock_path = canonical.with_file_name(format!("{file_name}.server.lock"));
+    let anchor_path = canonical.with_file_name(format!("{file_name}.server.lock.anchor"));
+    let database = Connection::open(&canonical).map_err(|_| StartupError::StoreUnavailable)?;
+    if lock_identity(&fs::symlink_metadata(&canonical).map_err(|_| StartupError::StoreUnavailable)?)
+        != lock_identity(&database_metadata)
+    {
+        return Err(StartupError::StoreIntegrity);
+    }
+    let lock = open_private_rw(&lock_path).map_err(|_| StartupError::StoreUnavailable)?;
+    let lock_metadata =
+        fs::symlink_metadata(&lock_path).map_err(|_| StartupError::StoreUnavailable)?;
+    if !lock_metadata.file_type().is_file() {
+        return Err(StartupError::StoreUnavailable);
+    }
+    match fs::symlink_metadata(&anchor_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(StartupError::StoreUnavailable);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            if std::os::unix::fs::MetadataExt::nlink(&lock_metadata) != 1 {
+                return Err(StartupError::AlreadyOwned);
+            }
+            fs::hard_link(&lock_path, &anchor_path).map_err(|_| StartupError::StoreUnavailable)?;
+        }
+        Err(_) => return Err(StartupError::StoreUnavailable),
+    }
+    let anchor_metadata =
+        fs::symlink_metadata(&anchor_path).map_err(|_| StartupError::StoreUnavailable)?;
+    if lock_identity(&lock_metadata) != lock_identity(&anchor_metadata) {
+        return Err(StartupError::AlreadyOwned);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if anchor_metadata.nlink() != 2
+            || anchor_metadata.permissions().mode() & 0o077 != 0
+            || lock_metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(StartupError::StoreUnavailable);
+        }
+    }
+    lock.try_lock_exclusive().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            StartupError::AlreadyOwned
+        } else {
+            StartupError::StoreUnavailable
+        }
+    })?;
+    connection_exclusive(&database)?;
+    let database_identity = lock_identity(&database_metadata);
+    ensure_database_identity(
+        &canonical,
+        marker_directory,
+        matches!(state, ControlDatabaseState::New),
+        &database_identity,
+        &lock_identity(&anchor_metadata),
+    )?;
+    Ok(DatabaseOwnership {
+        connection: database,
+        path: canonical,
+        database_identity,
+        lock,
+        state,
+    })
+}
+
+fn validate_existing_database(
+    database: &Path,
+    marker_directory: &Path,
+    subject_key_version: u64,
+    authority_id: &str,
+    keys: &KeyMaterial,
+) -> Result<(), StartupError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(database).map_err(|_| StartupError::StoreIntegrity)?;
+        if metadata.nlink() != 1 {
+            return Err(StartupError::AlreadyOwned);
+        }
+    }
+    let canonical_database =
+        fs::canonicalize(database).map_err(|_| StartupError::StoreIntegrity)?;
+    let file_name = canonical_database
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(StartupError::StoreIntegrity)?;
+    let lock_path = canonical_database.with_file_name(format!("{file_name}.server.lock"));
+    if existing_lock_is_busy(&lock_path)? {
+        return Err(StartupError::AlreadyOwned);
+    }
+    let wal_path = PathBuf::from(format!("{}-wal", database.display()));
+    let shm_path = PathBuf::from(format!("{}-shm", database.display()));
+    let wal_exists = fs::symlink_metadata(&wal_path).is_ok();
+    let shm_exists = fs::symlink_metadata(&shm_path).is_ok();
+    let wal_nonempty = fs::metadata(&wal_path)
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false);
+    if (wal_exists && !sqlite_sidecar_is_private(&wal_path))
+        || (shm_exists && !sqlite_sidecar_is_private(&shm_path))
+        || (wal_nonempty && !shm_exists)
+    {
+        return Err(StartupError::StoreIntegrity);
+    }
+    let connection = if wal_nonempty {
+        Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    } else {
+        Connection::open_with_flags(
+            sqlite_immutable_uri(database)?,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+    }
+    .map_err(|_| StartupError::StoreIntegrity)?;
+    validate_server_metadata(&connection, authority_id, subject_key_version, keys)?;
+    let anchor_path = database.with_file_name(format!("{file_name}.server.lock.anchor"));
+    let lock_metadata = fs::symlink_metadata(&lock_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            StartupError::AlreadyOwned
+        } else {
+            StartupError::StoreUnavailable
+        }
+    })?;
+    let anchor_metadata = fs::symlink_metadata(&anchor_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            StartupError::AlreadyOwned
+        } else {
+            StartupError::StoreUnavailable
+        }
+    })?;
+    if !lock_metadata.file_type().is_file()
+        || !anchor_metadata.file_type().is_file()
+        || lock_identity(&lock_metadata) != lock_identity(&anchor_metadata)
+    {
+        return Err(StartupError::AlreadyOwned);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if lock_metadata.nlink() != 2
+            || anchor_metadata.nlink() != 2
+            || lock_metadata.permissions().mode() & 0o077 != 0
+            || anchor_metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(StartupError::AlreadyOwned);
+        }
+    }
+    let database_identity = fs::symlink_metadata(database)
+        .map(|metadata| lock_identity(&metadata))
+        .map_err(|_| StartupError::StoreIntegrity)?;
+    let lock_identity = lock_identity(&lock_metadata);
+    let expected = [database_identity.as_slice(), lock_identity.as_slice()].concat();
+    for path in [
+        PathBuf::from(format!("{}.server-owner", database.display())),
+        marker_directory.join(".server-owner"),
+    ] {
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StartupError::AlreadyOwned
+            } else {
+                StartupError::StoreUnavailable
+            }
+        })?;
+        if !metadata.file_type().is_file()
+            || read_bounded(&path, expected.len()).map_err(|_| StartupError::AlreadyOwned)?
+                != expected
+        {
+            return Err(StartupError::AlreadyOwned);
+        }
+    }
+    Ok(())
+}
+
+fn existing_lock_is_busy(path: &Path) -> Result<bool, StartupError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(StartupError::StoreUnavailable),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(StartupError::AlreadyOwned);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(StartupError::AlreadyOwned);
+        }
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|_| StartupError::StoreUnavailable)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+        Err(_) => Err(StartupError::StoreUnavailable),
+    }
+}
+
+fn ensure_database_identity(
+    database: &Path,
+    marker_directory: &Path,
+    allow_create: bool,
+    database_identity: &[u8; 16],
+    lock_identity: &[u8; 16],
+) -> Result<(), StartupError> {
+    let expected = [database_identity.as_slice(), lock_identity.as_slice()].concat();
+    let paths = [
+        PathBuf::from(format!("{}.server-owner", database.display())),
+        marker_directory.join(".server-owner"),
+    ];
+    let mut missing = Vec::new();
+    for path in paths {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file()
+                    || read_bounded(&path, expected.len())
+                        .map_err(|_| StartupError::StoreUnavailable)?
+                        != expected
+                {
+                    return Err(StartupError::AlreadyOwned);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !allow_create {
+                    return Err(StartupError::AlreadyOwned);
+                }
+                missing.push(path);
+            }
+            Err(_) => return Err(StartupError::StoreUnavailable),
+        }
+    }
+    for path in missing {
+        let mut file = private_create_new(&path).map_err(|_| StartupError::StoreUnavailable)?;
+        file.write_all(&expected)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| StartupError::StoreUnavailable)?;
+        sync_directory(path.parent().ok_or(StartupError::StoreUnavailable)?)
+            .map_err(|_| StartupError::StoreUnavailable)?;
+    }
+    Ok(())
+}
+
+fn sqlite_immutable_uri(path: &Path) -> Result<String, StartupError> {
+    let path = path.to_str().ok_or(StartupError::StoreIntegrity)?;
+    Ok(format!(
+        "file:{}?immutable=1",
+        path.replace('%', "%25")
+            .replace('?', "%3F")
+            .replace('#', "%23")
+    ))
+}
+
+#[cfg(unix)]
+fn sqlite_sidecar_is_private(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file() && metadata.nlink() == 1)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn sqlite_sidecar_is_private(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn lock_identity(metadata: &fs::Metadata) -> [u8; 16] {
+    use std::os::unix::fs::MetadataExt;
+    let mut identity = [0_u8; 16];
+    identity[..8].copy_from_slice(&metadata.dev().to_le_bytes());
+    identity[8..].copy_from_slice(&metadata.ino().to_le_bytes());
+    identity
+}
+
+#[cfg(not(unix))]
+fn lock_identity(metadata: &fs::Metadata) -> [u8; 16] {
+    let mut identity = [0_u8; 16];
+    identity[..8].copy_from_slice(&metadata.len().to_le_bytes());
+    identity
+}
+
+fn open_private_rw(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn connection_exclusive(connection: &Connection) -> Result<(), StartupError> {
     connection
         .busy_timeout(Duration::ZERO)
         .map_err(|_| StartupError::StoreUnavailable)?;
@@ -1888,7 +2244,7 @@ fn acquire_database_ownership(path: &Path) -> Result<Connection, StartupError> {
             }
             _ => StartupError::StoreUnavailable,
         })?;
-    Ok(connection)
+    Ok(())
 }
 
 fn private_create_new(path: &Path) -> std::io::Result<File> {

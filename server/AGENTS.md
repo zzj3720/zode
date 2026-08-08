@@ -166,6 +166,20 @@ replication is `docs/auth-replication.md`; ingress identity is
   external phase. A second Server fails readiness. Release the lock last after
   graceful child shutdown; after a crash, only the next lock owner may adopt a
   surviving local Endpoint.
+- ControlStore binds one canonical control-database inode and its stable
+  `.server.lock`/`.anchor` inode pair for the process lifetime, with durable
+  owner markers beside the database and in the protected secret directory;
+  missing markers, symlink, inode/path replacement, or multiply-linked
+  sidecars fail before READY rather than changing the owned store.
+  Existing-store integrity is preflighted before a failed startup can create
+  new ownership sidecars.
+  The readiness matrix covers database/lock/pair swaps, both-marker removal,
+  URI-delimiter restart, corrupt-store cleanup, and WAL/SHM link rejection.
+  Its anchors include
+  `e2e_server_control_database_path_swap_cannot_cross_catalog_ownership`,
+  `e2e_server_control_owner_markers_removal_and_lock_pair_replacement_cannot_allow_second_owner`,
+  `e2e_server_corrupt_existing_control_store_failure_removes_new_ownership_sidecars`,
+  and `e2e_initialized_server_wal_shm_hardlink_is_rejected_before_ready`.
 - The combined Server starts one built-in local Endpoint on a private loopback
   listener as a supervised standalone `zode` child and treats it as a normal
   Endpoint record/client. Do not link or instantiate Endpoint runtime state in
