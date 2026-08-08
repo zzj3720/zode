@@ -211,6 +211,7 @@ async function main() {
   let started = false;
   let browser;
   let page;
+  let browserRequests = [];
   let browserResponses = [];
   let failure;
   const env = {
@@ -220,6 +221,7 @@ async function main() {
     ZODE_RELEASE_ACCESS_JWKS_URL: `${fixtures.issuer}/jwks`,
     ZODE_RELEASE_ACCESS_AUDIENCE: fixtures.audience,
     ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER: fixtures.controllerSecret,
+    ZODE_RELEASE_PROVIDER_ORIGINS: fixtures.providerOrigin,
   };
   try {
     const installed = await command(process.execPath, [channelEntry, 'install', '--artifact', path.resolve(artifact), '--release-root', root], env);
@@ -233,9 +235,15 @@ async function main() {
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext();
     page = await context.newPage();
-    const browserRequests = [];
+    browserRequests = [];
     browserResponses = [];
-    page.on('request', (request) => browserRequests.push({ method: request.method(), url: request.url() }));
+    page.on('request', (request) => {
+      const entry = { method: request.method(), url: request.url() };
+      if (entry.method === 'POST' && /\/sessions$/.test(new URL(entry.url).pathname)) {
+        entry.post_data = request.postData() || '';
+      }
+      browserRequests.push(entry);
+    });
     page.on('response', (response) => {
       const entry = { status: response.status(), url: response.url() };
       browserResponses.push(entry);
@@ -298,6 +306,7 @@ async function main() {
       artifact: path.resolve(artifact),
       root,
       browser: browserState,
+      requests: browserRequests,
       responses: browserResponses,
     });
     process.stderr.write(`${JSON.stringify({ status: 'RED', error: String(error.message || error), details: error.details || {} })}\n`);

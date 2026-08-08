@@ -883,11 +883,19 @@ async function reservePort() {
 }
 
 function endpointConfig(instance, endpointPort, secretPath, persistent) {
+  const providerOrigins = (process.env.ZODE_RELEASE_PROVIDER_ORIGINS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
   return {
     schema: "zode.config.v1",
     listen: `127.0.0.1:${endpointPort}`,
     runtime_store: { kind: "sqlite", path: persistent.endpoint_store },
     credential_replica_store: { kind: "files", directory: persistent.credential_replica_store },
+    provider_execution: {
+      adapter_kinds: ["openai_compatible"],
+      allowed_base_url_origins: providerOrigins,
+    },
     controller_auth: [{ authority_id: persistent.authority_id, revision: 1, kind: "bearer_secret_file", secret_file: secretPath }],
   };
 }
@@ -1226,6 +1234,7 @@ async function createInstance(root, artifact, kind, addresses = null) {
     "ZODE_RELEASE_TEST_MODE",
     "ZODE_RELEASE_RECORDER",
     "ZODE_RELEASE_E2E_MODE",
+    "ZODE_RELEASE_PROVIDER_ORIGINS",
   ]) delete childEnv[key];
   try {
     const server = await startProcess(instance, "server", artifact.paths.server.replace(artifact.artifact, artifact.installPath), ["--config", serverConfigPath], { ...childEnv, ZODE_RELEASE_ROLE: "server" });
