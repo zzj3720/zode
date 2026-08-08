@@ -415,7 +415,14 @@ If a process stops after the failure fact is committed but before its retry or
 terminal activation batch, restart recovery continues from that fact: it
 either schedules the recorded retry or commits exhaustion, terminal failure,
 and activation completion. A failed attempt without one of those boundaries is
-not considered reconciled.
+not considered reconciled. The `last_model_attempts_exhausted` state field is
+only the latest activation's projection; a later activation may append a new
+fact while conflicting facts within one activation remain invalid. The
+field-observation recovery anchor
+`e2e_restart_reconciles_failed_attempt_after_prior_activation_exhaustion`
+replays the original version-42 stream through public HTTP/SSE and proves the
+prefix remains unchanged while the missing v43--v45 terminal batch is
+reconstructed.
 
 Text, reasoning, tool-input fragments, and usage from an incomplete attempt are
 transient candidates. A model attempt succeeds only after the complete stream

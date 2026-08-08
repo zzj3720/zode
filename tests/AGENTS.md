@@ -54,6 +54,12 @@ recording, fixture promotion, and replay.
   that stable scheduled attempt exactly once. With one maximum attempt, restart
   must end the activation as `model_attempts_exhausted` and leave queued input
   runnable.
+- Preserve field-observed failed-session fixtures when a real installation
+  exposes a stuck activation. The immutable, secret-safe version-42 fixture
+  must be copied into a test-owned SQLite database and replayed through the
+  real Endpoint HTTP/SSE restart path; `e2e_restart_reconciles_failed_attempt_after_prior_activation_exhaustion`
+  proves the original event prefix is byte-stable while the terminal recovery
+  batch is appended.
 - Replica recovery stores sensitive payloads only in the test-owned secret
   directory. Kill before and after secret promotion, restart, and assert one
   ready revision or typed safe failure through public replica/session APIs;
