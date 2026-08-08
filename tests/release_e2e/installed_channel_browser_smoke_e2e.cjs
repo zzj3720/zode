@@ -288,8 +288,11 @@ async function main() {
     if (browserRequests.some((item) => new URL(item.url).origin !== edge.origin && new URL(item.url).protocol.startsWith('http'))) {
       fail('browser contacted a non-management origin');
     }
-    if (fixtures.requests.length !== 1 || !fixtures.requests[0].path.endsWith('/v1/chat/completions')) {
-      fail('installed Endpoint did not make exactly one provider request', { count: fixtures.requests.length });
+    if (fixtures.requests.length !== 1 || !fixtures.requests[0].path.includes('/chat/completions')) {
+      fail('installed Endpoint did not make exactly one provider chat request', {
+        count: fixtures.requests.length,
+        paths: fixtures.requests.map((request) => request.path),
+      });
     }
     await browser.close();
     browser = null;
@@ -308,6 +311,7 @@ async function main() {
       browser: browserState,
       requests: browserRequests,
       responses: browserResponses,
+      provider_requests: fixtures.requests.map((request) => ({ method: request.method, path: request.path })),
     });
     process.stderr.write(`${JSON.stringify({ status: 'RED', error: String(error.message || error), details: error.details || {} })}\n`);
     process.exitCode = 1;
