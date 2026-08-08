@@ -240,7 +240,7 @@ an unrelated corruption or migration fixture.
 | Subject ownership under one authority covers list/read/message/SSE with existence-safe failures and independently scoped create keys | `e2e_session_ownership_safe_not_found_and_ordered_sse` and `e2e_session_list_is_subject_scoped` | core anchors exist |
 | Authority ownership with the same opaque subject independently scopes create receipts and blocks cross-authority list/read/message/SSE | `e2e_authority_subject_create_receipts_are_scoped` plus `e2e_session_authority_ownership_isolates_list_read_message_and_sse` | receipt anchor exists; access-hardening anchor required red |
 | List uses owner-bound opaque keyset pagination by durable creation position and resumes identically after restart | `e2e_session_list_keyset_is_owner_bound_and_restart_stable` | functional follow-up; required red before pagination implementation |
-| History without the supported immutable owner fact cannot be claimed, repaired, or migrated to a guessed owner | `e2e_ownerless_session_history_fails_closed` | migration hardening; required red before migration handling |
+| History without the supported immutable owner fact cannot be claimed, repaired, or migrated to a guessed owner | `e2e_ownerless_session_history_fails_closed` | anchor green; startup fails closed without migration |
 
 An eventful command commits one non-empty event batch atomically. A unique
 no-change command may commit an explicit ignored fact when retaining its

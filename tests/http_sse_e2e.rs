@@ -826,6 +826,120 @@ async fn e2e_conflicting_create_receipt_projection_fails_closed(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_ownerless_session_history_fails_closed(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let database = test_database("ownerless-session-history")?;
+    let mut server = TestServer::start(&database).await?;
+    let client = http_client()?;
+    let response = authenticated(client.post(server.url("/v1/sessions")))
+        .header("Idempotency-Key", "ownerless-history-create")
+        .json(&json!({}))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response_json(response).await?;
+    let session_id = require_ulid(&body)?.to_owned();
+    let events = authenticated(
+        client
+            .get(server.url(&format!("/v1/sessions/{session_id}/events")))
+            .header("Last-Event-ID", "0"),
+    )
+    .send_with_timeout()
+    .await?;
+    assert_eq!(events.status(), StatusCode::OK);
+    assert_eq!(
+        read_sse_events(events, 1).await?[0].event,
+        "session_created"
+    );
+
+    server.stop().await?;
+    let database_file = database.path().to_owned();
+    let session_for_db = session_id.clone();
+    db_blocking(move || {
+        let mut connection = Connection::open(database_file)?;
+        let transaction = connection.transaction()?;
+        let (event_id, event_schema_version, command_id, event_type, payload, event_version): (
+            String,
+            i64,
+            String,
+            String,
+            Vec<u8>,
+            i64,
+        ) = transaction.query_row(
+            "SELECT event_id, event_schema_version, command_id, event_type, payload,
+                    stream_version
+             FROM events WHERE stream_id = ?1 AND stream_version = 1",
+            params![session_for_db],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        let mut payload_json: Value =
+            serde_json::from_slice(&payload).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        payload_json["owner"] = Value::Null;
+        let payload =
+            serde_json::to_vec(&payload_json).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let event_fingerprint = receipt_event_fingerprint(
+            &session_for_db,
+            u64::try_from(event_version)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+            &event_id,
+            &command_id,
+            u32::try_from(event_schema_version)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+            &event_type,
+            &payload,
+        );
+        let prefix_digest = receipt_prefix_digest(&session_for_db, &event_fingerprint);
+        transaction.execute(
+            "UPDATE events SET payload = ?1, event_fingerprint = ?2
+             WHERE stream_id = ?3 AND stream_version = 1",
+            params![payload, event_fingerprint, session_for_db],
+        )?;
+        transaction.execute(
+            "UPDATE integrity_anchors SET event_prefix_digest = ?1
+             WHERE stream_id = ?2 AND stream_version = 1",
+            params![prefix_digest, session_for_db],
+        )?;
+        transaction.execute(
+            "UPDATE storage_metadata SET projections_dirty = 1 WHERE singleton = 1",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok::<(), rusqlite::Error>(())
+    })
+    .await?;
+
+    let restart = TestServer::start(&database).await;
+    assert!(
+        restart.is_err(),
+        "ownerless history must fail before READY rather than guessing an owner"
+    );
+    db_blocking(move || {
+        let connection = Connection::open(database.path())?;
+        let event_count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        let receipt_count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM session_create_receipts", [], |row| {
+                row.get(0)
+            })?;
+        if event_count != 1 || receipt_count != 1 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        Ok::<(), rusqlite::Error>(())
+    })
+    .await?;
+    Ok(())
+}
+
 fn receipt_hash_field(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
