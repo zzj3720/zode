@@ -132,8 +132,8 @@ impl ProviderAuthority {
         }
         let dispatchable = tombstones
             .into_iter()
-            .filter(|dispatch| cleaned.contains(&dispatch.secret_ref))
-            .map(|dispatch| dispatch.tombstone)
+            .filter(|(_, secret_ref)| cleaned.contains(secret_ref))
+            .map(|(replica, _)| replica)
             .collect::<Vec<_>>();
         self.dispatch_tombstones(&dispatchable).await?;
         Ok(())
@@ -141,11 +141,11 @@ impl ProviderAuthority {
 
     async fn dispatch_tombstones(
         &self,
-        tombstones: &[crate::store::AuthTombstoneRecord],
+        tombstones: &[AuthReplicaRecord],
     ) -> Result<(), ProviderError> {
         for tombstone in tombstones
             .iter()
-            .filter(|tombstone| tombstone.status != "removed")
+            .filter(|tombstone| tombstone.kind == "tombstone" && tombstone.status != "removed")
         {
             let (status, observed_revision) = self.dispatch_tombstone(tombstone).await;
             let store = Arc::clone(&self.store);
@@ -153,7 +153,7 @@ impl ProviderAuthority {
             let endpoint_id = tombstone.endpoint_id.clone();
             let revision = tombstone.revision;
             tokio::task::spawn_blocking(move || {
-                store.mark_profile_tombstone(
+                store.mark_tombstone_replica(
                     &profile_id,
                     &endpoint_id,
                     revision,
@@ -170,7 +170,7 @@ impl ProviderAuthority {
 
     async fn dispatch_tombstone(
         &self,
-        tombstone: &crate::store::AuthTombstoneRecord,
+        tombstone: &AuthReplicaRecord,
     ) -> (&'static str, Option<u64>) {
         let body = json!({
             "schema": "zode.auth-replica.tombstone.v1",
@@ -568,7 +568,10 @@ impl ProviderAuthority {
         .map_err(map_store_error)?;
         let secret = Secret(secret);
         let secret_text = std::str::from_utf8(&secret.0).map_err(|_| ProviderError::Internal)?;
-        for replica in replicas.iter().filter(|replica| replica.status != "ready") {
+        for replica in replicas
+            .iter()
+            .filter(|replica| replica.kind == "install" && replica.status != "ready")
+        {
             let response = self
                 .catalog
                 .install_auth_replica(
