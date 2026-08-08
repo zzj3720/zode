@@ -513,7 +513,6 @@ impl ProviderAuthority {
             request_fingerprint,
             created_at_ms: unix_millis()?,
         };
-        self.reconcile_signal.notify_one();
         let store = Arc::clone(&self.store);
         let (_revision, profile, tombstones, receipt) =
             tokio::task::spawn_blocking(move || store.begin_profile_delete(write))
@@ -523,6 +522,7 @@ impl ProviderAuthority {
         if let Some(receipt) = receipt {
             return serde_json::from_str(&receipt).map_err(|_| ProviderError::Internal);
         }
+        self.reconcile_signal.notify_one();
         let store = Arc::clone(&self.store);
         let secret_ref = profile.secret_ref.clone();
         tokio::task::spawn_blocking(move || store.remove_provider_secret(&secret_ref))
