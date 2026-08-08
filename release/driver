@@ -845,6 +845,12 @@ function serverConfig(instance, serverPort, uiPath, endpointPath, endpointConfig
   return {
     schema: "zode.server-config.v1",
     listen: `127.0.0.1:${serverPort}`,
+    // Management now requires explicit, distinct origin authorities even for
+    // the local channel.  The edge fixture forwards the browser request with
+    // this management Host; callback traffic remains on the sibling loopback
+    // authority and never serves the UI surface.
+    management_origin: `http://127.0.0.1:${serverPort}`,
+    callback_origin: `http://127.0.0.2:${serverPort}`,
     server_authority_id: persistent.authority_id,
     deployment: "all_in_one",
     local_endpoint: {

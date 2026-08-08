@@ -49,6 +49,19 @@ ZODE_RELEASE_CHANNEL_ARTIFACT=<artifact> \
 `current`/`previous` 仍不存在），不把尚未具备 all-in-one 的启动失败伪装成
 浏览器行为红。
 
+Management all-in-one 进入 main 后，安装版浏览器 smoke 使用同一个 channel
+入口启动 artifact，并通过 test-owned Access/JWKS edge 和本地 fake provider
+完成真实 UI→Server→built-in Endpoint 操作：
+
+```sh
+ZODE_RELEASE_CHANNEL_ARTIFACT=<artifact> \
+  node tests/release_e2e/installed_channel_browser_smoke_e2e.cjs
+```
+
+该 E2E 不导入产品代码、不启动源码二进制，也不把 Access assertion 或
+provider secret 写入 artifact、日志或测试输出；失败首遇只进入 ignored
+quarantine。
+
 The test channel supplies the existing authentication inputs through
 `ZODE_RELEASE_ACCESS_ASSERTION` (or `_ACCESS_JWT_ASSERTION`) and
 `ZODE_RELEASE_ENDPOINT_CONTROLLER_BEARER` (or `_CONTROLLER_BEARER`). Optional
