@@ -422,6 +422,42 @@ async fn install_native_anthropic_replica_with_schema(
     Ok(())
 }
 
+/// Every public capability array is UTF-8 sorted even when more than one
+/// provider adapter is enabled in the same Endpoint composition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_capabilities_sort_all_arrays_with_multiple_provider_adapters() -> TestResult<()> {
+    let database = TempDatabase::new("provider-capabilities-multi-adapter")?;
+    let provider = AnthropicFixture::start(false).await?;
+    let path = write_endpoint_config(database.path(), Vec::new(), 1)?;
+    let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    config["provider_execution"]["adapter_kinds"] =
+        json!(["openai_compatible", "anthropic"]);
+    config["provider_execution"]["allowed_base_url_origins"] = json!([provider.base_url()]);
+    fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    let mut server = ConfiguredServer::start(&database, &path).await?;
+    let client = support::http_client()?;
+    let response = authenticated(client.get(server.url("/v1/capabilities")))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await?;
+    let capabilities: Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        capabilities["provider_adapter_kinds"],
+        json!(["anthropic", "openai_compatible"])
+    );
+    assert_eq!(
+        capabilities["auth_replica_credential_schemas"],
+        json!(["anthropic.api-key.v1", "openai-compatible.api-key.v1"])
+    );
+    assert_eq!(capabilities["outbound_capabilities"], json!(["provider_http"]));
+    assert_eq!(capabilities["built_in_tools"], json!(["wait_for"]));
+    server.stop().await?;
+    let mut provider = provider;
+    provider.stop().await?;
+    Ok(())
+}
+
 async fn create_model(
     client: &reqwest::Client,
     server: &ConfiguredServer,
