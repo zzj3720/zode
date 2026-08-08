@@ -1,7 +1,7 @@
 import { test, expect, type BrowserContext, type Page, type TestInfo } from "@playwright/test";
 import { createHash, createSign, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
@@ -12,7 +12,8 @@ import { promisify } from "node:util";
 const SPEC_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = process.env.ZODE_REPO_ROOT ?? resolve(SPEC_DIR, "../../..");
 const require = createRequire(import.meta.url);
-const { RealProcess: CapturedRealProcess, RecordingJournal, SecretLedger } = require("../support/harness.cjs") as {
+const { ProductBehaviorFailure, RealProcess: CapturedRealProcess, RecordingJournal, SecretLedger } = require("../support/harness.cjs") as {
+  ProductBehaviorFailure: new (classification: string, message: string, details?: Record<string, unknown>) => Error;
   RealProcess: {
     start: (options: Record<string, unknown>) => Promise<CapturedProcess>;
   };
@@ -32,6 +33,13 @@ const MUTATION_TEXT = "non-secret-access-entry-view-state";
 const EXPIRY_E2E_NAME = "e2e_browser_access_reentry_stops_mutations_and_uses_management_origin";
 const EXPIRY_LATER_RELATION = "later_test_reproduction_of_gap";
 const EXPIRY_ORIGINAL_GAP = "access-assertion-expiry-sse-first-occurrence-gap";
+const SESSION_ACCESS_REENTRY_E2E_NAME =
+  "e2e_browser_access_401_reentry_is_not_endpoint_unavailable";
+const SESSION_ACCESS_REENTRY_CLASSIFICATION =
+  "ACCESS_REENTRY_401_RENDERED_AS_ENDPOINT_UNAVAILABLE";
+const SESSION_ACCESS_REENTRY_FIRST_OBSERVED =
+  "the real Access edge returned HTTP 401 for a session read, but the browser rendered Endpoint unavailable instead of re-entering Access";
+const INCIDENT_DIRECTORY = resolve(REPO_ROOT, "web/e2e/fixtures/incidents");
 const execFileAsync = promisify(execFile);
 
 type AccessMode = "valid" | "expired" | "invalid" | "expiring";
@@ -75,6 +83,18 @@ type RecordingJournalContract = {
     captureSetId: string,
     options?: { firstFailureRecordingId?: string },
   ) => { records?: Array<{ recordingId: string; rawPath?: string }>; sourceDigest?: string };
+  replay: (envelope: unknown, options: Record<string, unknown>) => Promise<unknown>;
+  promoteCaptureSet: (
+    captureSetId: string,
+    options: {
+      e2eName: string;
+      classification: string;
+      firstObserved: string;
+      firstFailureRecordingId: string;
+      destinationDirectory: string;
+      replay: (envelope: unknown) => Promise<unknown>;
+    },
+  ) => Promise<{ cassettePath: string }>;
 };
 
 type Cassette = {
@@ -1358,6 +1378,16 @@ class TestStack {
     return new URL(path, `${this.access.origin}/`).toString();
   }
 
+  beginCaptureSet(e2eName: string): string {
+    const captureSetId = this.journal.beginCaptureSet({ e2eName, maxMembers: 64 });
+    this.access.setCapture(this.journal, captureSetId);
+    return captureSetId;
+  }
+
+  restoreCaptureSet(): void {
+    this.access.setCapture(this.journal, this.captureSetId);
+  }
+
   markExpiryRed(): void {
     this.expiryRedObserved = true;
   }
@@ -1524,6 +1554,48 @@ function assertSseCursorRecovery(stack: TestStack): void {
   expect([...firstIds].some((id) => recoveredIds.has(id))).toBe(false);
 }
 
+async function assertSessionAccessReentryCassette(): Promise<void> {
+  const matches: string[] = [];
+  for (const name of await readdir(INCIDENT_DIRECTORY)) {
+    if (!name.endsWith(".v1.json")) continue;
+    const path = join(INCIDENT_DIRECTORY, name);
+    try {
+      const value = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+      if (
+        value.e2e_name === SESSION_ACCESS_REENTRY_E2E_NAME &&
+        value.classification === SESSION_ACCESS_REENTRY_CLASSIFICATION
+      ) {
+        matches.push(path);
+      }
+    } catch {
+      // Unrelated incident files are validated by their owning E2Es.
+    }
+  }
+  expect(matches).toHaveLength(1);
+  const cassette = JSON.parse(await readFile(matches[0]!, "utf8")) as {
+    schema?: string;
+    version?: number;
+    boundary?: string;
+    first_observed?: string;
+    source_digest?: string;
+    integrity_sha256?: string;
+    exchanges?: Array<{ boundary?: string; method?: string; path?: string; response?: { status?: number } }>;
+  };
+  expect(cassette.schema).toBe("zode.http-incident-recording.v1");
+  expect(cassette.version).toBe(1);
+  expect(cassette.boundary).toBe("browser-capture-set");
+  expect(cassette.first_observed).toBe(SESSION_ACCESS_REENTRY_FIRST_OBSERVED);
+  expect(cassette.source_digest).toMatch(/^[0-9a-f]{64}$/u);
+  expect(cassette.integrity_sha256).toMatch(/^[0-9a-f]{64}$/u);
+  expect((await stat(matches[0]!)).mode & 0o777).toBe(0o444);
+  expect(cassette.exchanges?.some((exchange) =>
+    exchange.boundary === "management-access-edge" &&
+    exchange.method === "GET" &&
+    exchange.path?.includes("/sessions") &&
+    exchange.response?.status === 401,
+  )).toBe(true);
+}
+
 test.describe("Access entry and re-entry", () => {
   test.describe.configure({ mode: "serial", retries: 0 });
   test.setTimeout(45_000);
@@ -1652,6 +1724,77 @@ test.describe("Access entry and re-entry", () => {
       expect(page.url()).not.toContain(MUTATION_TEXT);
     });
   }
+
+  test(SESSION_ACCESS_REENTRY_E2E_NAME, async ({ page }) => {
+    test.setTimeout(60_000);
+    const captureMode = process.env.ZODE_CAPTURE_ACCESS_REENTRY_401 === "1";
+    if (!captureMode) await assertSessionAccessReentryCassette();
+
+    await page.goto(stack.managementUrl(stack.sessionPath), { waitUntil: "domcontentloaded" });
+    await assertManagementUi(page);
+    await expect(page.getByRole("heading", { name: "Session", exact: true })).toBeVisible();
+
+    const captureSetId = stack.beginCaptureSet(SESSION_ACCESS_REENTRY_E2E_NAME);
+    let primaryError: unknown;
+    try {
+      await stack.access.setMode("expired");
+      await page.getByRole("link", { name: "Endpoints", exact: true }).click();
+      await expect(page).toHaveURL(/\/endpoints$/u);
+      await page.getByRole("link", { name: "Sessions", exact: true }).click();
+      try {
+        await expect(page.locator("[data-access-reentry]")).toBeVisible({ timeout: 10_000 });
+      } catch (error) {
+        throw new ProductBehaviorFailure(
+          SESSION_ACCESS_REENTRY_CLASSIFICATION,
+          SESSION_ACCESS_REENTRY_FIRST_OBSERVED,
+          { cause: error instanceof Error ? error.message : String(error) },
+        );
+      }
+    } catch (error) {
+      primaryError = error;
+    } finally {
+      try {
+        await stack.journal.waitForIdle();
+        const firstFailure = stack.journal.first({
+          boundary: "management-access-edge",
+          responseStatus: 401,
+        });
+        if (!firstFailure) throw new Error("Access re-entry capture contained no HTTP 401 exchange");
+        const capture = stack.journal.flushCaptureSet(captureSetId, {
+          firstFailureRecordingId: firstFailure.recordingId,
+        });
+        expect(capture.sourceDigest).toMatch(/^[0-9a-f]{64}$/u);
+        for (const record of capture.records ?? []) {
+          if (record.rawPath) {
+            expect((await stat(record.rawPath)).mode & 0o777).toBe(0o600);
+          }
+        }
+        if (captureMode && primaryError) {
+          const promoted = await stack.journal.promoteCaptureSet(captureSetId, {
+            e2eName: SESSION_ACCESS_REENTRY_E2E_NAME,
+            classification: SESSION_ACCESS_REENTRY_CLASSIFICATION,
+            firstObserved: SESSION_ACCESS_REENTRY_FIRST_OBSERVED,
+            firstFailureRecordingId: firstFailure.recordingId,
+            destinationDirectory: INCIDENT_DIRECTORY,
+            replay: (envelope) => stack.journal.replay(envelope, {
+              baseUrl: stack.managementUrl(),
+              boundaryBaseUrls: { "management-access-edge": stack.managementUrl() },
+            }),
+          });
+          primaryError = new ProductBehaviorFailure(
+            SESSION_ACCESS_REENTRY_CLASSIFICATION,
+            `${SESSION_ACCESS_REENTRY_FIRST_OBSERVED}; cassette=${promoted.cassettePath}`,
+            { captureSetId, recordingId: firstFailure.recordingId },
+          );
+        }
+      } catch (captureError) {
+        primaryError = captureError;
+      } finally {
+        stack.restoreCaptureSet();
+      }
+    }
+    if (primaryError) throw primaryError;
+  });
 
   test("e2e_browser_access_reentry_stops_mutations_and_uses_management_origin", async ({ page, context }, testInfo) => {
     stack.access.enableAutoCompleteReentry();
