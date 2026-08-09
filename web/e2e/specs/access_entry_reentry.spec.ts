@@ -39,6 +39,12 @@ const SESSION_ACCESS_REENTRY_CLASSIFICATION =
   "ACCESS_REENTRY_401_RENDERED_AS_ENDPOINT_UNAVAILABLE";
 const SESSION_ACCESS_REENTRY_FIRST_OBSERVED =
   "the real Access edge returned HTTP 401 for a session read, but the browser rendered Endpoint unavailable instead of re-entering Access";
+const SSE_ACCESS_REENTRY_E2E_NAME =
+  "e2e_browser_sse_401_reenters_management_origin_and_stops_retries";
+const SSE_ACCESS_REENTRY_CLASSIFICATION =
+  "ACCESS_REENTRY_SSE_401_RECONNECT_LOOP";
+const SSE_ACCESS_REENTRY_FIRST_OBSERVED =
+  "the real Access edge returned HTTP 401 for a session event stream, but the browser kept retrying instead of re-entering Access";
 const INCIDENT_DIRECTORY = resolve(REPO_ROOT, "web/e2e/fixtures/incidents");
 const execFileAsync = promisify(execFile);
 
@@ -61,6 +67,7 @@ type SecretLedgerContract = {
 
 type RecordingJournalContract = {
   beginCaptureSet: (options: { e2eName: string; maxMembers?: number }) => string;
+  waitForIdle: () => Promise<void>;
   beginIngress: (options: {
     boundary: string;
     method: string;
@@ -78,6 +85,7 @@ type RecordingJournalContract = {
     boundary?: string;
     requestPath?: string;
     responseStatus?: number;
+    captureSetId?: string;
   }) => { recordingId: string } | undefined;
   flushCaptureSet: (
     captureSetId: string,
@@ -812,6 +820,11 @@ class AccessEdgeFixture {
   }
 
   async stop(): Promise<void> {
+    // Force any long-lived SSE client sockets to emit `close` before waiting
+    // for the listener itself.  Without this, a browser teardown can leave
+    // the forwarding recorder context active even though the edge is no
+    // longer accepting requests.
+    (this.server as typeof this.server & { closeAllConnections?: () => void }).closeAllConnections?.();
     await closeServer(this.server);
   }
 
@@ -1858,6 +1871,141 @@ test.describe("Access entry and re-entry", () => {
     await expect.poll(() => stack.access.mutationAttemptCount()).toBe(1);
     await expect.poll(() => stack.access.sseExchanges.length).toBeGreaterThanOrEqual(2);
     assertSseCursorRecovery(stack);
+  });
+
+  test(SSE_ACCESS_REENTRY_E2E_NAME, async ({ page, context }, testInfo) => {
+    test.setTimeout(60_000);
+    const captureSetId = stack.beginCaptureSet(SSE_ACCESS_REENTRY_E2E_NAME);
+    let primaryError: unknown;
+    try {
+      stack.access.enableAutoCompleteReentry();
+      stack.access.armSseLifecycle();
+      await stack.access.setMode("expiring");
+      const viewUrl = stack.managementUrl(stack.sessionPath);
+      const navigationUrls: string[] = [];
+      page.on("framenavigated", (frame) => {
+        if (frame === page.mainFrame()) navigationUrls.push(frame.url());
+      });
+      const response = await page.goto(viewUrl, { waitUntil: "domcontentloaded" });
+      assertManagementUiResponse(response, new URL(viewUrl).pathname + new URL(viewUrl).search, testInfo);
+      await assertManagementUi(page);
+      await stack.access.waitForSseOpened();
+      await stack.access.waitForSseClosed();
+
+      // The next stream receives a real forged Access assertion and therefore a
+      // real HTTP 401 from the management Server.  A browser must stop the SSE
+      // retry loop and re-enter through the management origin, rather than
+      // treating an admission failure as an Endpoint/network outage.
+      await stack.access.setMode("invalid");
+      const navigationCountBefore401 = navigationUrls.length;
+      try {
+        await expect
+          .poll(
+            () => stack.access.sseExchanges.filter((exchange) => exchange.responseStatus === 401).length,
+            { timeout: 10_000 },
+          )
+          .toBe(1);
+      } catch (error) {
+        throw new ProductBehaviorFailure(
+          SSE_ACCESS_REENTRY_CLASSIFICATION,
+          SSE_ACCESS_REENTRY_FIRST_OBSERVED,
+          {
+            cause: error instanceof Error ? error.message : String(error),
+            sse_statuses: stack.access.sseExchanges.map((exchange) => exchange.responseStatus),
+          },
+        );
+      }
+      const unauthorized = stack.access.sseExchanges.find((exchange) => exchange.responseStatus === 401);
+      if (!unauthorized) {
+        throw new ProductBehaviorFailure(
+          SSE_ACCESS_REENTRY_CLASSIFICATION,
+          `${SSE_ACCESS_REENTRY_FIRST_OBSERVED}; no retained HTTP 401 exchange`,
+        );
+      }
+      expect(unauthorized.lastEventId).toBeTruthy();
+      try {
+        await expect.poll(() => stack.access.reentryCount()).toBeGreaterThan(0);
+      } catch (error) {
+        throw new ProductBehaviorFailure(
+          SSE_ACCESS_REENTRY_CLASSIFICATION,
+          SSE_ACCESS_REENTRY_FIRST_OBSERVED,
+          {
+            cause: error instanceof Error ? error.message : String(error),
+            unauthorized_status: unauthorized.responseStatus,
+            navigation_count: navigationUrls.length,
+          },
+        );
+      }
+      await expect.poll(() => navigationUrls.length).toBeGreaterThan(navigationCountBefore401);
+      await expect(page.getByRole("main")).toBeVisible();
+      await assertNoZodeAuthSurface(page, context);
+      expect(new URL(page.url()).origin).toBe(stack.access.origin);
+      expect(new URL(page.url()).pathname + new URL(page.url()).search).toBe(
+        new URL(viewUrl).pathname + new URL(viewUrl).search,
+      );
+      expect(await page.locator("[data-access-reentry]").count()).toBe(0);
+      await expect.poll(
+        () => stack.access.sseExchanges.filter((exchange) => exchange.responseStatus === 401).length,
+      ).toBe(1);
+    } catch (error) {
+      primaryError = error;
+    } finally {
+      // SSE_401_CAPTURE_FLUSH
+      try {
+        // The re-entry page opens a fresh admitted SSE stream.  Close the page
+        // before flushing this capture set so that the journal observes the
+        // stream's terminal disconnect instead of waiting on an open reader.
+        await page.goto("about:blank", { waitUntil: "commit", timeout: 2_000 }).catch(() => undefined);
+        await page.close().catch(() => undefined);
+        // Stop the target before the edge so a target SSE cannot keep the
+        // forwarding request alive while the edge is being sealed.
+        await stack.server.stop().catch(() => undefined);
+        await stack.endpoint?.stop().catch(() => undefined);
+        await stack.access.stop().catch(() => undefined);
+        try {
+          await stack.journal.waitForIdle();
+        } catch (error) {
+          const journalState = stack.journal as unknown as { active?: Map<string, unknown> };
+          const active = journalState.active ? [...journalState.active.keys()] : [];
+          throw new Error(
+            `${error instanceof Error ? error.message : String(error)} active_recordings=${active.join(",")}`,
+          );
+        }
+        const firstFailure = stack.journal.first({
+          boundary: "management-access-edge",
+          responseStatus: 401,
+          captureSetId,
+        });
+        const capture = stack.journal.flushCaptureSet(captureSetId, {
+          firstFailureRecordingId: firstFailure?.recordingId,
+        });
+        await writeFile(
+          join(stack.captureRoot, "sse-401-reentry-first-occurrence.json"),
+          `${JSON.stringify({
+            schema: "zode.access-entry-sse-401-first-occurrence.v1",
+            version: 1,
+            owning_e2e: SSE_ACCESS_REENTRY_E2E_NAME,
+            classification: SSE_ACCESS_REENTRY_CLASSIFICATION,
+            first_observed: firstFailure
+              ? SSE_ACCESS_REENTRY_FIRST_OBSERVED
+              : "no typed red observed",
+            recording_id: firstFailure?.recordingId ?? null,
+            capture_set_id: captureSetId,
+            raw_exchange_retained: Boolean(firstFailure),
+            source_digest: capture.sourceDigest ?? null,
+          }, null, 2)}\n`,
+          { mode: 0o600 },
+        );
+        for (const record of capture.records ?? []) {
+          if (record.rawPath) expect((await stat(record.rawPath)).mode & 0o777).toBe(0o600);
+        }
+      } catch (captureError) {
+        primaryError ||= captureError;
+      } finally {
+        stack.restoreCaptureSet();
+      }
+    }
+    if (primaryError) throw primaryError;
   });
 
   test("e2e_callback_origin_never_serves_management_ui_or_api", async ({ page, context }) => {

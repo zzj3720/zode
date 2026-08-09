@@ -158,10 +158,70 @@ pub trait ToolExecutor: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct ModelRequest {
     pub owner: SessionOwner,
+    pub session_id: String,
+    pub activation_id: String,
+    pub round_id: String,
     pub selection: SessionModelSelection,
     pub transcript: Vec<TranscriptMessage>,
     pub tools: Vec<ToolDefinition>,
     pub stream_idle_timeout: Duration,
+    pub stream_observer: Option<Arc<dyn ModelStreamObserver>>,
+}
+
+/// Receives provider text deltas for transient browser observation only. The
+/// observer is never consulted by the durable reducer and its output is not
+/// persisted, replayed, or included in prepared model envelopes.
+pub trait ModelStreamObserver: Send + Sync + std::fmt::Debug {
+    fn text_delta(&self, session_id: &str, activation_id: &str, round_id: &str, text: &str);
+}
+
+/// A bounded, best-effort model text update for currently attached clients.
+/// It deliberately has no public cursor: reconnects replay durable facts only.
+#[derive(Clone, Debug)]
+pub struct TransientModelEvent {
+    pub session_id: String,
+    pub activation_id: String,
+    pub round_id: String,
+    pub text: String,
+}
+
+const MAX_TRANSIENT_TEXT_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Debug)]
+struct BroadcastModelStreamObserver {
+    publisher: broadcast::Sender<TransientModelEvent>,
+}
+
+impl ModelStreamObserver for BroadcastModelStreamObserver {
+    fn text_delta(&self, session_id: &str, activation_id: &str, round_id: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let mut start = 0;
+        while start < text.len() {
+            let mut end = (start + MAX_TRANSIENT_TEXT_BYTES).min(text.len());
+            while end > start && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end == start {
+                end = text[start..]
+                    .char_indices()
+                    .nth(MAX_TRANSIENT_TEXT_BYTES.saturating_sub(1))
+                    .map(|(index, _)| start + index)
+                    .unwrap_or(text.len());
+                if end == start {
+                    end = text.len();
+                }
+            }
+            let _ = self.publisher.send(TransientModelEvent {
+                session_id: session_id.to_owned(),
+                activation_id: activation_id.to_owned(),
+                round_id: round_id.to_owned(),
+                text: text[start..end].to_owned(),
+            });
+            start = end;
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -244,6 +304,8 @@ pub struct Runtime {
     model: Arc<dyn ModelExecutor>,
     tools: Arc<dyn ToolExecutor>,
     publisher: broadcast::Sender<EventRecord>,
+    transient_publisher: broadcast::Sender<TransientModelEvent>,
+    stream_observer: Arc<dyn ModelStreamObserver>,
     options: RuntimeOptions,
     session_locks: Mutex<HashMap<SessionKey, Arc<AsyncMutex<()>>>>,
     timer_worker_started: AtomicBool,
@@ -271,11 +333,17 @@ impl Runtime {
         options: RuntimeOptions,
     ) -> Arc<Self> {
         let (publisher, _) = broadcast::channel(1_024);
+        let (transient_publisher, _) = broadcast::channel(1_024);
+        let stream_observer = Arc::new(BroadcastModelStreamObserver {
+            publisher: transient_publisher.clone(),
+        });
         Arc::new(Self {
             store,
             model,
             tools,
             publisher,
+            transient_publisher,
+            stream_observer,
             options: options.bounded(),
             session_locks: Mutex::new(HashMap::new()),
             timer_worker_started: AtomicBool::new(false),
@@ -284,6 +352,10 @@ impl Runtime {
 
     pub fn publisher(&self) -> broadcast::Sender<EventRecord> {
         self.publisher.clone()
+    }
+
+    pub fn transient_publisher(&self) -> broadcast::Sender<TransientModelEvent> {
+        self.transient_publisher.clone()
     }
 
     /// Validate a session's configured adapter-tool selection against the
@@ -1105,12 +1177,20 @@ impl Runtime {
             .definitions(&state.selection.tools)
             .map_err(|_| "tool_selection")?;
         tools.push(ToolDefinition::wait_for());
-        let request = ModelRequest {
+        let mut request = ModelRequest {
             owner: owner.clone(),
+            session_id: session_id.to_owned(),
+            activation_id: state
+                .active_activation
+                .as_ref()
+                .map(|activation| activation.activation_id.clone())
+                .ok_or("active_activation_missing")?,
+            round_id: round_identity.clone(),
             selection: selection.clone(),
             transcript: provider_transcript(state),
             tools: tools.clone(),
             stream_idle_timeout: self.options.model_stream_idle_timeout,
+            stream_observer: Some(self.stream_observer.clone()),
         };
         let (prep_commits, _prepared_state, request_identity) = prepare_model_round(
             self.store.clone(),
@@ -1125,6 +1205,12 @@ impl Runtime {
             },
         )
         .await?;
+        // `prepare_model_round` derives the durable round identity from the
+        // committed stream version.  Use that identity for transient browser
+        // observations too; the caller's follow-up identity is only the
+        // deterministic input to that derivation.
+        request.activation_id = request_identity.activation_id.clone();
+        request.round_id = request_identity.round_id.clone();
         for (append, commit_state) in &prep_commits {
             self.observe_commit(append, commit_state).await;
         }

@@ -61,17 +61,17 @@ The public error shape is:
 
 Required classes are:
 
-| HTTP | Code family | Meaning |
-| --- | --- | --- |
-| 400 | `malformed_request` | Invalid JSON, header encoding, or SSE cursor |
-| 401/403 | `unauthenticated` / `forbidden` | Missing or invalid control/callback authorization |
-| 404 | resource-specific `*_not_found` | Public resource does not exist |
-| 409 | `conflict` | Idempotency mismatch, optimistic conflict, or losing terminal race |
-| 413 | `payload_too_large` | A public bound was exceeded |
-| 422 | `invalid_request` | Current request violates a public semantic rule |
-| 500 | `internal_error` | Storage, replay, reducer-history, adapter, or unexpected failure |
-| 503 | `auth_replica_unavailable` | The exact selected replica/revision is not ready, is tombstoned, or has no valid active secret |
-| 503 | `provider_unavailable` | The selected provider adapter or destination is unavailable before a model request |
+| HTTP    | Code family                     | Meaning                                                                                        |
+| ------- | ------------------------------- | ---------------------------------------------------------------------------------------------- |
+| 400     | `malformed_request`             | Invalid JSON, header encoding, or SSE cursor                                                   |
+| 401/403 | `unauthenticated` / `forbidden` | Missing or invalid control/callback authorization                                              |
+| 404     | resource-specific `*_not_found` | Public resource does not exist                                                                 |
+| 409     | `conflict`                      | Idempotency mismatch, optimistic conflict, or losing terminal race                             |
+| 413     | `payload_too_large`             | A public bound was exceeded                                                                    |
+| 422     | `invalid_request`               | Current request violates a public semantic rule                                                |
+| 500     | `internal_error`                | Storage, replay, reducer-history, adapter, or unexpected failure                               |
+| 503     | `auth_replica_unavailable`      | The exact selected replica/revision is not ready, is tombstoned, or has no valid active secret |
+| 503     | `provider_unavailable`          | The selected provider adapter or destination is unavailable before a model request             |
 
 `500` and SSE error events use neutral text. Internal error strings, SQL,
 paths, provider bodies, tool stderr, credentials, and authorization headers are
@@ -398,14 +398,28 @@ exactly once and in increasing global order. Subscribe/replay handoff and live
 publication cannot lose an event. Keepalive comments have no `id` and carry no
 state.
 
+While a model stream is attached to a live client, Endpoint may also emit
+best-effort transient text frames. They have no `id`, are never persisted, and
+are not replayed after reconnect:
+
+```text
+event: assistant_message_delta
+data: {"schema":"zode.transient-event.v1","session_id":"...","activation_id":"...","round_id":"...","text":"partial"}
+```
+
+Transient text is provisional display state only. A durable
+`assistant_message_committed` event replaces it; a reconnect must rely on the
+durable stream and must not duplicate or promote a transient candidate.
+
 Durable public kinds include session/message, activation final outcome,
 model-step retry/interruption, wait, and async tool lifecycle facts. A
 `model_step_retrying` payload exposes only round ID, failed/next/max zode
 attempt numbers, bounded delay, and a safe classified error code. Raw prepared
 model envelopes, credentials, raw tool result bodies, provider wire parts,
-incremental model candidates, aimux-internal HTTP attempts, internal ignored
-facts, snapshot operations, and mutable projection repair are not public event
-payloads.
+aimux-internal HTTP attempts, internal ignored facts, snapshot operations, and
+mutable projection repair are not public event payloads. A transient text frame
+contains only bounded display text and the session/activation identity above;
+provider metadata and raw wire parts remain private.
 
 The configured `model_step_max_attempts` includes the first zode call to aimux.
 Aimux may independently perform its bounded pre-stream transport retries inside

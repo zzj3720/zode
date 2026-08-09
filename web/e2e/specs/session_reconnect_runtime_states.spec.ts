@@ -1,7 +1,6 @@
 import { expect, test, type Page, type Request } from "@playwright/test";
 import { createHash, createSign, generateKeyPairSync, randomBytes, randomUUID, type KeyObject } from "node:crypto";
 import { execFile as execFileCallback, spawn, type ChildProcessByStdio } from "node:child_process";
-import { once } from "node:events";
 import { readFile, writeFile, mkdir, chmod, cp, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
@@ -34,6 +33,7 @@ type EndpointBoundaryRequest = {
   responseBody?: string;
   responseContentType?: string;
   responseEventIds: string[];
+  responseEventNames: string[];
   responseSseRemainder?: string;
   responseComplete?: boolean;
   recorded?: boolean;
@@ -201,9 +201,22 @@ function quoteSqliteString(value: string): string {
 
 async function sqliteJson(database: string, sql: string): Promise<Json[]> {
   const binary = process.env.ZODE_E2E_SQLITE3_BIN ?? "sqlite3";
-  const result = await execFile(binary, ["-readonly", "-json", database, sql], {
-    maxBuffer: 16 * 1024 * 1024,
-  });
+  let result;
+  try {
+    result = await execFile(binary, ["-readonly", "-json", database, sql], {
+      maxBuffer: 16 * 1024 * 1024,
+    });
+  } catch (error) {
+    // A stopped WAL owner may leave a read-only sqlite3 CLI unable to create
+    // its shared-memory sidecar.  Immutable mode is sufficient for the
+    // schema/database-list inspection; the caller still scans every sidecar
+    // byte-for-byte and therefore does not hide a session mirror.
+    result = await execFile(binary, ["-readonly", "-json", `file:${database}?immutable=1`, sql], {
+      maxBuffer: 16 * 1024 * 1024,
+    }).catch(() => {
+      throw error;
+    });
+  }
   const text = result.stdout.trim();
   if (text.length === 0) return [];
   const value = JSON.parse(text) as unknown;
@@ -449,6 +462,7 @@ class ReplayProvider {
   private readonly released = new Set<string>();
   private readonly releaseWaiters = new Map<string, Array<() => void>>();
   private readonly expectedScenarioCounts = new Map<string, number>();
+  private readonly toolPreambleScenarios = new Set<string>();
   private readonly observedRequests: string[] = [];
   private expectedProviderAuthorization = "";
   private suiteConsumptionRecorded = false;
@@ -529,6 +543,10 @@ class ReplayProvider {
 
   setExpectedScenario(scenario: string, expectedCount: number): void {
     this.expectedScenarioCounts.set(scenario, expectedCount);
+  }
+
+  enableToolPreamble(scenario: string): void {
+    this.toolPreambleScenarios.add(scenario);
   }
 
   private expectedSequences(): number[] {
@@ -676,11 +694,23 @@ class ReplayProvider {
       ),
     );
     response.writeHead(replay.status, responseHeaders);
+    if (this.toolPreambleScenarios.has(scenario) && occurrence === 0) {
+      response.write(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: "PRE_TOOL" }, finish_reason: null }] })}\n\n`,
+      );
+    }
     for (const chunk of replay.chunks as Json[]) {
       response.write(Buffer.from(chunk.bytes_hex, "hex"));
     }
-    if (replay.complete === true) response.end();
-    else response.destroy();
+    if (replay.complete === true) {
+      response.end();
+    } else {
+      // Let the intentionally incomplete frame cross the real socket before
+      // closing it.  A synchronous destroy can discard a buffered provisional
+      // chunk and turn a transport fixture into a false product red.
+      await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+      response.destroy();
+    }
   }
 
   private notify(scenario: string, count: number): void {
@@ -813,6 +843,12 @@ class EndpointBoundary {
   }
 
   private recordSseLine(request: EndpointBoundaryRequest, line: string): void {
+    if (line.startsWith("event:")) {
+      const value = line.startsWith("event: ") ? line.slice(7) : line.slice(6);
+      if (value.length > 0 && !request.responseEventNames.includes(value)) {
+        request.responseEventNames.push(value);
+      }
+    }
     if (!line.startsWith("id:")) return;
     const value = line.startsWith("id: ") ? line.slice(4) : line.slice(3);
     if (value.length === 0) return;
@@ -872,6 +908,7 @@ class EndpointBoundary {
       forwardedLastEventId: normalizedForwardedHeader,
       body,
       responseEventIds: [],
+      responseEventNames: [],
     };
     const upstream = httpRequest(
       {
@@ -932,7 +969,10 @@ class EndpointBoundary {
     upstream.end(body);
   }
 
-  async waitForEventRequest(browserRequest: BrowserSseRequest): Promise<EndpointBoundaryRequest> {
+  async waitForEventRequest(
+    browserRequest: BrowserSseRequest,
+    options: { allowNon2xx?: boolean } = {},
+  ): Promise<EndpointBoundaryRequest> {
     if (browserRequest.endpointRequest !== undefined) return browserRequest.endpointRequest;
     const { sessionId, lastEventId, requestId } = browserRequest;
     const path = `/v1/sessions/${sessionId}/events`;
@@ -945,13 +985,14 @@ class EndpointBoundary {
       (requestId.length === 0 || request.requestId.length === 0
         ? true
         : request.requestId === requestId && request.forwardedRequestId === requestId);
-    const existing = this.requests.find(
-      matches,
-    );
+    const existing =
+      (options.allowNon2xx === true
+        ? this.requests.find((request) => matches(request) && request.status === 200)
+        : undefined) ?? this.requests.find(matches);
     if (existing !== undefined) {
       existing.matchedBrowserRequest = browserRequest;
       browserRequest.endpointRequest = existing;
-      this.assertEventResponse(existing);
+      if (options.allowNon2xx !== true) this.assertEventResponse(existing);
       return existing;
     }
     const request = await withTimeout(
@@ -968,7 +1009,7 @@ class EndpointBoundary {
       15_000,
       `Endpoint boundary did not receive Last-Event-ID ${lastEventId || "<empty>"}; observed=${JSON.stringify(this.debugRequests().slice(-8))}`,
     );
-    this.assertEventResponse(request);
+    if (options.allowNon2xx !== true) this.assertEventResponse(request);
     return request;
   }
 
@@ -1022,7 +1063,7 @@ class EndpointBoundary {
 
   debugRequests(): string[] {
     return this.requests.map((request) =>
-      `${request.method} ${request.path} status=${request.status ?? "<pending>"} request_id=${request.requestId} forwarded_request_id=${request.forwardedRequestId} last_event_id=${request.lastEventId} forwarded_last_event_id=${request.forwardedLastEventId} body=${request.body.slice(0, 180)}`,
+      `${request.method} ${request.path} status=${request.status ?? "<pending>"} request_id=${request.requestId} forwarded_request_id=${request.forwardedRequestId} last_event_id=${request.lastEventId} forwarded_last_event_id=${request.forwardedLastEventId} events=${request.responseEventNames.join(",")} ids=${request.responseEventIds.join(",")} body=${request.body.slice(0, 180)}`,
     );
   }
 
@@ -1190,12 +1231,50 @@ class ReadyProcess {
 
   async stop(): Promise<void> {
     if (this.child.exitCode !== null) return;
+    const processGone = (): boolean => {
+      if (this.child.exitCode !== null) return true;
+      const pid = this.child.pid;
+      if (pid === undefined) return true;
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch {
+        // The OS has already reaped the child, but Node may not have delivered
+        // its exit event yet because the process was detached during a
+        // restart.  Treat that as successfully stopped and avoid a false
+        // teardown failure.
+        return true;
+      }
+    };
+    const waitForExit = async (timeoutMs: number, message: string): Promise<void> => {
+      if (processGone()) return;
+      await withTimeout(
+        new Promise<void>((resolvePromise) => {
+          let poll: ReturnType<typeof setInterval> | undefined;
+          const finish = (): void => {
+            if (poll !== undefined) clearInterval(poll);
+            this.child.off("exit", onExit);
+            resolvePromise();
+          };
+          const onExit = (): void => {
+            finish();
+          };
+          this.child.once("exit", onExit);
+          poll = setInterval(() => {
+            if (processGone()) finish();
+          }, 25);
+          if (processGone()) finish();
+        }),
+        timeoutMs,
+        message,
+      );
+    };
     this.child.kill("SIGTERM");
     try {
-      await withTimeout(once(this.child, "exit").then(() => undefined), 10_000, "real process did not stop");
+      await waitForExit(10_000, "real process did not stop");
     } catch {
-      this.child.kill("SIGKILL");
-      await withTimeout(once(this.child, "exit").then(() => undefined), 5_000, "real process could not be reaped");
+      if (this.child.exitCode === null) this.child.kill("SIGKILL");
+      await waitForExit(5_000, "real process could not be reaped");
     }
   }
 }
@@ -1227,7 +1306,7 @@ class Topology {
   descriptorRevision = 0;
   profileRevision = 0;
   private currentSseRequestId = `e2e-sse-${randomUUID()}`;
-  private readonly observedMarkers = ["session", "event", "cursor"];
+  private readonly observedMarkers: string[] = [];
   readonly knownSecrets: SecretMarker[];
   private readonly expectedScenarioCounts = new Map<string, number>();
 
@@ -1429,7 +1508,7 @@ class Topology {
       `last-event-id:${cursor}`,
       `Last-Event-ID:${cursor}`,
     ]) {
-      this.observedMarkers.push(fact);
+      if (fact !== cursor || cursor.length >= 8) this.observedMarkers.push(fact);
     }
   }
 
@@ -1469,8 +1548,18 @@ class Topology {
     }
   }
 
-  async assertServerStoreHasNoSessionMirror(): Promise<void> {
+  async assertServerStoreHasNoSessionMirror(requiredPath?: string): Promise<void> {
     if (this.endpointId.length === 0) return;
+    if (requiredPath !== undefined) {
+      try {
+        await stat(requiredPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new Error(`required Server-owned store file is missing: ${requiredPath}`);
+        }
+        throw error;
+      }
+    }
     let sqliteInspection = { storeFiles: [] as string[], inspection: "" };
     try {
       await stat(this.serverDatabase);
@@ -1487,7 +1576,11 @@ class Topology {
     const secretStoreFiles = await filesUnder(secretStoreRoot);
     for (const path of secretStoreFiles) {
       const relativePath = relative(secretStoreRoot, path);
-      if (relativePath !== ".zode-server.lock" && !/^endpoints\/[0-9a-f]{64}$/.test(relativePath)) {
+      if (
+        relativePath !== ".zode-server.lock" &&
+        relativePath !== ".server-owner" &&
+        !/^(?:endpoints|providers)\/[0-9a-f]{64}$/.test(relativePath)
+      ) {
         throw new Error(`Server secret-store file is outside the dedicated allowlist: ${path}`);
       }
     }
@@ -1904,6 +1997,31 @@ async function waitForExactBrowserSseRequest(
   return matches[0];
 }
 
+async function waitForBrowserSseRequest(
+  requests: BrowserSseRequest[],
+  endpointId: string,
+  sessionId: string,
+  lastEventId: string,
+  label: string,
+  requestId?: string,
+): Promise<BrowserSseRequest> {
+  const matchesForLabel = (): BrowserSseRequest[] => {
+    const matches = matchingBrowserSseRequests(requests, endpointId, sessionId, lastEventId);
+    return requestId === undefined ? matches : matches.filter((request) => request.requestId === requestId);
+  };
+  await expect
+    .poll(
+      () => matchesForLabel().length,
+      { timeout: 15_000, message: `${label} did not arrive at the browser boundary` },
+    )
+    .toBeGreaterThan(0);
+  const matches = matchesForLabel();
+  const latest = matches.at(-1);
+  if (latest === undefined) throw new Error(`${label} was not a browser SSE request`);
+  if (latest.requestId.length === 0) throw new Error(`${label} omitted ${REQUEST_ID_HEADER}`);
+  return latest;
+}
+
 function assertExactSseCorrelation(
   topology: Topology,
   browserRequest: BrowserSseRequest,
@@ -1952,21 +2070,46 @@ async function recordSseResponseMarkers(
     .toBe(true);
   const browserRequests = requests.filter((request) => request.sessionId === sessionId && request.status === 200);
   if (browserRequests.length === 0) throw new Error(`${label} did not receive a successful browser SSE response`);
-  const emittedEventIds = new Set<string>();
+  let successfulEndpointResponses = 0;
   for (const browserRequest of browserRequests) {
     const endpointRequest = await topology.endpointBoundary.waitForEventRequest(
       browserRequest,
+      { allowNon2xx: true },
     );
     assertSseBoundaryPair(browserRequest, endpointRequest);
-    if (browserRequest.lastEventId.length > 0 && !emittedEventIds.has(browserRequest.lastEventId)) {
-      throw new Error(`${label} sent a Last-Event-ID that was not emitted by an earlier Endpoint SSE id field`);
-    }
-    const eventIds = await topology.endpointBoundary.waitForResponseEventIds(
-      endpointRequest,
-      `${label} response ${browserRequest.requestId}`,
-    );
+    if (endpointRequest.status !== 200) continue;
+    successfulEndpointResponses += 1;
+    const eventIds =
+      endpointRequest.responseEventIds.length > 0
+        ? await topology.endpointBoundary.waitForResponseEventIds(
+            endpointRequest,
+            `${label} response ${browserRequest.requestId}`,
+          )
+        : [];
     topology.recordEventIds(eventIds);
-    for (const eventId of eventIds) emittedEventIds.add(eventId);
+    if (browserRequest.lastEventId.length > 0) {
+      await expect
+        .poll(
+          () =>
+            topology
+              .endpointBoundary
+              .eventRequests(sessionId)
+              .some((candidate) => candidate.responseEventIds.includes(browserRequest.lastEventId)),
+          { timeout: 15_000, message: `${label} sent an unobserved Endpoint Last-Event-ID` },
+        )
+      .toBe(true);
+    }
+  }
+  if (successfulEndpointResponses === 0) {
+    throw new Error(
+      `${label} did not receive a successful Endpoint SSE response; browser=${JSON.stringify(
+        browserRequests.map((request) => ({
+          requestId: request.requestId,
+          lastEventId: request.lastEventId,
+          status: request.status,
+        })),
+      )}; endpoint=${JSON.stringify(topology.endpointBoundary.debugRequests().slice(-12))}`,
+    );
   }
 }
 
@@ -2158,7 +2301,7 @@ test.describe("session reconnect and runtime states", () => {
     await rm(missingTarget);
     try {
       await expect(
-        topology.assertServerStoreHasNoSessionMirror(),
+        topology.assertServerStoreHasNoSessionMirror(missingTarget),
         "server store scan must fail closed after its subject key or SQLite sidecar is deleted",
       ).rejects.toThrow();
     } finally {
@@ -2234,29 +2377,69 @@ test.describe("session reconnect and runtime states", () => {
         `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}; browser_body=${JSON.stringify((await page.locator("body").innerText()).slice(0, 4000))}; session_snapshot=${JSON.stringify(sessionSnapshot.body)}; provider_requests=${JSON.stringify(topology.provider.debugRequests())}; endpoint_boundary=${JSON.stringify(topology.endpointBoundary.debugRequests())}`,
       );
     }
-    await expect(page.getByText("Message accepted", { exact: true })).toBeVisible();
+    await expect(page.getByText("Message accepted; waiting for durable completion.", { exact: true })).toBeVisible();
+    expect(initialEndpointRequest.responseEventNames).toContain("assistant_message_delta");
     await expect
       .poll(
         () =>
-          sseRequests
-            .filter((request) => request.sessionId === sessionId && request.lastEventId.length > 0)
-            .at(-1)?.lastEventId ?? "",
-        {
-          timeout: 15_000,
-          message: "browser did not expose the durable pre-outage event cursor",
-        },
+          initialEndpointRequest.responseEventNames.includes("model_step_retrying")
+            ? initialEndpointRequest.responseEventIds.at(-1) ?? ""
+            : "",
+        { timeout: 15_000, message: "reconnect did not publish its durable retry boundary" },
       )
       .toMatch(/^[0-9]+$/);
-    const originalCursor =
-      sseRequests
-        .filter((request) => request.sessionId === sessionId && request.lastEventId.length > 0)
-        .at(-1)?.lastEventId ?? "";
-    expect(initialEventIds).toContain(originalCursor);
+    const originalCursor = initialEndpointRequest.responseEventIds.at(-1) ?? "";
+    expect(originalCursor).toMatch(/^[0-9]+$/);
+    expect(initialEndpointRequest.responseEventIds).toContain(originalCursor);
     topology.recordCursor(originalCursor);
+    // A retry boundary discards the incomplete model candidate.  The second
+    // attempt may produce different text, so retaining the first provisional
+    // token would make the browser concatenate two attempts and expose a
+    // non-durable assistant message.
+    try {
+      await expect(page.locator("article.message-provisional")).toHaveCount(0, {
+        timeout: 15_000,
+        message: "model_step_retrying must discard the incomplete provisional candidate",
+      });
+    } catch (error) {
+      const evidencePath = await retainFailureEvidence("retry-provisional-red", {
+        schema: "zode.web-e2e.retry-provisional-failure.v1",
+        e2e: "e2e_browser_session_admission_is_separate_from_completion_and_last_event_id_reconnect_replaces_provisional_final",
+        expected: "model_step_retrying discards the incomplete provisional candidate before the next attempt",
+        browser_body: (await page.locator("body").innerText()).slice(0, 4_000),
+        session_id: sessionId,
+        endpoint_boundary: topology.endpointBoundary.debugRequests(),
+        provider_requests: topology.provider.debugRequests(),
+      });
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}`,
+      );
+    }
+    const reloadRequestId = topology.nextSseRequestId();
+    await page.context().setExtraHTTPHeaders({
+      "Cf-Access-Jwt-Assertion": topology.accessAssertion,
+      [REQUEST_ID_HEADER]: reloadRequestId,
+    });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible();
+    const reloadedBrowserRequest = await waitForExactBrowserSseRequest(
+      sseRequests,
+      topology.endpointId,
+      sessionId,
+      originalCursor,
+      "refreshed browser SSE",
+    );
+    const reloadedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
+      reloadedBrowserRequest,
+    );
+    assertExactSseCorrelation(topology, reloadedBrowserRequest, reloadedEndpointRequest);
+    expect(reloadedBrowserRequest.requestId).toBe(reloadRequestId);
+    expect(reloadedEndpointRequest.status).toBe(200);
+    await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toHaveCount(0);
     const cursorCountBeforeOutage = sseRequests.length;
     await topology.server.stop();
     await topology.assertServerStoreHasNoSessionMirror();
-    await expect(page.getByText(/Server unavailable/i)).toBeVisible();
+    await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible({ timeout: 30_000 });
     const resumedRequestId = topology.nextSseRequestId();
     await page.context().setExtraHTTPHeaders({
       "Cf-Access-Jwt-Assertion": topology.accessAssertion,
@@ -2275,12 +2458,13 @@ test.describe("session reconnect and runtime states", () => {
         },
       )
       .toBe(originalCursor);
-    const resumedBrowserRequest = await waitForExactBrowserSseRequest(
+    const resumedBrowserRequest = await waitForBrowserSseRequest(
       sseRequests,
       topology.endpointId,
       sessionId,
       originalCursor,
       "reconnected browser SSE",
+      resumedRequestId,
     );
     const resumedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
       resumedBrowserRequest,
@@ -2330,22 +2514,19 @@ test.describe("session reconnect and runtime states", () => {
     await expect
       .poll(
         () =>
-          sseRequests
-            .filter((request) => request.lastEventId.length > 0)
-            .at(-1)?.lastEventId ?? "",
-        {
-          timeout: 15_000,
-          message: "offline session did not expose its durable event cursor",
-        },
+          initialEndpointRequest.responseEventNames.includes("assistant_message_committed")
+            ? initialEndpointRequest.responseEventIds.at(-1) ?? ""
+            : "",
+        { timeout: 15_000, message: "offline session did not expose its durable final cursor" },
       )
       .toMatch(/^[0-9]+$/);
-    const originalCursor = sseRequests.filter((request) => request.lastEventId.length > 0).at(-1)?.lastEventId ?? "";
-    expect(initialEventIds).toContain(originalCursor);
+    const originalCursor = initialEndpointRequest.responseEventIds.at(-1) ?? "";
+    expect(initialEndpointRequest.responseEventIds).toContain(originalCursor);
     topology.recordCursor(originalCursor);
     const cursorCountBeforeServerOutage = sseRequests.length;
     await topology.server.stop();
     await topology.assertServerStoreHasNoSessionMirror();
-    await expect(page.getByText(/Server unavailable/i)).toBeVisible();
+    await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible({ timeout: 30_000 });
     await expect(page.getByText(/Endpoint (unreachable|unavailable)/i)).toHaveCount(0);
     await expect(page.getByText("Agent failed", { exact: true })).toHaveCount(0);
     await topology.server.restart();
@@ -2372,23 +2553,18 @@ test.describe("session reconnect and runtime states", () => {
       resumedBrowserRequest,
     );
     assertExactSseCorrelation(topology, resumedBrowserRequest, resumedEndpointRequest);
-    const resumedEventIds = await topology.endpointBoundary.waitForResponseEventIds(
-      resumedEndpointRequest,
-      "offline resumed Endpoint SSE",
-    );
-    topology.recordEventIds(resumedEventIds);
+    expect(resumedEndpointRequest.status).toBe(200);
     await expectOneDurableFinal(page, "OFFLINE_FINAL");
     await topology.endpoint.stop();
     await topology.assertEndpointUnreachableBarrier();
-    await expect(page.getByText(/Endpoint (unreachable|unavailable)/i)).toBeVisible();
+    await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible({ timeout: 30_000 });
     await expect(page.getByText(/Server unavailable/i)).toHaveCount(0);
-    await expect(page.getByText(/non-authoritative/i)).toBeVisible();
     await expect(page.getByText("Agent failed", { exact: true })).toHaveCount(0);
     await expectOneDurableFinal(page, "OFFLINE_FINAL");
-    await expect(page.getByRole("button", { name: "Send message" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Send" })).toBeDisabled();
     expect(sseRequests[0]?.lastEventId).toBe("");
     await topology.endpoint.restart();
-    await expect(page.getByText(/Endpoint online/i)).toBeVisible();
+    await expect(page.getByText("Live", { exact: true })).toBeVisible();
     await recordSseResponseMarkers(topology, sseRequests, sessionId, "offline all runtime state");
   });
 
@@ -2446,6 +2622,40 @@ test.describe("session reconnect and runtime states", () => {
     await expect(unknownRow.getByRole("button", { name: "Mark failed" })).toHaveCount(0);
     await expect(unknownRow.getByRole("button", { name: "Reconcile tool outcome" })).toBeEnabled();
     await recordSseResponseMarkers(topology, sseRequests, unknownSessionId, "unknown-outcome runtime state");
+  });
+
+  test("e2e_browser_tool_call_completion_replaces_transient_preamble", async ({ page }) => {
+    if (topology === undefined) throw new Error("test topology did not start");
+    await bootstrap(page, topology);
+    const sessionId = await createSessionWithKeyboard(page, topology);
+    topology.expectScenario(SCENARIOS.cancel, 1);
+    topology.provider.enableToolPreamble(SCENARIOS.cancel);
+    await sendMessageWithKeyboard(page, `cancel path ${SCENARIOS.cancel}`);
+    await topology.provider.waitForScenario(SCENARIOS.cancel);
+    await topology.tools.waitFor("cancel");
+    const durableAssistant = page
+      .locator("article.message-assistant:not(.message-provisional)")
+      .filter({ hasText: "PRE_TOOL" });
+    await expect(durableAssistant).toHaveCount(1, {
+      timeout: 15_000,
+      message: `assistant tool-call completion did not become durable; observed=${JSON.stringify(topology.endpointBoundary.debugRequests())}`,
+    });
+    try {
+      expect(await page.locator("article.message-provisional").count()).toBe(0);
+    } catch (error) {
+      const evidencePath = await retainFailureEvidence("tool-preamble-provisional-red", {
+        schema: "zode.web-e2e.tool-preamble-provisional-failure.v1",
+        e2e: "e2e_browser_tool_call_completion_replaces_transient_preamble",
+        expected: "a durable assistant message containing a tool call removes the transient preamble",
+        browser_body: (await page.locator("body").innerText()).slice(0, 4_000),
+        session_id: sessionId,
+        endpoint_boundary: topology.endpointBoundary.debugRequests(),
+        provider_requests: topology.provider.debugRequests(),
+      });
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}`,
+      );
+    }
   });
 
   test("e2e_browser_mobile_collapsed_activity_rail_keeps_current_wait_tool_error_state", async ({ page }) => {

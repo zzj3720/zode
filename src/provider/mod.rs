@@ -590,7 +590,17 @@ impl AimuxProvider {
         let mut finish = None;
         while let Some(part) = stream.next().await {
             match part.map_err(|_| ModelError::ProviderFailed)? {
-                StreamPart::TextDelta { delta, .. } => text.push_str(&delta),
+                StreamPart::TextDelta { delta, .. } => {
+                    if let Some(observer) = request.stream_observer.as_ref() {
+                        observer.text_delta(
+                            &request.session_id,
+                            &request.activation_id,
+                            &request.round_id,
+                            &delta,
+                        );
+                    }
+                    text.push_str(&delta);
+                }
                 StreamPart::ToolInputStart { id, tool_name, .. } => {
                     if !tool_calls.iter().any(|(call_id, ..)| call_id == &id) {
                         tool_calls.push((id, tool_name, String::new(), None));
