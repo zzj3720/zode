@@ -1,7 +1,8 @@
 # Endpoint HTTP and SSE adapter rules
 
 `src/api` is the passive device Endpoint adapter. It admits controller
-commands, renders Endpoint projections, and exposes durable session events. It
+commands, renders Endpoint projections, and exposes the Endpoint-wide durable
+event stream. It
 is not the agent runtime, management Server, UI API, provider-auth authority, or
 a second domain service. `docs/http-api.md` is the authoritative Endpoint
 contract.
@@ -65,9 +66,11 @@ contract.
 
 ## SSE contract
 
-- SSE IDs are durable global event positions. Replay and live publication form
-  one strictly increasing, lossless sequence of that session's public events.
-  Numeric IDs may skip positions belonging to other sessions or private facts.
+- SSE IDs are durable Endpoint-global event positions. One authenticated
+  Endpoint stream multiplexes every public event belonging to sessions owned by
+  the trusted controller authority and subject. Replay and live publication
+  form one strictly increasing, lossless eligible sequence. Numeric IDs may
+  skip private facts or sessions owned by another subject.
 - Commit order, not handler completion order, controls publication. Recover a
   lagged receiver from storage without leaking debug errors into the stream.
 - Subscribe before replay, deduplicate by durable cursor, and support
@@ -78,9 +81,11 @@ contract.
   bounded delay, round identity, and safe error classification. Prepared model
   envelopes, partial stream content/tool input, aimux HTTP attempts, and raw
   provider errors remain private.
-- A management Server may proxy session SSE, but Endpoint emits no
+- A management Server may proxy Endpoint SSE, but Endpoint emits no
   Server-specific cursor or callback. The controller resumes with the same
   public `Last-Event-ID` contract as any standalone client.
+- Expose only `GET /v1/events` for runtime events. Do not retain a
+  session-scoped compatibility route or cursor.
 
 ## Acceptance
 

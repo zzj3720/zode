@@ -317,9 +317,11 @@ rather than silently restarting pagination.
 }
 ```
 
-List, read, mutation, tool, and SSE routes return the same safe not-found result
-for a missing session and a session owned by another authority/subject. This
-prevents an Endpoint-shared user from probing another subject's session IDs.
+List, read, mutation, and tool routes return the same safe not-found result for
+a missing session and a session owned by another authority/subject. The
+Endpoint-wide SSE omits every event outside the authenticated owner scope and
+never reveals whether another subject's session exists. Together these rules
+prevent an Endpoint-shared user from probing another subject's session IDs.
 
 Secret tool inputs/results and provider continuation bytes are never exposed
 accidentally by this summary. Dedicated result routes return only explicitly
@@ -380,11 +382,16 @@ alter that request; if the activation performs another model round, it is
 materialized before that next request. Otherwise it makes the session runnable
 for a later activation.
 
-## 4. Session events
+## 4. Endpoint events
 
-`GET /v1/sessions/{session_id}/events` returns `text/event-stream`.
-`Last-Event-ID` is an optional durable global position. Every durable public
-frame has:
+`GET /v1/events` returns the one Endpoint-wide `text/event-stream`. The route
+requires the same trusted controller authority and opaque `Zode-Subject` used
+for session reads and commands. It multiplexes public events for every session
+owned by that authority/subject; it is not opened for, filtered by, or owned by
+one session.
+
+`Last-Event-ID` is an optional Endpoint-scoped durable global position. Every
+durable public frame identifies its owning session:
 
 ```text
 id: 42
@@ -392,11 +399,27 @@ event: assistant_message_committed
 data: {"schema":"zode.event.v1","id":"42","session_id":"...","version":7,"kind":"assistant_message_committed","data":{...}}
 ```
 
-IDs for one session can skip positions used by other sessions or private
-storage facts, but every public event for that session after the cursor appears
-exactly once and in increasing global order. Subscribe/replay handoff and live
-publication cannot lose an event. Keepalive comments have no `id` and carry no
-state.
+IDs can skip positions used by private storage facts or sessions outside the
+authenticated subject. Every eligible public event after the cursor appears
+exactly once and in increasing Endpoint-global order. Subscribe/replay handoff
+and live publication cannot lose an event. Keepalive comments have no `id` and
+carry no state.
+
+The cursor and connection belong to the Endpoint stream, not to a session.
+Creating, opening, closing, or navigating among sessions does not create or
+reset an SSE stream. A client uses the frame's `session_id` to dispatch the
+event to its canonical session projection. A fresh stream without
+`Last-Event-ID` replays all eligible public events from the beginning; clients
+may reconcile current session snapshots through bounded HTTP reads while the
+single stream remains attached.
+
+The former session-scoped `/v1/sessions/{session_id}/events` route is absent;
+there is no compatibility stream or second cursor authority. The public
+real-process anchor
+`e2e_endpoint_event_stream_multiplexes_owned_sessions_and_reconnects_once`
+creates two owned sessions plus an unowned session, proves one stream emits only
+the two owned sequences in Endpoint-global order, reconnects once with the last
+consumed ID, and observes no missed or duplicated durable terminal event.
 
 While a model stream is attached to a live client, Endpoint may also emit
 best-effort transient text frames. They have no `id`, are never persisted, and
@@ -407,7 +430,8 @@ event: assistant_message_delta
 data: {"schema":"zode.transient-event.v1","session_id":"...","activation_id":"...","round_id":"...","text":"partial"}
 ```
 
-Transient text is provisional display state only. A durable
+Transient text is provisional display state only and is dispatched by its
+`session_id`. A durable
 `assistant_message_committed` event replaces it; a reconnect must rely on the
 durable stream and must not duplicate or promote a transient candidate. On a
 live stream, a durable `model_step_retrying` boundary precedes every transient
@@ -655,8 +679,8 @@ older credential, and acknowledges only after revision 2 authenticates the
 same authority. Lower revisions are stale; same revision/different fingerprint
 conflicts. If the response is lost, the controller probes with the staged new
 secret first and otherwise retries the same operation with the old secret.
-Session list/read/SSE/mutation and same-key receipt replay remain accessible
-under the unchanged authority/subject after rotation and restart.
+Session list/read/mutation, Endpoint SSE, and same-key receipt replay remain
+accessible under the unchanged authority/subject after rotation and restart.
 
 The active authority manifest is the durable promotion fact. Its publication
 is also the authentication linearization point: a request admitted after that
@@ -778,8 +802,8 @@ ordering decision.
 
 A controller-auth rotation E2E creates a session, loses the rotation response,
 recovers with the staged new secret, restarts Endpoint, and proves the unchanged
-authority/subject can list/read/SSE/message and replay the original create key
-while the old secret is fenced.
+authority/subject can list/read/message, resume the Endpoint SSE, and replay the
+original create key while the old secret is fenced.
 
 The executable anchor is
 `e2e_controller_auth_rotation_lost_response_fences_old_secret_and_survives_restart`;

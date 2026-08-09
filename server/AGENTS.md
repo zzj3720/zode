@@ -60,8 +60,8 @@ replication is `docs/auth-replication.md`; ingress identity is
   Crash/retry obtains the original Endpoint result through that receipt.
 - Derive one stable opaque Endpoint subject from the validated Access actor and
   configured controller authority. Forward it in trusted controller
-  context on every session list/read/mutation/SSE request; browser input cannot
-  choose it, and Server stores no session ACL. Use a restart-stable keyed
+  context on every session list/read/mutation request and the Endpoint-wide SSE;
+  browser input cannot choose it, and Server stores no session ACL. Use a restart-stable keyed
   pseudonymous derivation, never raw email/name; key rotation needs explicit
   ownership migration.
 - Endpoint owns `endpoint_id`; Server uses that exact value as its catalog key
@@ -109,14 +109,18 @@ replication is `docs/auth-replication.md`; ingress identity is
 
 ## SSE proxy
 
-- Open Endpoint SSE only for an attached client, forward `Last-Event-ID`, and
-  preserve Endpoint event IDs and public frames.
+- Open one downstream Endpoint-wide SSE for each attached client Endpoint
+  stream, forward `Last-Event-ID`, and preserve Endpoint event IDs and public
+  frames. Never open or filter a downstream stream per session.
 - Close every management SSE no later than the validated Access assertion's
   expiry so reconnect must re-enter current Access policy.
 - Do not store session events, session projections, or resume cursors and do not
   allocate a Server session-event ID. Endpoint owns replay/live handoff and
   durable deduplication. Server-owned OAuth/control streams remain separate and
   may use resource-local cursors.
+- Expose only `/v1/endpoints/{endpoint_id}/events` for Endpoint runtime events.
+  The former session-scoped event proxy is absent; do not retain a compatibility
+  route or a second cursor path.
 - Transient token deltas may be proxied, but final messages and lifecycle facts
   are durable only after Endpoint commit.
 

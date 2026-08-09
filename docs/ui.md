@@ -21,8 +21,10 @@ The UI lets a user:
 
 The first UI is a management application, not an Endpoint dashboard pasted on
 top of raw routes. Every session link carries the Endpoint-owned pair
-`(endpoint_id, session_id)` and every stream uses the Endpoint event cursor
-proxied by Server.
+`(endpoint_id, session_id)`. Each browser application graph opens at most one
+SSE connection per Endpoint and keeps one Endpoint event cursor proxied by
+Server; sessions consume frames dispatched by `session_id` and never own a
+connection or cursor.
 
 The canonical browser route is
 `/endpoints/{endpoint_id}/sessions/{session_id}`. There is no ID-only session
@@ -284,8 +286,9 @@ At minimum, distinct experiences exist for:
   bodies.
 - Keep `endpoint_id` and Endpoint-generated `session_id` together in links,
   query keys, and open tabs. Never look up a session by `session_id` alone.
-- Resume each session stream with its Endpoint event ID. Server has no global
-  session event ID or durable session cursor; Server-owned OAuth attempt
+- Resume each Endpoint stream with its Endpoint event ID. Opening, closing, or
+  switching sessions does not replace that connection or reset its cursor.
+  Server has no durable Endpoint/session cursor; Server-owned OAuth attempt
   streams may have their own attempt-local cursor.
 - Reconnect SSE with `Last-Event-ID`, deduplicate durable frames, and reconcile
   lists through Server queries after lag/error.
@@ -374,7 +377,9 @@ Required browser scenarios:
 - refresh success, crash recovery, and refresh-unknown relogin states without a
   blind retry action;
 - distribution pending, stale, unreachable, ready, and removed states;
-- session SSE disconnect/reconnect without duplicate final messages;
+- one Endpoint SSE multiplexes at least two sessions across navigation, and
+  disconnect/reconnect does not miss or duplicate either session's durable
+  final message;
 - same-session execution recovery in a multi-provider catalog, including
   current-selection defaults, no-op submission, refresh, and legal
   Server/Endpoint restart without changing session identity or history;

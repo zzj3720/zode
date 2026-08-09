@@ -10,7 +10,8 @@ with a failing real-process E2E.
 The browser and API clients call Server only through the Cloudflare Access-
 protected management origin. Server validates the Access application assertion,
 resolves Endpoint and auth-profile semantics, and proxies Endpoint session
-HTTP/SSE. Session data passes through Server but is never persisted there.
+HTTP plus Endpoint-wide SSE. Session data passes through Server but is never
+persisted there.
 `docs/access.md` is authoritative for ingress, actor derivation, origin
 separation, key rotation, and authentication E2Es.
 
@@ -575,21 +576,32 @@ or `move` route. The Endpoint-scoped identity makes that ownership explicit.
 Disabling or losing an Endpoint does not silently run the session on the
 built-in Endpoint.
 
-## 7. Session events
+## 7. Endpoint events
 
-`GET /v1/endpoints/{endpoint_id}/sessions/{session_id}/events` proxies Endpoint
-SSE. Event IDs remain durable Endpoint event positions and support
+`GET /v1/endpoints/{endpoint_id}/events` proxies the Endpoint-wide SSE stream.
+Event IDs remain durable Endpoint-global event positions and support
 `Last-Event-ID`.
 
 Server forwards the Endpoint public event schema without allocating a second
-event identity. The route already supplies `endpoint_id`; each frame contains
-the Endpoint-generated `session_id`, session version, kind, and data.
+event identity. The route supplies `endpoint_id`; each session-owned frame
+contains the Endpoint-generated `session_id`, session version, kind, and data.
+The validated Access actor is translated to the same opaque Endpoint subject as
+session reads and commands, so one stream multiplexes only that actor's visible
+sessions.
 
-For each attached client, Server opens the matching Endpoint stream and forwards
-the client's `Last-Event-ID`. Endpoint owns replay/live handoff and
-deduplication. Server stores neither events nor cursors. If Endpoint is
-unreachable, the proxy returns or closes with a safe Endpoint-unavailable
-condition and cannot invent missing session facts.
+For each attached browser/client Endpoint stream, Server opens Endpoint
+`GET /v1/events` and forwards the client's `Last-Event-ID` unchanged. Endpoint
+owns subject filtering, replay/live handoff, ordering, and deduplication. Server
+stores neither events nor cursors and does not open one downstream stream per
+session. If Endpoint is unreachable, the proxy returns or closes with a safe
+Endpoint-unavailable condition and cannot invent missing session facts.
+
+The former
+`/v1/endpoints/{endpoint_id}/sessions/{session_id}/events` route is absent; the
+Server does not retain a compatibility proxy. The browser anchor
+`e2e_browser_endpoint_stream_multiplexes_sessions_across_navigation_and_reconnect`
+proves one management stream and one downstream Endpoint stream carry two
+sessions across navigation and reconnect while the Server remains stateless.
 
 Transient model token deltas may be proxied live. Final messages, activation
 outcomes, tool lifecycle, and waits are published as durable frames only after
@@ -665,7 +677,8 @@ provider/tool/OAuth fixtures.
 - restart Server after an unknown create response and retry without duplicating
   the Endpoint session;
 - rotate Endpoint control authentication, restart/probe, and continue the same
-  session GET/SSE/message and same-key create replay under unchanged authority;
+  session GET/message, Endpoint SSE, and same-key create replay under unchanged
+  authority;
 - after Endpoint commits create but Server loses the response, delete/unshare
   the profile and prove same-key retry replays the original ULID while a new key
   is rejected by current policy;
@@ -679,8 +692,8 @@ provider/tool/OAuth fixtures.
   the original result while a new key follows current policy;
 - a model selection missing profile/descriptor/minimum revision returns `422`
   and creates no Endpoint session; Server never fills a mutable default;
-- proxied SSE reconnect has no missing/duplicate durable Endpoint event and no
-  Server event cursor;
+- one proxied Endpoint-wide SSE carries two owned sessions, and reconnect has
+  no missing/duplicate durable Endpoint event and no Server event cursor;
 - Endpoint unreachable returns typed unavailability and never silently
   reroutes or serves invented stale session state;
 - OAuth/profile/default/distribution lifecycle with multiple profiles for one

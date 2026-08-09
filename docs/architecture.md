@@ -331,8 +331,8 @@ Server owns:
 - provider catalog for management, OAuth/API-key auth profiles, explicit
   defaults, non-secret execution descriptors, refresh, and secret authority;
 - profile-to-endpoint sharing policy and versioned distribution operations;
-- transparent proxying of Endpoint session HTTP/SSE under the derived actor
-  subject;
+- transparent proxying of Endpoint session HTTP and Endpoint-wide SSE under the
+  derived actor subject;
 - stateless callback relay when an external system cannot reach an Endpoint
   directly;
 - serving the web UI and its versioned API.
@@ -391,9 +391,10 @@ Health checks are bounded reads. An Endpoint is `online`, `degraded`,
 `unreachable`, or `disabled` in Server's projection. These are Server
 observations, not state written by Endpoint.
 
-Server opens Endpoint SSE only while a UI/client session stream is attached.
+Server opens Endpoint SSE only while a UI/client Endpoint stream is attached.
 It forwards `Last-Event-ID` and the Endpoint stream without storing events or a
-cursor. Endpoint never pushes to an unrequested Server callback.
+cursor. It does not create a downstream stream per session. Endpoint never
+pushes to an unrequested Server callback.
 
 ## 7. Auth-profile distribution
 
@@ -420,12 +421,16 @@ explicit secret-transfer operation; it is never automatic.
 
 ## 8. Session proxy and UI delivery
 
-Endpoint event IDs are durable global positions within one Endpoint database;
-one session stream may legitimately skip positions belonging to another.
-Server preserves those IDs while proxying. UI resumes an Endpoint-scoped stream
-with the Endpoint `Last-Event-ID`; Server forwards the cursor on reconnect.
-Endpoint performs replay/live handoff and deduplication under its public SSE
-contract. Server does not allocate a second event ID or retain a durable cursor.
+Endpoint event IDs are durable global positions within one Endpoint database.
+One Endpoint-wide stream multiplexes every public event visible to the current
+controller authority and subject; its IDs may skip private facts or sessions
+owned by another subject. Server preserves those IDs while proxying. Each
+browser application graph keeps at most one live stream and one cursor per
+Endpoint, resumes it with the Endpoint `Last-Event-ID`, and dispatches frames to
+sessions by `session_id`. Session navigation and component lifecycle do not
+open, close, or reset that stream. Endpoint performs subject filtering,
+replay/live handoff, and deduplication under its public SSE contract. Server
+does not allocate a second event ID or retain a durable cursor.
 
 Session list/read routes are also live Endpoint proxy reads. A cross-Endpoint
 screen may query multiple Endpoint-scoped list routes and combine the responses
@@ -597,7 +602,7 @@ Required cross-component scenarios include:
 | Access ingress | real RS256 Access/JWKS edge fixture accepts valid human and service actors; invalid claims/signatures fail closed; rotated `kid` refreshes without restart |
 | Actor isolation | two Access actors share management resources but get isolated Endpoint-owned session lists/commands/SSE and receipt scopes without a Server session ACL |
 | No user system | browser reaches the UI through Access with no Zode login/logout, user, workspace, role, grant, or login-cookie resource |
-| Streaming | disconnect/reconnect proxied Endpoint SSE without missing or duplicating durable events and without Server event storage |
+| Streaming | one proxied Endpoint-wide SSE carries at least two owned sessions across navigation; disconnect/reconnect uses one Endpoint cursor without missing or duplicating durable events and without Server event storage |
 | Callback split | OAuth callback remains Access-protected; external tool callback works only on the separate callback origin with its bearer and exposes no management route |
 | All-in-one | use the same Server API and distribution flow with the built-in local Endpoint |
 | Fencing | kill all-in-one Server while local Endpoint work is held; restart adopts or fences it and never creates two provider/tool effects |

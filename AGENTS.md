@@ -323,7 +323,8 @@ Endpoint surface stays execution-focused:
 
 - identity, bounded health, and non-secret capabilities;
 - create/read a session, select an explicit provider/model/profile revision,
-  append messages, and stream session events;
+  append messages, and stream all subject-visible session events through one
+  Endpoint-wide SSE;
 - read/cancel/reconcile tool calls and accept opaque-ID callback completion;
 - install/read/tombstone controller-authenticated credential replicas.
 
@@ -332,11 +333,13 @@ registration, or UI route. Server owns those resources plus Endpoint inventory,
 stateless Endpoint-scoped session/callback proxying, and UI delivery as defined
 in `docs/server-api.md`.
 
-Endpoint SSE is a durable ordered view of committed runtime events. Server
-forwards the UI's `Last-Event-ID` without storing a cursor or allocating a
-second event identity. Reconnect may not miss committed events or duplicate
-terminal effects. Transient token deltas may be best-effort, but the final
-assistant message and all lifecycle transitions are durable.
+Endpoint SSE is one durable ordered Endpoint-wide view of committed runtime
+events for the authenticated authority/subject. Each frame carries its
+`session_id`; session lifecycle never owns a connection or cursor. Server
+forwards the UI's Endpoint `Last-Event-ID` without storing a cursor or
+allocating a second event identity. Reconnect may not miss committed events or
+duplicate terminal effects. Transient token deltas may be best-effort, but the
+final assistant message and all lifecycle transitions are durable.
 
 Do not expose raw storage records as an accidental permanent public API. Map
 domain events to an explicitly versioned public event schema.

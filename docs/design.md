@@ -237,8 +237,8 @@ an unrelated corruption or migration fixture.
 | Concurrent equal creates atomically select one creation event and return byte-identical canonical `201` results | `e2e_concurrent_create_receipt_and_event_are_atomic` | core anchor exists |
 | The create-receipt projection rebuilds from the verified creation event and exact replay survives restart | `e2e_create_receipt_projection_rebuilds_from_verified_creation_event` | anchor green; projection-repair implementation already present |
 | One scoped create digest resolving to multiple verified streams is corruption and never chooses a winner | `e2e_conflicting_create_receipt_projection_fails_closed` | anchor green; verified projection repair fails closed before READY |
-| Subject ownership under one authority covers list/read/message/SSE with existence-safe failures and independently scoped create keys | `e2e_session_ownership_safe_not_found_and_ordered_sse` and `e2e_session_list_is_subject_scoped` | core anchors exist |
-| Authority ownership with the same opaque subject independently scopes create receipts and blocks cross-authority list/read/message/SSE | `e2e_authority_subject_create_receipts_are_scoped` plus `e2e_session_authority_ownership_isolates_list_read_message_and_sse` | receipt anchor exists; access-hardening anchor required red |
+| Subject ownership under one authority covers list/read/message with existence-safe failures, filters the Endpoint-wide SSE, and independently scopes create keys | `e2e_session_ownership_safe_not_found_and_ordered_sse`, `e2e_session_list_is_subject_scoped`, and `e2e_endpoint_event_stream_multiplexes_owned_sessions_and_reconnects_once` | former session-stream anchors exist; Endpoint-wide anchor required red |
+| Authority ownership with the same opaque subject independently scopes create receipts and blocks cross-authority list/read/message while filtering Endpoint SSE | `e2e_authority_subject_create_receipts_are_scoped` plus `e2e_session_authority_ownership_isolates_list_read_message_and_sse` | receipt anchor exists; access-hardening anchor required red |
 | List uses owner-bound opaque keyset pagination by durable creation position and resumes identically after restart | `e2e_session_list_keyset_is_owner_bound_and_restart_stable` | functional follow-up; required red before pagination implementation |
 | History without the supported immutable owner fact cannot be claimed, repaired, or migrated to a guessed owner | `e2e_ownerless_session_history_fails_closed` | anchor green; startup fails closed without migration |
 
@@ -620,7 +620,8 @@ Server-managed profile.
 The initial versioned resources are:
 
 - create/read sessions, append messages, and select the model/profile;
-- `GET /v1/sessions/{session_id}/events` using SSE and `Last-Event-ID`;
+- `GET /v1/events` using one Endpoint-wide SSE and Endpoint-scoped
+  `Last-Event-ID`;
 - read/cancel/reconcile async tool calls and accept authenticated external
   completion;
 - read Endpoint identity, health, and provider/tool capabilities;
@@ -634,11 +635,14 @@ Exact request and public event schemas are versioned in the API adapter as they
 are introduced. Mutations return only after durable commit/admission, not after
 an entire agent run.
 
-SSE IDs are durable global event positions. A publisher serializes cursor
-advancement and backfills all committed positions from storage, so handler
-completion order cannot reorder or lose events. A subscriber subscribes before
-replay, deduplicates by cursor, and recovers lag from storage. Durable lifecycle
-and final-message events reconnect; token deltas may remain transient.
+SSE IDs are durable Endpoint-global event positions. One authenticated stream
+multiplexes the public events of every session owned by the controller authority
+and subject, and each frame carries `session_id`. A publisher serializes cursor
+advancement and backfills all eligible committed positions from storage, so
+handler completion order cannot reorder or lose events. A subscriber subscribes
+before replay, deduplicates by the Endpoint cursor, and recovers lag from
+storage. Durable lifecycle and final-message events reconnect; token deltas may
+remain transient. Session lifecycle never owns the stream.
 
 Public failures use a stable envelope such as
 `{"error":{"code":"internal_error","message":"internal server error","retryable":false}}`.
@@ -722,7 +726,7 @@ The main scenario groups are:
 
 | Area | Required public scenario | Current executable anchors |
 | --- | --- | --- |
-| HTTP/event store | create, message, semantic idempotency, GET/list ownership, ordered SSE reconnect, restart | `e2e_create_message_sse_reconnect_get_restart`; `e2e_create_generates_ulid_and_binds_idempotency_payload`; `e2e_concurrent_create_receipt_and_event_are_atomic`; `e2e_session_ownership_safe_not_found_and_ordered_sse` |
+| HTTP/event store | create, message, semantic idempotency, GET/list ownership, one Endpoint-wide ordered SSE across owned sessions, reconnect, restart | `e2e_endpoint_event_stream_multiplexes_owned_sessions_and_reconnects_once`; `e2e_create_message_sse_reconnect_get_restart`; `e2e_create_generates_ulid_and_binds_idempotency_payload`; `e2e_concurrent_create_receipt_and_event_are_atomic`; `e2e_session_ownership_safe_not_found_and_ordered_sse` |
 | Snapshot/recovery | bounded snapshot-plus-tail restore, every configured runtime/API snapshot cadence point, corrupt fallback, dirty-index repair, healthy read-only startup | `sqlite_storage_e2e::e2e_sqlite_snapshot_cursor_follows_public_commits`; `sqlite_storage_e2e::e2e_snapshot_cannot_override_event_stream`; `sqlite_storage_e2e::e2e_corrupt_latest_snapshot_falls_back`; `e2e_runtime_commits_honor_snapshot_cadence_and_restart`; `sqlite_storage_e2e::e2e_sqlite_restart_rebuilds_derived_indexes_and_allows_harmless_extra_index`; storage-corruption cases in `reviewer_findings_e2e` |
 | Model activation | real aimux fake provider, final assistant event, input/completion arriving mid-request steers the next round when one exists, otherwise wakes the next activation; active model change remains deferred to the next activation; configured round budget stops feedback loops while allowing a queued user to wake a fresh activation; every accepted input and assistant round remains durably ordered online and after restart without a new client command | `e2e_golden_assembled_model_tool_loop_survives_restart`; `e2e_round_boundary_steering_waits_for_the_next_model_round`; `e2e_round_boundary_final_defers_steering_to_next_activation`; `e2e_max_rounds_per_activation_stops_tool_feedback_loop`; `e2e_concurrent_inputs_preserve_both_assistant_rounds`; `e2e_restart_recovers_queued_input_without_another_command` |
 | Model retry | aimux bounded pre-stream retry remains one logical runtime request; after stream establishment zode owns bounded step retry; first-chunk/chunk-idle disconnects become typed terminal failures without a stuck activation; a restart after a persisted failure fact completes the missing retry or terminal boundary; no partial assistant/tool effect; hard-crash interrupted-attempt recovery | `e2e_model_pre_stream_rate_limit_is_one_logical_request`; `e2e_model_partial_stream_retry_has_no_partial_tool_effect`; `e2e_provider_process_exit_finishes_activation_without_stuck_working`; `e2e_restart_reconciles_failed_model_attempt_before_retry_schedule`; `e2e_restart_reconciles_failed_model_attempt_before_terminal_finish`; `e2e_hard_crash_recovery_exhausts_one_model_attempt_and_keeps_delivery_runnable`; `e2e_hard_crash_after_retry_fact_claims_one_scheduled_attempt` |
