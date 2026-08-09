@@ -1445,7 +1445,7 @@ test.describe("approved Codex Desktop v0 visual shell", () => {
     try {
       const builtUi = await buildTestOwnedUiDist();
       restoreServerEnvironment = await installUiAssetsServerWrapper(builtUi);
-      harness = await createWebE2EHarness();
+      harness = await createWebE2EHarness({ includeServerOrigins: true });
       browserSecretGuard = attachVisualBrowserSecretGuard(harness, page);
       await harness.endpointIdentity();
       await assertUiAssetsDirectoryConfigured(harness, builtUi);
@@ -1529,7 +1529,7 @@ test.describe("approved Codex Desktop v0 visual shell", () => {
     try {
       const builtUi = await buildTestOwnedUiDist();
       restoreServerEnvironment = await installUiAssetsServerWrapper(builtUi);
-      harness = await createWebE2EHarness();
+      harness = await createWebE2EHarness({ includeServerOrigins: true });
       browserSecretGuard = attachVisualBrowserSecretGuard(harness, page);
       // This is a real Endpoint process barrier. Browser traffic below still
       // enters only through the Access edge and never calls Endpoint directly.
@@ -1680,7 +1680,7 @@ test.describe("approved Codex Desktop v0 visual shell", () => {
     try {
       const builtUi = await buildTestOwnedUiDist();
       restoreServerEnvironment = await installUiAssetsServerWrapper(builtUi);
-      harness = await createWebE2EHarness();
+      harness = await createWebE2EHarness({ includeServerOrigins: true });
       browserSecretGuard = attachVisualBrowserSecretGuard(harness, page);
       await harness.endpointIdentity();
       await assertUiAssetsDirectoryConfigured(harness, builtUi);

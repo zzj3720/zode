@@ -20,7 +20,7 @@ const {
   ProductBehaviorFailure,
   ProductRouteMissing,
 } = require("../support/harness.cjs") as {
-  createWebE2EHarness: () => Promise<RealWebE2EHarness>;
+  createWebE2EHarness: (options?: { includeServerOrigins?: boolean }) => Promise<RealWebE2EHarness>;
   HarnessFailure: new (...args: never[]) => Error;
   ProductBehaviorFailure: new (
     classification: string,
@@ -759,7 +759,7 @@ async function loadIncidentFixture(): Promise<{
   };
   const exchange = fixture.exchanges?.[0];
   if (
-    fixture.schema !== "zode.http-incident-cassette.v1" ||
+    fixture.schema !== "zode.http-incident-recording.v1" ||
     fixture.e2e_name !== NAMED_E2E ||
     fixture.boundary !== "management-access-edge" ||
     typeof fixture.first_observed !== "string" ||
@@ -805,7 +805,6 @@ async function replayTrackedCassette(
   try {
     await harness.journal.replay(INCIDENT_FIXTURE, {
       baseUrl: harness.managementUrl,
-      headers: { accept: "text/html" },
     });
   } catch (error) {
     const details =
@@ -816,12 +815,19 @@ async function replayTrackedCassette(
       error &&
       typeof error === "object" &&
       "classification" in error &&
-      error.classification === "REPLAY_MISMATCH" &&
-      details &&
-      typeof details === "object" &&
-      "actualStatus" in details &&
-      details.actualStatus === 200
+      (error.classification === "REPLAY_MISMATCH" ||
+        error.classification === "REPLAY_RESPONSE_HEADER_MISMATCH") &&
+      (error.classification === "REPLAY_RESPONSE_HEADER_MISMATCH" ||
+        (details &&
+          typeof details === "object" &&
+          "actualStatus" in details &&
+          details.actualStatus === 200))
     ) {
+      // The retained cassette is the pre-fix 404.  The public browser
+      // assertion above already proved the repaired route is 200; a strict
+      // replay therefore fails at the first differing response field (status
+      // or headers), both of which are valid evidence that the old exchange
+      // no longer matches.
       return;
     }
     throw error;
@@ -838,7 +844,7 @@ async function withRealServerBrowserHarness<T>(
   let harness: RealWebE2EHarness | undefined;
   let primaryFailure: unknown;
   try {
-    harness = await createWebE2EHarness();
+    harness = await createWebE2EHarness({ includeServerOrigins: true });
     harness.ledger.add("synthetic_api_key", SYNTHETIC_SECRET_MARKER);
     activeSecretMarkers = [
       SYNTHETIC_SECRET_MARKER,

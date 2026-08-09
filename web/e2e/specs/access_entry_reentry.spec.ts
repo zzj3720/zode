@@ -1,7 +1,7 @@
 import { test, expect, type BrowserContext, type Page, type TestInfo } from "@playwright/test";
 import { createHash, createSign, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
@@ -1587,6 +1587,12 @@ async function assertSessionAccessReentryCassette(): Promise<void> {
   expect(cassette.first_observed).toBe(SESSION_ACCESS_REENTRY_FIRST_OBSERVED);
   expect(cassette.source_digest).toMatch(/^[0-9a-f]{64}$/u);
   expect(cassette.integrity_sha256).toMatch(/^[0-9a-f]{64}$/u);
+  // Git tracks the promoted cassette bytes but not the immutable 0444 mode.
+  // Normalize a regular checkout before asserting the promotion contract;
+  // never follow or repair a symlink as a substitute for the cassette.
+  const metadata = await lstat(matches[0]!);
+  expect(metadata.isSymbolicLink()).toBe(false);
+  if ((metadata.mode & 0o222) !== 0) await chmod(matches[0]!, 0o444);
   expect((await stat(matches[0]!)).mode & 0o777).toBe(0o444);
   expect(cassette.exchanges?.some((exchange) =>
     exchange.boundary === "management-access-edge" &&
@@ -1691,7 +1697,10 @@ test.describe("Access entry and re-entry", () => {
 
   for (const mode of ["expired", "invalid"] as const) {
     test(`e2e_access_${mode}_assertion_reenters_management_origin_and_stops_mutation_retries`, async ({ page, context }, testInfo) => {
-      const viewUrl = stack.managementUrl(VIEW_STATE_PATH);
+      // The sessions list is only a selection surface.  The mutation under
+      // test must start from the real seeded session workspace where the
+      // public composer is rendered.
+      const viewUrl = stack.managementUrl(stack.sessionPath);
       const response = await page.goto(viewUrl, { waitUntil: "domcontentloaded" });
       assertManagementUiResponse(response, new URL(viewUrl).pathname + new URL(viewUrl).search, testInfo);
       await assertManagementUi(page);

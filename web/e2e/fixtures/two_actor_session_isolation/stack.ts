@@ -248,6 +248,14 @@ async function listen(server: Server): Promise<string> {
   return `http://127.0.0.1:${address.port}`;
 }
 
+async function reserveLoopbackPort(): Promise<number> {
+  const server = createServer();
+  const baseUrl = await listen(server);
+  const port = Number(new URL(baseUrl).port);
+  await closeServer(server);
+  return port;
+}
+
 async function closeServer(server: Server): Promise<void> {
   if (!server.listening) return;
   await new Promise<void>((resolveClose, reject) => {
@@ -812,12 +820,21 @@ async function writeEndpointConfig(root: string, providerOrigin: string): Promis
   return { config, database };
 }
 
-async function writeServerConfig(root: string, access: AccessFixture, subjectKey: string, controlDatabase: string, secretDirectory: string): Promise<string> {
+async function writeServerConfig(
+  root: string,
+  access: AccessFixture,
+  subjectKey: string,
+  controlDatabase: string,
+  secretDirectory: string,
+  serverPort: number,
+): Promise<string> {
   await mkdir(secretDirectory, { recursive: true });
   const config = join(root, "server-config.json");
   await writeFile(config, json({
     schema: "zode.server-config.v1",
-    listen: "127.0.0.1:0",
+    listen: `127.0.0.1:${serverPort}`,
+    management_origin: `http://127.0.0.1:${serverPort}`,
+    callback_origin: `http://127.0.0.2:${serverPort}`,
     server_authority_id: SERVER_AUTHORITY,
     deployment: "server_only",
     ui_mode: "api_only",
@@ -1004,7 +1021,15 @@ export async function createTwoActorStack(options: TwoActorStackOptions = {}): P
   const serverRoots = [initialServerRoot];
   const initialServerDatabase = join(initialServerRoot, "server.sqlite3");
   const initialServerSecrets = join(initialServerRoot, "server-secrets");
-  const initialServerConfig = await writeServerConfig(initialServerRoot, access, subjectKey, initialServerDatabase, initialServerSecrets);
+  const serverPort = await reserveLoopbackPort();
+  const initialServerConfig = await writeServerConfig(
+    initialServerRoot,
+    access,
+    subjectKey,
+    initialServerDatabase,
+    initialServerSecrets,
+    serverPort,
+  );
   const server = await spawnReady(serverBinary, ["--config", initialServerConfig], "ZODE_SERVER_READY ");
   const actorA = await startAccessEdge(access, "actor-a", server.baseUrl);
   const actorB = await startAccessEdge(access, "actor-b", server.baseUrl);
@@ -1036,7 +1061,7 @@ export async function createTwoActorStack(options: TwoActorStackOptions = {}): P
       serverRoots.push(freshRoot);
       const database = join(freshRoot, "server.sqlite3");
       const secrets = join(freshRoot, "server-secrets");
-      const config = await writeServerConfig(freshRoot, access, subjectKey, database, secrets);
+      const config = await writeServerConfig(freshRoot, access, subjectKey, database, secrets, serverPort);
       const restarted = await spawnReady(serverBinary, ["--config", config], "ZODE_SERVER_READY ");
       stack.server = restarted;
       actorA.setTarget(restarted.baseUrl);

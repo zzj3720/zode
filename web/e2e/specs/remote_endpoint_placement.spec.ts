@@ -1,7 +1,7 @@
 import { test, expect, type APIRequestContext, type BrowserContext, type Locator, type Page, type Request as PlaywrightRequest, type Response as PlaywrightResponse } from "@playwright/test";
 import { createHash, createSign, generateKeyPairSync, randomBytes } from "node:crypto";
 import { createServer, request as httpRequest, type Server as HttpServer } from "node:http";
-import { mkdtempSync, mkdirSync, chmodSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, mkdirSync, chmodSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -380,6 +380,8 @@ function writeServerConfig(
   root: string,
   issuer: string,
   jwksUrl: string,
+  managementPort: number,
+  uiAssetsDirectory: string,
   options: {
     deployment: "all_in_one" | "server_only";
     endpointBinary?: string;
@@ -397,9 +399,13 @@ function writeServerConfig(
   const path = join(root, "server-config.json");
   const config: JsonObject = {
     schema: "zode.server-config.v1",
-    listen: "127.0.0.1:0",
+    listen: `127.0.0.1:${managementPort}`,
+    management_origin: `http://127.0.0.1:${managementPort}`,
+    callback_origin: `http://127.0.0.2:${managementPort}`,
     server_authority_id: SERVER_AUTHORITY,
     deployment: options.deployment,
+    ui_mode: "assets",
+    ui_assets_directory: uiAssetsDirectory,
     control_database: database,
     secret_directory: secrets,
     access: {
@@ -428,6 +434,13 @@ function writeServerConfig(
   }
   writeFileSync(path, jsonBody(config, null, 2));
   return { path, database, secrets };
+}
+
+function materializeUiAssets(root: string): string {
+  const source = process.env.ZODE_UI_ASSETS_DIRECTORY ?? resolve(REPO_ROOT, "target/ci/product-ui");
+  const destination = join(root, "ui");
+  cpSync(source, destination, { recursive: true, force: false, errorOnExist: true });
+  return destination;
 }
 
 async function startHarness(): Promise<Harness> {
@@ -459,10 +472,13 @@ async function startHarness(): Promise<Harness> {
   let edge: AccessEdge | undefined;
   try {
     access = await startAccessFixture();
+    const uiAssetsDirectory = materializeUiAssets(root);
     const serverConfig = writeServerConfig(
       root,
       access.issuer,
       access.jwksUrl,
+      await reserveLoopbackPort(),
+      uiAssetsDirectory,
       {
         deployment: "all_in_one",
         endpointBinary,
@@ -519,7 +535,8 @@ async function startServerOnlyHarness(): Promise<ServerOnlyHarness> {
   let edge: AccessEdge | undefined;
   try {
     access = await startAccessFixture();
-    const serverConfig = writeServerConfig(root, access.issuer, access.jwksUrl, {
+    const uiAssetsDirectory = materializeUiAssets(root);
+    const serverConfig = writeServerConfig(root, access.issuer, access.jwksUrl, await reserveLoopbackPort(), uiAssetsDirectory, {
       deployment: "server_only",
     });
     server = await startChildProcess(serverBinary, ["--config", serverConfig.path], "ZODE_SERVER_READY ");

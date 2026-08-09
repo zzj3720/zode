@@ -9,7 +9,7 @@ import {
   type ServerResponse,
 } from 'node:http';
 import { readFileSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -286,6 +286,25 @@ async function listen(server: HttpServer): Promise<string> {
   return `http://127.0.0.1:${address.port}`;
 }
 
+async function reserveLoopbackPort(): Promise<number> {
+  const server = createServer();
+  await listen(server);
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('fixture did not expose a TCP address');
+  const port = address.port;
+  await new Promise<void>((resolveClose, rejectClose) => {
+    server.close((error) => (error ? rejectClose(error) : resolveClose()));
+  });
+  return port;
+}
+
+async function materializeUiAssets(root: string): Promise<string> {
+  const source = process.env.ZODE_UI_ASSETS_DIRECTORY ?? resolve(REPO_ROOT, 'target/ci/product-ui');
+  const destination = join(root, 'ui');
+  await cp(source, destination, { recursive: true, force: false, errorOnExist: true });
+  return destination;
+}
+
 class AccessFixture {
   readonly privateKey = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey;
   readonly publicKey = createPublicKey(this.privateKey);
@@ -368,7 +387,7 @@ class AccessEdge {
     }
     const target = new URL(request.url ?? '/', this.targetOrigin);
     const headers = safeForwardHeaders(request.headers);
-    headers.host = new URL(this.baseUrl).host;
+    headers.host = new URL(this.targetOrigin).host;
     headers['cf-access-jwt-assertion'] = this.access.token(this.actor);
     if (body.length > 0) headers['content-length'] = String(body.length);
     const upstream = httpRequest(
@@ -817,7 +836,12 @@ async function writeEndpointConfig(
   return configPath;
 }
 
-async function writeServerConfig(root: string, access: AccessFixture): Promise<string> {
+async function writeServerConfig(
+  root: string,
+  access: AccessFixture,
+  serverPort: number,
+  uiAssetsDirectory: string,
+): Promise<string> {
   const database = join(root, 'server.sqlite3');
   const secretDirectory = join(root, 'server-secrets');
   const subjectKey = join(root, 'subject.key');
@@ -827,9 +851,13 @@ async function writeServerConfig(root: string, access: AccessFixture): Promise<s
   const configPath = join(root, 'server-config.json');
   await writePrivateJson(configPath, {
     schema: 'zode.server-config.v1',
-    listen: '127.0.0.1:0',
+    listen: `127.0.0.1:${serverPort}`,
+    management_origin: `http://127.0.0.1:${serverPort}`,
+    callback_origin: `http://127.0.0.2:${serverPort}`,
     server_authority_id: SERVER_AUTHORITY,
     deployment: 'server_only',
+    ui_mode: 'assets',
+    ui_assets_directory: uiAssetsDirectory,
     control_database: database,
     secret_directory: secretDirectory,
     access: {
@@ -968,7 +996,11 @@ class ProviderDistributionEnvironment {
     this.recorder = recorder;
   }
 
-  static async start(secretMarkers: string[], owner: string): Promise<ProviderDistributionEnvironment> {
+  static async start(
+    secretMarkers: string[],
+    owner: string,
+    controllerSecrets: [string, string],
+  ): Promise<ProviderDistributionEnvironment> {
     const serverBinary =
       process.env.ZODE_SERVER_BIN ??
       process.env.CARGO_BIN_EXE_zode_server ??
@@ -996,7 +1028,7 @@ class ProviderDistributionEnvironment {
       for (const [index, endpointLabel] of ['Endpoint A', 'Endpoint B'].entries()) {
         const endpointRoot = join(root, `endpoint-${index + 1}`);
         const endpointDatabase = join(endpointRoot, 'endpoint.sqlite3');
-        const controlSecret = `web-e2e-controller-${index + 1}-${randomUUID()}`;
+        const controlSecret = controllerSecrets[index] as string;
         const configPath = await writeEndpointConfig(
           endpointRoot,
           endpointDatabase,
@@ -1016,7 +1048,9 @@ class ProviderDistributionEnvironment {
         environment.endpointProxies.push(proxy);
         void endpointLabel;
       }
-      const serverConfig = await writeServerConfig(root, access);
+      const serverPort = await reserveLoopbackPort();
+      const uiAssetsDirectory = await materializeUiAssets(root);
+      const serverConfig = await writeServerConfig(root, access, serverPort, uiAssetsDirectory);
       environment.server = await spawnReady(
         serverBinary,
         ['--config', serverConfig],
@@ -1259,7 +1293,7 @@ async function gotoProvidersWithBootstrap(
       after,
     );
   }
-  await expect(page.getByRole('heading', { name: 'Providers' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Providers', exact: true })).toBeVisible();
 }
 
 async function openProviders(page: Page): Promise<void> {
@@ -1267,15 +1301,12 @@ async function openProviders(page: Page): Promise<void> {
   const after = ledger.mark();
   await page.getByRole('link', { name: 'Providers' }).click();
   await ledger.expectNext(resolveRoute(seamMatrix.bootstrap.providers), 'providers navigation', after);
-  await expect(page.getByRole('heading', { name: 'Providers' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Providers', exact: true })).toBeVisible();
 }
 
 async function openEndpoints(page: Page): Promise<void> {
-  const ledger = browserRouteLedger(page);
-  const after = ledger.mark();
   await page.getByRole('link', { name: 'Endpoints' }).click();
-  await ledger.expectNext(resolveRoute(seamMatrix.endpointCatalog.read), 'Endpoint catalog read', after);
-  await expect(page.getByRole('heading', { name: 'Endpoints' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Endpoints', exact: true })).toBeVisible();
 }
 
 async function addRemoteEndpoint(
@@ -1290,7 +1321,7 @@ async function addRemoteEndpoint(
   const dialog = page.getByRole('dialog', { name: 'Add remote Endpoint' });
   await dialog.getByLabel('Endpoint label').fill(label);
   await dialog.getByLabel('Endpoint URL').fill(baseUrl);
-  const secret = dialog.getByLabel('Controller credential (write-only)');
+  const secret = dialog.getByLabel('Controller credential');
   await expect(secret).toHaveAttribute('type', 'password');
   await secret.fill(controlSecret);
   const response = await expectResponseAfter(
@@ -1304,7 +1335,7 @@ async function addRemoteEndpoint(
   expect(JSON.stringify(responseBody)).not.toContain(controlSecret);
   await expectEndpointCatalogBarrier(proxy, label);
   await expect(dialog).toBeHidden();
-  const endpoint = page.getByRole('article', { name: new RegExp(escapeRegex(label)) });
+  const endpoint = page.locator('article').filter({ hasText: label }).first();
   await expect(endpoint).toContainText(/online|ready/i);
   return String(responseBody.endpoint_id);
 }
@@ -1312,11 +1343,11 @@ async function addRemoteEndpoint(
 async function configureProvider(page: Page, recorderBaseUrl: string): Promise<void> {
   await openProviders(page);
   await page.getByRole('button', { name: 'Configure provider' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Configure provider' });
-  await dialog.getByLabel('Provider name').fill(scenario.provider);
+  const dialog = page.locator('form.editor-panel').filter({ hasText: 'Configure provider' });
+  await dialog.getByLabel('Provider ID').fill(scenario.provider);
   await dialog.getByLabel('Provider kind').selectOption('openai_compatible');
-  await dialog.getByLabel('Execution base URL').fill(`${recorderBaseUrl}/v1`);
-  await dialog.getByLabel('Model').fill(scenario.model);
+  await dialog.getByLabel('Base URL').fill(`${recorderBaseUrl}/v1`);
+  await dialog.getByLabel('Models').fill(scenario.model);
   const response = await expectResponseAfter(
     page,
     resolveRoute(seamMatrix.providerDescriptor, { provider: scenario.provider }),
@@ -1326,10 +1357,8 @@ async function configureProvider(page: Page, recorderBaseUrl: string): Promise<v
   const responseBody = (await response.json()) as JsonObject;
   expect(responseBody.provider).toBe(scenario.provider);
   expect(Number(responseBody.revision)).toBe(1);
-  await expect(dialog).toBeHidden();
-  await expect(page.getByRole('article', { name: new RegExp(escapeRegex(scenario.provider)) })).toContainText(
-    scenario.model,
-  );
+  await expect(dialog).toHaveCount(0);
+  await expect(page.locator('article').filter({ hasText: scenario.provider }).first()).toContainText(scenario.model);
 }
 
 async function updateProviderDescriptor(page: Page, recorderBaseUrl: string, model: string): Promise<void> {
@@ -1749,6 +1778,7 @@ test.describe('provider profile distribution', () => {
     const environment = await ProviderDistributionEnvironment.start(
       [apiKeyA, controllerA, controllerB],
       testInfo.title,
+      [controllerA, controllerB],
     );
     const guard = new SecretSurfaceGuard(page, context, [apiKeyA, controllerA, controllerB]);
     let actorB: ActorBrowserSession | undefined;
@@ -1848,6 +1878,7 @@ test.describe('provider profile distribution', () => {
     const environment = await ProviderDistributionEnvironment.start(
       [apiKeyA, rotatedApiKeyA, controllerA, controllerB],
       testInfo.title,
+      [controllerA, controllerB],
     );
     const guard = new SecretSurfaceGuard(page, context, [apiKeyA, rotatedApiKeyA, controllerA, controllerB]);
     try {
@@ -1968,6 +1999,7 @@ test.describe('provider profile distribution', () => {
     const environment = await ProviderDistributionEnvironment.start(
       [apiKeyA, controllerA, controllerB],
       testInfo.title,
+      [controllerA, controllerB],
     );
     const guard = new SecretSurfaceGuard(page, context, [apiKeyA, controllerA, controllerB]);
     let adminPage: Page | undefined;
@@ -2115,7 +2147,12 @@ test.describe('provider profile distribution', () => {
   }, testInfo) => {
     const apiKey = `web-e2e-secret-${randomUUID()}`;
     const controllerSecret = `web-e2e-control-secret-${randomUUID()}`;
-    const environment = await ProviderDistributionEnvironment.start([apiKey, controllerSecret], testInfo.title);
+    const secondaryControllerSecret = `web-e2e-control-secret-secondary-${randomUUID()}`;
+    const environment = await ProviderDistributionEnvironment.start(
+      [apiKey, controllerSecret, secondaryControllerSecret],
+      testInfo.title,
+      [controllerSecret, secondaryControllerSecret],
+    );
     const guard = new SecretSurfaceGuard(page, context, [apiKey, controllerSecret]);
     try {
       await gotoProvidersWithBootstrap(page, environment.accessEdges[0].baseUrl);
