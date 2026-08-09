@@ -1,5 +1,6 @@
 const fs = require("node:fs");
 const path = require("node:path");
+const { isDeepStrictEqual } = require("node:util");
 
 const { expect, test } = require("@playwright/test");
 const {
@@ -29,8 +30,16 @@ const SELECTION_FIRST_OBSERVED =
   "a recovered Endpoint-owned session exposed its current provider, model, and profile, but the real browser recovery form selected a different execution after refresh";
 const SELECTION_LATER_FIRST_OBSERVED =
   `relation=later_test_reproduction_of_gap; ${SELECTION_FIRST_OBSERVED}`;
+const NOOP_DESCRIPTOR_CLASSIFICATION =
+  "BAD_SESSION_RECOVERY_NOOP_REPLACED_CURRENT_EXECUTION_DESCRIPTOR";
+const NOOP_DESCRIPTOR_FIRST_OBSERVED =
+  "after the Server provider descriptor advanced without changing the visible provider, model, or profile, the real browser no-op Apply replaced the Endpoint-owned current execution descriptor";
+const NOOP_DESCRIPTOR_LATER_CLASSIFICATION =
+  `${NOOP_DESCRIPTOR_CLASSIFICATION}__later_test_reproduction_of_gap`;
+const NOOP_DESCRIPTOR_LATER_FIRST_OBSERVED =
+  `relation=later_test_reproduction_of_gap; ${NOOP_DESCRIPTOR_FIRST_OBSERVED}`;
 
-function matchingCassettes() {
+function cassettesFor(classification) {
   if (!fs.existsSync(INCIDENT_DIRECTORY)) return [];
   return fs
     .readdirSync(INCIDENT_DIRECTORY)
@@ -39,24 +48,7 @@ function matchingCassettes() {
     .filter((candidate) => {
       try {
         const value = JSON.parse(fs.readFileSync(candidate, "utf8"));
-        return value.e2e_name === E2E_NAME && value.classification === LATER_CLASSIFICATION;
-      } catch {
-        return false;
-      }
-    });
-}
-
-function selectionCassettes() {
-  if (!fs.existsSync(INCIDENT_DIRECTORY)) return [];
-  return fs
-    .readdirSync(INCIDENT_DIRECTORY)
-    .filter((name) => name.endsWith(".v1.json"))
-    .map((name) => path.join(INCIDENT_DIRECTORY, name))
-    .filter((candidate) => {
-      try {
-        const value = JSON.parse(fs.readFileSync(candidate, "utf8"));
-        return value.e2e_name === E2E_NAME &&
-          value.classification === SELECTION_LATER_CLASSIFICATION;
+        return value.e2e_name === E2E_NAME && value.classification === classification;
       } catch {
         return false;
       }
@@ -64,7 +56,7 @@ function selectionCassettes() {
 }
 
 function assertCassetteIdentity() {
-  const matches = matchingCassettes();
+  const matches = cassettesFor(LATER_CLASSIFICATION);
   expect(matches).toHaveLength(1);
   const cassette = JSON.parse(fs.readFileSync(matches[0], "utf8"));
   expect(cassette.schema).toBe("zode.http-incident-recording.v1");
@@ -88,7 +80,7 @@ function assertCassetteIdentity() {
     exchange.response.status === 200,
   )).toBe(true);
 
-  const selectionMatches = selectionCassettes();
+  const selectionMatches = cassettesFor(SELECTION_LATER_CLASSIFICATION);
   expect(selectionMatches).toHaveLength(1);
   const selection = JSON.parse(fs.readFileSync(selectionMatches[0], "utf8"));
   expect(selection.schema).toBe("zode.http-incident-recording.v1");
@@ -103,6 +95,27 @@ function assertCassetteIdentity() {
     "management-access-edge",
     "server-endpoint-control",
   ]);
+
+  const noopDescriptorMatches = cassettesFor(NOOP_DESCRIPTOR_LATER_CLASSIFICATION);
+  expect(noopDescriptorMatches).toHaveLength(1);
+  const noopDescriptor = JSON.parse(fs.readFileSync(noopDescriptorMatches[0], "utf8"));
+  expect(noopDescriptor.schema).toBe("zode.http-incident-recording.v1");
+  expect(noopDescriptor.version).toBe(1);
+  expect(noopDescriptor.boundary).toBe("browser-capture-set");
+  expect(noopDescriptor.e2e_name).toBe(E2E_NAME);
+  expect(noopDescriptor.classification).toBe(NOOP_DESCRIPTOR_LATER_CLASSIFICATION);
+  expect(noopDescriptor.first_observed).toBe(NOOP_DESCRIPTOR_LATER_FIRST_OBSERVED);
+  expect(noopDescriptor.source_digest).toMatch(/^[0-9a-f]{64}$/u);
+  expect(noopDescriptor.integrity_sha256).toMatch(/^[0-9a-f]{64}$/u);
+  expect(noopDescriptor.exchanges.some((exchange) =>
+    exchange.boundary === "management-access-edge" &&
+    exchange.method === "PUT" &&
+    exchange.path.endsWith("/model") &&
+    exchange.response.status === 202,
+  )).toBe(true);
+  expect(noopDescriptor.exchanges.every((exchange) =>
+    exchange.boundary === "management-access-edge",
+  )).toBe(true);
 }
 
 function recordsFor(harness, captureSetId) {
@@ -129,6 +142,7 @@ async function managementJson(page, method, requestPath, body) {
 async function mutableEndpointProxy(harness) {
   let target = harness.endpoint;
   let subject;
+  let captureSetId;
   const proxy = await startHttpServer((request, response) => {
     subject = request.headers["zode-subject"] || subject;
     return proxyHttp({
@@ -142,7 +156,7 @@ async function mutableEndpointProxy(harness) {
       boundary: "server-endpoint-control",
       journal: harness.journal,
       ledger: harness.ledger,
-      captureSetId: harness.journal.currentCaptureSetId,
+      captureSetId: captureSetId ?? harness.journal.currentCaptureSetId,
       canonicalOrigin: target.baseUrl,
     }).catch((error) => {
       harness.journal._fail(error);
@@ -155,6 +169,7 @@ async function mutableEndpointProxy(harness) {
   return {
     proxy,
     setTarget(next) { target = next; },
+    setCaptureSetId(next) { captureSetId = next; },
     async close() { await proxy.close(); },
   };
 }
@@ -314,6 +329,7 @@ test(E2E_NAME, async ({ page }) => {
     }
   });
   let captureSetId;
+  let controlCaptureSetId;
   let primaryError;
   try {
     await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
@@ -372,6 +388,13 @@ test(E2E_NAME, async ({ page }) => {
       expect((await modelResponse).status()).toBe(202);
       await expect(page.getByText("Session execution updated. Existing history was preserved.", { exact: true })).toBeVisible();
       await page.evaluate(() => window.localStorage.removeItem("zode-bad-session-disable-event-source"));
+      const advancedDescriptor = await managementJson(page, "PUT", `/v1/providers/${PROVIDER}`, {
+        kind: "openai_compatible",
+        base_url: `${harness.providerProxy.baseUrl}/v1`,
+        models: [MODEL],
+        options: {},
+      });
+      expect(advancedDescriptor.status).toBe(200);
       await page.reload({ waitUntil: "domcontentloaded" });
       await expect(page.getByRole("heading", { name: MODEL, exact: true })).toBeVisible();
       await expect(page.getByText(`${PROVIDER} · ${MODEL}`, { exact: true })).toBeVisible();
@@ -387,26 +410,41 @@ test(E2E_NAME, async ({ page }) => {
       const beforeNoop = await managementJson(page, "GET", sessionPath);
       expect(beforeNoop.status).toBe(200);
       expect(beforeNoop.body.session_id).toBe(session.sessionId);
+      expect(advancedDescriptor.body.revision)
+        .toBeGreaterThan(beforeNoop.body.model.provider_execution_revision);
       await assertRecoverySelection(recoveredForm, {
         provider: PROVIDER,
         model: MODEL,
         profileId: session.recoveryProfileId,
       });
       harness.journal.flushCaptureSet(captureSetId);
+      controlCaptureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 16 });
       captureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 64 });
+      endpointProxy.setCaptureSetId(controlCaptureSetId);
       await expect(recoveredForm.getByLabel("Auth profile").locator("option:checked"))
         .toHaveText("Recovery session profile");
-      const noopResponse = page.waitForResponse((response) =>
-        response.request().method() === "PUT" &&
-        new URL(response.url()).pathname ===
-          `/v1/endpoints/${session.endpointId}/sessions/${session.sessionId}/model`,
-      );
       await recoveredForm.getByRole("button", { name: "Apply execution", exact: true }).click();
-      expect((await noopResponse).status()).toBe(202);
+      await expect(page.getByRole("status")).toContainText("Existing history was preserved.");
       const afterNoop = await managementJson(page, "GET", sessionPath);
       expect(afterNoop.status).toBe(200);
       expect(afterNoop.body.session_id).toBe(session.sessionId);
-      expect(afterNoop.body.model).toEqual(beforeNoop.body.model);
+      await harness.journal.waitForIdle(15_000);
+      endpointProxy.setCaptureSetId(undefined);
+      harness.journal.flushCaptureSet(controlCaptureSetId);
+      controlCaptureSetId = undefined;
+      if (!isDeepStrictEqual(afterNoop.body.model, beforeNoop.body.model)) {
+        throw new ProductBehaviorFailure(
+          NOOP_DESCRIPTOR_CLASSIFICATION,
+          NOOP_DESCRIPTOR_FIRST_OBSERVED,
+          {
+            beforeRevision: beforeNoop.body.model.provider_execution_revision,
+            afterRevision: afterNoop.body.model.provider_execution_revision,
+            provider: beforeNoop.body.model.provider,
+            model: beforeNoop.body.model.model,
+            profileId: beforeNoop.body.model.auth_profile_id,
+          },
+        );
+      }
       expect(afterNoop.body.transcript).toEqual(beforeNoop.body.transcript);
       await page.reload({ waitUntil: "domcontentloaded" });
       await expect(page.getByRole("heading", { name: MODEL, exact: true })).toBeVisible();
@@ -464,14 +502,23 @@ test(E2E_NAME, async ({ page }) => {
         for (const source of window.__zodeBadSessionEventSources || []) source.close();
       });
       await harness.journal.waitForIdle(15_000);
+      endpointProxy.setCaptureSetId(undefined);
+      if (controlCaptureSetId) harness.journal.flushCaptureSet(controlCaptureSetId);
       if (!captureSetId) throw new Error("bad-session recovery capture was not armed");
       const records = recordsFor(harness, captureSetId);
-      const firstFailure = records.find((record) =>
-        record.boundary === "management-access-edge" &&
-        record.method === "GET" &&
-        record.path.includes("/sessions/") &&
-        record.response.status === 200,
-      ) || records[0];
+      const firstFailure = primaryError?.classification === NOOP_DESCRIPTOR_CLASSIFICATION
+        ? records.find((record) =>
+            record.boundary === "management-access-edge" &&
+            record.method === "PUT" &&
+            record.path.endsWith("/model") &&
+            record.response.status === 202,
+          )
+        : records.find((record) =>
+            record.boundary === "management-access-edge" &&
+            record.method === "GET" &&
+            record.path.includes("/sessions/") &&
+            record.response.status === 200,
+          ) || records[0];
       if (!firstFailure) throw new Error("bad-session recovery capture contained no public exchange");
       if (primaryError) {
         const capture = harness.journal.flushCaptureSet(captureSetId, {
@@ -486,6 +533,11 @@ test(E2E_NAME, async ({ page }) => {
                 classification: SELECTION_LATER_CLASSIFICATION,
                 firstObserved: SELECTION_LATER_FIRST_OBSERVED,
               }
+            : primaryError.classification === NOOP_DESCRIPTOR_CLASSIFICATION
+              ? {
+                  classification: NOOP_DESCRIPTOR_LATER_CLASSIFICATION,
+                  firstObserved: NOOP_DESCRIPTOR_LATER_FIRST_OBSERVED,
+                }
             : undefined;
         if (captureRequested && promotion) {
           const promoted = await harness.journal.promoteFlushedCaptureSet(captureSetId, {

@@ -957,6 +957,7 @@ function sessionExecutionRecovery(endpoint: Endpoint, session: Session): HTMLFor
   let submit: HTMLButtonElement | undefined;
   let preferredModel = session.model?.model;
   let preferredProfileId = session.model?.auth_profile_id;
+  let selectionChanged = false;
 
   const updateChoices = (): void => {
     const current = state.providers.find((item) => item.provider === provider.value);
@@ -999,9 +1000,16 @@ function sessionExecutionRecovery(endpoint: Endpoint, session: Session): HTMLFor
     }
   };
   provider.addEventListener("change", () => {
+    selectionChanged = true;
     preferredModel = undefined;
     preferredProfileId = undefined;
     updateChoices();
+  });
+  model.addEventListener("change", () => {
+    selectionChanged = true;
+  });
+  profile.addEventListener("change", () => {
+    selectionChanged = true;
   });
   endpointLabel.setAttribute("aria-label", "Selected Endpoint");
   const grid = node("div", "form-grid");
@@ -1020,6 +1028,15 @@ function sessionExecutionRecovery(endpoint: Endpoint, session: Session): HTMLFor
       );
       if (!selectedProvider || !selectedProfile || !model.value) {
         throw new ServerClientError("invalid_request", 422);
+      }
+      if (
+        !selectionChanged &&
+        session.model?.provider === provider.value &&
+        session.model.model === model.value &&
+        session.model.auth_profile_id === profile.value
+      ) {
+        state.notice = "Session execution is already current. Existing history was preserved.";
+        return;
       }
       await selectSessionModel(endpoint.endpoint_id, session.session_id, {
         provider: selectedProvider,
