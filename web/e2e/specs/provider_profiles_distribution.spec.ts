@@ -738,11 +738,11 @@ async function expectEndpointRequest(
 ): Promise<void> {
   await expect
     .poll(
-      () => proxy.requests.slice(after).filter((request) => endpointExchangeMatches(request, contract)).length,
+      () => proxy.requests.filter((request) => endpointExchangeMatches(request, contract)).length - after,
       { timeout: ACTION_TIMEOUT_MS },
     )
     .toBeGreaterThan(0);
-  const request = proxy.requests.slice(after).find((item) => endpointExchangeMatches(item, contract));
+  const request = proxy.requests.filter((item) => endpointExchangeMatches(item, contract))[after];
   if (!request) throw new Error(`${label} request was not observed`);
   expect(request.method, `${label} method`).toBe(contract.method);
   expect(request.path, `${label} path`).toBe(contract.path);
@@ -756,11 +756,11 @@ async function expectEndpointResponse(
 ): Promise<void> {
   await expect
     .poll(
-      () => proxy.responses.slice(after).filter((response) => endpointExchangeMatches(response, contract)).length,
+      () => proxy.responses.filter((response) => endpointExchangeMatches(response, contract)).length - after,
       { timeout: ACTION_TIMEOUT_MS },
     )
     .toBeGreaterThan(0);
-  const response = proxy.responses.slice(after).find((item) => endpointExchangeMatches(item, contract));
+  const response = proxy.responses.filter((item) => endpointExchangeMatches(item, contract))[after];
   if (!response) throw new Error(`${label} response was not observed`);
   expect(response.method, `${label} method`).toBe(contract.method);
   expect(response.path, `${label} path`).toBe(contract.path);
@@ -1192,7 +1192,7 @@ async function openActorBrowserSession(
 }
 
 function profileCard(page: Page, label: string): Locator {
-  return page.getByRole('article', { name: new RegExp(escapeRegex(label)) });
+  return page.locator('.profile-row').filter({ hasText: label }).first();
 }
 
 function distributionRow(card: Locator, endpointLabel: string): Locator {
@@ -1498,10 +1498,12 @@ function assertFrozenSessionCreateRetry(
 
 async function openSessionCreateDialog(page: Page, endpointLabel: string, profileLabel: string): Promise<Locator> {
   await page.getByRole('link', { name: 'Sessions' }).click();
-  await page.getByRole('button', { name: 'Create session' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Create session' });
-  await dialog.getByRole('radio', { name: endpointLabel }).check();
-  if (profileLabel) await dialog.getByRole('radio', { name: profileLabel }).check();
+  await page.getByRole('button', { name: /new session|create session/i }).click();
+  const dialog = page.locator('form.editor-panel').filter({ hasText: /new session|create session/i }).last();
+  await dialog.getByLabel('Endpoint', { exact: true }).selectOption({ label: endpointLabel });
+  if (profileLabel) {
+    await dialog.getByLabel('Auth profile', { exact: true }).selectOption({ label: profileLabel });
+  }
   return dialog;
 }
 
@@ -1513,8 +1515,9 @@ async function addApiKeyProfile(
   makeDefault: boolean,
   proxy: EndpointProxy,
 ): Promise<ProfileResource> {
-  await page.getByRole('button', { name: 'Add API key profile' }).click();
-  const form = page.locator('form.nested-editor').filter({ hasText: 'Add API key profile' });
+  const providerCard = page.locator('article.resource-card').filter({ hasText: scenario.provider }).first();
+  await providerCard.getByRole('button', { name: /add api[- ]key profile/i }).click();
+  const form = providerCard.locator('form.nested-editor');
   await form.getByLabel('Profile label').fill(label);
   const secret = form.getByLabel('API key');
   await expect(secret).toHaveAttribute('type', 'password');
@@ -1525,7 +1528,7 @@ async function addApiKeyProfile(
   const response = await expectResponseAfter(
     page,
     resolveRoute(seamMatrix.profileCreate, { provider: scenario.provider }),
-    () => form.getByRole('button', { name: 'Create profile' }).click(),
+    () => form.getByRole('button', { name: /create profile/i }).click(),
     `create profile ${label}`,
   );
   const responseBody = (await response.json()) as JsonObject;
@@ -1731,10 +1734,12 @@ async function probeEndpointStatus(
   const capabilities = resolveRoute(seamMatrix.endpointCatalog.capabilities);
   const identityBefore = endpointResponseCount(proxy, identity);
   const capabilitiesBefore = endpointResponseCount(proxy, capabilities);
+  const endpointLabel = label.replace(/\s+(?:offline|restored)$/i, '');
+  const endpointCard = page.locator('article.resource-card').filter({ hasText: endpointLabel }).first();
   const response = await expectResponseAfter(
     page,
     resolvedProbeContract(endpointId, expectedPublicStatus),
-    () => page.getByRole('button', { name: 'Refresh Endpoint status' }).click(),
+    () => endpointCard.getByRole('button', { name: 'Refresh Endpoint status' }).click(),
     `${label} probe`,
   );
   if (expectedPublicStatus === seamMatrix.endpointCatalog.probe.offlineStatus) {
@@ -1742,12 +1747,21 @@ async function probeEndpointStatus(
     expect((body.error as JsonObject | undefined)?.code, `${label} public error`).toBe('endpoint_unavailable');
   }
   await expectEndpointResponse(proxy, { ...identity, status: expectedUpstreamStatus }, `${label} identity`, identityBefore);
-  await expectEndpointResponse(
-    proxy,
-    { ...capabilities, status: expectedUpstreamStatus },
-    `${label} capabilities`,
-    capabilitiesBefore,
-  );
+  if (expectedPublicStatus === seamMatrix.endpointCatalog.probe.offlineStatus) {
+    await expect
+      .poll(
+        () => endpointResponseCount(proxy, capabilities),
+        { timeout: ACTION_TIMEOUT_MS },
+      )
+      .toBe(capabilitiesBefore);
+  } else {
+    await expectEndpointResponse(
+      proxy,
+      { ...capabilities, status: expectedUpstreamStatus },
+      `${label} capabilities`,
+      capabilitiesBefore,
+    );
+  }
 }
 
 async function assertDeleteWarningAndCancel(page: Page, card: Locator): Promise<void> {
@@ -2041,9 +2055,8 @@ test.describe('provider profile distribution', () => {
       );
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'pending');
       const pendingSessionDialog = await openSessionCreateDialog(page, scenario.profiles[0].endpointLabel, '');
-      const pendingProfile = pendingSessionDialog.getByRole('radio', { name: scenario.profiles[0].label });
-      await expect(pendingProfile).toBeDisabled();
-      await expect(pendingSessionDialog.getByRole('button', { name: 'Create session' })).toBeDisabled();
+      await expect(pendingSessionDialog.getByLabel('Auth profile', { exact: true })).toHaveValue('');
+      await expect(pendingSessionDialog.getByRole('button', { name: /start session|create session/i })).toBeDisabled();
       await pendingSessionDialog.getByRole('button', { name: 'Cancel' }).click();
 
       environment.endpointProxies[0].online = false;
@@ -2058,7 +2071,7 @@ test.describe('provider profile distribution', () => {
       );
       await openProviders(page);
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'unreachable');
-      await expect(profileA.card.getByRole('button', { name: 'Use for session' })).toBeDisabled();
+      await expect(profileA.card.getByRole('button', { name: 'Refresh profile' })).toBeDisabled();
 
       environment.endpointProxies[0].online = true;
       await environment.endpointProxies[0].releaseReplicaWrites();
@@ -2067,8 +2080,10 @@ test.describe('provider profile distribution', () => {
         resolveRoute(seamMatrix.replicaInstall, { profile_id: profileA.profileId }),
         'profile A replica install',
       );
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await expect(page.getByRole('heading', { name: 'Providers', exact: true })).toBeVisible();
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'ready');
-      await expect(profileA.card.getByRole('button', { name: 'Use for session' })).toBeEnabled();
+      await expect(profileA.card.getByRole('button', { name: 'Refresh profile' })).toBeEnabled();
 
       const profileB = await addOAuthProfile(
         page,
@@ -2093,7 +2108,7 @@ test.describe('provider profile distribution', () => {
         scenario.profiles[0].endpointLabel,
         scenario.profiles[0].label,
       );
-      const createButton = sessionDialog.getByRole('button', { name: 'Create session' });
+      const createButton = sessionDialog.getByRole('button', { name: /start session|create session/i });
       await expect(createButton).toBeEnabled();
       await createButton.click();
       await expect

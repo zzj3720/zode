@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { chmod, mkdir, open, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { expect, test, type Page, type Response, type TestInfo } from "@playwright/test";
@@ -46,9 +46,6 @@ const SERVER_WRAPPER_PATH = resolve(
   REPO_ROOT,
   "target/web-e2e-playwright/codex-desktop-visual-server-wrapper.cjs",
 );
-const CANONICAL_PATH =
-  process.env.ZODE_CODEX_DESKTOP_CANONICAL_PATH ??
-  "/endpoints/visual-e2e-endpoint/sessions/01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
 type Box = {
   x: number;
@@ -435,7 +432,12 @@ async function assertShellPalette(page: Page, contract: Contract): Promise<void>
   for (const [selector, property, expected] of paletteSelectors) {
     const locator = page.locator(selector).first();
     await expect(locator, `${selector} must expose its semantic visual surface`).toBeVisible();
-    const actual = await locator.evaluate((element, styleProperty) => getComputedStyle(element).getPropertyValue(styleProperty), property);
+    const actual = await locator.evaluate((element, styleProperty) => {
+      const style = getComputedStyle(element);
+      return style.getPropertyValue(styleProperty) ||
+        (style as unknown as Record<string, string>)[styleProperty] ||
+        "";
+    }, property);
     assertColor(actual, expected, `${selector} ${property}`);
   }
 
@@ -452,7 +454,7 @@ async function assertShellStates(page: Page, contract: Contract): Promise<void> 
   if (!selectedState?.includes("selected")) throw new Error("selected navigation row did not expose selected state");
 
   const composer = page.locator(contract.selectors.composer).first();
-  await composer.focus();
+  await composer.locator("textarea").first().focus();
   const focusState = await composer.evaluate((element) => {
     const style = getComputedStyle(element);
     return {
@@ -471,7 +473,7 @@ async function assertShellStates(page: Page, contract: Contract): Promise<void> 
   await hoverTarget.hover();
   const hoverState = await hoverTarget.evaluate((element) => element.matches(":hover"));
   if (!hoverState) throw new Error("navigation hover state could not be observed");
-  await composer.focus();
+  await composer.locator("textarea").first().focus();
 }
 
 async function assertKeyboardAndAccessibility(page: Page, contract: Contract): Promise<void> {
@@ -538,12 +540,21 @@ async function assertKeyboardAndAccessibility(page: Page, contract: Contract): P
   }
 
   const activationTarget = page.locator(contract.selectors.navigation_row).first();
+  const sessionUrl = page.url();
   await activationTarget.focus();
   await activationTarget.press("Enter");
   if (!(await activationTarget.evaluate((element) => document.activeElement === element && element.matches(":focus-visible")))) {
     throw new Error("keyboard activation did not preserve a visible focus target");
   }
-  await page.locator(contract.selectors.composer).first().focus();
+  // The selected Sessions row is a real navigation control: activating it
+  // returns to the session list.  Restore the public session route before
+  // continuing shell assertions so this helper does not mistake a legitimate
+  // route transition for a missing composer.
+  if (page.url() !== sessionUrl) {
+    await page.goto(sessionUrl, { waitUntil: "domcontentloaded" });
+    await expect(page.locator(contract.selectors.composer).first()).toBeVisible();
+  }
+  await page.locator(contract.selectors.composer).first().locator("textarea").focus();
 }
 
 async function assertNoSecretMarkers(
@@ -826,16 +837,14 @@ async function driveRealSessionStateFlow(
   contract: Contract,
 ): Promise<Set<string>> {
   const observedStates = new Set<string>();
-  const eventsResponse = page.waitForResponse(
-    (response) => new URL(response.url()).pathname.endsWith("/events") && response.status() === 200,
-  );
   const messageResponse = page.waitForResponse(
     (response) => new URL(response.url()).pathname.endsWith("/messages") && response.request().method() === "POST",
   );
   const composer = page.locator(contract.selectors.composer).first();
-  await composer.focus();
-  await composer.fill("visual state stream wait tool error reconnect barrier");
-  await composer.press("Enter");
+  const input = composer.locator("textarea").first();
+  await input.focus();
+  await input.fill("visual state stream wait tool error reconnect barrier");
+  await input.press("Enter");
   const message = await messageResponse;
   if (message.status() !== 202) {
     throw new ProductBehaviorFailure(
@@ -844,7 +853,31 @@ async function driveRealSessionStateFlow(
       { status: message.status() },
     );
   }
-  await eventsResponse;
+  const sessionRoute = new URL(page.url()).pathname.match(/^\/endpoints\/([^/]+)\/sessions\/([^/]+)$/);
+  if (!sessionRoute) throw new Error("visual session route did not expose Endpoint and session identity");
+  const eventsPath = `/v1/endpoints/${sessionRoute[1]}/sessions/${sessionRoute[2]}/events`;
+  const streamProbe = await page.evaluate(async ({ path }) => {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 8_000);
+    try {
+      const response = await fetch(path, {
+        headers: { accept: "text/event-stream" },
+        signal: controller.signal,
+      });
+      const first = response.body ? await response.body.getReader().read() : undefined;
+      return {
+        status: response.status,
+        contentType: response.headers.get("content-type") ?? "",
+        observedBytes: first?.value?.byteLength ?? 0,
+      };
+    } finally {
+      window.clearTimeout(timer);
+      controller.abort();
+    }
+  }, { path: eventsPath });
+  expect(streamProbe.status).toBe(200);
+  expect(streamProbe.contentType).toMatch(/^text\/event-stream(?:;|$)/i);
+  expect(streamProbe.observedBytes).toBeGreaterThan(0);
   await expect(page.locator(contract.session_states.stream).first()).toBeVisible();
   observedStates.add("stream");
   for (const state of ["wait", "tool", "error"]) {
@@ -870,7 +903,7 @@ async function driveRealSessionStateFlow(
     new URL(routeBeforeRestart, harness.managementUrl).toString(),
     routeBeforeRestart,
   );
-  await composer.focus();
+  await composer.locator("textarea").first().focus();
   await expect(composer).toBeFocused();
   observedStates.add("focus");
   return observedStates;
@@ -1033,7 +1066,7 @@ async function extractRenderedAssetHref(page: Page, label: string): Promise<stri
 }
 
 function assertSafeHtmlCache(response: Response | null, label: string): void {
-  const cacheControl = response?.headers().get("cache-control")?.toLowerCase() ?? "";
+  const cacheControl = response?.headers()["cache-control"]?.toLowerCase() ?? "";
   if (!cacheControl.includes("no-cache") && !cacheControl.includes("no-store")) {
     throw new ProductBehaviorFailure(
       "STATIC_HTML_CACHE_BEHAVIOR_FAILURE",
@@ -1348,11 +1381,37 @@ async function assertUiAssetsDirectoryConfigured(
     : isAbsolute(config.ui_assets_directory)
       ? resolve(config.ui_assets_directory)
       : resolve(dirname(configPath), config.ui_assets_directory);
-  if (config.ui_mode !== "assets" || configuredDirectory !== builtUi.directory) {
+  const serverRoot = resolve(dirname(configPath));
+  const configuredRealDirectory = await realpath(configuredDirectory).catch(() => "");
+  const relativeConfiguredDirectory = configuredRealDirectory
+    ? relative(serverRoot, configuredRealDirectory)
+    : "";
+  const confined =
+    configuredRealDirectory !== "" &&
+    relativeConfiguredDirectory !== "" &&
+    !relativeConfiguredDirectory.startsWith("..") &&
+    !isAbsolute(relativeConfiguredDirectory) &&
+    configuredRealDirectory !== resolve(builtUi.directory);
+  const configuredIndex = confined
+    ? await readFile(join(configuredRealDirectory, "index.html")).catch(() => undefined)
+    : undefined;
+  const builtIndex = await readFile(join(builtUi.directory, "index.html")).catch(() => undefined);
+  const configuredAsset = confined
+    ? await readFile(join(configuredRealDirectory, builtUi.assetHref.replace(/^\/+/, ""))).catch(() => undefined)
+    : undefined;
+  const builtAsset = await readFile(join(builtUi.directory, builtUi.assetHref.replace(/^\/+/, ""))).catch(() => undefined);
+  const sameBuild =
+    configuredIndex !== undefined &&
+    builtIndex !== undefined &&
+    configuredAsset !== undefined &&
+    builtAsset !== undefined &&
+    createHash("sha256").update(configuredIndex).digest("hex") === createHash("sha256").update(builtIndex).digest("hex") &&
+    createHash("sha256").update(configuredAsset).digest("hex") === createHash("sha256").update(builtAsset).digest("hex");
+  if (config.ui_mode !== "assets" || !confined || !sameBuild) {
     throw new HarnessFailure(
       "UI_ASSETS_DIRECTORY_UNWIRED",
-      "installed/browser E2E requires ui_mode=assets and the test-owned vp build as Server ui_assets_directory; the shared harness did not inject them",
-      { nonEvidence: true },
+      "installed/browser E2E requires ui_mode=assets and a confined copy of the test-owned vp build under the Server config root",
+      { configuredDirectory, configuredRealDirectory, builtDirectory: builtUi.directory, nonEvidence: true },
     );
   }
 }
@@ -1420,6 +1479,64 @@ async function assertManagementSystemBarrier(page: Page, managementUrl: string):
   await assertSystemResponse(response, "new management origin /v1/system");
 }
 
+async function createVisualSession(
+  page: Page,
+  harness: Awaited<ReturnType<typeof createWebE2EHarness>>,
+): Promise<string> {
+  const endpointLabel = "Visual Endpoint";
+  const providerId = "visual-e2e-provider";
+  const profileLabel = "Visual profile";
+
+  await page.getByRole("link", { name: /^Endpoints$/i }).click();
+  await page.getByRole("button", { name: /add remote endpoint/i }).click();
+  const endpointDialog = page.getByRole("dialog", { name: /add remote endpoint/i });
+  await endpointDialog.getByLabel("Endpoint label", { exact: true }).fill(endpointLabel);
+  await endpointDialog.getByLabel("Endpoint URL", { exact: true }).fill(harness.endpoint.baseUrl);
+  await endpointDialog.getByLabel("Controller credential", { exact: true }).fill(harness.controllerSecret);
+  const endpointResponse = page.waitForResponse(
+    (response) => response.request().method() === "POST" && new URL(response.url()).pathname === "/v1/endpoints",
+  );
+  await endpointDialog.getByRole("button", { name: /add endpoint/i }).click();
+  const endpointResult = await endpointResponse;
+  if (endpointResult.status() !== 201) {
+    throw new ProductBehaviorFailure(
+      "VISUAL_SESSION_FIXTURE_FAILURE",
+      `visual endpoint admission returned HTTP ${endpointResult.status()}`,
+      { status: endpointResult.status() },
+    );
+  }
+  await expect(page.getByText(endpointLabel, { exact: true })).toBeVisible();
+
+  await page.getByRole("link", { name: /^Providers$/i }).click();
+  await page.getByRole("button", { name: /configure provider/i }).click();
+  const providerForm = page.locator("form.editor-panel").filter({ hasText: "Configure provider" });
+  await providerForm.getByLabel("Provider ID", { exact: true }).fill(providerId);
+  await providerForm.getByLabel("Base URL", { exact: true }).fill(`${harness.providerProxy.baseUrl}/v1`);
+  await providerForm.getByLabel("Models", { exact: true }).fill("visual-e2e-model");
+  await providerForm.getByRole("button", { name: /save provider/i }).click();
+  const providerCard = page.locator("article.resource-card").filter({ hasText: providerId }).first();
+  await expect(providerCard).toBeVisible();
+  await providerCard.getByRole("button", { name: /add api[- ]key profile/i }).click();
+  const profileForm = providerCard.locator("form.nested-editor");
+  await profileForm.getByLabel("Profile label", { exact: true }).fill(profileLabel);
+  await profileForm.getByLabel("API key", { exact: true }).fill(harness.providerSecret);
+  await profileForm.getByLabel(`Share with ${endpointLabel}`, { exact: true }).check();
+  await profileForm.getByRole("button", { name: /create profile/i }).click();
+  const profileRow = providerCard.locator(".profile-row").filter({ hasText: profileLabel });
+  await expect(profileRow).toContainText(/ready/i, { timeout: 20_000 });
+
+  await page.getByRole("link", { name: /^Sessions$/i }).click();
+  await page.getByRole("button", { name: /new session|create session/i }).click();
+  const sessionForm = page.locator("form.editor-panel").filter({ hasText: "New session" });
+  await sessionForm.getByLabel("Endpoint", { exact: true }).selectOption({ label: endpointLabel });
+  await sessionForm.getByLabel("Provider", { exact: true }).selectOption(providerId);
+  await sessionForm.getByLabel("Model", { exact: true }).selectOption("visual-e2e-model");
+  await expect(sessionForm.getByLabel("Auth profile", { exact: true })).toHaveValue(/.+/);
+  await sessionForm.getByRole("button", { name: /start session/i }).click();
+  await expect(page).toHaveURL(/\/endpoints\/[^/]+\/sessions\/[A-Z0-9]+$/);
+  return new URL(page.url()).pathname;
+}
+
 test.describe("approved Codex Desktop v0 visual shell", () => {
   test(`${INDEXED_DB_GATE_E2E_NAME} @harness-gate`, async ({ page }, testInfo) => {
     test.setTimeout(90_000);
@@ -1445,7 +1562,7 @@ test.describe("approved Codex Desktop v0 visual shell", () => {
     try {
       const builtUi = await buildTestOwnedUiDist();
       restoreServerEnvironment = await installUiAssetsServerWrapper(builtUi);
-      harness = await createWebE2EHarness({ includeServerOrigins: true });
+      harness = await createWebE2EHarness({ includeServerOrigins: true, authorityId: "web-e2e-server" });
       browserSecretGuard = attachVisualBrowserSecretGuard(harness, page);
       await harness.endpointIdentity();
       await assertUiAssetsDirectoryConfigured(harness, builtUi);
@@ -1529,8 +1646,7 @@ test.describe("approved Codex Desktop v0 visual shell", () => {
     try {
       const builtUi = await buildTestOwnedUiDist();
       restoreServerEnvironment = await installUiAssetsServerWrapper(builtUi);
-      harness = await createWebE2EHarness({ includeServerOrigins: true });
-      browserSecretGuard = attachVisualBrowserSecretGuard(harness, page);
+      harness = await createWebE2EHarness({ includeServerOrigins: true, authorityId: "web-e2e-server" });
       // This is a real Endpoint process barrier. Browser traffic below still
       // enters only through the Access edge and never calls Endpoint directly.
       await harness.endpointIdentity();
@@ -1547,7 +1663,13 @@ test.describe("approved Codex Desktop v0 visual shell", () => {
         );
       }
       await assertRenderedAsset(page, rootAssetHref, "management versioned asset");
-      const historyResponse = await gotoOrBlock(page, `${harness.managementUrl}${CANONICAL_PATH}`, CANONICAL_PATH);
+      const visualSessionPath = await createVisualSession(page, harness);
+      browserSecretGuard = attachVisualBrowserSecretGuard(harness, page);
+      const historyResponse = await gotoOrBlock(
+        page,
+        `${harness.managementUrl}${visualSessionPath}`,
+        visualSessionPath,
+      );
       assertSafeHtmlCache(historyResponse, "management canonical history route");
       const historyAssetHref = await extractRenderedAssetHref(page, "management canonical history route");
       if (historyAssetHref !== rootAssetHref) {
@@ -1680,13 +1802,14 @@ test.describe("approved Codex Desktop v0 visual shell", () => {
     try {
       const builtUi = await buildTestOwnedUiDist();
       restoreServerEnvironment = await installUiAssetsServerWrapper(builtUi);
-      harness = await createWebE2EHarness({ includeServerOrigins: true });
-      browserSecretGuard = attachVisualBrowserSecretGuard(harness, page);
+      harness = await createWebE2EHarness({ includeServerOrigins: true, authorityId: "web-e2e-server" });
       await harness.endpointIdentity();
       await assertUiAssetsDirectoryConfigured(harness, builtUi);
       await gotoRootWithSystemBarrier(page, harness.managementUrl);
       await waitForCurrentRunJwks(harness);
-      await gotoOrBlock(page, `${harness.managementUrl}${CANONICAL_PATH}`, CANONICAL_PATH);
+      const visualSessionPath = await createVisualSession(page, harness);
+      browserSecretGuard = attachVisualBrowserSecretGuard(harness, page);
+      await gotoOrBlock(page, `${harness.managementUrl}${visualSessionPath}`, visualSessionPath);
       if (!browserRequests.some((url) => url.startsWith(harness!.managementUrl))) {
         throw new Error("browser did not enter through the Access-protected management origin");
       }

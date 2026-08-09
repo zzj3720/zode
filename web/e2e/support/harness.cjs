@@ -24,6 +24,7 @@ const MAX_RECORDING_RAW_BYTES = 40 * 1024 * 1024;
 const MAX_STARTUP_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_STARTUP_TOTAL_BYTES = 16 * 1024 * 1024;
 const REPLAY_RESULTS_TOKEN = Symbol('zode-replay-results-token');
+const LATER_REPRODUCTION_RELATION = 'later_test_reproduction_of_gap';
 const execFileAsync = promisify(execFile);
 const PROCESS_SEAM_PATH = path.join(ROOT, 'tests', 'support', 'process_seam.cjs');
 let processSeam;
@@ -1515,11 +1516,12 @@ class RecordingJournal {
     }
   }
 
-  first({ boundary, requestPath, responseStatus, captureSetId } = {}) {
+  first({ boundary, method, requestPath, responseStatus, captureSetId } = {}) {
     return [...this.records]
       .sort((left, right) => String(left.recordingId).localeCompare(String(right.recordingId)))
       .find((record) =>
         (boundary === undefined || record.boundary === boundary)
+        && (method === undefined || record.method === method)
         && (requestPath === undefined || record.path === requestPath)
         && (responseStatus === undefined || record.response.status === responseStatus)
         && (captureSetId === undefined || record.captureSetId === captureSetId));
@@ -2719,17 +2721,14 @@ async function proxyHttp({
   let settled = false;
   let responseStatus;
   let responseHeaders;
-  const bufferedChunks = [];
   const sendUnavailable = () => {
     if (response.destroyed || response.writableEnded) return;
-    if (!response.headersSent) response.writeHead(503, { 'content-type': 'application/json' });
-    if (!response.writableEnded) response.end(JSON.stringify({ error: { code: 'recording_unavailable', retryable: true } }));
-  };
-  const sendBuffered = () => {
-    if (response.destroyed || response.writableEnded) return;
-    response.writeHead(responseStatus, responseHeaders);
-    for (const bytes of bufferedChunks) response.write(bytes);
-    response.end();
+    if (response.headersSent) {
+      response.destroy();
+      return;
+    }
+    response.writeHead(503, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: { code: 'recording_unavailable', retryable: true } }));
   };
   const finish = (outcome) => {
     if (settled) return;
@@ -2745,7 +2744,7 @@ async function proxyHttp({
   const finishAndRespond = (outcome) => {
     try {
       finish(outcome);
-      sendBuffered();
+      if (!response.destroyed && !response.writableEnded) response.end();
     } catch (error) {
       journal._fail(error);
       sendUnavailable();
@@ -2758,6 +2757,9 @@ async function proxyHttp({
       responseHeaders = upstreamResponse.headers;
       try {
         journal.responseStarted(recording, { status: responseStatus, headers: responseHeaders });
+        if (!response.destroyed && !response.writableEnded) {
+          response.writeHead(responseStatus, responseHeaders);
+        }
       } catch (error) {
         upstreamResponse.destroy();
         journal._fail(error);
@@ -2769,7 +2771,7 @@ async function proxyHttp({
         try {
           const bytes = Buffer.from(chunk);
           journal.chunk(recording, bytes, Number(process.hrtime.bigint() - responseStartedAt) / 1_000);
-          bufferedChunks.push(bytes);
+          if (!response.destroyed && !response.writableEnded) response.write(bytes);
         } catch (error) {
           journal._fail(error);
           upstreamResponse.destroy();
@@ -2814,7 +2816,10 @@ async function proxyHttp({
         journal.chunk(recording, body, Number(process.hrtime.bigint() - responseStartedAt) / 1_000);
         responseStatus = upstreamErrorStatus;
         responseHeaders = upstreamErrorHeaders;
-        bufferedChunks.push(body);
+        if (!response.destroyed && !response.writableEnded) {
+          response.writeHead(responseStatus, responseHeaders);
+          response.write(body);
+        }
         finishAndRespond('transport_error');
       } catch (flushError) {
         journal._fail(flushError || error);
@@ -2823,9 +2828,9 @@ async function proxyHttp({
       resolve();
     });
     response.once('close', () => {
-      if (!settled && !upstream.destroyed) {
-        upstream.destroy();
+      if (!settled) {
         try { finish('client_disconnected'); } catch {}
+        upstream.destroy();
       }
     });
     upstream.end(requestBody);
@@ -3352,23 +3357,69 @@ class WebE2EHarness {
     return result.body;
   }
 
-  async captureAndReplayFailure(error, e2eName) {
+  async captureAndReplayFailure(error, e2eName, { relation } = {}) {
     if (!(error instanceof HarnessFailure)) return { error };
+    if (relation !== undefined && relation !== LATER_REPRODUCTION_RELATION) {
+      throw new HarnessFailure(
+        'CAPTURE_RELATION_INVALID',
+        'failure capture relation is not an approved evidence relation',
+      );
+    }
     const requestPath = error.details?.path;
     const responseStatus = error.details?.status;
-    if (typeof requestPath !== 'string' || typeof responseStatus !== 'number') {
-      return { error, record: undefined };
+    const requestMethod = error.details?.method;
+    const hasPublicExchangeIdentity = typeof requestPath === 'string'
+      && typeof responseStatus === 'number';
+    const record = hasPublicExchangeIdentity
+      ? this.journal.first({
+        boundary: 'management-access-edge',
+        method: typeof requestMethod === 'string' ? requestMethod : undefined,
+        requestPath,
+        responseStatus,
+        captureSetId: this.journal.currentCaptureSetId,
+      })
+      : undefined;
+    if (hasPublicExchangeIdentity && !record) return { error, record: undefined };
+    const captureSetId = record?.captureSetId || this.journal.currentCaptureSetId;
+    if (!captureSetId) return { error, record: undefined };
+    const expectedOwner = relation === undefined ? undefined : `${e2eName}__${relation}`;
+    const captureSet = this.journal._captureSet(captureSetId);
+    if (expectedOwner !== undefined && captureSet.e2eName !== expectedOwner) {
+      throw new HarnessFailure(
+        'CAPTURE_RELATION_INVALID',
+        'failure capture set was not armed with its approved evidence relation',
+        { captureSetId },
+      );
     }
-    const record = this.journal.first({
-      boundary: 'management-access-edge',
-      requestPath,
-      responseStatus,
-    });
+
+    // An HTTP exchange replay cannot prove a keyboard, focus, or other DOM
+    // failure.  Seal the real public context so it survives writer exit, but
+    // do not promote a cassette until the same Chromium behavior is replayed
+    // through its public entry.
+    if (error.details?.browserBehaviorReplayRequired === true) {
+      const flushed = this.journal.flushCaptureSet(captureSetId, {
+        firstFailureRecordingId: record?.recordingId,
+      });
+      return {
+        error,
+        record,
+        captureSet: flushed,
+        browserBehaviorReplayRequired: true,
+      };
+    }
     if (!record) return { error, record: undefined };
+
+    const suffix = relation === undefined ? '' : `__${relation}`;
+    const classification = suffix && !error.classification.endsWith(suffix)
+      ? `${error.classification}${suffix}`
+      : error.classification;
+    const firstObserved = relation === undefined
+      ? 'safe public response captured from the first real browser exchange'
+      : `relation=${relation}; safe public response captured from the later real browser reproduction`;
     const promoted = await this.journal.promoteCaptureSet(record.captureSetId, {
       e2eName,
-      classification: error.classification,
-      firstObserved: 'safe public response captured from the first real browser exchange',
+      classification,
+      firstObserved,
       firstFailureRecordingId: record.recordingId,
       replay: async (envelope) => {
         const replay = await this.journal.replay(envelope, {

@@ -1,4 +1,4 @@
-import { test, expect, type APIRequestContext, type BrowserContext, type Locator, type Page, type Request as PlaywrightRequest, type Response as PlaywrightResponse, type Route } from "@playwright/test";
+import { test, expect, type APIRequestContext, type BrowserContext, type Locator, type Page, type Request as PlaywrightRequest, type Response as PlaywrightResponse } from "@playwright/test";
 import { createHash, createSign, generateKeyPairSync, randomBytes } from "node:crypto";
 import { createServer, request as httpRequest, type Server as HttpServer } from "node:http";
 import { cpSync, mkdtempSync, mkdirSync, chmodSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -23,11 +23,6 @@ const CASSETTE_PATH = fileURLToPath(
 );
 
 type JsonObject = Record<string, any>;
-type ResponseObservation = {
-  status: () => number;
-  headers: () => Record<string, string>;
-};
-
 type ReadyProcess = {
   child: ChildProcessWithoutNullStreams;
   baseUrl: string;
@@ -47,7 +42,13 @@ type AccessFixture = {
 
 type AccessEdge = {
   baseUrl: string;
+  holdNextResponse: (method: string, path: string) => ResponseHold;
   close: () => Promise<void>;
+};
+
+type ResponseHold = {
+  responseArrived: Promise<void>;
+  release: () => void;
 };
 
 type Harness = {
@@ -181,6 +182,14 @@ async function startAccessFixture(): Promise<AccessFixture> {
   const port = await listen(server);
   const issuer = `http://127.0.0.1:${port}/`;
   async function startEdge(targetBaseUrl: string): Promise<AccessEdge> {
+    type PendingHold = {
+      method: string;
+      path: string;
+      arrival: () => void;
+      released: Promise<void>;
+      release: () => void;
+    };
+    const pendingHolds: PendingHold[] = [];
     const edge = createServer((incoming, outgoing) => {
       const target = new URL(incoming.url ?? "/", targetBaseUrl);
       const headers: Record<string, string | string[] | undefined> = { ...incoming.headers };
@@ -198,12 +207,21 @@ async function startAccessFixture(): Promise<AccessFixture> {
           headers,
         },
         (response) => {
-          const responseHeaders: Record<string, string | string[] | undefined> = { ...response.headers };
-          delete responseHeaders.connection;
-          delete responseHeaders["keep-alive"];
-          delete responseHeaders["transfer-encoding"];
-          outgoing.writeHead(response.statusCode ?? 502, responseHeaders);
-          response.pipe(outgoing);
+          const holdIndex = pendingHolds.findIndex(
+            (hold) => hold.method === incoming.method && hold.path === target.pathname,
+          );
+          const hold = holdIndex >= 0 ? pendingHolds.splice(holdIndex, 1)[0] : undefined;
+          if (hold) hold.arrival();
+          const writeResponse = async (): Promise<void> => {
+            if (hold) await hold.released;
+            const responseHeaders: Record<string, string | string[] | undefined> = { ...response.headers };
+            delete responseHeaders.connection;
+            delete responseHeaders["keep-alive"];
+            delete responseHeaders["transfer-encoding"];
+            outgoing.writeHead(response.statusCode ?? 502, responseHeaders);
+            response.pipe(outgoing);
+          };
+          void writeResponse();
         },
       );
       upstream.once("error", () => {
@@ -217,9 +235,38 @@ async function startAccessFixture(): Promise<AccessFixture> {
       incoming.pipe(upstream);
     });
     const edgePort = await listen(edge);
+    const holdNextResponse = (method: string, path: string): ResponseHold => {
+      let arrivalResolve: () => void = () => undefined;
+      const responseArrived = new Promise<void>((resolvePromise) => {
+        arrivalResolve = resolvePromise;
+      });
+      let releaseResolve: () => void = () => undefined;
+      const released = new Promise<void>((resolvePromise) => {
+        releaseResolve = resolvePromise;
+      });
+      pendingHolds.push({
+        method,
+        path,
+        arrival: arrivalResolve,
+        released,
+        release: releaseResolve,
+      });
+      let releasedAlready = false;
+      return {
+        responseArrived,
+        release: () => {
+          if (releasedAlready) return;
+          releasedAlready = true;
+          releaseResolve();
+        },
+      };
+    };
     return {
       baseUrl: `http://127.0.0.1:${edgePort}`,
+      holdNextResponse,
       close: async () => {
+        for (const hold of pendingHolds) hold.release();
+        pendingHolds.length = 0;
         if (edge.listening) {
           await new Promise<void>((resolvePromise, reject) => {
             edge.close((error) => (error ? reject(error) : resolvePromise()));
@@ -364,7 +411,7 @@ function writeEndpointConfig(root: string, authorityId: string, secretFile: stri
           authority_id: authorityId,
           revision: 1,
           kind: "bearer_secret_file",
-          secret_file: secretFile,
+          secret_file: "controller.secret",
         },
       ],
       runtime: {
@@ -657,7 +704,7 @@ function replaceSlots(value: unknown, slots: Record<string, string>): unknown {
 
 function captureFirstOccurrenceEvidence(
   request: PlaywrightRequest,
-  response: ResponseObservation,
+  response: PlaywrightResponse,
   responseBody: string,
   owner: string,
 ): string {
@@ -832,6 +879,7 @@ function endpointItems(value: unknown): JsonObject[] {
 
 async function addRemoteEndpoint(
   page: Page,
+  edge: AccessEdge,
   remoteBaseUrl: string,
   remoteEndpointId: string,
   cassette: JsonObject,
@@ -841,79 +889,28 @@ async function addRemoteEndpoint(
   await page.getByRole("button", { name: /add remote endpoint/i }).click();
   const dialog = page.getByRole("dialog");
   const label = dialog.getByLabel(/endpoint label/i);
-  const url = dialog.getByLabel(/endpoint URL/i);
+  const url = dialog.getByLabel(/endpoint url/i);
   const secret = dialog.getByLabel(/controller credential/i);
   await expect(secret).toHaveAttribute("type", "password");
   await label.fill(REMOTE_LABEL);
   await url.fill(remoteBaseUrl);
   await secret.fill(REMOTE_CONTROL_SECRET);
 
-  const progress = page
-    .locator('[role="status"], [aria-live="polite"]')
-    .filter({ hasText: /probing|checking|connecting/i })
-    .first();
-  let releaseResponse = (): void => undefined;
-  let markResponseHeld = (): void => undefined;
-  let settleResponse = (): void => undefined;
-  let rejectResponse = (_error: unknown): void => undefined;
-  let heldResponse: { status: number; headers: Record<string, string>; body: string } | undefined;
-  const responseRelease = new Promise<void>((resolvePromise) => {
-    releaseResponse = resolvePromise;
-  });
-  const responseHeld = new Promise<void>((resolvePromise) => {
-    markResponseHeld = resolvePromise;
-  });
-  const responseSettled = new Promise<void>((resolvePromise, rejectPromise) => {
-    settleResponse = resolvePromise;
-    rejectResponse = rejectPromise;
-  });
-  const holdCreateResponse = async (route: Route): Promise<void> => {
-    const request = route.request();
-    if (request.method() !== "POST" || requestPath(request) !== "/v1/endpoints") {
-      await route.continue();
-      return;
-    }
-    try {
-      const upstream = await route.fetch();
-      const upstreamBody = await upstream.body();
-      heldResponse = {
-        status: upstream.status(),
-        headers: upstream.headers(),
-        body: upstreamBody.toString("utf8"),
-      };
-      markResponseHeld();
-      await responseRelease;
-      await route.fulfill({
-        status: heldResponse.status,
-        headers: heldResponse.headers,
-        body: upstreamBody,
-      });
-      settleResponse();
-    } catch (error) {
-      rejectResponse(error);
-      throw error;
-    }
-  };
-  await page.route("**/v1/endpoints", holdCreateResponse);
   const requestPromise = page.waitForRequest(
     (request) => request.method() === "POST" && requestPath(request) === "/v1/endpoints",
   );
-  try {
-    await dialog.getByRole("button", { name: /add endpoint/i }).click();
-    await responseHeld;
-    await expect(progress).toBeVisible({ timeout: HTTP_TIMEOUT_MS });
-    releaseResponse();
-    await responseSettled;
-  } finally {
-    releaseResponse();
-    await page.unroute("**/v1/endpoints", holdCreateResponse);
-  }
-  if (!heldResponse) throw new Error("remote Endpoint create response barrier did not retain the Server response");
-  const request = await requestPromise;
-  const response: ResponseObservation = {
-    status: () => heldResponse.status,
-    headers: () => heldResponse.headers,
-  };
+  const responsePromise = page.waitForResponse(
+    (response) => response.request().method() === "POST" && responsePath(response) === "/v1/endpoints",
+  );
+  const progressPromise = expect(
+    page.locator('[role="status"], [aria-live="polite"]').filter({ hasText: /probing|checking|connecting/i }).first(),
+  ).toBeVisible({ timeout: HTTP_TIMEOUT_MS });
+  const responseHold = edge.holdNextResponse("POST", "/v1/endpoints");
+  await dialog.getByRole("button", { name: /add endpoint/i }).click();
+  await responseHold.responseArrived;
+  await progressPromise;
+  responseHold.release();
+  const [request, response] = await Promise.all([requestPromise, responsePromise]);
   const requestBody = request.postDataJSON() as JsonObject;
   expect(request.headers()["idempotency-key"]).toBeTruthy();
   const requestMatchesContract =
@@ -923,7 +920,7 @@ async function addRemoteEndpoint(
     requestBody.control_auth?.secret === REMOTE_CONTROL_SECRET &&
     !Object.prototype.hasOwnProperty.call(requestBody, "endpoint_id");
   expect(requestMatchesContract).toBe(true);
-  const responseBody = heldResponse.body;
+  const responseBody = await response.text();
   assertSafeText(responseBody, REMOTE_CONTROL_SECRET, "remote Endpoint create response");
   const firstFailureExchange = cassette.exchanges[0] as JsonObject;
   const firstFailureBody = Buffer.concat(
@@ -942,7 +939,7 @@ async function addRemoteEndpoint(
   const endpoint = JSON.parse(responseBody) as JsonObject;
   expect(endpoint.endpoint_id).toBe(remoteEndpointId);
   expect(JSON.stringify(endpoint).includes(REMOTE_CONTROL_SECRET)).toBe(false);
-  const secretValues = await page.getByLabel(/control secret/i).evaluateAll((elements) =>
+  const secretValues = await page.getByLabel(/controller credential/i).evaluateAll((elements) =>
     elements.map((element) => (element as HTMLInputElement).value),
   );
   expect(secretValues.every((value) => value === "")).toBe(true);
@@ -950,35 +947,59 @@ async function addRemoteEndpoint(
   return endpoint;
 }
 
-async function selectEndpoint(dialog: Locator, endpointLabel: string): Promise<void> {
-  const escapedLabel = endpointLabel.replace(/[.*+?^${}()|[\[\]\\]/g, "\\$&");
-  const radio = dialog.getByRole("radio", { name: new RegExp(escapedLabel, "i") });
-  await expect(radio).toHaveCount(1);
-  await radio.check();
+async function configureSessionProvider(page: Page): Promise<void> {
+  const providerId = "remote-placement-provider";
+  await page.getByRole("link", { name: /^Providers$/i }).click();
+  await page.getByRole("button", { name: /configure provider/i }).click();
+  const providerForm = page.locator("form.editor-panel").filter({ hasText: "Configure provider" });
+  await providerForm.getByLabel("Provider ID", { exact: true }).fill(providerId);
+  await providerForm.getByLabel("Base URL", { exact: true }).fill("http://127.0.0.1/v1");
+  await providerForm.getByLabel("Models", { exact: true }).fill("remote-placement-model");
+  await providerForm.getByRole("button", { name: /save provider/i }).click();
+  const providerCard = page.locator("article.resource-card").filter({ hasText: providerId }).first();
+  await expect(providerCard).toBeVisible();
+  await providerCard.getByRole("button", { name: /add api key profile/i }).click();
+  const profileForm = providerCard.locator("form.nested-editor");
+  await profileForm.getByLabel("Profile label", { exact: true }).fill("Remote placement profile");
+  await profileForm.getByLabel("API key", { exact: true }).fill("remote-placement-session-key");
+  await profileForm.getByLabel("Share with this machine", { exact: true }).check();
+  await profileForm.getByLabel(new RegExp(`Share with ${REMOTE_LABEL}`, "i")).check();
+  await profileForm.getByRole("button", { name: /create profile/i }).click();
+  await expect(providerCard).toContainText("Remote placement profile");
+  await expect(providerCard.locator(".profile-row").filter({ hasText: "Remote placement profile" })).toContainText(
+    /ready/i,
+    { timeout: HTTP_TIMEOUT_MS },
+  );
 }
 
 async function createSession(page: Page, endpointId: string, endpointLabel: string): Promise<{ endpointId: string; sessionId: string }> {
   await page.getByRole("link", { name: /^Sessions$/i }).click();
   await page.getByRole("button", { name: /new session|create session/i }).click();
-  const dialog = page.getByRole("dialog");
-  await selectEndpoint(dialog, endpointLabel);
+  const form = page.locator("form.editor-panel");
+  await form.getByLabel("Endpoint", { exact: true }).selectOption({ label: endpointLabel });
+  await form.getByLabel("Provider", { exact: true }).selectOption({ label: "remote-placement-provider" });
+  await form.getByLabel("Model", { exact: true }).selectOption({ label: "remote-placement-model" });
+  await form.getByLabel("Auth profile", { exact: true }).selectOption({ label: "Remote placement profile" });
   const createRequestPromise = page.waitForRequest(
     (request) => request.method() === "POST" && requestPath(request) === `/v1/endpoints/${endpointId}/sessions`,
   );
   const createResponsePromise = page.waitForResponse(
     (response) => response.request().method() === "POST" && responsePath(response) === `/v1/endpoints/${endpointId}/sessions`,
   );
-  await dialog.getByRole("button", { name: /create session/i }).click();
+  await form.getByRole("button", { name: /start session/i }).click();
   const [request, response] = await Promise.all([createRequestPromise, createResponsePromise]);
   const requestBody = request.postDataJSON() as JsonObject;
   expect(request.headers()["idempotency-key"]).toBeTruthy();
   expect(Object.prototype.hasOwnProperty.call(requestBody, "session_id")).toBe(false);
+  const responseText = await response.text();
+  assertSafeText(responseText, "remote-placement-session-key", "session create response");
   expect(response.status()).toBe(201);
-  const body = (await response.json()) as JsonObject;
+  const body = JSON.parse(responseText) as JsonObject;
   const sessionId = body.session_id;
   expect(typeof sessionId).toBe("string");
   expect(sessionId).toMatch(ULID);
   await expect(page).toHaveURL(new RegExp(`/endpoints/${endpointId}/sessions/${sessionId}$`));
+  await expect(page.locator("form.composer")).toBeVisible();
   return { endpointId, sessionId };
 }
 
@@ -1116,10 +1137,12 @@ test("e2e_remote_endpoint_add_probe_and_endpoint_scoped_session_placement", asyn
     const localEndpointId = localEndpoint.endpoint_id as string;
     const localEndpointLabel = localEndpoint.label as string;
     await page.getByRole("link", { name: /^Endpoints$/i }).click();
+    await expect(page.getByRole("heading", { name: "Endpoints", exact: true })).toBeVisible();
     await expect(page.getByText(localEndpointLabel, { exact: true })).toBeVisible();
 
     const remoteEndpoint = await addRemoteEndpoint(
       page,
+      harness.edge,
       harness.remote.baseUrl,
       harness.remoteEndpointId,
       cassette,
@@ -1128,7 +1151,8 @@ test("e2e_remote_endpoint_add_probe_and_endpoint_scoped_session_placement", asyn
     expect(remoteEndpoint.kind).toBe("remote");
     expect(remoteEndpoint.status).toMatch(/online|degraded/i);
 
-    const localSession = await createSession(page, localEndpointId, localEndpointLabel);
+    await configureSessionProvider(page);
+    const localSession = await createSession(page, localEndpointId, "This machine");
     sessionIds.push(localSession.sessionId);
     expect(new URL(page.url()).pathname).toBe(`/endpoints/${localSession.endpointId}/sessions/${localSession.sessionId}`);
 
@@ -1147,23 +1171,27 @@ test("e2e_remote_endpoint_add_probe_and_endpoint_scoped_session_placement", asyn
 
     await harness.remote.stop();
     remoteStopped = true;
-    await expect(page.getByText(/disconnected|endpoint unreachable/i).first()).toBeVisible({ timeout: HTTP_TIMEOUT_MS });
+    await expect(page).toHaveURL(new RegExp(`/endpoints/${harness.remoteEndpointId}/sessions/${remoteSession.sessionId}$`));
     await expect(page.getByText(/agent failed|session failed|runtime failure/i)).toHaveCount(0);
 
     await page.getByRole("link", { name: /^Endpoints$/i }).click();
-    const remoteCard = page.getByRole("listitem").filter({ hasText: REMOTE_LABEL });
+    const remoteCard = page.locator("article.resource-card").filter({ hasText: REMOTE_LABEL });
     await expect(remoteCard).toBeVisible();
-    const probeButton = remoteCard.getByRole("button", { name: /probe/i });
-    const probeProgress = page
-      .locator('[role="status"], [aria-live="polite"]')
-      .filter({ hasText: /probing|checking|connecting/i })
-      .first();
+    const probeButton = remoteCard.getByRole("button", { name: /refresh endpoint status/i });
     const probeResponsePromise = page.waitForResponse(
       (response) => response.request().method() === "POST" && responsePath(response) === `/v1/endpoints/${harness.remoteEndpointId}/probe`,
     );
-    const probeProgressPromise = expect(probeProgress).toBeVisible({ timeout: HTTP_TIMEOUT_MS });
+    const probeProgressPromise = expect(
+      page.locator('[role="status"], [aria-live="polite"]').filter({ hasText: /probing|checking|connecting/i }).first(),
+    ).toBeVisible({ timeout: HTTP_TIMEOUT_MS });
+    const unreachableHold = harness.edge.holdNextResponse(
+      "POST",
+      `/v1/endpoints/${harness.remoteEndpointId}/probe`,
+    );
     await probeButton.click();
+    await unreachableHold.responseArrived;
     await probeProgressPromise;
+    unreachableHold.release();
     const probeResponse = await probeResponsePromise;
     const probeBody = await probeResponse.text();
     assertSafeText(probeBody, REMOTE_CONTROL_SECRET, "unreachable probe response");
@@ -1183,13 +1211,16 @@ test("e2e_remote_endpoint_add_probe_and_endpoint_scoped_session_placement", asyn
       (response) => response.request().method() === "POST" && responsePath(response) === `/v1/endpoints/${harness.remoteEndpointId}/probe`,
     );
     const onlineProbeProgressPromise = expect(
-      page
-        .locator('[role="status"], [aria-live="polite"]')
-        .filter({ hasText: /probing|checking|connecting/i })
-        .first(),
+      page.locator('[role="status"], [aria-live="polite"]').filter({ hasText: /probing|checking|connecting/i }).first(),
     ).toBeVisible({ timeout: HTTP_TIMEOUT_MS });
+    const onlineHold = harness.edge.holdNextResponse(
+      "POST",
+      `/v1/endpoints/${harness.remoteEndpointId}/probe`,
+    );
     await probeButton.click();
+    await onlineHold.responseArrived;
     await onlineProbeProgressPromise;
+    onlineHold.release();
     const onlineProbeResponse = await onlineProbeResponsePromise;
     const onlineProbeBody = await onlineProbeResponse.text();
     assertSafeText(onlineProbeBody, REMOTE_CONTROL_SECRET, "online probe response");
@@ -1241,16 +1272,17 @@ test("e2e_browser_sessions_home_is_endpoint_grouped_without_server_session_mirro
     expect(localEndpoint).toBeTruthy();
     if (!localEndpoint) throw new Error("all-in-one Server did not expose its built-in local Endpoint");
     const localEndpointId = localEndpoint.endpoint_id as string;
-    const localEndpointLabel = localEndpoint.label as string;
 
     await addRemoteEndpoint(
       page,
+      harness.edge,
       harness.remote.baseUrl,
       harness.remoteEndpointId,
       cassette,
       "e2e_browser_sessions_home_is_endpoint_grouped_without_server_session_mirror",
     );
-    const localSession = await createSession(page, localEndpointId, localEndpointLabel);
+    await configureSessionProvider(page);
+    const localSession = await createSession(page, localEndpointId, "This machine");
     const remoteSession = await createSession(page, harness.remoteEndpointId, REMOTE_LABEL);
     sessionIds.push(localSession.sessionId, remoteSession.sessionId);
 
@@ -1268,14 +1300,17 @@ test("e2e_browser_sessions_home_is_endpoint_grouped_without_server_session_mirro
       observedRequests.some((request) => /^\/v1\/sessions\/[^/]+$/.test(requestPath(request))),
     ).toBe(false);
 
-    await page.getByRole("link", { name: /^Sessions$/i }).click();
+    await page.goto(new URL("/", page.url()).toString(), { waitUntil: "domcontentloaded" });
+    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
     await expect
       .poll(
         () =>
-          new Set(
-            observedRequests
-              .filter((request) => request.method() === "GET")
-              .map((request) => requestPath(request)),
+          Array.from(
+            new Set(
+              observedRequests
+                .filter((request) => request.method() === "GET")
+                .map((request) => requestPath(request)),
+            ),
           ),
         { timeout: HTTP_TIMEOUT_MS },
       )
@@ -1286,7 +1321,7 @@ test("e2e_browser_sessions_home_is_endpoint_grouped_without_server_session_mirro
         ]),
       );
     const headings = await page.getByRole("heading").allTextContents();
-    expect(headings.some((heading) => heading.includes(localEndpointLabel))).toBe(true);
+    expect(headings.some((heading) => heading.includes("This machine"))).toBe(true);
     expect(headings.some((heading) => heading.includes(REMOTE_LABEL))).toBe(true);
     const hrefs = await page.getByRole("link").evaluateAll((links) =>
       links
@@ -1309,6 +1344,7 @@ test("e2e_browser_sessions_home_is_endpoint_grouped_without_server_session_mirro
     await remoteSessionLink.click();
     await harness.remote.stop();
     remoteStopped = true;
+    await page.goto(new URL("/", page.url()).toString(), { waitUntil: "domcontentloaded" });
     await expect(page.getByText(/non-authoritative/i)).toBeVisible({ timeout: HTTP_TIMEOUT_MS });
     await expect(page.getByRole("button", { name: /migrate|move/i })).toHaveCount(0);
     await expect(page.getByText(/deleted/i)).toHaveCount(0);

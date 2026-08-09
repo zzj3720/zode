@@ -24,6 +24,8 @@ body {
   min-height: 100vh;
   overflow: hidden;
   background: #181818;
+  font-size: 15px;
+  line-height: 24px;
 }
 
 button,
@@ -387,6 +389,10 @@ textarea:focus-visible {
   background: #382e22;
 }
 
+[data-zode-attention] {
+  color: #f39c12;
+}
+
 .nested-editor {
   margin-top: 16px;
   padding: 16px;
@@ -444,6 +450,17 @@ textarea:focus-visible {
 .profile-row > div {
   display: grid;
   gap: 3px;
+}
+
+.profile-distribution {
+  display: grid;
+  gap: 3px;
+}
+
+.profile-targets {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
 }
 
 .profile-row strong {
@@ -635,6 +652,11 @@ textarea:focus-visible {
   border: 1px solid #414141;
   border-radius: 24px;
   background: #2a2a2a;
+}
+
+.composer:focus-within {
+  outline: 2px solid #f5f6f6;
+  outline-offset: 2px;
 }
 
 .composer-input {

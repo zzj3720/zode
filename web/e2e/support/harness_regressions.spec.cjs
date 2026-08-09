@@ -231,6 +231,43 @@ test.describe('Zode web E2E harness regressions', () => {
     }
   });
 
+  test('e2e_shared_real_process_stops_interpreter_wrapper_with_durable_proof', async ({}, testInfo) => {
+    test.setTimeout(120_000);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-process-wrapper-'));
+    const wrapper = path.join(root, 'ready-wrapper.cjs');
+    fs.writeFileSync(
+      wrapper,
+      '#!/usr/bin/env node\nconsole.log("ZODE_READY http://127.0.0.1:45682");\nsetInterval(() => {}, 30_000);\n',
+      { mode: 0o700 },
+    );
+    fs.chmodSync(wrapper, 0o700);
+    const ledger = new SecretLedger();
+    let childProcess;
+    try {
+      childProcess = await RealProcess.start({
+        name: 'server',
+        binary: wrapper,
+        args: [],
+        cwd: process.cwd(),
+        env: {},
+        readyPrefix: 'ZODE_READY ',
+        ledger,
+        logDir: path.join(root, 'logs'),
+        startupCaptureRoot: path.join(root, 'capture'),
+        startupConfigBytes: Buffer.from('test-only-wrapper-config\n'),
+        e2eName: testInfo.title,
+      });
+      await childProcess.stop();
+      const observation = JSON.parse(fs.readFileSync(childProcess.startupCapture.observationPath, 'utf8'));
+      assert.equal(observation.phase, 'stop');
+      assert.equal(observation.stop.flush_status, 'ok');
+      assert.equal(observation.stop.timed_out, false);
+      assert.deepEqual(observation.stop.leaked_pids, []);
+    } finally {
+      try { await childProcess?.stop(); } catch {}
+    }
+  });
+
   test('e2e_shared_real_process_prefers_durable_ready_line_before_exit', async ({}, testInfo) => {
     test.setTimeout(120_000);
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-process-ready-race-'));
@@ -368,6 +405,112 @@ test.describe('Zode web E2E harness regressions', () => {
         200,
         `cassette evidence retained at ${retained.evidencePath}`,
       );
+    } finally {
+      await harness?.close();
+    }
+  });
+
+  test('e2e_later_reproduction_relation_is_bound_to_real_browser_capture', async ({ page }, testInfo) => {
+    test.setTimeout(120_000);
+    const relation = 'later_test_reproduction_of_gap';
+    const classification = 'HARNESS_LATER_RELATION_FIXTURE_FAILURE';
+    let harness;
+    try {
+      harness = await createWebE2EHarness({ uiMode: 'assets', includeServerOrigins: true });
+      const captureSetId = harness.beginCaptureSet({
+        e2eName: `${testInfo.title}__${relation}`,
+        maxMembers: 16,
+      });
+
+      const uiResponse = await page.goto(`${harness.managementUrl}/`, {
+        waitUntil: 'domcontentloaded',
+      });
+      const status = uiResponse?.status() ?? 0;
+      assert.equal(status, 200, 'the real browser exchange did not reach the management UI');
+      await page.waitForLoadState('networkidle');
+      assert.ok((await page.locator('body').innerText()).trim(), 'the real browser UI document was empty');
+
+      const evidence = await harness.captureAndReplayFailure(
+        new HarnessFailure(
+          classification,
+          'recorder relation fixture stopped after the real browser exchange',
+          {
+            method: 'GET',
+            path: '/',
+            status,
+            browserBehaviorReplayRequired: false,
+            nonEvidence: true,
+          },
+        ),
+        testInfo.title,
+        { relation },
+      );
+      assert.equal(evidence.captureSet?.captureSetId, captureSetId, 'later reproduction did not seal its bounded capture set');
+      assert.ok(evidence.record?.rawPath, 'later reproduction did not retain its real browser exchange');
+      assert.ok(evidence.cassettePath, 'later reproduction did not create a replay-proven cassette');
+
+      const retained = retainFirstOccurrenceEvidence({
+        rawPath: evidence.record.rawPath,
+        cassettePath: evidence.cassettePath,
+        label: testInfo.title,
+      });
+      const cassette = JSON.parse(fs.readFileSync(evidence.cassettePath, 'utf8'));
+      assert.equal(
+        cassette.classification,
+        `${classification}__${relation}`,
+        `later-reproduction relation was not bound to the retained cassette; evidence=${retained.evidencePath}`,
+      );
+      assert.match(
+        cassette.first_observed,
+        new RegExp(`^relation=${relation}; `),
+        `later-reproduction relation was not bound to first_observed; evidence=${retained.evidencePath}`,
+      );
+    } finally {
+      await harness?.close();
+    }
+  });
+
+  test('e2e_browser_only_failure_seals_context_without_false_http_promotion', async ({ page }, testInfo) => {
+    test.setTimeout(120_000);
+    const relation = 'later_test_reproduction_of_gap';
+    let harness;
+    try {
+      harness = await createWebE2EHarness({ uiMode: 'assets', includeServerOrigins: true });
+      const captureSetId = harness.beginCaptureSet({
+        e2eName: `${testInfo.title}__${relation}`,
+        maxMembers: 16,
+      });
+
+      const uiResponse = await page.goto(`${harness.managementUrl}/`, {
+        waitUntil: 'domcontentloaded',
+      });
+      assert.equal(uiResponse?.status(), 200, 'the real browser context did not reach the management UI');
+      await page.waitForLoadState('networkidle');
+      assert.ok((await page.locator('body').innerText()).trim(), 'the real browser UI document was empty');
+
+      const evidence = await harness.captureAndReplayFailure(
+        new HarnessFailure(
+          'HARNESS_BROWSER_ONLY_FIXTURE_FAILURE',
+          'browser-only fixture stopped without inventing an HTTP failure identity',
+          { browserBehaviorReplayRequired: true, nonEvidence: true },
+        ),
+        testInfo.title,
+        { relation },
+      );
+      assert.equal(evidence.record, undefined, 'browser-only failure was falsely bound to an earlier HTTP response');
+      assert.equal(evidence.captureSet?.captureSetId, captureSetId, 'browser-only context did not seal its capture set');
+      assert.ok(evidence.captureSet?.records.length > 0, 'browser-only failure sealed no real public context');
+      assert.equal(evidence.browserBehaviorReplayRequired, true, 'browser-only failure was misrepresented as replay proven');
+      assert.equal(evidence.cassettePath, undefined, 'HTTP replay falsely promoted a browser behavior cassette');
+
+      const manifest = JSON.parse(fs.readFileSync(
+        path.join(harness.journal.rootDir, `${captureSetId}.manifest.json`),
+        'utf8',
+      ));
+      assert.equal(manifest.state, 'flushed', 'browser-only failure context was not durable before writer exit');
+      assert.equal(manifest.e2e_name, `${testInfo.title}__${relation}`, 'sealed context lost its later-reproduction provenance');
+      assert.equal(manifest.first_failure_recording_id, undefined, 'browser-only failure invented an HTTP first-failure identity');
+      assert.deepEqual(fs.readdirSync(harness.journal.promotedDir), [], 'browser-only failure created an immutable cassette without browser replay');
     } finally {
       await harness?.close();
     }
@@ -867,6 +1010,98 @@ test.describe('Zode web E2E harness regressions', () => {
       );
     } finally {
       try { await jwks?.jwksServer?.close(); } catch {}
+    }
+  });
+
+  test('e2e_http_streaming_proxy_forwards_durable_chunk_before_terminal_and_records_client_disconnect', async ({ page }, testInfo) => {
+    test.setTimeout(120_000);
+    const quarantineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-streaming-proxy-'));
+    const ledger = new SecretLedger();
+    const journal = new RecordingJournal({ rootDir: quarantineRoot, ledger });
+    const upstreamStarted = new Barrier('streaming upstream started');
+    const releaseUpstream = new Barrier('release streaming upstream');
+    let upstream;
+    let edge;
+    let firstChunkPromise;
+    try {
+      upstream = await startHttpServer(async (request, response) => {
+        if (request.url === '/bootstrap') {
+          response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          response.end('<title>streaming proxy regression</title>');
+          return;
+        }
+        assert.equal(request.url, '/stream');
+        response.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+        });
+        response.flushHeaders();
+        response.write(': durable-first-chunk\n\n');
+        upstreamStarted.notify();
+        await releaseUpstream.wait();
+        if (!response.destroyed) response.end('data: terminal\n\n');
+      });
+      edge = await startHttpServer((request, response) => proxyHttp({
+        targetBaseUrl: upstream.baseUrl,
+        request,
+        response,
+        boundary: 'streaming-proxy-edge',
+        journal,
+        ledger,
+        canonicalOrigin: upstream.baseUrl,
+      }));
+      await page.goto(`${edge.baseUrl}/bootstrap`, { waitUntil: 'domcontentloaded' });
+      firstChunkPromise = page.evaluate(async () => {
+        const controller = new AbortController();
+        window.__zodeStreamingProxyAbort = () => controller.abort();
+        try {
+          const response = await fetch('/stream', {
+            headers: { accept: 'text/event-stream' },
+            signal: controller.signal,
+          });
+          const first = response.body ? await response.body.getReader().read() : undefined;
+          controller.abort();
+          return {
+            status: response.status,
+            contentType: response.headers.get('content-type') || '',
+            text: first?.value ? new TextDecoder().decode(first.value) : '',
+          };
+        } finally {
+          delete window.__zodeStreamingProxyAbort;
+        }
+      });
+      await upstreamStarted.wait();
+      let timer;
+      const observed = await Promise.race([
+        firstChunkPromise,
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve({ timedOut: true }), 2_000);
+        }),
+      ]).finally(() => clearTimeout(timer));
+      assert.equal(observed.timedOut, undefined, 'the durable upstream SSE chunk was buffered until terminal');
+      assert.equal(observed.status, 200);
+      assert.match(observed.contentType, /^text\/event-stream(?:;|$)/i);
+      assert.equal(observed.text, ': durable-first-chunk\n\n');
+      await journal.waitForIdle();
+      const record = journal.first({
+        boundary: 'streaming-proxy-edge',
+        method: 'GET',
+        requestPath: '/stream',
+        responseStatus: 200,
+      });
+      assert.ok(record, 'streaming client disconnect was not durably captured');
+      assert.equal(record.response.outcome, 'client_disconnected');
+      assert.equal(
+        Buffer.from(record.response.chunks[0].data_base64, 'base64').toString(),
+        ': durable-first-chunk\n\n',
+      );
+      assert.equal(fs.statSync(record.rawPath).mode & 0o777, 0o600);
+    } finally {
+      await page.evaluate(() => window.__zodeStreamingProxyAbort?.()).catch(() => undefined);
+      releaseUpstream.notify();
+      await firstChunkPromise?.catch(() => undefined);
+      try { await edge?.close(); } catch {}
+      try { await upstream?.close(); } catch {}
     }
   });
 

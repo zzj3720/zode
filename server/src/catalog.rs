@@ -253,7 +253,21 @@ impl Catalog {
         .await
         .map_err(|_| CatalogError::Internal)??;
         let secret = std::str::from_utf8(&secret).map_err(|_| CatalogError::Internal)?;
-        let probe = self.probe_endpoint(&record.base_url, secret).await?;
+        let probe = match self.probe_endpoint(&record.base_url, secret).await {
+            Ok(probe) => probe,
+            Err(CatalogError::EndpointUnavailable) => {
+                let store = Arc::clone(&self.store);
+                let endpoint_id = record.endpoint_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    store.mark_install_replicas_unreachable(&endpoint_id)
+                })
+                .await
+                .map_err(|_| CatalogError::Internal)?
+                .map_err(map_store_error)?;
+                return Err(CatalogError::EndpointUnavailable);
+            }
+            Err(error) => return Err(error),
+        };
         if probe.identity.endpoint_id != record.endpoint_id
             || probe.identity.authority_id != record.controller_authority_id
             || probe.identity.revision != record.controller_credential_revision

@@ -1,5 +1,8 @@
-import { expect, test, type Page } from "@playwright/test";
-import { join } from "node:path";
+import { expect, test, type Browser, type Page } from "@playwright/test";
+import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, realpath, unlink } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -14,6 +17,7 @@ import {
   type AccessActor,
   type CassetteClassification,
   type CassetteTermination,
+  type EndpointCassetteExchange,
   type EndpointObservation,
   type IncidentCassette,
   type RecordedExchange,
@@ -36,8 +40,109 @@ const SHARING_MODE = "selected";
 const CASSETTE_DIRECTORY = fileURLToPath(new URL("../fixtures/two_actor_session_isolation", import.meta.url));
 const ISOLATION_CASSETTE = join(CASSETTE_DIRECTORY, "session-isolation-complete.v2.json");
 const PROFILE_CASSETTE = join(CASSETTE_DIRECTORY, "provider-profile-sharing-complete.v2.json");
+const ISOLATION_ENDPOINT_REPLAY = join(CASSETTE_DIRECTORY, "session-isolation-endpoint-replay.v7.json");
+const PROFILE_ENDPOINT_REPLAY = join(CASSETTE_DIRECTORY, "provider-profile-sharing-endpoint-replay.v7.json");
 const ISOLATION_RECORDING_ID = "two-actor-session-isolation-first-404-complete-20260808-v2";
 const PROFILE_RECORDING_ID = "two-actor-provider-profile-sharing-first-404-complete-20260808-v2";
+const ISOLATION_ENDPOINT_REPLAY_ID = "two-actor-session-isolation-endpoint-replay-20260809-v7";
+const PROFILE_ENDPOINT_REPLAY_ID = "two-actor-provider-profile-sharing-endpoint-replay-20260809-v7";
+const ISOLATION_E2E = "e2e_browser_two_actor_session_isolation";
+const PROFILE_E2E = "e2e_browser_provider_profiles_are_shared_deployment_resources";
+const ISOLATION_REPLAY_E2E = "e2e_browser_two_actor_session_isolation_replays_complete_endpoint_transcript";
+const PROFILE_REPLAY_E2E = "e2e_browser_provider_profiles_shared_deployment_replays_complete_endpoint_transcript";
+const LATER_RELATION = "later_test_reproduction_of_gap";
+const SSE_LATER_CLASSIFICATION = "TWO_ACTOR_ASSISTANT_STREAM_MARKER_NOT_OBSERVED";
+const UI_LATER_CLASSIFICATION = "TWO_ACTOR_UI_ASSETS_NOT_SERVED";
+const CAPTURE_SSE_LATER_GAP = process.env.ZODE_CAPTURE_TWO_ACTOR_SSE_LATER_GAP === "1";
+const CAPTURE_UI_LATER_GAP = process.env.ZODE_CAPTURE_TWO_ACTOR_UI_LATER_GAP === "1";
+const CAPTURE_ENDPOINT_REPLAY = process.env.ZODE_CAPTURE_TWO_ACTOR_ENDPOINT_REPLAY === "1";
+const PROMOTE_ENDPOINT_REPLAY = process.env.ZODE_PROMOTE_TWO_ACTOR_ENDPOINT_REPLAY === "1";
+const SSE_FIRST_GAP =
+  "target/test-recordings/quarantine/local-evidence-gaps/two-actor-sse-terminal-wait-first-gap.v1.json";
+const SSE_FIRST_GAP_SHA256 = "dca8187aa95581c10e0e0c848aece50bf3d10b7c89b4b9f39f795ef728f4568e";
+const UI_FIRST_GAP =
+  "target/test-recordings/quarantine/local-evidence-gaps/two-actor-ui-assets-mode-first-gap.v1.json";
+const UI_FIRST_GAP_SHA256 = "239cd0b931fcb43ac8bb0068088d98a0666cbbcc626ce4ff582ae2d93deeca32";
+const UI_SAFE_NOT_FOUND_CLASSIFICATION = "TWO_ACTOR_SAFE_NOT_FOUND_NOT_VISIBLE";
+const UI_SAFE_NOT_FOUND_FIRST_GAP =
+  "target/test-recordings/quarantine/local-evidence-gaps/two-actor-ui-safe-not-found-first-gap.v1.json";
+const UI_SAFE_NOT_FOUND_FIRST_GAP_SHA256 = "f8ca192f9d38a78c2c030162a6f216e269315b6f1b198fc69c05d5c3199136fa";
+const UI_SHARED_TRUST_CLASSIFICATION = "TWO_ACTOR_SHARED_TRUST_BOUNDARY_NOT_VISIBLE";
+const UI_SHARED_TRUST_FIRST_GAP =
+  "target/test-recordings/quarantine/local-evidence-gaps/two-actor-ui-shared-trust-boundary-first-gap.v1.json";
+const UI_SHARED_TRUST_FIRST_GAP_SHA256 = "e6a5138a2862dada84f9276e9ede8033015954e8f747334da742a9cc4b3bf7ec";
+const ASSISTANT_STREAM_TIMEOUT_MS = 20_000;
+const REPOSITORY_ROOT = resolve(CASSETTE_DIRECTORY, "../../../..");
+
+type AssistantStreamOutcome =
+  | "marker_observed"
+  | "stream_ended"
+  | "observation_timeout"
+  | "stream_error"
+  | "response_unavailable";
+
+class BrowserStreamObservationFailure extends Error {
+  readonly classification = SSE_LATER_CLASSIFICATION;
+
+  constructor(readonly observation: {
+    actor: AccessActor;
+    method: "GET";
+    path: string;
+    status: number;
+    outcome: AssistantStreamOutcome;
+    observedBytes: number;
+  }) {
+    super(
+      `relation=${LATER_RELATION}; the bounded public SSE observation did not contain the expected assistant marker`,
+    );
+    this.name = "BrowserStreamObservationFailure";
+  }
+}
+
+class BrowserUiObservationFailure extends Error {
+  constructor(
+    readonly owningE2e: typeof ISOLATION_E2E | typeof PROFILE_E2E,
+    readonly classification: string,
+    readonly originalGap: string,
+    readonly originalGapSha256: string,
+    message: string,
+    readonly observation: {
+      actor: AccessActor;
+      method: "GET";
+      path: string;
+      status: number;
+      outcome:
+        | "visible_marker_missing"
+        | "safe_not_found_not_visible"
+        | "shared_trust_boundary_not_visible";
+      observedBytes: number;
+    },
+  ) {
+    super(`relation=${LATER_RELATION}; ${message}`);
+    this.name = "BrowserUiObservationFailure";
+  }
+}
+
+type RetainableBrowserObservationFailure =
+  | BrowserStreamObservationFailure
+  | BrowserUiObservationFailure;
+
+type EndpointReplayCassette = {
+  schema: "zode.web-two-actor-endpoint-replay.v1";
+  version: 1;
+  recording_id: string;
+  owner: typeof ISOLATION_E2E | typeof PROFILE_E2E;
+  boundary: "server_endpoint_http";
+  relation: typeof LATER_RELATION;
+  purpose: string;
+  source_incident: {
+    recording_id: string;
+    whole_digest: string;
+  };
+  endpoint_exchanges: EndpointCassetteExchange[];
+  source_digest: string;
+  whole_digest: string;
+};
 
 type PublicResponse = {
   status: number;
@@ -52,8 +157,6 @@ type SessionAdmission = {
   response: PublicResponse;
   idempotencyKey: string;
 };
-
-type RecorderMode = "live" | "replay";
 
 function isExpectedActorIsolationNotFound(actor: AccessActor, method: string, path: string): boolean {
   if (actor !== "actor-b") return false;
@@ -92,6 +195,7 @@ function isRelevantBrowserPath(path: string): boolean {
     || pathname === "/providers"
     || pathname === "/endpoints"
     || pathname === "/sessions"
+    || (CAPTURE_UI_LATER_GAP && /^\/endpoints\/[^/]+\/sessions\/[^/]+$/.test(pathname))
     || pathname.startsWith("/v1/");
 }
 
@@ -100,20 +204,14 @@ class ExchangeRecorder {
   private dynamicIds: string[] = [];
   private firstFailure: { exchange: RecordedExchange; classification: CassetteClassification["kind"] } | undefined;
   private readonly browserRequests = new Map<unknown, RecordedExchange>();
-  private readonly replayResponses = new Map<RecordedExchange, RecordedExchange>();
-  private readonly replayExpected: RecordedExchange[] | undefined;
-  private replayIndex = 0;
-  private replayError: string | null = null;
   private readonly pendingCaptures: Promise<void>[] = [];
   private readonly attachedPages = new WeakSet<Page>();
 
   constructor(
     private readonly secrets: string[],
-    replayExpected: RecordedExchange[] | undefined,
     private readonly classificationContract: CassetteClassification,
-  ) {
-    this.replayExpected = replayExpected;
-  }
+    private readonly positiveCatalogBarrierContract: RecordedExchange | undefined,
+  ) {}
 
   arm(dynamicIds: string[]): void {
     this.dynamicIds = dynamicIds.filter(Boolean);
@@ -173,7 +271,6 @@ class ExchangeRecorder {
       };
       this.observed.push(item);
       this.browserRequests.set(request, item);
-      this.consumeReplayRequest(item);
     });
     page.on("response", (response) => {
       const item = this.browserRequests.get(response.request());
@@ -194,32 +291,6 @@ class ExchangeRecorder {
       if (!item) return;
       this.completeItem(item, "", 0, {}, false, "disconnect");
     });
-  }
-
-  private consumeReplayRequest(actual: RecordedExchange): void {
-    if (!this.replayExpected) return;
-    const expected = this.replayExpected[this.replayIndex];
-    if (!expected) {
-      this.replayError ??= `browser cassette has an unexpected exchange ${actual.sequence}`;
-      return;
-    }
-    const mismatch = this.requestMismatch(expected, actual);
-    if (mismatch) {
-      this.replayError ??= `browser cassette exchange ${expected.sequence} changed: ${mismatch}`;
-      return;
-    }
-    this.replayResponses.set(actual, expected);
-    this.replayIndex += 1;
-  }
-
-  private requestMismatch(expected: RecordedExchange, actual: RecordedExchange): string | null {
-    if (expected.actor !== actual.actor) return "actor changed";
-    if (expected.method !== actual.method) return "method changed";
-    if (expected.path !== actual.path) return `path ${actual.path} != ${expected.path}`;
-    if (JSON.stringify(expected.request.semanticHeaders) !== JSON.stringify(actual.request.semanticHeaders)) return "request semantic headers changed";
-    if (expected.request.bodyHex !== actual.request.bodyHex) return "request body changed";
-    if (expected.request.bodySha256 !== actual.request.bodySha256) return "request body digest changed";
-    return null;
   }
 
   private completeItem(
@@ -243,23 +314,33 @@ class ExchangeRecorder {
     item.response.termination = termination;
     item.response.responseCode = findSafeResponseCode(responseBody.canonicalJson);
     item.response.completed = completed;
-    const expected = this.replayResponses.get(item);
-    if (expected) {
-      const mismatch = this.responseMismatch(expected, item);
-      if (mismatch) this.replayError ??= `browser cassette exchange ${expected.sequence} changed: ${mismatch}`;
-    }
   }
 
-  private responseMismatch(expected: RecordedExchange, actual: RecordedExchange): string | null {
-    if (expected.response.status !== actual.response.status) return `status ${actual.response.status} != ${expected.response.status}`;
-    if (JSON.stringify(expected.response.semanticHeaders) !== JSON.stringify(actual.response.semanticHeaders)) return "response semantic headers changed";
-    if (expected.response.bodyHex !== actual.response.bodyHex) return "response body changed";
-    if (expected.response.bodySha256 !== actual.response.bodySha256) return "response body digest changed";
-    const expectedChunks = expected.response.chunks.map(({ sequence, bodyHex, bodySha256 }) => ({ sequence, bodyHex, bodySha256 }));
-    const actualChunks = actual.response.chunks.map(({ sequence, bodyHex, bodySha256 }) => ({ sequence, bodyHex, bodySha256 }));
-    if (JSON.stringify(expectedChunks) !== JSON.stringify(actualChunks)) return "response chunks changed";
-    if (expected.response.termination !== actual.response.termination) return "response termination changed";
-    if (expected.response.completed !== actual.response.completed) return "response completion changed";
+  private positiveCatalogBarrierMismatch(actual: RecordedExchange): string | null {
+    const barrier = this.classificationContract.positive_catalog_barrier;
+    const expected = this.positiveCatalogBarrierContract;
+    if (!barrier.observed || !expected || barrier.exchange_sequence === null) {
+      return "positive catalog barrier contract is unavailable";
+    }
+    if (actual.sequence !== barrier.exchange_sequence) return "positive catalog barrier sequence changed";
+    if (actual.actor !== expected.actor) return "positive catalog barrier actor changed";
+    if (actual.method !== expected.method) return "positive catalog barrier method changed";
+    if (actual.path !== expected.path) return "positive catalog barrier path changed";
+    if (actual.response.status !== barrier.expected_status) {
+      return `positive catalog barrier status ${actual.response.status} != ${barrier.expected_status}`;
+    }
+    if (actual.response.completed !== true || actual.response.termination !== "complete") {
+      return "positive catalog barrier did not terminate completely";
+    }
+    const expectedSchema = expected.response.canonicalJson?.schema;
+    if (
+      typeof expectedSchema !== "string"
+      || !actual.response.canonicalJson
+      || typeof actual.response.canonicalJson !== "object"
+      || actual.response.canonicalJson.schema !== expectedSchema
+    ) {
+      return "positive catalog barrier schema changed";
+    }
     return null;
   }
 
@@ -274,11 +355,14 @@ class ExchangeRecorder {
     }
     const barrier = this.classificationContract.positive_catalog_barrier;
     if (barrier.observed) {
-      const barrierExchange = this.observed.find((item) =>
-        barrier.exact_response !== null && cassetteExactResponseMatches(item.response, barrier.exact_response),
-      );
-      if (!barrierExchange || barrierExchange.sequence !== barrier.exchange_sequence || barrierExchange.response.status !== barrier.expected_status) {
-        throw new Error("positive catalog barrier no longer matches the cassette contract");
+      const barrierExchange = barrier.exchange_sequence === null
+        ? undefined
+        : this.observed[barrier.exchange_sequence];
+      const mismatch = barrierExchange
+        ? this.positiveCatalogBarrierMismatch(barrierExchange)
+        : "positive catalog barrier was not observed";
+      if (mismatch) {
+        throw new Error(`positive catalog barrier no longer matches the public contract: ${mismatch}`);
       }
     } else if (this.classificationContract.kind !== "evidence_gap_no_positive_catalog_barrier") {
       throw new Error("cassette classification claims evidence without a positive catalog barrier");
@@ -317,21 +401,19 @@ class ExchangeRecorder {
     await Promise.all(this.pendingCaptures.splice(0));
   }
 
-  async assertReplayConsumed(): Promise<void> {
-    await this.flush();
-    if (!this.replayExpected) return;
-    if (this.replayError) throw new Error(this.replayError);
-    if (this.replayIndex !== this.replayExpected.length) {
-      throw new Error(`browser cassette consumed ${this.replayIndex}/${this.replayExpected.length} exchanges`);
-    }
-  }
-
   isBrowserPage(page: Page): boolean {
     return this.attachedPages.has(page);
   }
 
   values(): RecordedExchange[] {
     return [...this.observed];
+  }
+
+  latestExchange(actor: AccessActor, method: string, path: string): RecordedExchange | undefined {
+    const normalizedPath = browserPath(path, this.dynamicIds);
+    return [...this.observed].reverse().find((item) =>
+      item.actor === actor && item.method === method && item.path === normalizedPath,
+    );
   }
 
   firstObserved(): { exchange: RecordedExchange; classification: CassetteClassification["kind"] } | undefined {
@@ -346,8 +428,623 @@ function findSafeResponseCode(value: unknown): string | null {
   return null;
 }
 
-function mode(): RecorderMode {
-  return process.env.ZODE_WEB_TWO_ACTOR_MODE === "replay" ? "replay" : "live";
+async function syncDirectory(directory: string): Promise<void> {
+  const handle = await open(directory, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function writePrivateDurableJson(path: string, value: unknown): Promise<void> {
+  const handle = await open(path, "wx", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await chmod(path, 0o600);
+  await syncDirectory(dirname(path));
+}
+
+const MAX_ENDPOINT_REPLAY_EXCHANGES = 128;
+const MAX_ENDPOINT_REPLAY_BODY_BYTES = 8 * 1024 * 1024;
+const MAX_ENDPOINT_REPLAY_TOTAL_BYTES = 24 * 1024 * 1024;
+const MAX_ENDPOINT_REPLAY_FILE_BYTES = 64 * 1024 * 1024;
+const ENDPOINT_REPLAY_HEADERS = new Set([
+  "accept",
+  "cache-control",
+  "content-length",
+  "content-type",
+  "idempotency-key",
+  "last-event-id",
+  "location",
+]);
+
+function sha256Hex(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function decodeCanonicalHex(value: unknown, label: string): Buffer {
+  if (
+    typeof value !== "string"
+    || value.length > MAX_ENDPOINT_REPLAY_BODY_BYTES * 2
+    || !/^(?:[0-9a-f]{2})*$/.test(value)
+  ) {
+    throw new Error(`two-actor Endpoint replay ${label} is not canonical bounded hex`);
+  }
+  const decoded = Buffer.from(value, "hex");
+  if (decoded.toString("hex") !== value) {
+    throw new Error(`two-actor Endpoint replay ${label} changed while decoding`);
+  }
+  return decoded;
+}
+
+function validateSemanticHeaderMap(value: unknown, label: string): asserts value is Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`two-actor Endpoint replay ${label} headers are invalid`);
+  }
+  for (const [name, headerValue] of Object.entries(value)) {
+    if (
+      name !== name.toLowerCase()
+      || !ENDPOINT_REPLAY_HEADERS.has(name)
+      || typeof headerValue !== "string"
+      || Buffer.byteLength(headerValue) > 8 * 1024
+    ) {
+      throw new Error(`two-actor Endpoint replay ${label} header is invalid`);
+    }
+  }
+}
+
+function replayForbiddenMarkers(): string[] {
+  const markerValues = [PROVIDER_SECRET, ENDPOINT_CONTROL_SECRET];
+  const encodedMarkers = markerValues.flatMap((marker) => [
+    marker,
+    Buffer.from(marker).toString("base64"),
+    Buffer.from(marker).toString("base64url"),
+    Buffer.from(marker).toString("hex"),
+    encodeURIComponent(marker),
+  ]);
+  return [...encodedMarkers, "cf-access-jwt-assertion", "authorization", "cookie"];
+}
+
+function assertReplayTextSecretSafe(value: string, label: string): void {
+  const lowered = value.toLowerCase();
+  for (const forbidden of replayForbiddenMarkers()) {
+    if (lowered.includes(forbidden.toLowerCase())) {
+      throw new Error(`two-actor Endpoint replay ${label} contains forbidden credential material`);
+    }
+  }
+}
+
+function assertReplaySecretSafe(metadata: unknown, decodedBodies: Buffer[]): void {
+  assertReplayTextSecretSafe(JSON.stringify(metadata), "cassette");
+  for (const body of decodedBodies) {
+    assertReplayTextSecretSafe(body.toString("utf8"), "decoded bytes");
+  }
+}
+
+function hasExactKeys(value: unknown, expectedKeys: readonly string[]): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...expectedKeys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+const ENDPOINT_REPLAY_TOP_LEVEL_KEYS = [
+  "schema",
+  "version",
+  "recording_id",
+  "owner",
+  "boundary",
+  "relation",
+  "purpose",
+  "source_incident",
+  "endpoint_exchanges",
+  "source_digest",
+  "whole_digest",
+] as const;
+const ENDPOINT_REPLAY_EXCHANGE_KEYS = [
+  "sequence",
+  "method",
+  "path",
+  "subjectSlot",
+  "controllerAuth",
+  "idempotencyKey",
+  "requestHeaders",
+  "requestBodyHex",
+  "requestBodyDigest",
+  "status",
+  "responseHeaders",
+  "responseBodyHex",
+  "responseBodyDigest",
+  "responseChunks",
+  "termination",
+  "responseCode",
+  "completed",
+] as const;
+
+function assertCanonicalReplayBytes(bytes: Buffer, replay: EndpointReplayCassette): void {
+  const canonical = Buffer.from(`${JSON.stringify(replay, null, 2)}\n`, "utf8");
+  if (!bytes.equals(canonical)) {
+    throw new Error("two-actor Endpoint replay cassette is not canonical JSON or contains duplicate keys");
+  }
+}
+
+async function readExactlyAt(
+  handle: Awaited<ReturnType<typeof open>>,
+  size: number,
+): Promise<Buffer> {
+  const bytes = Buffer.alloc(size);
+  let offset = 0;
+  while (offset < size) {
+    const result = await handle.read(bytes, offset, size - offset, offset);
+    if (result.bytesRead === 0) {
+      throw new Error("two-actor Endpoint replay source ended during bounded read");
+    }
+    offset += result.bytesRead;
+  }
+  return bytes;
+}
+
+async function readStableBoundedBytes(
+  handle: Awaited<ReturnType<typeof open>>,
+  expectedSize: number,
+): Promise<Buffer> {
+  if (!Number.isSafeInteger(expectedSize) || expectedSize <= 0 || expectedSize > MAX_ENDPOINT_REPLAY_FILE_BYTES) {
+    throw new Error("two-actor Endpoint replay source exceeds the file bound");
+  }
+  const first = await readExactlyAt(handle, expectedSize);
+  const second = await readExactlyAt(handle, expectedSize);
+  const after = await handle.stat();
+  if (after.size !== expectedSize || !first.equals(second)) {
+    throw new Error("two-actor Endpoint replay source changed during bounded read");
+  }
+  assertReplayTextSecretSafe(first.toString("utf8"), "raw bytes");
+  return first;
+}
+
+function validateEndpointReplayCassette(
+  replay: EndpointReplayCassette,
+  owner: typeof ISOLATION_E2E | typeof PROFILE_E2E,
+  recordingId: string,
+  incident: IncidentCassette,
+): void {
+  if (
+    !hasExactKeys(replay, ENDPOINT_REPLAY_TOP_LEVEL_KEYS)
+    || replay.schema !== "zode.web-two-actor-endpoint-replay.v1"
+    || replay.version !== 1
+    || replay.recording_id !== recordingId
+    || replay.owner !== owner
+    || replay.boundary !== "server_endpoint_http"
+    || replay.relation !== LATER_RELATION
+    || typeof replay.purpose !== "string"
+    || replay.purpose.length === 0
+    || replay.purpose.length > 4_096
+    || !hasExactKeys(replay.source_incident, ["recording_id", "whole_digest"])
+    || replay.source_incident?.recording_id !== incident.recording_id
+    || replay.source_incident?.whole_digest !== incident.whole_digest
+    || !Array.isArray(replay.endpoint_exchanges)
+    || replay.endpoint_exchanges.length === 0
+    || replay.endpoint_exchanges.length > MAX_ENDPOINT_REPLAY_EXCHANGES
+    || replay.source_digest !== jsonDigest(replay.endpoint_exchanges)
+    || !/^sha256:[0-9a-f]{64}$/.test(replay.whole_digest)
+  ) {
+    throw new Error("two-actor Endpoint replay cassette metadata is invalid");
+  }
+  const { whole_digest: wholeDigest, ...unsigned } = replay;
+  if (wholeDigest !== jsonDigest(unsigned)) {
+    throw new Error("two-actor Endpoint replay cassette integrity changed");
+  }
+
+  const decodedBodies: Buffer[] = [];
+  let totalBytes = 0;
+  for (const [index, exchange] of replay.endpoint_exchanges.entries()) {
+    if (
+      !hasExactKeys(exchange, ENDPOINT_REPLAY_EXCHANGE_KEYS)
+      || exchange.sequence !== index
+      || typeof exchange.method !== "string"
+      || !/^[A-Z]{3,16}$/.test(exchange.method)
+      || typeof exchange.path !== "string"
+      || !exchange.path.startsWith("/")
+      || Buffer.byteLength(exchange.path) > 16 * 1024
+      || typeof exchange.subjectSlot !== "string"
+      || !/^(?:none|subject-[1-9][0-9]*)$/.test(exchange.subjectSlot)
+      || !["shared", "unexpected"].includes(exchange.controllerAuth)
+      || (exchange.idempotencyKey !== null
+        && (typeof exchange.idempotencyKey !== "string" || Buffer.byteLength(exchange.idempotencyKey) > 8 * 1024))
+      || !Number.isInteger(exchange.status)
+      || exchange.status < 100
+      || exchange.status > 599
+      || !["complete", "disconnect", "error"].includes(exchange.termination)
+      || exchange.completed !== (exchange.termination === "complete")
+      || (exchange.responseCode !== null
+        && (typeof exchange.responseCode !== "string" || Buffer.byteLength(exchange.responseCode) > 8 * 1024))
+      || !Array.isArray(exchange.responseChunks)
+      || exchange.responseChunks.length > 4_096
+    ) {
+      throw new Error(`two-actor Endpoint replay exchange ${index} metadata is invalid`);
+    }
+    validateSemanticHeaderMap(exchange.requestHeaders, `exchange ${index} request`);
+    validateSemanticHeaderMap(exchange.responseHeaders, `exchange ${index} response`);
+
+    const requestBody = decodeCanonicalHex(exchange.requestBodyHex, `exchange ${index} request body`);
+    if (!/^[0-9a-f]{64}$/.test(exchange.requestBodyDigest) || sha256Hex(requestBody) !== exchange.requestBodyDigest) {
+      throw new Error(`two-actor Endpoint replay exchange ${index} request digest changed`);
+    }
+    decodedBodies.push(requestBody);
+    totalBytes += requestBody.byteLength;
+
+    if ((exchange.responseBodyHex === null) !== (exchange.responseBodyDigest === null)) {
+      throw new Error(`two-actor Endpoint replay exchange ${index} response body metadata is incomplete`);
+    }
+    const responseBody = exchange.responseBodyHex === null
+      ? Buffer.alloc(0)
+      : decodeCanonicalHex(exchange.responseBodyHex, `exchange ${index} response body`);
+    if (
+      exchange.responseBodyDigest !== null
+      && (!/^[0-9a-f]{64}$/.test(exchange.responseBodyDigest) || sha256Hex(responseBody) !== exchange.responseBodyDigest)
+    ) {
+      throw new Error(`two-actor Endpoint replay exchange ${index} response digest changed`);
+    }
+
+    const chunkBodies = exchange.responseChunks.map((chunk, chunkIndex) => {
+      if (
+        !hasExactKeys(chunk, ["sequence", "bodyHex", "bodySha256", "offsetMs"])
+        || chunk.sequence !== chunkIndex
+        || typeof chunk.offsetMs !== "number"
+        || !Number.isFinite(chunk.offsetMs)
+        || chunk.offsetMs < 0
+      ) {
+        throw new Error(`two-actor Endpoint replay exchange ${index} chunk ${chunkIndex} metadata is invalid`);
+      }
+      const body = decodeCanonicalHex(chunk.bodyHex, `exchange ${index} chunk ${chunkIndex}`);
+      if (chunk.bodySha256 !== `sha256:${sha256Hex(body)}`) {
+        throw new Error(`two-actor Endpoint replay exchange ${index} chunk ${chunkIndex} digest changed`);
+      }
+      decodedBodies.push(body);
+      totalBytes += body.byteLength;
+      return body;
+    });
+    const concatenatedChunks = Buffer.concat(chunkBodies);
+    if (!concatenatedChunks.equals(responseBody)) {
+      throw new Error(`two-actor Endpoint replay exchange ${index} chunks do not equal the complete response body`);
+    }
+    if (exchange.responseBodyHex === null && exchange.responseChunks.length !== 0) {
+      throw new Error(`two-actor Endpoint replay exchange ${index} has chunks without a response body`);
+    }
+    decodedBodies.push(responseBody);
+    totalBytes += responseBody.byteLength;
+    if (totalBytes > MAX_ENDPOINT_REPLAY_TOTAL_BYTES) {
+      throw new Error("two-actor Endpoint replay cassette exceeds the decoded byte bound");
+    }
+  }
+  assertReplaySecretSafe(replay, decodedBodies);
+}
+
+function sameFileIdentity(left: Awaited<ReturnType<typeof lstat>>, right: Awaited<ReturnType<typeof lstat>>): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function readReplayBytesWithoutLinks(path: string, allowedMode: number): Promise<Buffer> {
+  const before = await lstat(path);
+  if (
+    !before.isFile()
+    || before.isSymbolicLink()
+    || before.nlink !== 1
+    || (before.mode & 0o777) !== allowedMode
+    || before.size <= 0
+    || before.size > MAX_ENDPOINT_REPLAY_FILE_BYTES
+  ) {
+    throw new Error("two-actor Endpoint replay source is not a regular file with the required mode");
+  }
+  const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || !sameFileIdentity(before, opened) || opened.size !== before.size) {
+      throw new Error("two-actor Endpoint replay source changed during open");
+    }
+    return await readStableBoundedBytes(handle, opened.size);
+  } finally {
+    await handle.close();
+  }
+}
+
+function parseEndpointReplayCassette(
+  bytes: Buffer,
+  owner: typeof ISOLATION_E2E | typeof PROFILE_E2E,
+  recordingId: string,
+  incident: IncidentCassette,
+): EndpointReplayCassette {
+  if (bytes.byteLength <= 0 || bytes.byteLength > MAX_ENDPOINT_REPLAY_FILE_BYTES) {
+    throw new Error("two-actor Endpoint replay cassette exceeds the file bound");
+  }
+  assertReplayTextSecretSafe(bytes.toString("utf8"), "raw bytes");
+  const replay = JSON.parse(bytes.toString("utf8")) as EndpointReplayCassette;
+  validateEndpointReplayCassette(replay, owner, recordingId, incident);
+  assertCanonicalReplayBytes(bytes, replay);
+  return replay;
+}
+
+async function readEndpointReplayCassette(
+  path: string,
+  owner: typeof ISOLATION_E2E | typeof PROFILE_E2E,
+  recordingId: string,
+  incident: IncidentCassette,
+): Promise<EndpointReplayCassette> {
+  const before = await lstat(path);
+  const checkoutMode = before.mode & 0o777;
+  if (
+    !before.isFile()
+    || before.isSymbolicLink()
+    || before.nlink !== 1
+    || ![0o444, 0o644].includes(checkoutMode)
+    || before.size <= 0
+    || before.size > MAX_ENDPOINT_REPLAY_FILE_BYTES
+  ) {
+    throw new Error("two-actor Endpoint replay cassette is not a checkout-safe regular file");
+  }
+  const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let normalized = false;
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || !sameFileIdentity(before, opened) || opened.size !== before.size) {
+      throw new Error("two-actor Endpoint replay cassette changed during open");
+    }
+    const replay = parseEndpointReplayCassette(
+      await readStableBoundedBytes(handle, opened.size),
+      owner,
+      recordingId,
+      incident,
+    );
+    if (checkoutMode === 0o644) {
+      await handle.chmod(0o444);
+      await handle.sync();
+      normalized = true;
+    }
+    return replay;
+  } finally {
+    await handle.close();
+    if (normalized) await syncDirectory(dirname(path));
+    const after = await lstat(path);
+    if (!sameFileIdentity(before, after) || !after.isFile() || (after.mode & 0o777) !== 0o444) {
+      throw new Error("two-actor Endpoint replay cassette is not immutable after validation");
+    }
+  }
+}
+
+async function pathMatchesFileIdentity(
+  path: string,
+  identity: Awaited<ReturnType<typeof lstat>>,
+): Promise<boolean> {
+  try {
+    const current = await lstat(path);
+    return current.isFile() && !current.isSymbolicLink() && sameFileIdentity(current, identity);
+  } catch {
+    return false;
+  }
+}
+
+async function promoteEndpointReplayCandidate(
+  candidatePath: string,
+  destinationPath: string,
+  owner: typeof ISOLATION_E2E | typeof PROFILE_E2E,
+  recordingId: string,
+  incident: IncidentCassette,
+): Promise<void> {
+  const bytes = await readReplayBytesWithoutLinks(candidatePath, 0o600);
+  parseEndpointReplayCassette(bytes, owner, recordingId, incident);
+  const destinationDirectory = dirname(destinationPath);
+  const destinationDirectoryMetadata = await lstat(destinationDirectory);
+  if (
+    !destinationDirectoryMetadata.isDirectory()
+    || destinationDirectoryMetadata.isSymbolicLink()
+    || await realpath(destinationDirectory) !== resolve(destinationDirectory)
+  ) {
+    throw new Error("two-actor Endpoint replay destination directory is not a confined regular directory");
+  }
+  const temporaryPath = join(
+    destinationDirectory,
+    `.${basename(destinationPath)}.tmp-${process.pid}-${randomUUID()}`,
+  );
+  let temporaryCreated = false;
+  let destinationLinked = false;
+  let createdIdentity: Awaited<ReturnType<typeof lstat>> | undefined;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporaryPath, "wx+", 0o600);
+    temporaryCreated = true;
+    createdIdentity = await handle.stat();
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await handle.chmod(0o444);
+    await handle.sync();
+    const written = await readStableBoundedBytes(handle, bytes.byteLength);
+    if (!written.equals(bytes)) {
+      throw new Error("two-actor Endpoint replay promotion changed the validated bytes");
+    }
+    parseEndpointReplayCassette(written, owner, recordingId, incident);
+    await link(temporaryPath, destinationPath);
+    destinationLinked = true;
+    const linked = await lstat(destinationPath);
+    if (
+      !createdIdentity
+      || !sameFileIdentity(createdIdentity, linked)
+      || linked.nlink !== 2
+      || (linked.mode & 0o777) !== 0o444
+    ) {
+      throw new Error("two-actor Endpoint replay promotion did not create the validated inode");
+    }
+    if (!await pathMatchesFileIdentity(temporaryPath, createdIdentity)) {
+      throw new Error("two-actor Endpoint replay temporary inode changed before publication");
+    }
+    await unlink(temporaryPath);
+    temporaryCreated = false;
+    await syncDirectory(destinationDirectory);
+    const published = await lstat(destinationPath);
+    if (
+      !sameFileIdentity(createdIdentity, published)
+      || published.nlink !== 1
+      || (published.mode & 0o777) !== 0o444
+    ) {
+      throw new Error("two-actor Endpoint replay published inode changed before completion");
+    }
+    await handle.close();
+    handle = undefined;
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    if (destinationLinked && createdIdentity && await pathMatchesFileIdentity(destinationPath, createdIdentity)) {
+      await unlink(destinationPath).catch(() => undefined);
+    }
+    if (temporaryCreated && createdIdentity && await pathMatchesFileIdentity(temporaryPath, createdIdentity)) {
+      await unlink(temporaryPath).catch(() => undefined);
+    }
+    await syncDirectory(destinationDirectory).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function retainEndpointReplayCandidate(
+  owner: typeof ISOLATION_E2E | typeof PROFILE_E2E,
+  recordingId: string,
+  incident: IncidentCassette,
+  endpointExchanges: EndpointCassetteExchange[],
+): Promise<string> {
+  if (!incident.whole_digest) throw new Error("the source incident cassette has no integrity digest");
+  const unsigned = {
+    schema: "zode.web-two-actor-endpoint-replay.v1" as const,
+    version: 1 as const,
+    recording_id: recordingId,
+    owner,
+    boundary: "server_endpoint_http" as const,
+    relation: LATER_RELATION,
+    purpose:
+      "Replay the complete secret-safe Server-to-Endpoint transcript through the same real browser and real processes while retaining the original incident cassette as first-occurrence provenance.",
+    source_incident: {
+      recording_id: incident.recording_id,
+      whole_digest: incident.whole_digest,
+    },
+    endpoint_exchanges: endpointExchanges,
+    source_digest: jsonDigest(endpointExchanges),
+  };
+  const replay: EndpointReplayCassette = {
+    ...unsigned,
+    whole_digest: jsonDigest(unsigned),
+  };
+  validateEndpointReplayCassette(replay, owner, recordingId, incident);
+  const quarantineRoot = resolve(
+    process.env.ZODE_TEST_RECORDING_ROOT
+      ?? join(REPOSITORY_ROOT, "target/test-recordings/quarantine"),
+  );
+  await mkdir(quarantineRoot, { recursive: true, mode: 0o700 });
+  const runRoot = await mkdtemp(join(quarantineRoot, "two-actor-endpoint-replay-"));
+  await chmod(runRoot, 0o700);
+  await syncDirectory(quarantineRoot);
+  const path = join(runRoot, `${recordingId}.json`);
+  await writePrivateDurableJson(path, replay);
+  return path;
+}
+
+async function retainLaterBrowserObservation(
+  failure: RetainableBrowserObservationFailure,
+  exchange: RecordedExchange,
+): Promise<string> {
+  const streamFailure = failure instanceof BrowserStreamObservationFailure;
+  const originalGap = streamFailure ? SSE_FIRST_GAP : failure.originalGap;
+  const expectedGapDigest = streamFailure ? SSE_FIRST_GAP_SHA256 : failure.originalGapSha256;
+  const gapPath = resolve(REPOSITORY_ROOT, originalGap);
+  const gapBytes = await readFile(gapPath);
+  const gapDigest = createHash("sha256").update(gapBytes).digest("hex");
+  if (gapDigest !== expectedGapDigest) {
+    throw new Error("the original two-actor browser evidence gap digest changed");
+  }
+  const safetyText = JSON.stringify(exchange).toLowerCase();
+  for (const forbidden of [
+    PROVIDER_SECRET,
+    ENDPOINT_CONTROL_SECRET,
+    "cf-access-jwt-assertion",
+    "authorization",
+    "cookie",
+  ]) {
+    if (safetyText.includes(forbidden.toLowerCase())) {
+      throw new Error("the later two-actor browser observation contains forbidden credential material");
+    }
+  }
+  const quarantineRoot = resolve(
+    process.env.ZODE_TEST_RECORDING_ROOT
+      ?? join(REPOSITORY_ROOT, "target/test-recordings/quarantine"),
+  );
+  await mkdir(quarantineRoot, { recursive: true, mode: 0o700 });
+  const runRoot = await mkdtemp(join(quarantineRoot, streamFailure ? "two-actor-sse-later-" : "two-actor-ui-later-"));
+  await chmod(runRoot, 0o700);
+  await syncDirectory(quarantineRoot);
+  const unsigned = {
+    schema: "zode.evidence-gap-later-reproduction.v1",
+    version: 1,
+    owning_e2e: streamFailure ? ISOLATION_E2E : failure.owningE2e,
+    recording_id: basename(runRoot),
+    relation: LATER_RELATION,
+    original_evidence_gap: originalGap,
+    original_evidence_gap_sha256: expectedGapDigest,
+    classification: failure.classification,
+    first_observed: {
+      actor: failure.observation.actor,
+      method: failure.observation.method,
+      path: exchange.path,
+      status: failure.observation.status,
+      observation_outcome: failure.observation.outcome,
+      observed_bytes: failure.observation.observedBytes,
+      expected_marker_observed: false,
+    },
+    secret_safe_exchange_retained: true,
+    raw_exchange_retained: false,
+    public_sse_same_entry_replay_required: streamFailure,
+    browser_behavior_replay_required: !streamFailure,
+    do_not_relabel_as_first: true,
+    source_digest: jsonDigest(exchange),
+    exchange,
+  };
+  const metadata = {
+    ...unsigned,
+    integrity_sha256: jsonDigest(unsigned),
+  };
+  const path = join(runRoot, "observation.v1.json");
+  await writePrivateDurableJson(path, metadata);
+  return path;
+}
+
+async function retainRequestedBrowserObservation(
+  error: unknown,
+  recorder: ExchangeRecorder,
+): Promise<void> {
+  const failure =
+    error instanceof BrowserStreamObservationFailure && CAPTURE_SSE_LATER_GAP
+    || error instanceof BrowserUiObservationFailure && CAPTURE_UI_LATER_GAP
+      ? error
+      : undefined;
+  if (!failure) return;
+  const observed = recorder.latestExchange(
+    failure.observation.actor,
+    failure.observation.method,
+    failure.observation.path,
+  );
+  if (!observed) {
+    throw new AggregateError(
+      [error, new Error("the browser failure had no secret-safe public exchange")],
+      "two-actor later reproduction could not retain its public browser observation",
+    );
+  }
+  try {
+    const path = await retainLaterBrowserObservation(failure, observed);
+    process.stderr.write(`ZODE_E2E_TWO_ACTOR_LATER_OBSERVATION ${path}\n`);
+  } catch (captureError) {
+    throw new AggregateError(
+      [error, captureError],
+      "two-actor later reproduction failed together with its durable browser evidence capture",
+    );
+  }
 }
 
 function quarantineCassette(
@@ -450,9 +1147,11 @@ async function publicRequest(
   return result;
 }
 
-async function gotoPublic(page: Page, actor: AccessActor, baseUrl: string, path: string, recorder: ExchangeRecorder): Promise<void> {
+async function gotoPublic(page: Page, actor: AccessActor, baseUrl: string, path: string, recorder: ExchangeRecorder): Promise<number> {
   const response = await page.goto(`${baseUrl}${path}`, { waitUntil: "domcontentloaded" });
-  if (!recorder.isBrowserPage(page)) recorder.record(actor, "GET", path, undefined, response?.status() ?? 0, null);
+  const status = response?.status() ?? 0;
+  if (!recorder.isBrowserPage(page)) recorder.record(actor, "GET", path, undefined, status, null);
+  return status;
 }
 
 async function waitForReplicaReady(
@@ -486,25 +1185,68 @@ async function waitForAssistant(
   path: string,
   recorder: ExchangeRecorder,
 ): Promise<{ status: number; data: string }> {
-  const result = await page.evaluate(async ({ path, marker }) => {
+  const result = await page.evaluate(async ({ path, marker, timeoutMs }) => {
     const response = await fetch(path, { headers: { accept: "text/event-stream" } });
-    if (!response.ok || !response.body) return { status: response.status, data: "", headers: Object.fromEntries(response.headers.entries()) };
+    const headers = Object.fromEntries(response.headers.entries());
+    if (!response.ok || !response.body) {
+      return {
+        status: response.status,
+        data: "",
+        headers,
+        outcome: "response_unavailable" as const,
+      };
+    }
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let data = "";
-    const deadline = Date.now() + 20_000;
+    const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const next = await reader.read();
-      if (next.done) break;
-      data += decoder.decode(next.value, { stream: true });
+      const remaining = Math.max(1, deadline - Date.now());
+      const next = await new Promise<
+        | { kind: "read"; value: ReadableStreamReadResult<Uint8Array> }
+        | { kind: "timeout" }
+        | { kind: "error" }
+      >((resolveRead) => {
+        let settled = false;
+        const settle = (
+          value:
+            | { kind: "read"; value: ReadableStreamReadResult<Uint8Array> }
+            | { kind: "timeout" }
+            | { kind: "error" },
+        ) => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timer);
+          resolveRead(value);
+        };
+        const timer = window.setTimeout(() => settle({ kind: "timeout" }), remaining);
+        void reader.read()
+          .then((value) => settle({ kind: "read", value }))
+          .catch(() => settle({ kind: "error" }));
+      });
+      if (next.kind === "timeout") {
+        void reader.cancel().catch(() => undefined);
+        return { status: response.status, data, headers, outcome: "observation_timeout" as const };
+      }
+      if (next.kind === "error") {
+        void reader.cancel().catch(() => undefined);
+        return { status: response.status, data, headers, outcome: "stream_error" as const };
+      }
+      if (next.value.done) {
+        data += decoder.decode();
+        return { status: response.status, data, headers, outcome: "stream_ended" as const };
+      }
+      data += decoder.decode(next.value.value, { stream: true });
       if (data.includes(marker)) {
-        await reader.cancel().catch(() => undefined);
-        return { status: response.status, data, headers: Object.fromEntries(response.headers.entries()) };
+        void reader.cancel().catch(() => undefined);
+        return { status: response.status, data, headers, outcome: "marker_observed" as const };
       }
     }
-    return { status: response.status, data, headers: Object.fromEntries(response.headers.entries()) };
-  }, { path, marker: ASSISTANT_MARKER });
+    void reader.cancel().catch(() => undefined);
+    return { status: response.status, data, headers, outcome: "observation_timeout" as const };
+  }, { path, marker: ASSISTANT_MARKER, timeoutMs: ASSISTANT_STREAM_TIMEOUT_MS });
   if (recorder.isBrowserPage(page)) {
+    const completed = result.outcome === "stream_ended";
     recorder.completeBrowserResult(
       actor,
       "GET",
@@ -513,11 +1255,21 @@ async function waitForAssistant(
       result.status,
       result.data,
       result.headers,
-      result.data.length > 0,
-      "disconnect",
+      completed,
+      completed ? "complete" : result.outcome === "stream_error" ? "error" : "disconnect",
     );
   } else {
     recorder.record(actor, "GET", path, undefined, result.status, null);
+  }
+  if (result.outcome !== "marker_observed") {
+    throw new BrowserStreamObservationFailure({
+      actor,
+      method: "GET",
+      path,
+      status: result.status,
+      outcome: result.outcome,
+      observedBytes: Buffer.byteLength(result.data),
+    });
   }
   return result;
 }
@@ -602,9 +1354,28 @@ async function expectSharedProviderResource(
   expect(containsValue(endpointReplica, profileId)).toBe(true);
 
   await gotoPublic(page, "actor-b", stack.actorB.baseUrl, "/providers", recorder);
+  await expect(page.getByText(PROFILE_LABEL, { exact: true })).toBeVisible();
   const providerText = await page.locator("body").innerText();
   expect(providerText).toContain(PROFILE_LABEL);
-  expect(providerText).toMatch(/deployment[ -]shared|shared deployment/i);
+  try {
+    expect(providerText).toMatch(/deployment[ -]shared|shared deployment/i);
+  } catch {
+    throw new BrowserUiObservationFailure(
+      PROFILE_E2E,
+      UI_SHARED_TRUST_CLASSIFICATION,
+      UI_SHARED_TRUST_FIRST_GAP,
+      UI_SHARED_TRUST_FIRST_GAP_SHA256,
+      "the shared profile was available to the second admitted actor but the UI did not explain its deployment-shared trust boundary",
+      {
+        actor: "actor-b",
+        method: "GET",
+        path: `/v1/providers/${PROVIDER_NAME}/auth-profiles`,
+        status: profiles.status,
+        outcome: "shared_trust_boundary_not_visible",
+        observedBytes: Buffer.byteLength(providerText),
+      },
+    );
+  }
   expect(providerText).toMatch(/ready|installed|distributed/i);
   for (const forbidden of [/\bpersonal\b/i, /\bowner\b/i, /\bworkspace\b/i, /\brole\b/i, /\bgrant\b/i]) {
     expect(providerText).not.toMatch(forbidden);
@@ -623,6 +1394,10 @@ function isEndpointSessionPath(path: string): boolean {
   return path === "/v1/sessions" || /^\/v1\/sessions\/[^/]+(?:\/messages|\/events)?$/.test(path);
 }
 
+function isIdempotencyReceiptMiss(observation: EndpointObservation): boolean {
+  return observation.status === 404 && observation.responseCode === "idempotency_receipt_not_found";
+}
+
 function assertEndpointOwnershipTrace(
   stack: Awaited<ReturnType<typeof createTwoActorStack>>,
   admission: SessionAdmission,
@@ -639,19 +1414,35 @@ function assertEndpointOwnershipTrace(
       && observation.path === "/v1/sessions"
       && observation.idempotencyKey === admission.idempotencyKey,
   );
-  expect(createRequests.length).toBeGreaterThanOrEqual(3);
-  const actorASubject = createRequests[0]?.subject;
+  const receiptMisses = createRequests.filter(
+    isIdempotencyReceiptMiss,
+  );
+  expect(receiptMisses).toHaveLength(2);
+  const successfulCreates = createRequests.filter(
+    (observation) => observation.status === 201 && observation.responseCode === null,
+  );
+  expect(successfulCreates).toHaveLength(3);
+  const successfulCreatesBySubject = new Map<string, EndpointObservation[]>();
+  for (const observation of successfulCreates) {
+    const subject = observation.subject as string;
+    successfulCreatesBySubject.set(subject, [...successfulCreatesBySubject.get(subject) ?? [], observation]);
+  }
+  expect(successfulCreatesBySubject.size).toBe(2);
+  const actorACreates = [...successfulCreatesBySubject.values()].find((items) => items.length === 2) ?? [];
+  expect(actorACreates).toHaveLength(2);
+  const actorASubject = actorACreates[0]?.subject;
   expect(actorASubject).not.toBeNull();
-  const actorAReplay = createRequests.find((observation, index) => index > 0 && observation.subject === actorASubject);
-  expect(actorAReplay).toBeDefined();
-  expect(actorAReplay?.requestBodyDigest).toBe(createRequests[0]?.requestBodyDigest);
-  expect(actorAReplay?.status).toBe(createRequests[0]?.status);
-  expect(actorAReplay?.responseBodyDigest).toBe(createRequests[0]?.responseBodyDigest);
-  const actorBCreate = createRequests.find((observation) => observation.subject !== actorASubject);
+  expect(actorACreates[1]?.subject).toBe(actorASubject);
+  expect(actorACreates[1]?.requestBodyDigest).toBe(actorACreates[0]?.requestBodyDigest);
+  expect(actorACreates[1]?.responseBodyDigest).toBe(actorACreates[0]?.responseBodyDigest);
+  const actorBCreate = [...successfulCreatesBySubject.values()].find((items) => items.length === 1)?.[0];
   expect(actorBCreate).toBeDefined();
-  expect(actorBCreate?.requestBodyDigest).toBe(createRequests[0]?.requestBodyDigest);
+  expect(actorBCreate?.requestBodyDigest).toBe(actorACreates[0]?.requestBodyDigest);
   expect(actorBCreate?.status).toBe(201);
   expect(actorBCreate?.subject).not.toBe(actorASubject);
+  expect(new Set(receiptMisses.map((observation) => observation.subject))).toEqual(
+    new Set([actorASubject, actorBCreate?.subject]),
+  );
   const subjects = new Set(observations.map((observation) => observation.subject));
   expect(subjects.size).toBe(2);
   expect(observations.every((observation) => observation.subject === actorASubject || observation.subject === actorBCreate?.subject)).toBe(true);
@@ -662,17 +1453,31 @@ function assertEndpointOwnershipTrace(
     (observation) => observation.subject === actorASubject && observation.path.includes(actorASessionPath),
   );
   expect(actorAOwned.length).toBeGreaterThan(0);
-  expect(actorAOwned.every((observation) => observation.status !== 404)).toBe(true);
+  const actorAReceiptMisses = actorAOwned.filter(isIdempotencyReceiptMiss);
+  const actorAResolved = actorAOwned.filter((observation) => !isIdempotencyReceiptMiss(observation));
+  expect(actorAResolved.every((observation) => observation.status !== 404)).toBe(true);
+  for (const receiptMiss of actorAReceiptMisses) {
+    expect(actorAResolved.some((observation) =>
+      observation.method === receiptMiss.method
+      && observation.path === receiptMiss.path
+      && observation.idempotencyKey === receiptMiss.idempotencyKey
+      && observation.requestBodyDigest === receiptMiss.requestBodyDigest,
+    )).toBe(true);
+  }
 
   const actorAMessageRequests = observations.filter(
     (observation) => observation.subject === actorASubject
       && observation.path === `${actorASessionPath}/messages`
       && observation.idempotencyKey === SESSION_MESSAGE_IDEMPOTENCY_KEY,
   );
-  expect(actorAMessageRequests.length).toBeGreaterThanOrEqual(2);
-  expect(actorAMessageRequests[1]?.requestBodyDigest).toBe(actorAMessageRequests[0]?.requestBodyDigest);
-  expect(actorAMessageRequests[1]?.status).toBe(actorAMessageRequests[0]?.status);
-  expect(actorAMessageRequests[1]?.responseBodyDigest).toBe(actorAMessageRequests[0]?.responseBodyDigest);
+  expect(actorAMessageRequests.filter(isIdempotencyReceiptMiss)).toHaveLength(1);
+  const actorAResolvedMessages = actorAMessageRequests.filter(
+    (observation) => !isIdempotencyReceiptMiss(observation),
+  );
+  expect(actorAResolvedMessages).toHaveLength(2);
+  expect(actorAResolvedMessages[1]?.requestBodyDigest).toBe(actorAResolvedMessages[0]?.requestBodyDigest);
+  expect(actorAResolvedMessages[1]?.status).toBe(actorAResolvedMessages[0]?.status);
+  expect(actorAResolvedMessages[1]?.responseBodyDigest).toBe(actorAResolvedMessages[0]?.responseBodyDigest);
 
   const actorBSubject = actorBCreate?.subject;
   expect(actorBSubject).not.toBeNull();
@@ -687,8 +1492,11 @@ function assertEndpointOwnershipTrace(
       && observation.idempotencyKey === SESSION_MESSAGE_IDEMPOTENCY_KEY,
   );
   expect(actorBMessageRequests.length).toBeGreaterThanOrEqual(2);
-  expect(actorBMessageRequests[0]?.requestBodyDigest).toBe(actorAMessageRequests[0]?.requestBodyDigest);
+  expect(actorBMessageRequests[0]?.requestBodyDigest).toBe(actorAResolvedMessages[0]?.requestBodyDigest);
   expect(actorBMessageRequests.every((observation) => observation.status === 404)).toBe(true);
+  expect(new Set(actorBMessageRequests.map((observation) => observation.responseCode))).toEqual(
+    new Set(["idempotency_receipt_not_found", "session_not_found"]),
+  );
 
   const actorBOwned = observations.filter(
     (observation) => observation.subject === actorBSubject && observation.path.includes(actorBSessionPath),
@@ -703,7 +1511,7 @@ function escapeRegex(value: string): string {
 }
 
 function profileCard(page: Page, label: string) {
-  return page.getByRole("article", { name: new RegExp(escapeRegex(label)) });
+  return page.locator(".profile-row").filter({ has: page.getByText(label, { exact: true }) });
 }
 
 function distributionRow(card: ReturnType<typeof profileCard>, endpointLabel: string) {
@@ -712,12 +1520,12 @@ function distributionRow(card: ReturnType<typeof profileCard>, endpointLabel: st
 
 async function openProviders(page: Page): Promise<void> {
   await page.getByRole("link", { name: "Providers" }).click();
-  await expect(page.getByRole("heading", { name: "Providers" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Providers", exact: true })).toBeVisible();
 }
 
 async function openEndpoints(page: Page): Promise<void> {
   await page.getByRole("link", { name: "Endpoints" }).click();
-  await expect(page.getByRole("heading", { name: "Endpoints" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Endpoints", exact: true })).toBeVisible();
 }
 
 async function configureSharedResourcesViaUi(
@@ -727,13 +1535,15 @@ async function configureSharedResourcesViaUi(
   onProfileCreated?: (resource: { endpointId: string; profileId: string }) => void,
 ): Promise<{ endpointId: string; profileId: string; descriptorRevision: number; profileRevision: number }> {
   await page.goto(`${stack.actorA.baseUrl}/providers`, { waitUntil: "domcontentloaded" });
-  await expect(page.getByRole("heading", { name: "Providers" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Providers", exact: true })).toBeVisible();
   await openEndpoints(page);
   await page.getByRole("button", { name: "Add remote Endpoint" }).click();
   const endpointDialog = page.getByRole("dialog", { name: "Add remote Endpoint" });
   await endpointDialog.getByLabel("Endpoint label").fill(ENDPOINT_LABEL);
   await endpointDialog.getByLabel("Endpoint URL").fill(stack.endpointBaseUrl);
-  await endpointDialog.getByLabel("Controller credential (write-only)").fill(stack.endpointControlSecret);
+  const controllerCredential = endpointDialog.getByLabel("Controller credential");
+  await expect(controllerCredential).toHaveAttribute("type", "password");
+  await controllerCredential.fill(stack.endpointControlSecret);
   const endpointResponsePromise = page.waitForResponse(
     (response) => response.request().method() === "POST" && new URL(response.url()).pathname === "/v1/endpoints",
   );
@@ -744,15 +1554,21 @@ async function configureSharedResourcesViaUi(
   const endpointId = String(endpointBody.endpoint_id ?? "");
   expect(endpointId).not.toBe("");
   await expect(endpointDialog).toBeHidden();
-  await expect(page.getByRole("article", { name: new RegExp(escapeRegex(ENDPOINT_LABEL)) })).toContainText(/online|ready/i);
+  const endpointCard = page.locator("article.resource-card").filter({
+    has: page.getByRole("heading", { name: ENDPOINT_LABEL, exact: true }),
+  });
+  await expect(endpointCard).toHaveCount(1);
+  await expect(endpointCard).toContainText(/online|ready/i);
 
   await openProviders(page);
   await page.getByRole("button", { name: "Configure provider" }).click();
-  const providerDialog = page.getByRole("dialog", { name: "Configure provider" });
-  await providerDialog.getByLabel("Provider name").fill(PROVIDER_NAME);
+  const providerDialog = page.locator("form.editor-panel").filter({
+    has: page.getByRole("heading", { name: "Configure provider", exact: true }),
+  });
+  await providerDialog.getByLabel("Provider ID").fill(PROVIDER_NAME);
   await providerDialog.getByLabel("Provider kind").selectOption("openai_compatible");
-  await providerDialog.getByLabel("Execution base URL").fill(stack.providerBaseUrl);
-  await providerDialog.getByLabel("Model").fill(PROVIDER_MODEL);
+  await providerDialog.getByLabel("Base URL").fill(stack.providerBaseUrl);
+  await providerDialog.getByLabel("Models").fill(PROVIDER_MODEL);
   const descriptorResponsePromise = page.waitForResponse(
     (response) => response.request().method() === "PUT" && new URL(response.url()).pathname === `/v1/providers/${PROVIDER_NAME}`,
   );
@@ -764,10 +1580,12 @@ async function configureSharedResourcesViaUi(
   expect(descriptorRevision).toBeGreaterThan(0);
   await expect(providerDialog).toBeHidden();
 
-  await page.getByRole("button", { name: "Add API-key profile" }).click();
-  const profileDialog = page.getByRole("dialog", { name: "Add API-key profile" });
+  await page.getByRole("button", { name: "Add API key profile" }).click();
+  const profileDialog = page.locator("form.nested-editor").filter({
+    has: page.getByRole("heading", { name: "Add API key profile", exact: true }),
+  });
   await profileDialog.getByLabel("Profile label").fill(PROFILE_LABEL);
-  const apiKey = profileDialog.getByLabel("API key (write-only)");
+  const apiKey = profileDialog.getByLabel("API key");
   await expect(apiKey).toHaveAttribute("type", "password");
   await apiKey.fill(stack.providerSecret);
   await profileDialog.getByRole("checkbox", { name: "Make this the default profile" }).check();
@@ -775,7 +1593,7 @@ async function configureSharedResourcesViaUi(
   const profileResponsePromise = page.waitForResponse(
     (response) => response.request().method() === "POST" && new URL(response.url()).pathname === `/v1/providers/${PROVIDER_NAME}/auth-profiles`,
   );
-  await profileDialog.getByRole("button", { name: "Create API-key profile" }).click();
+  await profileDialog.getByRole("button", { name: "Create profile" }).click();
   const profileResponse = await profileResponsePromise;
   expect(profileResponse.status()).toBe(201);
   const profileBody = (await profileResponse.json()) as Record<string, unknown>;
@@ -866,17 +1684,6 @@ async function configureSharedResources(
   expect(profileId).not.toBe("");
   expect(profileRevision).toBeGreaterThan(0);
   recorder.arm([endpointId, profileId]);
-
-  const sharing = await publicRequest(
-    page,
-    "actor-a",
-    "PUT",
-    `/v1/auth-profiles/${profileId}/sharing`,
-    { mode: SHARING_MODE, endpoint_ids: [endpointId] },
-    "two-actor-profile-share",
-    recorder,
-  );
-  expect([200, 202]).toContain(sharing.status);
 
   await waitForReplicaReady(page, "actor-a", profileId, endpointId, recorder);
   recorder.arm([endpointId, profileId]);
@@ -1100,16 +1907,56 @@ async function assertSessionIsolation(
   expect(actorAReadAfterB.text).not.toContain(ACTOR_B_MUTATION_MARKER);
   if (includeProviderRound) expect(actorAReadAfterB.text).toContain(ASSISTANT_MARKER);
 
-  await gotoPublic(pageA, "actor-a", stack.actorA.baseUrl, sessionRoute, recorder);
+  const actorANavigationStatus = await gotoPublic(pageA, "actor-a", stack.actorA.baseUrl, sessionRoute, recorder);
   expect(new URL(pageA.url()).pathname).toBe(sessionRoute);
-  const actorABody = await pageA.locator("body").innerText();
-  if (includeProviderRound) expect(actorABody).toContain(ASSISTANT_MARKER);
+  if (includeProviderRound) {
+    try {
+      await expect(pageA.getByText(ASSISTANT_MARKER, { exact: false })).toBeVisible();
+    } catch {
+      throw new BrowserUiObservationFailure(
+        ISOLATION_E2E,
+        UI_LATER_CLASSIFICATION,
+        UI_FIRST_GAP,
+        UI_FIRST_GAP_SHA256,
+        "the public session was durable but the real browser did not render its assistant marker",
+        {
+          actor: "actor-a",
+          method: "GET",
+          path: sessionRoute,
+          status: actorANavigationStatus,
+          outcome: "visible_marker_missing",
+          observedBytes: Buffer.byteLength(await pageA.locator("body").innerText()),
+        },
+      );
+    }
+  }
 
   await gotoPublic(pageB, "actor-b", stack.actorB.baseUrl, sessionRoute, recorder);
   expect(new URL(pageB.url()).pathname).toBe(sessionRoute);
-  const actorBBody = await pageB.locator("body").innerText();
-  expect(actorBBody).not.toContain(ASSISTANT_MARKER);
-  expect(actorBBody).toMatch(/not found|unavailable|cannot|access/i);
+  try {
+    const unavailable = pageB.getByRole("status").filter({
+      hasText: /^The requested resource was not found or is unavailable\.$/,
+    });
+    await expect(unavailable).toHaveCount(1);
+    await expect(unavailable).toBeVisible();
+  } catch {
+    throw new BrowserUiObservationFailure(
+      ISOLATION_E2E,
+      UI_SAFE_NOT_FOUND_CLASSIFICATION,
+      UI_SAFE_NOT_FOUND_FIRST_GAP,
+      UI_SAFE_NOT_FOUND_FIRST_GAP_SHA256,
+      "the isolated session returned a safe 404 but the real browser did not render a safe unavailable state",
+      {
+        actor: "actor-b",
+        method: "GET",
+        path: sessionPath,
+        status: actorBRead.status,
+        outcome: "safe_not_found_not_visible",
+        observedBytes: Buffer.byteLength(await pageB.locator("body").innerText()),
+      },
+    );
+  }
+  await expect(pageB.locator("body")).not.toContainText(ASSISTANT_MARKER);
 
   const idOnly = await publicRequest(pageB, "actor-b", "GET", `/v1/sessions/${sessionId}`, undefined, undefined, recorder, recordPublic);
   expect(idOnly.status).toBe(404);
@@ -1120,15 +1967,22 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
   test.describe.configure({ mode: "serial" });
   test.setTimeout(120_000);
 
-  test("e2e_browser_two_actor_session_isolation", async ({ browser }) => {
+  async function runSessionIsolation(browser: Browser, replay: boolean): Promise<void> {
     const cassettePath = ISOLATION_CASSETTE;
-    const replay = mode() === "replay";
     const cassette = await readCassette(
       cassettePath,
-      "e2e_browser_two_actor_session_isolation",
+      ISOLATION_E2E,
       ISOLATION_RECORDING_ID,
     );
-    const stack = await createTwoActorStack({ replayEndpointExchanges: cassette?.endpointExchanges });
+    const endpointReplay = replay
+      ? await readEndpointReplayCassette(
+          ISOLATION_ENDPOINT_REPLAY,
+          ISOLATION_E2E,
+          ISOLATION_ENDPOINT_REPLAY_ID,
+          cassette,
+        )
+      : undefined;
+    const stack = await createTwoActorStack({ replayEndpointExchanges: endpointReplay?.endpoint_exchanges });
     const contextA = await browser.newContext();
     const contextB = await browser.newContext();
     const pageA = await contextA.newPage();
@@ -1137,8 +1991,10 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
     const directEndpointRequestsB = watchDirectEndpointRequests(pageB, stack.endpointBaseUrl);
     const recorder = new ExchangeRecorder(
       [PROVIDER_SECRET, ENDPOINT_CONTROL_SECRET],
-      replay ? cassette.exchanges : undefined,
       cassette.classification,
+      cassette.classification.positive_catalog_barrier.exchange_sequence === null
+        ? undefined
+        : cassette.exchanges[cassette.classification.positive_catalog_barrier.exchange_sequence],
     );
     recorder.attachBrowserPage(pageA, "actor-a");
     recorder.attachBrowserPage(pageB, "actor-b");
@@ -1204,19 +2060,45 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
       await expectSafeNotFound(afterRestartBRead, [stack.providerSecret, stack.endpointControlSecret]);
       await stack.stopServer();
       expect(await serverStoresContainSessionMirrors(stack, [sessionId, actorBSessionId])).toBe(false);
+      await contextA.close();
+      await contextB.close();
+      await recorder.flush();
+      await stack.endpointTransport.flush();
+      if (!replay && CAPTURE_ENDPOINT_REPLAY) {
+        const path = await retainEndpointReplayCandidate(
+          ISOLATION_E2E,
+          ISOLATION_ENDPOINT_REPLAY_ID,
+          cassette,
+          stack.endpointTransport.cassetteExchanges(),
+        );
+        if (PROMOTE_ENDPOINT_REPLAY) {
+          await promoteEndpointReplayCandidate(
+            path,
+            ISOLATION_ENDPOINT_REPLAY,
+            ISOLATION_E2E,
+            ISOLATION_ENDPOINT_REPLAY_ID,
+            cassette,
+          );
+        }
+        process.stderr.write(`ZODE_E2E_TWO_ACTOR_ENDPOINT_REPLAY ${path}\n`);
+      }
       if (replay) {
-        await recorder.assertReplayConsumed();
-        await stack.endpointTransport.flush();
         stack.endpointTransport.assertReplayConsumed();
       }
     } catch (error) {
       await recorder.flush();
-      if (replay) {
-        await recorder.assertReplayConsumed();
+      if (!replay) await retainRequestedBrowserObservation(error, recorder);
+      await contextA.close().catch(() => undefined);
+      await contextB.close().catch(() => undefined);
+      try {
         await stack.endpointTransport.flush();
-        stack.endpointTransport.assertReplayConsumed();
+        if (replay) stack.endpointTransport.assertReplayConsumed();
+      } catch (flushError) {
+        throw new AggregateError(
+          [error, flushError],
+          "two-actor public failure was retained before Endpoint transport flush failed",
+        );
       }
-      await stack.endpointTransport.flush();
       const first = recorder.classifyFirstFailure();
       if (!replay && first) {
         await writeFirstFailureCassette(
@@ -1229,17 +2111,24 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
       await contextB.close().catch(() => undefined);
       await stack.dispose();
     }
-  });
+  }
 
-  test("e2e_browser_provider_profiles_are_shared_deployment_resources", async ({ browser }) => {
+  async function runSharedProviderProfiles(browser: Browser, replay: boolean): Promise<void> {
     const cassettePath = PROFILE_CASSETTE;
-    const replay = mode() === "replay";
     const cassette = await readCassette(
       cassettePath,
-      "e2e_browser_provider_profiles_are_shared_deployment_resources",
+      PROFILE_E2E,
       PROFILE_RECORDING_ID,
     );
-    const stack = await createTwoActorStack({ replayEndpointExchanges: cassette?.endpointExchanges });
+    const endpointReplay = replay
+      ? await readEndpointReplayCassette(
+          PROFILE_ENDPOINT_REPLAY,
+          PROFILE_E2E,
+          PROFILE_ENDPOINT_REPLAY_ID,
+          cassette,
+        )
+      : undefined;
+    const stack = await createTwoActorStack({ replayEndpointExchanges: endpointReplay?.endpoint_exchanges });
     const contextA = await browser.newContext();
     const contextB = await browser.newContext();
     const pageA = await contextA.newPage();
@@ -1248,8 +2137,10 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
     const directEndpointRequestsB = watchDirectEndpointRequests(pageB, stack.endpointBaseUrl);
     const recorder = new ExchangeRecorder(
       [PROVIDER_SECRET, ENDPOINT_CONTROL_SECRET],
-      replay ? cassette.exchanges : undefined,
       cassette.classification,
+      cassette.classification.positive_catalog_barrier.exchange_sequence === null
+        ? undefined
+        : cassette.exchanges[cassette.classification.positive_catalog_barrier.exchange_sequence],
     );
     recorder.attachBrowserPage(pageA, "actor-a");
     recorder.attachBrowserPage(pageB, "actor-b");
@@ -1276,19 +2167,46 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
       expect(directEndpointRequestsB).toHaveLength(0);
       await expectNoBrowserCredentialState(pageA, ["Cf-Access-Jwt-Assertion", PROVIDER_SECRET, ENDPOINT_CONTROL_SECRET]);
       await expectNoBrowserCredentialState(pageB, ["Cf-Access-Jwt-Assertion", PROVIDER_SECRET, ENDPOINT_CONTROL_SECRET]);
+      await stack.stopServer();
+      await contextA.close();
+      await contextB.close();
+      await recorder.flush();
+      await stack.endpointTransport.flush();
+      if (!replay && CAPTURE_ENDPOINT_REPLAY) {
+        const path = await retainEndpointReplayCandidate(
+          PROFILE_E2E,
+          PROFILE_ENDPOINT_REPLAY_ID,
+          cassette,
+          stack.endpointTransport.cassetteExchanges(),
+        );
+        if (PROMOTE_ENDPOINT_REPLAY) {
+          await promoteEndpointReplayCandidate(
+            path,
+            PROFILE_ENDPOINT_REPLAY,
+            PROFILE_E2E,
+            PROFILE_ENDPOINT_REPLAY_ID,
+            cassette,
+          );
+        }
+        process.stderr.write(`ZODE_E2E_TWO_ACTOR_ENDPOINT_REPLAY ${path}\n`);
+      }
       if (replay) {
-        await recorder.assertReplayConsumed();
-        await stack.endpointTransport.flush();
         stack.endpointTransport.assertReplayConsumed();
       }
     } catch (error) {
       await recorder.flush();
-      if (replay) {
-        await recorder.assertReplayConsumed();
+      if (!replay) await retainRequestedBrowserObservation(error, recorder);
+      await contextA.close().catch(() => undefined);
+      await contextB.close().catch(() => undefined);
+      try {
         await stack.endpointTransport.flush();
-        stack.endpointTransport.assertReplayConsumed();
+        if (replay) stack.endpointTransport.assertReplayConsumed();
+      } catch (flushError) {
+        throw new AggregateError(
+          [error, flushError],
+          "two-actor shared-profile failure was retained before Endpoint transport flush failed",
+        );
       }
-      await stack.endpointTransport.flush();
       const first = recorder.classifyFirstFailure();
       if (!replay && first) {
         await writeFirstFailureCassette(
@@ -1301,5 +2219,21 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
       await contextB.close().catch(() => undefined);
       await stack.dispose();
     }
+  }
+
+  test(ISOLATION_E2E, async ({ browser }) => {
+    await runSessionIsolation(browser, false);
+  });
+
+  test(ISOLATION_REPLAY_E2E, async ({ browser }) => {
+    await runSessionIsolation(browser, true);
+  });
+
+  test(PROFILE_E2E, async ({ browser }) => {
+    await runSharedProviderProfiles(browser, false);
+  });
+
+  test(PROFILE_REPLAY_E2E, async ({ browser }) => {
+    await runSharedProviderProfiles(browser, true);
   });
 });

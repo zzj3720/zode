@@ -2,7 +2,7 @@ import { expect, test, type Page, type Request } from "@playwright/test";
 import { createHash, createSign, generateKeyPairSync, randomBytes, randomUUID, type KeyObject } from "node:crypto";
 import { execFile as execFileCallback, spawn, type ChildProcessByStdio } from "node:child_process";
 import { once } from "node:events";
-import { readFile, writeFile, mkdir, chmod, mkdtemp, readdir, rm, cp } from "node:fs/promises";
+import { readFile, writeFile, mkdir, chmod, mkdtemp, readdir, rm, cp, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
@@ -10,7 +10,7 @@ import { createServer as createTcpServer, type Socket } from "node:net";
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import type { Readable } from "node:stream";
 import { promisify } from "node:util";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 type Json = Record<string, any>;
 type Cassette = Json & { exchanges: Json[] };
@@ -191,7 +191,9 @@ function quoteSqliteString(value: string): string {
 
 async function sqliteJson(database: string, sql: string): Promise<Json[]> {
   const binary = process.env.ZODE_E2E_SQLITE3_BIN ?? "sqlite3";
-  const result = await execFile(binary, ["-readonly", "-json", database, sql], {
+  const databaseUrl = pathToFileURL(database);
+  databaseUrl.searchParams.set("immutable", "1");
+  const result = await execFile(binary, ["-readonly", "-json", databaseUrl.href, sql], {
     maxBuffer: 16 * 1024 * 1024,
   });
   const text = result.stdout.trim();
@@ -1393,14 +1395,26 @@ class Topology {
   }
 
   async assertServerStoreHasNoSessionMirror(): Promise<void> {
-    const sqliteInspection = await inspectSqliteDatabase(this.serverDatabase);
+    let sqliteInspection: { storeFiles: string[]; inspection: string };
+    try {
+      const metadata = await stat(this.serverDatabase);
+      if (!metadata.isFile()) throw new Error("Server control database path is not a regular file");
+      sqliteInspection = await inspectSqliteDatabase(this.serverDatabase);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      sqliteInspection = { storeFiles: [this.serverDatabase], inspection: "" };
+    }
     const serverRoot = join(this.root, "server");
     const secretStoreRoot = join(serverRoot, "secrets");
     const subjectKeyPath = join(serverRoot, "subject.key");
     const secretStoreFiles = await filesUnder(secretStoreRoot);
     for (const path of secretStoreFiles) {
       const relativePath = relative(secretStoreRoot, path);
-      if (relativePath !== ".zode-server.lock" && !/^endpoints\/[0-9a-f]{64}$/.test(relativePath)) {
+      if (
+        relativePath !== ".zode-server.lock" &&
+        relativePath !== ".server-owner" &&
+        !/^endpoints\/[0-9a-f]{64}$/.test(relativePath)
+      ) {
         throw new Error(`Server secret-store file is outside the dedicated allowlist: ${path}`);
       }
     }

@@ -80,7 +80,9 @@
     {"file":"specs/surface_authority_grammar.spec.cjs","title":"e2e_browser_management_surface_authority_rejects_userinfo"},
     {"file":"specs/surface_authority_grammar.spec.cjs","title":"e2e_browser_management_surface_authority_accepts_default_port_alias"},
     {"file":"specs/two_actor_session_isolation.spec.ts","title":"two Access actors and Endpoint-owned session subjects › e2e_browser_two_actor_session_isolation"},
+    {"file":"specs/two_actor_session_isolation.spec.ts","title":"two Access actors and Endpoint-owned session subjects › e2e_browser_two_actor_session_isolation_replays_complete_endpoint_transcript"},
     {"file":"specs/two_actor_session_isolation.spec.ts","title":"two Access actors and Endpoint-owned session subjects › e2e_browser_provider_profiles_are_shared_deployment_resources"},
+    {"file":"specs/two_actor_session_isolation.spec.ts","title":"two Access actors and Endpoint-owned session subjects › e2e_browser_provider_profiles_shared_deployment_replays_complete_endpoint_transcript"},
     {"file":"specs/ui_delivery_surface_security.spec.cjs","title":"e2e_browser_callback_surface_isolated_and_management_system_no_store"}
   ]
 }
