@@ -214,9 +214,12 @@ replication is `docs/auth-replication.md`; ingress identity is
 - The public Server binds only after configured local Endpoint recovery and
   catalog composition succeed. Shutdown stops admission, drains Server work, then
   signals and waits/reaps a child owned through the supervisor process handle;
-  this is not a private handler or an Endpoint shutdown route. Crash-surviving
-  adoption/handoff remains an explicit later lifecycle state, never an accidental
-  orphan.
+  this is not a private handler or an Endpoint shutdown route. Before releasing
+  the control-store owner, a normal shutdown checkpoints and truncates its WAL so
+  a later startup does not mistake the Server's own missing SQLite SHM sidecar for
+  external store damage; external sidecar/link mutations still fail closed during
+  preflight. Crash-surviving adoption/handoff remains an explicit later lifecycle
+  state, never an accidental orphan.
 - Endpoint holds an exclusive process-lifetime lock for its runtime/secret
   identity. On startup, all-in-one first probes the stable loopback address and
   adopts a healthy matching installation. An unresponsive/mismatched probe
