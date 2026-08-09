@@ -1477,6 +1477,13 @@ async function activeHealth(root) {
 }
 
 async function bootstrap(root, record) {
+  // A start after stop is a process restart, not a new baseline.  Capture the
+  // existing pointer history before teardown removes instance state so the
+  // atomic switch below preserves rollback even when health had to fall back
+  // to bootstrap.  A genuinely empty channel has no current, so stale/missing
+  // previous state is deliberately not carried into its first baseline.
+  const existingCurrent = pointerTarget(root, "current", true);
+  const existingPrevious = existingCurrent ? pointerTarget(root, "previous", true) : null;
   const installed = installArtifact(root, record);
   for (const instance of allStates(root)) {
     const stop = await stopInstance(instance);
@@ -1492,7 +1499,7 @@ async function bootstrap(root, record) {
       health: healthPayload(instance, readiness),
     });
   }
-  switchPointers(root, installed.installPath, null);
+  switchPointers(root, installed.installPath, existingPrevious?.target ?? null);
   removeIfExists(pointerPath(root, "staged"));
   const health = healthPayload(instance, readiness);
   return { installed, instance, health, readiness };

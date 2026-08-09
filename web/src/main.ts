@@ -52,6 +52,8 @@ const state: {
   deletingProfile: { profile: AuthProfile; idempotencyKey: string } | null;
   probingEndpointId: string | null;
   connection: "Connecting" | "Live" | "Reconnecting" | "Disconnected";
+  provisional: { sessionId: string; text: string } | null;
+  composerDraft: { endpointId: string; sessionId: string; text: string } | null;
 } = {
   system: null,
   endpoints: [],
@@ -69,10 +71,13 @@ const state: {
   deletingProfile: null,
   probingEndpointId: null,
   connection: "Disconnected",
+  provisional: null,
+  composerDraft: null,
 };
 
-let eventSource: EventSource | null = null;
-let eventSourceKey: string | null = null;
+let eventStreamAbort: AbortController | null = null;
+let eventStreamKey: string | null = null;
+let eventStreamGeneration = 0;
 let restoreFocusId: string | null = null;
 let providerRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -152,10 +157,12 @@ function setRoute(path: string): void {
 }
 
 function closeEventStream(): void {
-  eventSource?.close();
-  eventSource = null;
-  eventSourceKey = null;
+  eventStreamGeneration += 1;
+  eventStreamAbort?.abort();
+  eventStreamAbort = null;
+  eventStreamKey = null;
   state.connection = "Disconnected";
+  state.provisional = null;
 }
 
 function navigationItem(
@@ -1000,6 +1007,15 @@ function renderSession(): void {
     );
     transcript.append(article);
   }
+  if (state.provisional?.sessionId === session.session_id && state.provisional.text.length > 0) {
+    const article = node("article", "message message-assistant message-provisional");
+    article.setAttribute("aria-live", "polite");
+    article.append(
+      node("span", "message-role", "Agent"),
+      node("p", undefined, state.provisional.text),
+    );
+    transcript.append(article);
+  }
   workspace.append(
     transcript,
     runtimeActivity(session),
@@ -1174,22 +1190,38 @@ function composer(endpointId: string, sessionId: string): HTMLFormElement {
   input.rows = 2;
   input.placeholder = "Message Zode";
   input.setAttribute("aria-label", "Message");
+  if (
+    state.composerDraft?.endpointId === endpointId &&
+    state.composerDraft.sessionId === sessionId
+  ) {
+    input.value = state.composerDraft.text;
+  }
+  input.addEventListener("input", () => {
+    state.composerDraft = input.value ? { endpointId, sessionId, text: input.value } : null;
+  });
   const footer = node("div", "composer-footer");
+  const send = submitButton("Send", "arrow-up");
+  send.disabled = state.busy || state.connection !== "Live";
   footer.append(
     node(
       "span",
       "composer-hint",
-      state.busy ? "Submitting…" : "Enter to send · Shift+Enter for a new line",
+      state.busy
+        ? "Submitting…"
+        : state.connection === "Live"
+          ? "Enter to send · Shift+Enter for a new line"
+          : "Reconnect to the Endpoint before sending",
     ),
-    submitButton("Send", "arrow-up"),
+    send,
   );
   form.append(input, footer);
   const submit = async (): Promise<void> => {
     const content = input.value.trim();
-    if (!content || state.busy) return;
+    if (!content || state.busy || state.connection !== "Live") return;
+    const submittedDraft = state.composerDraft;
     await withBusy(async () => {
       await sendMessage(endpointId, sessionId, content);
-      input.value = "";
+      if (state.composerDraft === submittedDraft) state.composerDraft = null;
       state.notice = "Message accepted; waiting for durable completion.";
       await loadActiveSession();
     });
@@ -1320,6 +1352,10 @@ async function refreshSessions(): Promise<void> {
 }
 
 async function openSession(endpointId: string, sessionId: string): Promise<void> {
+  if (state.activeSession?.session_id !== sessionId || state.activeEndpointId !== endpointId) {
+    state.provisional = null;
+    state.composerDraft = null;
+  }
   state.activeEndpointId = endpointId;
   state.activeSession = await getSession(endpointId, sessionId);
   state.view = "session";
@@ -1334,50 +1370,212 @@ async function loadActiveSession(): Promise<void> {
   render();
 }
 
-function connectEventStream(endpointId: string, sessionId: string): void {
-  const key = `${endpointId}:${sessionId}`;
-  if (eventSourceKey === key && eventSource) return;
+type SseFrame = { event: string; data: string; id: string };
+const SSE_IDLE_TIMEOUT_MS = 20_000;
+
+function sessionCursorStorageKey(endpointId: string, sessionId: string): string {
+  return `zode.endpoint-event-cursor.v1:${endpointId}:${sessionId}`;
+}
+
+function readSessionCursor(endpointId: string, sessionId: string): string {
+  try {
+    return sessionStorage.getItem(sessionCursorStorageKey(endpointId, sessionId)) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeSessionCursor(endpointId: string, sessionId: string, cursor: string): void {
+  if (!/^[0-9]+$/.test(cursor)) return;
+  try {
+    sessionStorage.setItem(sessionCursorStorageKey(endpointId, sessionId), cursor);
+  } catch {
+    // A storage quota/private-mode failure must not stop live SSE delivery.
+  }
+}
+
+function parseSseFrame(frame: string): SseFrame | null {
+  let event = "message";
+  let id = "";
+  const data: string[] = [];
+  for (const line of frame.split(/\r\n|\n|\r/)) {
+    if (line.startsWith("event:")) event = line.slice(line.startsWith("event: ") ? 7 : 6);
+    else if (line.startsWith("id:")) id = line.slice(3).trim();
+    else if (line.startsWith("data:")) data.push(line.slice(line.startsWith("data: ") ? 6 : 5));
+  }
+  if (data.length === 0) return null;
+  return { event, data: data.join("\n"), id };
+}
+
+async function readSseBody(
+  body: ReadableStream<Uint8Array>,
+  onFrame: (frame: SseFrame) => void,
+): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  try {
+    while (true) {
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      const next = await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(
+            () => reject(new Error("session event stream idle timeout")),
+            SSE_IDLE_TIMEOUT_MS,
+          );
+        }),
+      ]).finally(() => {
+        if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+      });
+      pending += decoder.decode(next.value, { stream: !next.done });
+      while (true) {
+        const match = /\r\n\r\n|\n\n|\r\r/.exec(pending);
+        if (!match || match.index === undefined) break;
+        const frame = pending.slice(0, match.index);
+        pending = pending.slice(match.index + match[0].length);
+        const parsed = parseSseFrame(frame);
+        if (parsed) onFrame(parsed);
+      }
+      if (next.done) break;
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+}
+
+function handleSseFrame(frame: SseFrame, endpointId: string, sessionId: string): void {
+  if (frame.event === "assistant_message_delta") {
+    try {
+      const payload = JSON.parse(frame.data) as {
+        schema?: string;
+        session_id?: string;
+        text?: string;
+      };
+      if (
+        payload.schema !== "zode.transient-event.v1" ||
+        payload.session_id !== sessionId ||
+        typeof payload.text !== "string" ||
+        payload.text.length === 0
+      ) {
+        return;
+      }
+      const previous = state.provisional;
+      state.provisional = {
+        sessionId,
+        text: previous?.sessionId === sessionId ? previous.text + payload.text : payload.text,
+      };
+      render();
+    } catch {
+      state.notice = "A transient model update could not be read.";
+      render();
+    }
+    return;
+  }
+  if (!/^[0-9]+$/.test(frame.id)) return;
+  writeSessionCursor(endpointId, sessionId, frame.id);
+  try {
+    const payload = JSON.parse(frame.data) as PublicEvent;
+    if (payload.session_id !== sessionId) return;
+    const message = payload.data?.message;
+    const isAssistantMessageAppended =
+      frame.event === "message_appended" &&
+      typeof message === "object" &&
+      message !== null &&
+      "role" in message &&
+      (message as { role?: unknown }).role === "assistant";
+    // Incomplete model attempts have no assistant side effect.  A retry may
+    // produce different text, and exhaustion/activation termination must not
+    // leave a stale candidate looking like durable history.
+    if (
+      frame.event === "assistant_message_committed" ||
+      isAssistantMessageAppended ||
+      frame.event === "model_step_retrying" ||
+      frame.event === "model_attempt_failed" ||
+      frame.event === "model_attempt_interrupted" ||
+      frame.event === "model_attempts_exhausted" ||
+      frame.event === "activation_finished"
+    ) {
+      state.provisional = null;
+    }
+    void loadActiveSession().catch(showError);
+  } catch {
+    state.notice = "A durable event could not be read.";
+    render();
+  }
+}
+
+function reenterManagementOrigin(): void {
   closeEventStream();
-  state.connection = "Connecting";
-  const stream = new EventSource(eventStreamUrl(endpointId, sessionId), { withCredentials: true });
-  eventSource = stream;
-  eventSourceKey = key;
-  stream.onopen = () => {
-    state.connection = "Live";
-    render();
-  };
-  stream.onerror = () => {
-    state.connection = "Reconnecting";
-    render();
-  };
-  const kinds = [
-    "assistant_message_committed",
-    "message_appended",
-    "status_changed",
-    "activation_started",
-    "activation_finished",
-    "wait_set",
-    "wait_cleared",
-    "wait_expired",
-    "async_tool_call_started",
-    "async_tool_call_running",
-    "async_tool_call_completed",
-    "async_tool_call_failed",
-    "async_tool_call_unknown_outcome",
-  ];
-  for (const kind of kinds) {
-    stream.addEventListener(kind, (event) => {
-      const message = event as MessageEvent<string>;
-      try {
-        const payload = JSON.parse(message.data) as PublicEvent;
-        if (payload.session_id !== sessionId) return;
-        void loadActiveSession().catch(showError);
-      } catch {
-        state.notice = "A durable event could not be read.";
+  location.assign(`${location.pathname}${location.search}${location.hash}`);
+}
+
+async function runEventStream(
+  endpointId: string,
+  sessionId: string,
+  key: string,
+  generation: number,
+): Promise<void> {
+  while (generation === eventStreamGeneration && eventStreamKey === key) {
+    const controller = new AbortController();
+    eventStreamAbort = controller;
+    try {
+      const cursor = readSessionCursor(endpointId, sessionId);
+      const headers: HeadersInit = {
+        Accept: "text/event-stream",
+        ...(cursor.length > 0 ? { "Last-Event-ID": cursor } : {}),
+      };
+      const response = await fetch(eventStreamUrl(endpointId, sessionId), {
+        credentials: "same-origin",
+        headers,
+        signal: controller.signal,
+      });
+      if (response.status === 401) {
+        reenterManagementOrigin();
+        return;
+      }
+      const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+      if (response.status === 503) {
+        state.notice = "Endpoint unavailable; state is non-authoritative.";
         render();
       }
-    });
+      if (!response.ok || !contentType.includes("text/event-stream") || response.body === null) {
+        throw new Error("session event stream unavailable");
+      }
+      const wasReconnecting = state.connection === "Reconnecting";
+      if (wasReconnecting) state.provisional = null;
+      if (state.notice === "Endpoint unavailable; state is non-authoritative.") state.notice = null;
+      state.connection = "Live";
+      render();
+      await readSseBody(response.body, (frame) => handleSseFrame(frame, endpointId, sessionId));
+    } catch {
+      if (
+        controller.signal.aborted ||
+        generation !== eventStreamGeneration ||
+        eventStreamKey !== key
+      )
+        return;
+      state.connection = "Reconnecting";
+      render();
+    } finally {
+      if (eventStreamAbort === controller) eventStreamAbort = null;
+    }
+    if (generation !== eventStreamGeneration || eventStreamKey !== key) return;
+    state.connection = "Reconnecting";
+    render();
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 250));
   }
+}
+
+function connectEventStream(endpointId: string, sessionId: string): void {
+  const key = `${endpointId}:${sessionId}`;
+  if (eventStreamKey === key) return;
+  closeEventStream();
+  eventStreamKey = key;
+  state.connection = "Connecting";
+  render();
+  void runEventStream(endpointId, sessionId, key, eventStreamGeneration);
 }
 
 async function routeFromLocation(): Promise<void> {
@@ -1415,7 +1613,7 @@ async function withBusy(operation: () => Promise<void>): Promise<void> {
 
 function showError(error: unknown): void {
   if (error instanceof ServerClientError && error.status === 401) {
-    location.assign(location.href);
+    reenterManagementOrigin();
     return;
   }
   const code = error instanceof ServerClientError ? error.code : "request_failed";

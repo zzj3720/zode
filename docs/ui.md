@@ -158,6 +158,9 @@ The session page contains:
 The composer submits once with a generated idempotency key and disables only
 while admission is unknown. A lost response is retried with the same key. The
 UI must not infer that `202 Accepted` means the assistant has finished.
+Same-session durable or transient rendering preserves an unsent composer draft
+in browser memory; accepting the submission or opening another session clears
+it. The draft is never persisted as session state or sent before submission.
 
 Before session create, the UI resolves the visible provider default to one
 explicit auth profile, full immutable non-secret provider-execution descriptor,
