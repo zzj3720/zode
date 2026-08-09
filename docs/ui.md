@@ -165,6 +165,18 @@ and minimum installed auth revision. It freezes that request body with the
 idempotency key for all retries; a changed default or descriptor never mutates
 an in-flight create.
 
+An existing session's execution recovery form starts from that session's
+current provider, model, and auth profile whenever each remains available. A
+different provider elsewhere in the catalog cannot become the implicit
+selection merely because it sorts first. Refreshing the page or legally
+restarting Server and Endpoint preserves the same visible selection, and
+submitting it without an explicit change preserves the Endpoint-owned current
+execution, session identity, and transcript. If the current profile is no
+longer usable, the form keeps the current provider and model while offering a
+current shared profile for an explicit same-session recovery. This contract is
+frozen by
+`e2e_browser_bad_session_retains_history_and_offers_same_session_execution_recovery`.
+
 When Endpoint becomes unreachable, the UI:
 
 - may keep already rendered transcript data visible in the current browser
@@ -360,6 +372,9 @@ Required browser scenarios:
   blind retry action;
 - distribution pending, stale, unreachable, ready, and removed states;
 - session SSE disconnect/reconnect without duplicate final messages;
+- same-session execution recovery in a multi-provider catalog, including
+  current-selection defaults, no-op submission, refresh, and legal
+  Server/Endpoint restart without changing session identity or history;
 - Endpoint goes unreachable while a session page remains open and the UI keeps
   only its clearly disconnected current view without a fake terminal event;
 - async tool completion, wait timeout, cancellation, and unknown-outcome safe
