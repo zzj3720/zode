@@ -797,8 +797,6 @@ async function main() {
             contentType: 'application/json',
             body: JSON.stringify(staleSession),
           });
-        } else if (blockSecondAssistantEvents && pathname.endsWith('/events')) {
-          await route.abort('failed');
         } else {
           await route.continue();
         }
