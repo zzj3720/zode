@@ -165,7 +165,7 @@ pub struct ModelRequest {
     pub transcript: Vec<TranscriptMessage>,
     pub tools: Vec<ToolDefinition>,
     pub stream_idle_timeout: Duration,
-    pub stream_observer: Option<Arc<dyn ModelStreamObserver>>,
+    pub stream_observer: Arc<dyn ModelStreamObserver>,
 }
 
 /// Receives provider text deltas for transient browser observation only. The
@@ -197,29 +197,20 @@ impl ModelStreamObserver for BroadcastModelStreamObserver {
         if text.is_empty() {
             return;
         }
-        let mut start = 0;
-        while start < text.len() {
-            let mut end = (start + MAX_TRANSIENT_TEXT_BYTES).min(text.len());
-            while end > start && !text.is_char_boundary(end) {
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            let mut end = remaining.len().min(MAX_TRANSIENT_TEXT_BYTES);
+            while !remaining.is_char_boundary(end) {
                 end -= 1;
             }
-            if end == start {
-                end = text[start..]
-                    .char_indices()
-                    .nth(MAX_TRANSIENT_TEXT_BYTES.saturating_sub(1))
-                    .map(|(index, _)| start + index)
-                    .unwrap_or(text.len());
-                if end == start {
-                    end = text.len();
-                }
-            }
+            let (chunk, rest) = remaining.split_at(end);
             let _ = self.publisher.send(TransientModelEvent {
                 session_id: session_id.to_owned(),
                 activation_id: activation_id.to_owned(),
                 round_id: round_id.to_owned(),
-                text: text[start..end].to_owned(),
+                text: chunk.to_owned(),
             });
-            start = end;
+            remaining = rest;
         }
     }
 }
@@ -1190,7 +1181,7 @@ impl Runtime {
             transcript: provider_transcript(state),
             tools: tools.clone(),
             stream_idle_timeout: self.options.model_stream_idle_timeout,
-            stream_observer: Some(self.stream_observer.clone()),
+            stream_observer: self.stream_observer.clone(),
         };
         let (prep_commits, _prepared_state, request_identity) = prepare_model_round(
             self.store.clone(),

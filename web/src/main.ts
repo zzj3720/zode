@@ -1238,26 +1238,6 @@ async function loadActiveSession(): Promise<void> {
 type SseFrame = { event: string; data: string; id: string };
 const SSE_IDLE_TIMEOUT_MS = 20_000;
 
-const durableStreamKinds = new Set([
-  "assistant_message_committed",
-  "message_appended",
-  "status_changed",
-  "activation_started",
-  "activation_finished",
-  "model_step_retrying",
-  "model_attempt_failed",
-  "model_attempt_interrupted",
-  "model_attempts_exhausted",
-  "wait_set",
-  "wait_cleared",
-  "wait_expired",
-  "async_tool_call_started",
-  "async_tool_call_running",
-  "async_tool_call_completed",
-  "async_tool_call_failed",
-  "async_tool_call_unknown_outcome",
-]);
-
 function sessionCursorStorageKey(endpointId: string, sessionId: string): string {
   return `zode.endpoint-event-cursor.v1:${endpointId}:${sessionId}`;
 }
@@ -1331,7 +1311,6 @@ async function readSseBody(
 }
 
 function handleSseFrame(frame: SseFrame, endpointId: string, sessionId: string): void {
-  if (frame.id.length > 0) writeSessionCursor(endpointId, sessionId, frame.id);
   if (frame.event === "assistant_message_delta") {
     try {
       const payload = JSON.parse(frame.data) as {
@@ -1359,7 +1338,8 @@ function handleSseFrame(frame: SseFrame, endpointId: string, sessionId: string):
     }
     return;
   }
-  if (!durableStreamKinds.has(frame.event)) return;
+  if (!/^[0-9]+$/.test(frame.id)) return;
+  writeSessionCursor(endpointId, sessionId, frame.id);
   try {
     const payload = JSON.parse(frame.data) as PublicEvent;
     if (payload.session_id !== sessionId) return;
