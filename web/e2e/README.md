@@ -224,17 +224,30 @@ dependency.
 
 The two-actor browser scenarios retain their original shallow public incident
 cassettes as immutable provenance; those cassettes are not rewritten into a
-later full-flow oracle. Separate `zode.web-two-actor-endpoint-replay.v1`
-later-reproduction cassettes record the complete secret-safe
-Server-to-Endpoint transcripts. Two explicit approved-product test identities
-reload those immutable files, drive the unchanged real Chromium flows through
-real Server and Endpoint processes, and verify every request fingerprint,
-complete response bytes, and terminal outcome. A missing or corrupt replay is
-therefore a merge-gate failure rather than an optional local mode. Independent
-request fingerprints may arrive in a different transport order, while
-repeated identical fingerprints retain their recorded occurrence order and
-every exchange must be consumed. Dynamic loopback ports, opaque lifecycle IDs,
-and wall-clock fields use ordered synthetic slots; public event kinds, event
+later full-flow oracle. A complete later reproduction uses
+`zode.web-two-actor-endpoint-replay.v2` and explicitly declares
+`capture_wide_ordered_identity_slots.v1`: one normalization state spans the
+whole capture and replay, so equal IDs remain equal and distinct IDs cannot
+collapse merely because they appeared in different bodies or exchanges. The
+earlier v8 candidates used per-body slot numbering and are therefore
+ineligible as exact transcripts; they are never rewritten or relabeled. A
+replacement requires a new recording ID from the unchanged real Chromium
+journey after its current UI blocker is removed. Enabling capture while the
+configured identity still names retired v8 evidence fails before any product
+child is spawned or candidate is created, so a later run cannot silently reuse
+that provenance.
+
+Two explicit approved-product replay identities remain pinned and fail closed
+while that v2 cassette is absent or invalid. Once a new candidate is captured,
+they reload its immutable bytes, drive the unchanged real Chromium flow
+through real Server and Endpoint processes, and verify every request
+fingerprint, complete response bytes, identity relation, and terminal outcome.
+A missing, legacy, or corrupt replay is therefore a merge-gate failure rather
+than an optional local mode. Independent request fingerprints may arrive in a
+different transport order, while repeated identical fingerprints retain their
+recorded occurrence order and every exchange must be consumed. Dynamic
+loopback ports, resource IDs, opaque lifecycle IDs, message IDs, and wall-clock
+fields use capture-wide ordered synthetic slots; public event kinds, event
 IDs/versions, content, status, headers, and termination remain exact.
 
 Capture normalizes each complete response once and records that safe result as

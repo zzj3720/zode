@@ -11,7 +11,6 @@ import {
   getSystem,
   listEndpoints,
   listProfiles,
-  listReplicas,
   listProviders,
   listSessions,
   putProvider,
@@ -50,7 +49,6 @@ const state: {
   busy: boolean;
   notice: string | null;
   deletingProfile: { profile: AuthProfile; idempotencyKey: string } | null;
-  probingEndpointId: string | null;
   connection: "Connecting" | "Live" | "Reconnecting" | "Disconnected";
   provisional: { sessionId: string; text: string } | null;
   composerDraft: { endpointId: string; sessionId: string; text: string } | null;
@@ -69,7 +67,6 @@ const state: {
   busy: false,
   notice: null,
   deletingProfile: null,
-  probingEndpointId: null,
   connection: "Disconnected",
   provisional: null,
   composerDraft: null,
@@ -79,7 +76,6 @@ let eventStreamAbort: AbortController | null = null;
 let eventStreamKey: string | null = null;
 let eventStreamGeneration = 0;
 let restoreFocusId: string | null = null;
-let providerRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
 const viewPaths: Record<Exclude<View, "session">, string> = {
   sessions: "/",
@@ -172,21 +168,14 @@ function navigationItem(
 ): HTMLAnchorElement {
   const selected = state.view === view || (view === "sessions" && state.view === "session");
   const link = node("a", `nav-item${selected ? " is-selected" : ""}`);
-  link.id = `nav-${view}`;
   link.href = viewPaths[view];
-  link.setAttribute("data-zode-nav-row", "");
-  link.setAttribute("data-zode-selected", selected ? "true" : "false");
-  link.setAttribute("data-zode-state", selected ? "selected" : "idle");
   if (selected) link.setAttribute("aria-current", "page");
-  const navIcon = icon(iconName);
-  navIcon.setAttribute("data-zode-nav-icon", "");
-  link.append(navIcon, node("span", undefined, label));
+  link.append(icon(iconName), node("span", undefined, label));
   link.addEventListener("click", (event) => {
     if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
       return;
     }
     event.preventDefault();
-    restoreFocusId = link.id;
     history.pushState(null, "", viewPaths[view]);
     void routeFromLocation().catch(showError);
   });
@@ -196,9 +185,7 @@ function navigationItem(
 function renderShell(content: HTMLElement, title: string, subtitle?: string): void {
   root.replaceChildren();
   const shell = node("div", "app-shell");
-  shell.setAttribute("data-zode-shell", "");
   const sidebar = node("aside", "sidebar");
-  sidebar.setAttribute("data-zode-shell-sidebar", "");
   const brand = node("div", "brand");
   brand.append(node("span", "brand-name", "Zode"), node("span", "brand-caption", "Durable agents"));
   const navigation = node("nav", "primary-nav");
@@ -210,33 +197,23 @@ function renderShell(content: HTMLElement, title: string, subtitle?: string): vo
     navigationItem("Settings", "settings", "sliders-horizontal"),
   );
   const sidebarStatus = node("div", "sidebar-status");
-  const statusText = node(
-    "span",
-    undefined,
-    state.system?.deployment === "all_in_one" ? "All-in-one ready" : "Server ready",
-  );
-  statusText.setAttribute("data-zode-secondary-text", "");
   sidebarStatus.append(
     icon(state.system?.deployment === "all_in_one" ? "desktop" : "cloud"),
-    statusText,
+    node(
+      "span",
+      undefined,
+      state.system?.deployment === "all_in_one" ? "All-in-one ready" : "Server ready",
+    ),
   );
   sidebar.append(brand, navigation, sidebarStatus);
 
   const main = node("main", "main-surface");
-  main.setAttribute("data-zode-shell-main", "");
   const header = node("header", "main-header");
-  header.setAttribute("data-zode-shell-header", "");
   const heading = node("div", "header-copy");
   const h1 = node("h1", undefined, title);
-  h1.setAttribute("data-zode-primary-text", "");
   heading.append(h1);
-  if (subtitle) {
-    const subtitleNode = node("p", undefined, subtitle);
-    subtitleNode.setAttribute("data-zode-secondary-text", "");
-    heading.append(subtitleNode);
-  }
+  if (subtitle) heading.append(node("p", undefined, subtitle));
   header.append(heading);
-  content.setAttribute("data-zode-thread-column", "");
   main.append(header, content);
   shell.append(sidebar, main);
   root.append(shell);
@@ -250,7 +227,6 @@ function renderShell(content: HTMLElement, title: string, subtitle?: string): vo
 function notice(): HTMLElement | null {
   if (!state.notice) return null;
   const value = node("div", "notice");
-  value.setAttribute("data-zode-attention", "");
   value.setAttribute("role", "status");
   value.append(icon("info"), node("span", undefined, state.notice));
   return value;
@@ -278,7 +254,7 @@ function renderProviders(): void {
     node(
       "p",
       "page-intro",
-      "Profiles are deployment-shared across all admitted actors. Configure execution once, then share write-only profiles to selected Endpoints.",
+      "Configure execution once, then share write-only profiles to selected Endpoints.",
     ),
     action(
       "Configure provider",
@@ -479,37 +455,10 @@ function profileRow(profile: AuthProfile): HTMLElement {
     node("strong", undefined, profile.label),
     node("span", undefined, `${profile.kind.replace("_", " ")} · revision ${profile.revision}`),
   );
-  const distribution = node("div", "profile-distribution");
-  for (const replica of profile.distribution) {
-    const endpoint = state.endpoints.find((item) => item.endpoint_id === replica.endpoint_id);
-    const target = node("div", "profile-targets");
-    target.setAttribute("role", "group");
-    target.setAttribute("aria-label", endpoint?.label ?? replica.endpoint_id);
-    target.append(
-      node("span", undefined, endpoint?.label ?? replica.endpoint_id),
-      statusBadge(replica.status),
-    );
-    distribution.append(target);
-  }
-  if (profile.distribution.length === 0 && profile.sharing.endpoint_ids.length > 0) {
-    for (const endpointId of profile.sharing.endpoint_ids) {
-      const endpoint = state.endpoints.find((item) => item.endpoint_id === endpointId);
-      const target = node("div", "profile-targets", endpoint?.label ?? endpointId);
-      target.setAttribute("role", "group");
-      target.setAttribute("aria-label", endpoint?.label ?? endpointId);
-      target.append(statusBadge("pending"));
-      distribution.append(target);
-    }
-  }
+  const targets = profile.sharing.endpoint_ids
+    .map((id) => state.endpoints.find((endpoint) => endpoint.endpoint_id === id)?.label ?? id)
+    .join(", ");
   const controls = node("div", "profile-actions");
-  const refresh = action("Refresh profile", "arrows-clockwise", async () => {
-    await withBusy(async () => {
-      await refreshProviders();
-      state.notice = `${profile.label} distribution status refreshed.`;
-    });
-  });
-  refresh.disabled = state.busy || profile.status !== "ready";
-  controls.append(refresh);
   if (!profile.is_default) {
     const makeDefault = action("Set as default", "star", async () => {
       await withBusy(async () => {
@@ -531,7 +480,7 @@ function profileRow(profile: AuthProfile): HTMLElement {
   row.append(
     copy,
     node("span", "profile-default", profile.is_default ? "Default profile" : "Not default"),
-    distribution,
+    node("span", "profile-targets", targets || "Not shared"),
     statusBadge(profile.status),
     controls,
   );
@@ -639,15 +588,8 @@ function renderEndpoints(): void {
     fact(facts, "Providers", endpoint.capabilities.providers.join(", ") || "None");
     fact(facts, "Tools", endpoint.capabilities.tools.join(", ") || "None");
     const actions = node("div", "card-actions");
-    if (state.probingEndpointId === endpoint.endpoint_id) {
-      const progress = node("p", "inline-progress", "Checking Endpoint status…");
-      progress.setAttribute("role", "status");
-      progress.setAttribute("aria-live", "polite");
-      actions.append(progress);
-    }
     actions.append(
       action("Refresh Endpoint status", "arrows-clockwise", async () => {
-        state.probingEndpointId = endpoint.endpoint_id;
         await withBusy(async () => {
           try {
             const observed = await probeEndpoint(endpoint.endpoint_id);
@@ -667,8 +609,6 @@ function renderEndpoints(): void {
             }
             throw error;
           }
-        }).finally(() => {
-          state.probingEndpointId = null;
         });
       }),
     );
@@ -725,12 +665,6 @@ function endpointDialog(): HTMLElement {
       restoreFocusId = "add-remote-endpoint";
     });
   });
-  if (state.busy) {
-    const progress = node("p", "inline-progress", "Connecting to Endpoint…");
-    progress.setAttribute("role", "status");
-    progress.setAttribute("aria-live", "polite");
-    form.append(progress);
-  }
   dialog.append(form);
   return dialog;
 }
@@ -949,10 +883,6 @@ function renderSession(): void {
   const session = state.activeSession;
   const endpoint = state.endpoints.find((item) => item.endpoint_id === state.activeEndpointId);
   const workspace = node("section", "session-workspace");
-  const sessionState = session?.status.toLowerCase() ?? "";
-  if (sessionState.includes("error") || sessionState.includes("failed")) {
-    workspace.setAttribute("data-zode-session-state", "error");
-  }
   if (!session || !endpoint) {
     workspace.append(
       emptyState("warning", "Session unavailable", "The Endpoint could not provide this session."),
@@ -961,15 +891,8 @@ function renderSession(): void {
     return;
   }
   const meta = node("div", "session-meta");
-  const connectionBadge = statusBadge(state.connection);
-  connectionBadge.setAttribute("data-zode-attention", "");
-  if (state.connection === "Live") {
-    connectionBadge.setAttribute("data-zode-session-state", "streaming");
-  } else if (state.connection === "Reconnecting") {
-    connectionBadge.setAttribute("data-zode-session-state", "reconnecting");
-  }
   meta.append(
-    connectionBadge,
+    statusBadge(state.connection),
     node("span", undefined, endpoint.kind === "local" ? "This machine" : endpoint.label),
     node(
       "span",
@@ -977,9 +900,6 @@ function renderSession(): void {
       session.model ? `${session.model.provider} · ${session.model.model}` : "No model",
     ),
   );
-  const sessionId = node("span", "session-meta-id", session.session_id);
-  sessionId.setAttribute("data-zode-visual-id", "");
-  meta.append(sessionId);
   workspace.append(meta);
   const message = notice();
   if (message) workspace.append(message);
@@ -996,7 +916,6 @@ function renderSession(): void {
   }
   for (const message of session.transcript) {
     const article = node("article", `message message-${message.role}`);
-    article.setAttribute("data-zode-visual-dynamic", "");
     article.append(
       node(
         "span",
@@ -1031,7 +950,6 @@ function renderSession(): void {
 
 function sessionExecutionRecovery(endpoint: Endpoint, session: Session): HTMLFormElement {
   const form = node("form", "editor-panel session-execution-recovery");
-  form.setAttribute("data-zode-secondary-surface", "");
   const title = node("div", "panel-title");
   title.append(
     node("h2", undefined, "Recover session execution"),
@@ -1152,40 +1070,24 @@ function runtimeActivity(session: Session): HTMLElement {
   const activity = node("aside", "runtime-activity");
   activity.setAttribute("aria-label", "Runtime activity");
   if (session.wait) {
-    const waiting = statusLine(
-      "clock",
-      "Waiting",
-      session.wait.reason ?? "Awaiting an external result",
+    activity.append(
+      statusLine("clock", "Waiting", session.wait.reason ?? "Awaiting an external result"),
     );
-    waiting.setAttribute("data-zode-session-state", "waiting");
-    activity.append(waiting);
   }
   for (const tool of session.tool_calls ?? []) {
-    const toolLine = statusLine("wrench", tool.name ?? "Tool", tool.status.replaceAll("_", " "));
-    toolLine.setAttribute("data-zode-session-state", "tool");
-    activity.append(toolLine);
+    activity.append(statusLine("wrench", tool.name ?? "Tool", tool.status.replaceAll("_", " ")));
   }
   if (session.active_activation) {
-    const working = statusLine("spinner-gap", "Working", "Model activation in progress");
-    working.setAttribute("data-zode-session-state", "streaming");
-    activity.append(working);
+    activity.append(statusLine("spinner-gap", "Working", "Model activation in progress"));
   }
   if (!session.wait && (session.tool_calls?.length ?? 0) === 0 && !session.active_activation) {
-    const upToDate = statusLine("check-circle", "Up to date", "Durable events are connected");
-    if (
-      session.status.toLowerCase().includes("error") ||
-      session.status.toLowerCase().includes("failed")
-    ) {
-      upToDate.setAttribute("data-zode-session-state", "error");
-    }
-    activity.append(upToDate);
+    activity.append(statusLine("check-circle", "Up to date", "Durable events are connected"));
   }
   return activity;
 }
 
 function composer(endpointId: string, sessionId: string): HTMLFormElement {
   const form = node("form", "composer");
-  form.setAttribute("data-zode-composer", "");
   const input = node("textarea", "composer-input");
   input.rows = 2;
   input.placeholder = "Message Zode";
@@ -1288,37 +1190,13 @@ function submitButton(label: string, iconName = "check"): HTMLButtonElement {
 }
 
 async function refreshProviders(): Promise<void> {
-  if (providerRefreshTimer) {
-    clearTimeout(providerRefreshTimer);
-    providerRefreshTimer = null;
-  }
   state.providers = await listProviders();
   const profiles = await Promise.all(
-    state.providers.map(async (provider) => {
-      const items = await listProfiles(provider.provider);
-      const withDistribution = await Promise.all(
-        items.map(async (profile) => ({
-          ...profile,
-          distribution: await listReplicas(profile.profile_id),
-        })),
-      );
-      return [provider.provider, withDistribution] as const;
-    }),
+    state.providers.map(
+      async (provider) => [provider.provider, await listProfiles(provider.provider)] as const,
+    ),
   );
   state.profiles = new Map(profiles);
-  const hasPendingDistribution = profiles.some(([, items]) =>
-    items.some((profile) => profile.status === "pending" || profile.status === "unreachable"),
-  );
-  if (hasPendingDistribution && state.view === "providers") {
-    providerRefreshTimer = setTimeout(() => {
-      providerRefreshTimer = null;
-      if (!state.busy && state.view === "providers") {
-        void refreshProviders()
-          .then(() => render())
-          .catch(showError);
-      }
-    }, 500);
-  }
 }
 
 async function refreshSessions(): Promise<void> {
@@ -1629,7 +1507,6 @@ function friendlyError(code: string): string {
     conflict:
       "This action conflicts with an earlier command. Review the current state and try again.",
     operation_conflict: "This action conflicts with an earlier management change.",
-    not_found: "The requested resource was not found or is unavailable.",
     network_error: "The Server could not be reached.",
     invalid_request: "Check the requested values and try again.",
   };

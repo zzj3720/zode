@@ -35,7 +35,11 @@ type EndpointBoundaryRequest = {
   responseEventIds: string[];
   responseEventNames: string[];
   responseEventSequence: string[];
+  responseEvents: Array<{ id: string; event: string; data: string }>;
+  forwardedResponseEvents: Array<{ id: string; event: string; data: string }>;
   responseSseRemainder?: string;
+  responseSseFrameRemainder?: string;
+  forwardedSseFrameRemainder?: string;
   responseComplete?: boolean;
   recorded?: boolean;
   matchedBrowserRequest?: BrowserSseRequest;
@@ -74,10 +78,26 @@ type EventBodyHold = {
   released: Promise<void>;
   release: () => void;
 };
+type EventForwardingState = {
+  upstream: IncomingMessage;
+  frozen: boolean;
+  released: boolean;
+  backpressured: boolean;
+};
 type BrowserResponseHold = {
   received: Promise<void>;
   release: () => void;
   dispose: () => Promise<void>;
+};
+type BrowserDurableCursorWrite = {
+  storageKey: string;
+  cursor: string;
+};
+type BrowserConsumedSseFrame = {
+  path: string;
+  id: string;
+  event: string;
+  data: string;
 };
 
 const REPO_ROOT = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -769,15 +789,11 @@ class ReplayProvider {
 
   async waitForScenario(scenario: string, count = 1): Promise<void> {
     if ((this.calls.get(scenario) ?? 0) >= count) return;
-    await withTimeout(
-      new Promise<void>((resolvePromise) => {
-        const waiters = this.waiters.get(scenario) ?? [];
-        waiters.push({ count, resolve: resolvePromise });
-        this.waiters.set(scenario, waiters);
-      }),
-      15_000,
-      `provider scenario ${scenario} did not reach the retained public exchange`,
-    );
+    await new Promise<void>((resolvePromise) => {
+      const waiters = this.waiters.get(scenario) ?? [];
+      waiters.push({ count, resolve: resolvePromise });
+      this.waiters.set(scenario, waiters);
+    });
   }
 
   release(name: string): void {
@@ -855,6 +871,7 @@ class EndpointBoundary {
     resolve: (eventIds: string[]) => void;
   }> = [];
   private readonly eventBodyHolds = new Map<string, EventBodyHold>();
+  private readonly eventForwarding = new Map<EndpointBoundaryRequest, EventForwardingState>();
 
   holdEventBody(sessionId: string): void {
     if (this.eventBodyHolds.has(sessionId)) throw new Error("session event body is already held");
@@ -880,6 +897,22 @@ class EndpointBoundary {
     if (hold === undefined) return;
     hold.release();
     this.eventBodyHolds.delete(sessionId);
+  }
+
+  freezeEventForwarding(request: EndpointBoundaryRequest): void {
+    const forwarding = this.eventForwarding.get(request);
+    if (forwarding === undefined) {
+      if (request.responseComplete === true) return;
+      throw new Error("Endpoint SSE forwarding was not available to freeze");
+    }
+    // Stop only the browser-facing bytes for this exact response. Keep reading
+    // and observing Endpoint frames so a later connection must replay every
+    // durable frame that the browser did not consume before detaching.
+    forwarding.frozen = true;
+    if (forwarding.backpressured) {
+      forwarding.backpressured = false;
+      forwarding.upstream.resume();
+    }
   }
 
   static async start(targetBaseUrl: string): Promise<EndpointBoundary> {
@@ -933,7 +966,52 @@ class EndpointBoundary {
     }
   }
 
+  private decodeSseFrame(frame: string): { id: string; event: string; data: string } | undefined {
+    let event = "message";
+    let id = "";
+    const data: string[] = [];
+    for (const line of frame.split(/\r\n|\n|\r/)) {
+      if (line.startsWith("event:")) {
+        event = line.startsWith("event: ") ? line.slice(7) : line.slice(6);
+      } else if (line.startsWith("id:")) {
+        id = (line.startsWith("id: ") ? line.slice(4) : line.slice(3)).trim();
+      } else if (line.startsWith("data:")) {
+        data.push(line.startsWith("data: ") ? line.slice(6) : line.slice(5));
+      }
+    }
+    return id.length > 0 || data.length > 0 ? { id, event, data: data.join("\n") } : undefined;
+  }
+
+  private recordSseFrame(request: EndpointBoundaryRequest, frame: string): void {
+    const decoded = this.decodeSseFrame(frame);
+    if (decoded !== undefined) request.responseEvents.push(decoded);
+  }
+
+  private observeSseFrames(request: EndpointBoundaryRequest, chunk: Buffer): void {
+    let text = `${request.responseSseFrameRemainder ?? ""}${chunk.toString("utf8")}`;
+    while (true) {
+      const separator = /\r\n\r\n|\n\n|\r\r/.exec(text);
+      if (separator?.index === undefined) break;
+      this.recordSseFrame(request, text.slice(0, separator.index));
+      text = text.slice(separator.index + separator[0].length);
+    }
+    request.responseSseFrameRemainder = text;
+  }
+
+  private observeForwardedSseFrames(request: EndpointBoundaryRequest, chunk: Buffer): void {
+    let text = `${request.forwardedSseFrameRemainder ?? ""}${chunk.toString("utf8")}`;
+    while (true) {
+      const separator = /\r\n\r\n|\n\n|\r\r/.exec(text);
+      if (separator?.index === undefined) break;
+      const decoded = this.decodeSseFrame(text.slice(0, separator.index));
+      if (decoded !== undefined) request.forwardedResponseEvents.push(decoded);
+      text = text.slice(separator.index + separator[0].length);
+    }
+    request.forwardedSseFrameRemainder = text;
+  }
+
   private observeSseChunk(request: EndpointBoundaryRequest, chunk: Buffer): void {
+    this.observeSseFrames(request, chunk);
     const text = `${request.responseSseRemainder ?? ""}${chunk.toString("utf8")}`;
     const lines = text.split(/\r\n|\n|\r/);
     request.responseSseRemainder = lines.pop() ?? "";
@@ -946,6 +1024,9 @@ class EndpointBoundary {
       this.recordSseLine(request, request.responseSseRemainder);
       request.responseSseRemainder = "";
     }
+    // A public SSE frame is dispatched only after its terminating blank line.
+    // Keep an unterminated remainder available for diagnostics, but never
+    // promote it into the complete-frame/replay authority on end or close.
     request.responseComplete = true;
   }
 
@@ -982,6 +1063,8 @@ class EndpointBoundary {
       responseEventIds: [],
       responseEventNames: [],
       responseEventSequence: [],
+      responseEvents: [],
+      forwardedResponseEvents: [],
     };
     const upstream = httpRequest(
       {
@@ -996,6 +1079,7 @@ class EndpointBoundary {
         captured.responseContentType = Array.isArray(upstreamResponse.headers["content-type"])
           ? upstreamResponse.headers["content-type"].join(",")
           : String(upstreamResponse.headers["content-type"] ?? "");
+        const isSse = upstreamResponse.statusCode === 200 && captured.path.endsWith("/events");
         if (upstreamResponse.statusCode === 404) {
           const chunks: Buffer[] = [];
           upstreamResponse.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
@@ -1005,11 +1089,6 @@ class EndpointBoundary {
             this.record(captured);
           });
         } else {
-          if (upstreamResponse.statusCode === 200 && captured.path.endsWith("/events")) {
-            upstreamResponse.on("data", (chunk) => this.observeSseChunk(captured, Buffer.from(chunk)));
-            upstreamResponse.once("end", () => this.finishSseResponse(captured));
-            upstreamResponse.once("close", () => this.finishSseResponse(captured));
-          }
           this.record(captured);
         }
         const responseHeaders: Record<string, string | string[] | undefined> = { ...upstreamResponse.headers };
@@ -1019,18 +1098,59 @@ class EndpointBoundary {
         response.writeHead(upstreamResponse.statusCode ?? 502, responseHeaders);
         const heldSession = captured.path.match(/^\/v1\/sessions\/([^/]+)\/events$/)?.[1];
         const hold = heldSession === undefined ? undefined : this.eventBodyHolds.get(heldSession);
-        if (upstreamResponse.statusCode === 200 && hold !== undefined) {
+        if (isSse) {
           upstreamResponse.pause();
-          response.flushHeaders();
-          hold.markHeld();
-          void hold.released.then(() => {
-            if (response.destroyed) {
-              upstreamResponse.destroy();
-              return;
+          const forwarding: EventForwardingState = {
+            upstream: upstreamResponse,
+            frozen: false,
+            released: hold === undefined,
+            backpressured: false,
+          };
+          this.eventForwarding.set(captured, forwarding);
+          const cleanup = (): void => {
+            if (this.eventForwarding.get(captured) === forwarding) {
+              this.eventForwarding.delete(captured);
             }
-            upstreamResponse.pipe(response);
-            upstreamResponse.resume();
+          };
+          upstreamResponse.on("data", (rawChunk) => {
+            const chunk = Buffer.from(rawChunk);
+            this.observeSseChunk(captured, chunk);
+            if (forwarding.frozen || !forwarding.released || response.destroyed) return;
+            this.observeForwardedSseFrames(captured, chunk);
+            if (!response.write(chunk)) {
+              forwarding.backpressured = true;
+              upstreamResponse.pause();
+              response.once("drain", () => {
+                forwarding.backpressured = false;
+                if (!forwarding.frozen && forwarding.released && !response.destroyed) {
+                  upstreamResponse.resume();
+                }
+              });
+            }
           });
+          upstreamResponse.once("end", () => {
+            this.finishSseResponse(captured);
+            cleanup();
+            if (!response.destroyed && !response.writableEnded) response.end();
+          });
+          upstreamResponse.once("close", () => {
+            this.finishSseResponse(captured);
+            cleanup();
+          });
+          if (hold !== undefined) {
+            response.flushHeaders();
+            hold.markHeld();
+            void hold.released.then(() => {
+              forwarding.released = true;
+              if (response.destroyed) {
+                upstreamResponse.destroy();
+                return;
+              }
+              if (!forwarding.frozen) upstreamResponse.resume();
+            });
+          } else {
+            upstreamResponse.resume();
+          }
         } else {
           upstreamResponse.pipe(response);
         }
@@ -1055,6 +1175,12 @@ class EndpointBoundary {
         response.destroy();
       }
     });
+    response.once("close", () => {
+      if (captured.status === 200 && captured.path.endsWith("/events")) {
+        upstream.destroy();
+        this.finishSseResponse(captured);
+      }
+    });
     upstream.end(body);
   }
 
@@ -1070,6 +1196,7 @@ class EndpointBoundary {
       request.path === path &&
       request.lastEventId === lastEventId &&
       request.forwardedLastEventId === lastEventId &&
+      (browserRequest.status === undefined || request.status === browserRequest.status) &&
       request.matchedBrowserRequest === undefined &&
       (requestId.length === 0 || request.requestId.length === 0
         ? true
@@ -2210,29 +2337,310 @@ async function waitForExactBrowserSseRequest(
   return matches[0];
 }
 
-async function waitForBrowserSseRequest(
+function browserSessionCursorStorageKey(endpointId: string, sessionId: string): string {
+  return `zode.endpoint-event-cursor.v1:${endpointId}:${sessionId}`;
+}
+
+async function installBrowserDurableCursorObserver(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const writes: BrowserDurableCursorWrite[] = [];
+    const frames: BrowserConsumedSseFrame[] = [];
+    const observedWindow = window as unknown as {
+      __zodeE2eDurableCursorWrites?: BrowserDurableCursorWrite[];
+      __zodeE2eConsumedSseFrames?: BrowserConsumedSseFrame[];
+    };
+    Object.defineProperty(observedWindow, "__zodeE2eDurableCursorWrites", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: writes,
+    });
+    Object.defineProperty(observedWindow, "__zodeE2eConsumedSseFrames", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: frames,
+    });
+    const originalSetItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function setItem(key: string, value: string): void {
+      originalSetItem.call(this, key, value);
+      if (
+        this === window.sessionStorage
+        && key.startsWith("zode.endpoint-event-cursor.v1:")
+        && /^[0-9]+$/.test(value)
+      ) {
+        writes.push({ storageKey: key, cursor: value });
+      }
+    };
+
+    // This pass-through transform observes exactly the SSE bytes read by the
+    // production fetch consumer. It neither pulls a second branch nor changes
+    // the response bytes; the cursor-write hook above separately proves that
+    // the production frame handler processed each durable ID.
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = async (...args: Parameters<typeof fetch>): Promise<Response> => {
+      const response = await originalFetch(...args);
+      const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+      if (!contentType.includes("text/event-stream") || response.body === null) return response;
+      const input = args[0];
+      const requestUrl = new URL(
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+        location.href,
+      );
+      const decoder = new TextDecoder();
+      let pending = "";
+      const observe = (final: boolean): void => {
+        pending += decoder.decode(undefined, { stream: !final });
+        while (true) {
+          const separator = /\r\n\r\n|\n\n|\r\r/.exec(pending);
+          if (!separator || separator.index === undefined) break;
+          const rawFrame = pending.slice(0, separator.index);
+          pending = pending.slice(separator.index + separator[0].length);
+          let event = "message";
+          let id = "";
+          const data: string[] = [];
+          for (const line of rawFrame.split(/\r\n|\n|\r/)) {
+            if (line.startsWith("event:")) event = line.slice(line.startsWith("event: ") ? 7 : 6);
+            else if (line.startsWith("id:")) id = line.slice(3).trim();
+            else if (line.startsWith("data:")) data.push(line.slice(line.startsWith("data: ") ? 6 : 5));
+          }
+          if (id.length > 0 || data.length > 0) {
+            frames.push({ path: requestUrl.pathname, id, event, data: data.join("\n") });
+          }
+        }
+      };
+      const body = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          pending += decoder.decode(chunk, { stream: true });
+          observe(false);
+          controller.enqueue(chunk);
+        },
+        flush() {
+          observe(true);
+        },
+      }));
+      return new Response(body, {
+        headers: response.headers,
+        status: response.status,
+        statusText: response.statusText,
+      });
+    };
+  });
+}
+
+async function browserDurableCursorWrites(
+  page: Page,
+  endpointId: string,
+  sessionId: string,
+): Promise<string[]> {
+  const storageKey = browserSessionCursorStorageKey(endpointId, sessionId);
+  return page.evaluate((key) => {
+    const observedWindow = window as unknown as {
+      __zodeE2eDurableCursorWrites?: BrowserDurableCursorWrite[];
+    };
+    return (observedWindow.__zodeE2eDurableCursorWrites ?? [])
+      .filter((write) => write.storageKey === key)
+      .map((write) => write.cursor);
+  }, storageKey);
+}
+
+async function browserConsumedSseFrames(
+  page: Page,
+  endpointId: string,
+  sessionId: string,
+): Promise<BrowserConsumedSseFrame[]> {
+  const path = `/v1/endpoints/${endpointId}/sessions/${sessionId}/events`;
+  return page.evaluate((expectedPath) => {
+    const observedWindow = window as unknown as {
+      __zodeE2eConsumedSseFrames?: BrowserConsumedSseFrame[];
+    };
+    return (observedWindow.__zodeE2eConsumedSseFrames ?? [])
+      .filter((frame) => frame.path === expectedPath)
+      .map((frame) => ({ ...frame }));
+  }, path);
+}
+
+function completeDurableFrames(
+  request: EndpointBoundaryRequest,
+): Array<{ id: string; event: string; data: string }> {
+  return request.responseEvents
+    .filter((frame) => /^[0-9]+$/.test(frame.id))
+    .map(({ id, event, data }) => ({ id, event, data }));
+}
+
+function completeDurableEventIds(request: EndpointBoundaryRequest): string[] {
+  return completeDurableFrames(request).map((frame) => frame.id);
+}
+
+async function waitForBrowserSseRequestWithExactCursor(
   requests: BrowserSseRequest[],
   endpointId: string,
   sessionId: string,
-  lastEventId: string,
+  cursor: string,
   label: string,
-  requestId?: string,
+  requestId: string,
 ): Promise<BrowserSseRequest> {
-  const matchesForLabel = (): BrowserSseRequest[] => {
-    const matches = matchingBrowserSseRequests(requests, endpointId, sessionId, lastEventId);
-    return requestId === undefined ? matches : matches.filter((request) => request.requestId === requestId);
-  };
+  const matches = (): BrowserSseRequest[] =>
+    requests.filter(
+      (request) =>
+        request.method === "GET" &&
+        request.path === `/v1/endpoints/${endpointId}/sessions/${sessionId}/events` &&
+        request.endpointId === endpointId &&
+        request.sessionId === sessionId &&
+        request.requestId === requestId &&
+        request.status === 200 &&
+        request.lastEventId === cursor,
+    );
+  await expect
+    .poll(() => matches().length, {
+      timeout: 15_000,
+      message: `${label} did not carry the exact browser-consumed cursor ${cursor}`,
+    })
+    .toBe(1);
+  const [match] = matches();
+  if (match === undefined) throw new Error(`${label} was not a single exact browser SSE request`);
+  return match;
+}
+
+async function waitForRenderedDurableEventId(
+  page: Page,
+  request: EndpointBoundaryRequest,
+  endpointId: string,
+  sessionId: string,
+  visibleText: string,
+  label: string,
+): Promise<string> {
+  await expect(page.getByText(visibleText, { exact: true })).toBeVisible({ timeout: 15_000 });
+  let matchingEventIds: string[] = [];
   await expect
     .poll(
-      () => matchesForLabel().length,
-      { timeout: 15_000, message: `${label} did not arrive at the browser boundary` },
+      () => {
+        matchingEventIds = request.forwardedResponseEvents
+          .filter((candidate) => /^[0-9]+$/.test(candidate.id) && candidate.data.includes(visibleText))
+          .map((candidate) => candidate.id);
+        return matchingEventIds.length;
+      },
+      {
+        timeout: 15_000,
+        message: `${label} was visible without a matching durable public SSE event`,
+      },
     )
-    .toBeGreaterThan(0);
-  const matches = matchesForLabel();
-  const latest = matches.at(-1);
-  if (latest === undefined) throw new Error(`${label} was not a browser SSE request`);
-  if (latest.requestId.length === 0) throw new Error(`${label} omitted ${REQUEST_ID_HEADER}`);
-  return latest;
+    .toBe(1);
+  const eventId = matchingEventIds[0] ?? "";
+  const expectedFrames = request.forwardedResponseEvents.filter((frame) => /^[0-9]+$/.test(frame.id));
+  const endpointIndex = expectedFrames.findIndex((frame) => frame.id === eventId);
+  if (endpointIndex < 0) throw new Error(`${label} event ${eventId} was not in the ordered Endpoint SSE stream`);
+  const expectedFramePrefix = expectedFrames.slice(0, endpointIndex + 1);
+  const expectedBrowserPrefix = expectedFramePrefix.map((frame) => frame.id);
+  let consumed: string[] = [];
+  let consumedFrames: BrowserConsumedSseFrame[] = [];
+  await expect
+    .poll(
+      async () => {
+        consumed = await browserDurableCursorWrites(page, endpointId, sessionId);
+        consumedFrames = (await browserConsumedSseFrames(page, endpointId, sessionId))
+          .filter((frame) => /^[0-9]+$/.test(frame.id));
+        return consumed.includes(eventId) && consumedFrames.some((frame) => frame.id === eventId);
+      },
+      {
+        timeout: 15_000,
+        message: `${label} durable event ${eventId} was emitted but never processed by the browser`,
+      },
+    )
+    .toBe(true);
+  const targetIndex = consumed.indexOf(eventId);
+  const consumedPrefix = consumed.slice(targetIndex - expectedBrowserPrefix.length + 1, targetIndex + 1);
+  expect(consumedPrefix, `${label} browser cursor writes skipped or reordered a durable public SSE frame`).toEqual(
+    expectedBrowserPrefix,
+  );
+  expect(new Set(consumed).size, `${label} browser processed a durable public SSE ID more than once`).toBe(
+    consumed.length,
+  );
+  const targetFrameIndex = consumedFrames.findIndex((frame) => frame.id === eventId);
+  const consumedFramePrefix = consumedFrames
+    .slice(targetFrameIndex - expectedFramePrefix.length + 1, targetFrameIndex + 1)
+    .map(({ id, event, data }) => ({ id, event, data }));
+  expect(
+    consumedFramePrefix,
+    `${label} browser-consumed SSE bytes skipped, reordered, or changed a durable public frame`,
+  ).toEqual(expectedFramePrefix);
+  expect(
+    new Set(consumedFrames.map((frame) => frame.id)).size,
+    `${label} browser consumed a durable public SSE frame more than once`,
+  ).toBe(consumedFrames.length);
+  return eventId;
+}
+
+async function freezeAndSnapshotBrowserCursor(
+  page: Page,
+  boundary: EndpointBoundary,
+  request: EndpointBoundaryRequest,
+  endpointId: string,
+  sessionId: string,
+  label: string,
+): Promise<string> {
+  boundary.freezeEventForwarding(request);
+  const baseCursor = request.lastEventId;
+  if (baseCursor.length > 0 && !/^[0-9]+$/.test(baseCursor)) {
+    throw new Error(`${label} started from a non-numeric durable cursor`);
+  }
+  const isAfterBase = (id: string): boolean =>
+    /^[0-9]+$/.test(id) && (baseCursor.length === 0 || BigInt(id) > BigInt(baseCursor));
+  const forwardedFrames = request.forwardedResponseEvents.filter((frame) => /^[0-9]+$/.test(frame.id));
+  if (baseCursor.length > 0 && forwardedFrames.some((frame) => BigInt(frame.id) <= BigInt(baseCursor))) {
+    throw new Error(`${label} forwarded a durable frame at or before its Last-Event-ID cursor`);
+  }
+  const expectedFrames = forwardedFrames.filter((frame) => isAfterBase(frame.id));
+  const expectedIds = expectedFrames.map((frame) => frame.id);
+  for (let index = 1; index < expectedIds.length; index += 1) {
+    if (BigInt(expectedIds[index]) <= BigInt(expectedIds[index - 1])) {
+      throw new Error(`${label} Endpoint durable frame IDs were duplicated or out of order`);
+    }
+  }
+  const expectedCursor = expectedIds.at(-1) ?? baseCursor;
+  if (!/^[0-9]+$/.test(expectedCursor)) {
+    throw new Error(`${label} had no durable cursor to preserve before detaching`);
+  }
+  const storageKey = browserSessionCursorStorageKey(endpointId, sessionId);
+  await expect
+    .poll(
+      async () => {
+        const [storedCursor, writes, frames] = await Promise.all([
+          page.evaluate((key) => window.sessionStorage.getItem(key), storageKey),
+          browserDurableCursorWrites(page, endpointId, sessionId),
+          browserConsumedSseFrames(page, endpointId, sessionId),
+        ]);
+        return {
+          storedCursor,
+          lastWrite: writes.filter(isAfterBase).at(-1) ?? baseCursor,
+          lastFrame: frames.filter((frame) => isAfterBase(frame.id)).at(-1)?.id ?? baseCursor,
+        };
+      },
+      {
+        timeout: 15_000,
+        message: `${label} did not finish processing every byte forwarded before the detach barrier`,
+      },
+    )
+    .toEqual({ storedCursor: expectedCursor, lastWrite: expectedCursor, lastFrame: expectedCursor });
+  const writes = (await browserDurableCursorWrites(page, endpointId, sessionId)).filter(isAfterBase);
+  const frames = (await browserConsumedSseFrames(page, endpointId, sessionId))
+    .filter((frame) => isAfterBase(frame.id))
+    .map(({ id, event, data }) => ({ id, event, data }));
+  expect(writes, `${label} browser cursor writes skipped or reordered a forwarded durable frame`).toEqual(
+    expectedIds,
+  );
+  expect(frames, `${label} browser-consumed bytes skipped, reordered, or changed a forwarded frame`).toEqual(
+    expectedFrames,
+  );
+  expect(new Set(writes).size, `${label} browser wrote a durable cursor more than once`).toBe(writes.length);
+  expect(new Set(frames.map((frame) => frame.id)).size, `${label} browser consumed a durable frame twice`).toBe(
+    frames.length,
+  );
+  return expectedCursor;
 }
 
 function assertExactSseCorrelation(
@@ -2527,6 +2935,7 @@ test.describe("session reconnect and runtime states", () => {
     page,
   }) => {
     if (topology === undefined) throw new Error("test topology did not start");
+    await installBrowserDurableCursorObserver(page);
     await bootstrap(page, topology);
     const sseRequests = observeEventRequests(page, topology);
     topology.expectScenario(SCENARIOS.keyboard, 1);
@@ -2613,14 +3022,40 @@ test.describe("session reconnect and runtime states", () => {
     topology.expectScenario(SCENARIOS.reconnect, 2);
     let diagnosticPage: Page | undefined;
     let diagnosticNetwork: BrowserNetworkObservation[] | undefined;
+    let browserConsumedAdmissionCursor = "";
+    const reconnectAdmission = await holdNextBrowserMessageResponse(page);
     try {
-      await sendMessageWithKeyboard(page, `reconnect path ${SCENARIOS.reconnect}`);
-      await withTimeout(
-        firstProviderChunk,
-        15_000,
-        "provider did not flush its provisional chunk while Endpoint replay was held",
-      );
-      topology.endpointBoundary.releaseEventBody(sessionId);
+      try {
+        await sendMessageWithKeyboard(
+          page,
+          `reconnect path ${SCENARIOS.reconnect}`,
+          undefined,
+          async () => {
+            await withTimeout(
+              reconnectAdmission.received,
+              15_000,
+              "reconnect message was not durably admitted before its browser response hold",
+            );
+            await withTimeout(
+              firstProviderChunk,
+              15_000,
+              "provider did not flush its provisional chunk while Endpoint replay was held",
+            );
+            topology!.endpointBoundary.releaseEventBody(sessionId);
+            browserConsumedAdmissionCursor = await waitForRenderedDurableEventId(
+              page,
+              initialEndpointRequest,
+              topology!.endpointId,
+              sessionId,
+              `reconnect path ${SCENARIOS.reconnect}`,
+              "browser-consumed reconnect admission",
+            );
+            reconnectAdmission.release();
+          },
+        );
+      } finally {
+        await reconnectAdmission.dispose();
+      }
       await topology.provider.waitForScenario(SCENARIOS.reconnect);
       try {
         await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toBeVisible();
@@ -2643,18 +3078,19 @@ test.describe("session reconnect and runtime states", () => {
           `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}; browser_body=${JSON.stringify((await page.locator("body").innerText()).slice(0, 4000))}; session_snapshot=${JSON.stringify(sessionSnapshot.body)}; provider_requests=${JSON.stringify(topology.provider.debugRequests())}; endpoint_boundary=${JSON.stringify(topology.endpointBoundary.debugRequests())}`,
         );
       }
-      await expect
-        .poll(() => initialEndpointRequest.responseEventIds.at(-1) ?? "", {
-          timeout: 15_000,
-          message: "initial long replay did not expose a durable cursor before refresh",
-        })
-        .toMatch(/^[0-9]+$/);
-      const initialEventIds = [...initialEndpointRequest.responseEventIds];
-      topology.recordEventIds(initialEventIds);
       await expect(page.getByText(`reconnect path ${SCENARIOS.reconnect}`, { exact: true })).toBeVisible();
       expect(initialEndpointRequest.responseEventNames).toContain("assistant_message_delta");
-      const originalCursor = initialEventIds.at(-1) ?? "";
-      topology.recordCursor(originalCursor);
+      expect(initialEndpointRequest.responseEventIds).toContain(browserConsumedAdmissionCursor);
+      topology.recordCursor(browserConsumedAdmissionCursor);
+      const reloadCursor = await freezeAndSnapshotBrowserCursor(
+        page,
+        topology.endpointBoundary,
+        initialEndpointRequest,
+        topology.endpointId,
+        sessionId,
+        "browser refresh detach barrier",
+      );
+      topology.recordCursor(reloadCursor);
 
       const reloadRequestId = topology.nextSseRequestId();
       await page.context().setExtraHTTPHeaders({
@@ -2663,12 +3099,13 @@ test.describe("session reconnect and runtime states", () => {
       });
       await page.reload({ waitUntil: "domcontentloaded" });
       await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible();
-      const reloadedBrowserRequest = await waitForExactBrowserSseRequest(
+      const reloadedBrowserRequest = await waitForBrowserSseRequestWithExactCursor(
         sseRequests,
         topology.endpointId,
         sessionId,
-        originalCursor,
+        reloadCursor,
         "refreshed browser SSE",
+        reloadRequestId,
       );
       const reloadedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
         reloadedBrowserRequest,
@@ -2676,10 +3113,60 @@ test.describe("session reconnect and runtime states", () => {
       assertExactSseCorrelation(topology, reloadedBrowserRequest, reloadedEndpointRequest);
       expect(reloadedBrowserRequest.requestId).toBe(reloadRequestId);
       expect(reloadedEndpointRequest.status).toBe(200);
+      await expect
+        .poll(() => initialEndpointRequest.responseComplete === true, {
+          timeout: 15_000,
+          message: "initial browser SSE did not close after refresh",
+        })
+        .toBe(true);
+      const initialFrames = completeDurableFrames(initialEndpointRequest);
+      const initialEventIds = initialFrames.map((frame) => frame.id);
+      topology.recordEventIds(initialEventIds);
+      expect(initialEventIds).toContain(reloadCursor);
+      const publishedBeforeReload = initialEventIds.at(-1) ?? "";
+      expect(publishedBeforeReload).toMatch(/^[0-9]+$/);
+      const expectedReplayFrames = initialFrames.filter(
+        (frame) => BigInt(frame.id) > BigInt(reloadCursor),
+      );
+      await expect
+        .poll(
+          () =>
+            completeDurableFrames(reloadedEndpointRequest).filter(
+              (frame) => BigInt(frame.id) <= BigInt(publishedBeforeReload),
+            ),
+          {
+            timeout: 15_000,
+            message: "refreshed browser SSE did not replay every public durable id after its consumed cursor",
+          },
+        )
+        .toEqual(expectedReplayFrames);
       await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toHaveCount(0);
 
+      const serverRestartCursor = await freezeAndSnapshotBrowserCursor(
+        page,
+        topology.endpointBoundary,
+        reloadedEndpointRequest,
+        topology.endpointId,
+        sessionId,
+        "Server restart detach barrier",
+      );
+      topology.recordCursor(serverRestartCursor);
       const cursorCountBeforeOutage = sseRequests.length;
       await topology.server.stop();
+      await expect
+        .poll(() => reloadedEndpointRequest.responseComplete === true, {
+          timeout: 15_000,
+          message: "pre-outage Endpoint SSE did not close after Server stop",
+        })
+        .toBe(true);
+      const framesPublishedBeforeServerRestart = completeDurableFrames(reloadedEndpointRequest);
+      const eventIdsPublishedBeforeServerRestart = framesPublishedBeforeServerRestart.map(
+        (frame) => frame.id,
+      );
+      const publishedBeforeServerRestart = eventIdsPublishedBeforeServerRestart.at(-1) ?? serverRestartCursor;
+      const expectedServerRestartReplayFrames = framesPublishedBeforeServerRestart.filter(
+        (frame) => BigInt(frame.id) > BigInt(serverRestartCursor),
+      );
       await topology.assertServerStoreHasNoSessionMirror();
       await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible({ timeout: 30_000 });
       const resumedRequestId = topology.nextSseRequestId();
@@ -2688,25 +3175,17 @@ test.describe("session reconnect and runtime states", () => {
         [REQUEST_ID_HEADER]: resumedRequestId,
       });
       await topology.server.restart();
-      await expect
-        .poll(
-          () =>
-            sseRequests
-              .slice(cursorCountBeforeOutage)
-              .find((request) => request.sessionId === sessionId && request.lastEventId.length > 0)?.lastEventId ?? "",
-          {
-            timeout: 15_000,
-            message: "browser did not reconnect the session SSE with Last-Event-ID",
-          },
-        )
-        .toBe(originalCursor);
-      const resumedBrowserRequest = await waitForBrowserSseRequest(
+      const resumedBrowserRequest = await waitForBrowserSseRequestWithExactCursor(
         sseRequests,
         topology.endpointId,
         sessionId,
-        originalCursor,
+        serverRestartCursor,
         "reconnected browser SSE",
         resumedRequestId,
+      );
+      expect(sseRequests.indexOf(resumedBrowserRequest)).toBeGreaterThanOrEqual(cursorCountBeforeOutage);
+      expect([reloadCursor, ...completeDurableEventIds(reloadedEndpointRequest)]).toContain(
+        resumedBrowserRequest.lastEventId,
       );
       const resumedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
         resumedBrowserRequest,
@@ -2716,6 +3195,17 @@ test.describe("session reconnect and runtime states", () => {
       );
       expect(resumedBrowserRequest.requestId).toBe(resumedRequestId);
       assertExactSseCorrelation(topology, resumedBrowserRequest, resumedEndpointRequest);
+      await expect
+        .poll(
+          () => completeDurableFrames(resumedEndpointRequest).filter(
+            (frame) => BigInt(frame.id) <= BigInt(publishedBeforeServerRestart),
+          ),
+          {
+            timeout: 15_000,
+            message: "Server-restarted browser SSE did not replay every frame withheld at detach",
+          },
+        )
+        .toEqual(expectedServerRestartReplayFrames);
 
       // A second real browser connection starts at cursor zero and is held
       // behind the long durable replay. This makes the already-published retry
@@ -2832,24 +3322,48 @@ test.describe("session reconnect and runtime states", () => {
       await diagnosticPage.close();
       diagnosticPage = undefined;
 
-      await expect
-        .poll(
-          () =>
-            resumedEndpointRequest.responseEventNames.includes("assistant_message_committed")
-              ? resumedEndpointRequest.responseEventIds.at(-1) ?? ""
-              : "",
-          { timeout: 15_000, message: "resumed SSE omitted its unique durable final cursor" },
-        )
-        .toMatch(/^[0-9]+$/);
-      const resumedEventIds = [...resumedEndpointRequest.responseEventIds];
+      const finalCursor = await waitForRenderedDurableEventId(
+        page,
+        resumedEndpointRequest,
+        topology.endpointId,
+        sessionId,
+        "DURABLE_FINAL",
+        "browser-consumed durable final",
+      );
+      const resumedEventIds = completeDurableEventIds(resumedEndpointRequest);
       topology.recordEventIds(resumedEventIds);
-      const finalCursor = resumedEventIds.at(-1) ?? "";
+      expect(resumedEventIds).toContain(finalCursor);
       await expectOneDurableFinal(page, "DURABLE_FINAL");
       await expect(page.locator("article.message-provisional")).toHaveCount(0);
       await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toHaveCount(0);
 
+      const endpointRestartCursor = await freezeAndSnapshotBrowserCursor(
+        page,
+        topology.endpointBoundary,
+        resumedEndpointRequest,
+        topology.endpointId,
+        sessionId,
+        "Endpoint restart detach barrier",
+      );
+      expect(BigInt(endpointRestartCursor)).toBeGreaterThanOrEqual(BigInt(finalCursor));
+      topology.recordCursor(endpointRestartCursor);
       const cursorCountBeforeEndpointRestart = sseRequests.length;
       await topology.endpoint.stop();
+      await expect
+        .poll(() => resumedEndpointRequest.responseComplete === true, {
+          timeout: 15_000,
+          message: "pre-restart Endpoint SSE did not close after Endpoint stop",
+        })
+        .toBe(true);
+      const framesPublishedBeforeEndpointRestart = completeDurableFrames(resumedEndpointRequest);
+      const eventIdsPublishedBeforeEndpointRestart = framesPublishedBeforeEndpointRestart.map(
+        (frame) => frame.id,
+      );
+      const publishedBeforeEndpointRestart =
+        eventIdsPublishedBeforeEndpointRestart.at(-1) ?? endpointRestartCursor;
+      const expectedEndpointRestartReplayFrames = framesPublishedBeforeEndpointRestart.filter(
+        (frame) => BigInt(frame.id) > BigInt(endpointRestartCursor),
+      );
       await topology.assertEndpointUnreachableBarrier();
       await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible({ timeout: 30_000 });
       const endpointRestartRequestId = topology.nextSseRequestId();
@@ -2858,24 +3372,36 @@ test.describe("session reconnect and runtime states", () => {
         [REQUEST_ID_HEADER]: endpointRestartRequestId,
       });
       await topology.endpoint.restart();
+      const endpointRestartBrowserRequest = await waitForBrowserSseRequestWithExactCursor(
+        sseRequests,
+        topology.endpointId,
+        sessionId,
+        endpointRestartCursor,
+        "Endpoint-restarted browser SSE",
+        endpointRestartRequestId,
+      );
+      expect(sseRequests.indexOf(endpointRestartBrowserRequest)).toBeGreaterThanOrEqual(
+        cursorCountBeforeEndpointRestart,
+      );
+      expect(completeDurableEventIds(resumedEndpointRequest)).toContain(
+        endpointRestartBrowserRequest.lastEventId,
+      );
+      const endpointRestartEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
+        endpointRestartBrowserRequest,
+      );
+      assertExactSseCorrelation(topology, endpointRestartBrowserRequest, endpointRestartEndpointRequest);
+      expect(endpointRestartEndpointRequest.status).toBe(200);
       await expect
         .poll(
-          () =>
-            sseRequests
-              .slice(cursorCountBeforeEndpointRestart)
-              .filter(
-                (request) =>
-                  request.sessionId === sessionId &&
-                  request.lastEventId === finalCursor &&
-                  request.status === 200,
-              )
-              .length,
+          () => completeDurableFrames(endpointRestartEndpointRequest).filter(
+            (frame) => BigInt(frame.id) <= BigInt(publishedBeforeEndpointRestart),
+          ),
           {
             timeout: 15_000,
-            message: "Endpoint restart did not resume the same session from its durable final cursor",
+            message: "Endpoint-restarted browser SSE did not replay every frame withheld at detach",
           },
         )
-        .toBeGreaterThan(0);
+        .toEqual(expectedEndpointRestartReplayFrames);
       await expect(page.getByText("Live", { exact: true })).toBeVisible({ timeout: 15_000 });
       await expectOneDurableFinal(page, "DURABLE_FINAL");
       await recordSseResponseMarkers(topology, sseRequests, sessionId, "reconnect all runtime state");

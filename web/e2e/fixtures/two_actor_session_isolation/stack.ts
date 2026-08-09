@@ -152,45 +152,98 @@ function isSessionEndpointPath(path: string): boolean {
   return path === "/v1/sessions" || /^\/v1\/sessions\/[^/]+(?:\/messages|\/events)?$/.test(path);
 }
 
-function normalizeText(value: string, dynamicIds: string[]): string {
+export type NormalizationSlots = {
+  activation: Map<string, number>;
+  delivery: Map<string, number>;
+  dynamic: Map<string, number>;
+  message: Map<string, number>;
+  port: Map<string, number>;
+  profile: Map<string, number>;
+  round: Map<string, number>;
+  session: Map<string, number>;
+  timestamp: Map<string, number>;
+};
+
+export function createNormalizationSlots(): NormalizationSlots {
+  return {
+    activation: new Map(),
+    delivery: new Map(),
+    dynamic: new Map(),
+    message: new Map(),
+    port: new Map(),
+    profile: new Map(),
+    round: new Map(),
+    session: new Map(),
+    timestamp: new Map(),
+  };
+}
+
+function syntheticSlot(values: Map<string, number>, value: string, name: string): string {
+  let index = values.get(value);
+  if (index === undefined) {
+    index = values.size + 1;
+    values.set(value, index);
+  }
+  return `{{${name}_${index}}}`;
+}
+
+function normalizeText(
+  value: string,
+  dynamicIds: string[],
+  slots: NormalizationSlots = createNormalizationSlots(),
+): string {
   let normalized = value;
   normalized = normalized.replace(
-    /http:\/\/(127\.0\.0\.[12]):\d+/g,
-    "http://$1:{{PORT}}",
+    /http:\/\/(127\.0\.0\.[12]):(\d+)/g,
+    (_origin, hostname, port) =>
+      `http://${hostname}:${syntheticSlot(slots.port, String(Number(port)), "PORT")}`,
   );
-  normalized = normalized.replace(/\bprofile-[0-9a-f]{32}\b/g, "{{OPAQUE_ID}}");
-  normalized = normalized.replace(/\b[0-9A-HJKMNP-TV-Z]{26}\b/g, "{{SESSION_ID}}");
-  for (const id of dynamicIds.filter(Boolean)) normalized = normalized.replaceAll(id, "{{OPAQUE_ID}}");
+  for (const id of [...new Set(dynamicIds.filter(Boolean))].sort((left, right) => right.length - left.length)) {
+    const replacement = /^profile-[0-9a-f]{32}$/.test(id)
+      ? syntheticSlot(slots.profile, id, "PROFILE_ID")
+      : /^[0-9A-HJKMNP-TV-Z]{26}$/.test(id)
+        ? syntheticSlot(slots.session, id, "SESSION_ID")
+        : syntheticSlot(slots.dynamic, id, "OPAQUE_ID");
+    normalized = normalized.replaceAll(id, replacement);
+  }
   normalized = normalized.replace(
-    /("(?:created_at_ms|updated_at_ms|last_observed_at_ms|started_at_ms|finished_at_ms)"\s*:)\d+/g,
-    "$1{{TIMESTAMP_MS}}",
+    /\bprofile-[0-9a-f]{32}\b/g,
+    (id) => syntheticSlot(slots.profile, id, "PROFILE_ID"),
   );
-  for (const [field, pattern, slot] of [
-    ["activation_id", "sha256:v1:[0-9a-f]{64}", "ACTIVATION_ID"],
-    ["round_id", "sha256:v1:[0-9a-f]{64}", "ROUND_ID"],
-    ["delivery_id", "delivery-sha256:v1:[0-9a-f]{64}", "DELIVERY_ID"],
+  normalized = normalized.replace(
+    /\b[0-9A-HJKMNP-TV-Z]{26}\b/g,
+    (id) => syntheticSlot(slots.session, id, "SESSION_ID"),
+  );
+  normalized = normalized.replace(
+    /("(?:created_at_ms|updated_at_ms|last_observed_at_ms|started_at_ms|finished_at_ms)"\s*:)(\d+)/g,
+    (_match, prefix, raw) => `${prefix}${syntheticSlot(slots.timestamp, raw, "TIMESTAMP_MS")}`,
+  );
+  for (const [field, pattern, name, values] of [
+    ["activation_id", "sha256:v1:[0-9a-f]{64}", "ACTIVATION_ID", slots.activation],
+    ["round_id", "sha256:v1:[0-9a-f]{64}", "ROUND_ID", slots.round],
+    ["delivery_id", "delivery-sha256:v1:[0-9a-f]{64}", "DELIVERY_ID", slots.delivery],
     [
       "message_id",
       "(?:message-sha256:v1|assistant:v1:sha256:v1):[0-9a-f]{64}",
       "MESSAGE_ID",
+      slots.message,
     ],
   ] as const) {
-    const values = new Map<string, number>();
     const expression = new RegExp(`("${field}"\\s*:\\s*")(${pattern})(")`, "g");
     normalized = normalized.replace(expression, (_match, prefix, opaqueId, suffix) => {
-      let index = values.get(opaqueId);
-      if (index === undefined) {
-        index = values.size + 1;
-        values.set(opaqueId, index);
-      }
-      return `${prefix}{{${slot}_${index}}}${suffix}`;
+      return `${prefix}${syntheticSlot(values, opaqueId, name)}${suffix}`;
     });
   }
   return normalized;
 }
 
-function redactText(value: string, secrets: string[], dynamicIds: string[]): string {
-  let redacted = normalizeText(value, dynamicIds);
+function redactText(
+  value: string,
+  secrets: string[],
+  dynamicIds: string[],
+  slots: NormalizationSlots = createNormalizationSlots(),
+): string {
+  let redacted = normalizeText(value, dynamicIds, slots);
   for (const secret of secrets.filter(Boolean)) {
     const slot = secret === PROVIDER_SECRET
       ? "<secret:SLOT_PROVIDER_SECRET>"
@@ -202,8 +255,13 @@ function redactText(value: string, secrets: string[], dynamicIds: string[]): str
   return redacted;
 }
 
-export function redactForCassette(value: string, secrets: string[], dynamicIds: string[] = []): string {
-  return redactText(value, secrets, dynamicIds);
+export function redactForCassette(
+  value: string,
+  secrets: string[],
+  dynamicIds: string[] = [],
+  slots: NormalizationSlots = createNormalizationSlots(),
+): string {
+  return redactText(value, secrets, dynamicIds, slots);
 }
 
 export type CapturedBody = {
@@ -216,9 +274,10 @@ export function captureBody(
   value: string | Buffer | undefined,
   secrets: string[],
   dynamicIds: string[] = [],
+  slots: NormalizationSlots = createNormalizationSlots(),
 ): CapturedBody {
   const source = value === undefined ? "" : typeof value === "string" ? value : value.toString("utf8");
-  const redacted = redactText(source, secrets, dynamicIds);
+  const redacted = redactText(source, secrets, dynamicIds, slots);
   let canonicalJson: Json | null = null;
   if (redacted.length > 0) {
     try {
@@ -235,11 +294,12 @@ export function captureBody(
   };
 }
 
-export function normalizePath(path: string, dynamicIds: string[]): string {
-  const normalized = normalizeText(path, dynamicIds);
-  const parts = normalized.split("/");
-  if (parts[1] === "v1" && parts[2] === "sessions" && parts[3]) parts[3] = "{{SESSION_ID}}";
-  return parts.join("/");
+export function normalizePath(
+  path: string,
+  dynamicIds: string[],
+  slots: NormalizationSlots = createNormalizationSlots(),
+): string {
+  return normalizeText(path, dynamicIds, slots);
 }
 
 function normalizedBodyDigest(body: Buffer, dynamicIds: string[]): string {
@@ -385,11 +445,11 @@ function semanticHeaders(
   headers: Record<string, string | string[] | undefined>,
   dynamicIds: string[],
   secrets: string[],
+  slots: NormalizationSlots = createNormalizationSlots(),
 ): Record<string, string> {
   const allowed = new Set([
     "accept",
     "cache-control",
-    "content-length",
     "content-type",
     "idempotency-key",
     "last-event-id",
@@ -401,7 +461,7 @@ function semanticHeaders(
     if (!allowed.has(name)) continue;
     const value = Array.isArray(rawValue) ? rawValue.join(",") : rawValue;
     if (value === undefined) continue;
-    result[name] = redactText(value, secrets, dynamicIds);
+    result[name] = redactText(value, secrets, dynamicIds, slots);
   }
   return result;
 }
@@ -451,6 +511,7 @@ async function startEndpointTransport(
   replayExpected: EndpointCassetteExchange[] | undefined,
 ): Promise<EndpointTransport> {
   let dynamicIds: string[] = [];
+  const normalizationSlots = createNormalizationSlots();
   const replayReservations = replayExpected?.map(() => false) ?? [];
   let replayReservationCount = 0;
   let replayError: string | null = null;
@@ -471,14 +532,16 @@ async function startEndpointTransport(
   function requestMismatch(expected: EndpointCassetteExchange, actual: EndpointObservation): string | null {
     const actualSlot = subjectSlot(actual.subject);
     if (expected.method !== actual.method) return `method ${actual.method} != ${expected.method}`;
-    if (expected.path !== normalizePath(actual.path, dynamicIds)) return `path ${normalizePath(actual.path, dynamicIds)} != ${expected.path}`;
+    if (expected.path !== normalizePath(actual.path, dynamicIds, normalizationSlots)) {
+      return `path ${normalizePath(actual.path, dynamicIds, normalizationSlots)} != ${expected.path}`;
+    }
     if (expected.subjectSlot !== actualSlot) return `subject slot ${actualSlot} != ${expected.subjectSlot}`;
     if (expected.controllerAuth !== (actual.controllerAuthMatched ? "shared" : "unexpected")) {
       return "controller authority changed";
     }
     const actualIdempotencyKey = actual.idempotencyKey === null
       ? null
-      : normalizeText(actual.idempotencyKey, dynamicIds);
+      : normalizeText(actual.idempotencyKey, dynamicIds, normalizationSlots);
     if (expected.idempotencyKey !== actualIdempotencyKey) return "idempotency key changed";
     if (JSON.stringify(expected.requestHeaders) !== JSON.stringify(actual.requestHeaders)) return "request semantic headers changed";
     if (expected.requestBodyHex !== actual.requestBodyHex) return "request body changed";
@@ -505,16 +568,27 @@ async function startEndpointTransport(
   }
 
   function captureRequest(incoming: IncomingMessage, body: Buffer): EndpointObservation {
+    const requestUrl = new URL(incoming.url ?? "/", `${target}/`);
     const subjectHeader = incoming.headers["zode-subject"];
     const subject = Array.isArray(subjectHeader) ? subjectHeader[0] ?? null : subjectHeader ?? null;
     const authorization = incoming.headers.authorization;
     const authorizationValue = Array.isArray(authorization) ? authorization[0] : authorization;
     const idempotency = incoming.headers["idempotency-key"];
-    const requestHeaders = semanticHeaders(incoming.headers, dynamicIds, [PROVIDER_SECRET, ENDPOINT_CONTROL_SECRET]);
-    const requestBody = captureBody(body, [PROVIDER_SECRET, ENDPOINT_CONTROL_SECRET], dynamicIds);
+    const requestHeaders = semanticHeaders(
+      incoming.headers,
+      dynamicIds,
+      [PROVIDER_SECRET, ENDPOINT_CONTROL_SECRET],
+      normalizationSlots,
+    );
+    const requestBody = captureBody(
+      body,
+      [PROVIDER_SECRET, ENDPOINT_CONTROL_SECRET],
+      dynamicIds,
+      normalizationSlots,
+    );
     return {
       method: incoming.method ?? "GET",
-      path: new URL(incoming.url ?? "/", `${target}/`).pathname,
+      path: `${requestUrl.pathname}${requestUrl.search}`,
       subject,
       controllerAuthMatched: authorizationValue === `Bearer ${ENDPOINT_CONTROL_SECRET}`,
       idempotencyKey: Array.isArray(idempotency) ? idempotency[0] ?? null : idempotency ?? null,
@@ -538,7 +612,7 @@ async function startEndpointTransport(
       !replayReservations[index] && requestMismatch(candidate, actual) === null,
     );
     if (expectedIndex === -1) {
-      const normalizedPath = normalizePath(actual.path, dynamicIds);
+      const normalizedPath = normalizePath(actual.path, dynamicIds, normalizationSlots);
       noteReplayError(
         replayReservationCount,
         `request ${actual.method} ${normalizedPath} did not match any remaining exchange`,
@@ -580,7 +654,12 @@ async function startEndpointTransport(
       if (settled) return;
       settled = true;
       observation.status = status;
-      const captured = captureBody(responseBody, [PROVIDER_SECRET, ENDPOINT_CONTROL_SECRET], dynamicIds);
+      const captured = captureBody(
+        responseBody,
+        [PROVIDER_SECRET, ENDPOINT_CONTROL_SECRET],
+        dynamicIds,
+        normalizationSlots,
+      );
       observation.responseBodyHex = captured.bodyHex;
       observation.responseBodyDigest = captured.bodySha256.replace(/^sha256:/, "");
       observation.responseCode = safeResponseCode(responseBody);
@@ -608,6 +687,7 @@ async function startEndpointTransport(
         response.headers,
         dynamicIds,
         [PROVIDER_SECRET, ENDPOINT_CONTROL_SECRET],
+        normalizationSlots,
       );
       outgoing.writeHead(response.statusCode ?? 502, hopByHopHeaders(response.headers));
       response.on("data", (chunk: Buffer | string) => {
@@ -674,12 +754,12 @@ async function startEndpointTransport(
         .map((observation, sequence) => ({
           sequence,
           method: observation.method,
-          path: normalizePath(observation.path, dynamicIds),
+          path: normalizePath(observation.path, dynamicIds, normalizationSlots),
           subjectSlot: subjectSlot(observation.subject),
           controllerAuth: observation.controllerAuthMatched ? "shared" : "unexpected",
           idempotencyKey: observation.idempotencyKey === null
             ? null
-            : normalizeText(observation.idempotencyKey, dynamicIds),
+            : normalizeText(observation.idempotencyKey, dynamicIds, normalizationSlots),
           requestHeaders: { ...observation.requestHeaders },
           requestBodyHex: observation.requestBodyHex,
           requestBodyDigest: observation.requestBodyDigest,
@@ -1351,18 +1431,20 @@ export function exchange(
   responseBody: unknown,
   dynamicIds: string[],
   secrets: string[],
+  slots: NormalizationSlots = createNormalizationSlots(),
 ): RecordedExchange {
   const request = captureBody(
     requestBody === undefined ? undefined : JSON.stringify(requestBody),
     secrets,
     dynamicIds,
+    slots,
   );
-  const response = captureBody(JSON.stringify(responseBody), secrets, dynamicIds);
+  const response = captureBody(JSON.stringify(responseBody), secrets, dynamicIds, slots);
   return {
     sequence: 0,
     actor,
     method,
-    path: normalizePath(path, dynamicIds),
+    path: normalizePath(path, dynamicIds, slots),
     request: {
       semanticHeaders: {},
       bodyHex: request.bodyHex,

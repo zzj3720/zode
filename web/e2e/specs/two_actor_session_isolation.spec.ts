@@ -13,6 +13,7 @@ import {
   PROVIDER_SECRET,
   cassetteExactResponseMatches,
   captureBody,
+  createNormalizationSlots,
   redactForCassette,
   type AccessActor,
   type CassetteClassification,
@@ -20,6 +21,7 @@ import {
   type EndpointCassetteExchange,
   type EndpointObservation,
   type IncidentCassette,
+  type NormalizationSlots,
   type RecordedExchange,
   createTwoActorStack,
   exchange,
@@ -40,12 +42,20 @@ const SHARING_MODE = "selected";
 const CASSETTE_DIRECTORY = fileURLToPath(new URL("../fixtures/two_actor_session_isolation", import.meta.url));
 const ISOLATION_CASSETTE = join(CASSETTE_DIRECTORY, "session-isolation-complete.v2.json");
 const PROFILE_CASSETTE = join(CASSETTE_DIRECTORY, "provider-profile-sharing-complete.v2.json");
-const ISOLATION_ENDPOINT_REPLAY = join(CASSETTE_DIRECTORY, "session-isolation-endpoint-replay.v7.json");
-const PROFILE_ENDPOINT_REPLAY = join(CASSETTE_DIRECTORY, "provider-profile-sharing-endpoint-replay.v7.json");
+const ISOLATION_ENDPOINT_REPLAY = join(CASSETTE_DIRECTORY, "session-isolation-endpoint-replay.v8.json");
+const PROFILE_ENDPOINT_REPLAY = join(CASSETTE_DIRECTORY, "provider-profile-sharing-endpoint-replay.v8.json");
 const ISOLATION_RECORDING_ID = "two-actor-session-isolation-first-404-complete-20260808-v2";
 const PROFILE_RECORDING_ID = "two-actor-provider-profile-sharing-first-404-complete-20260808-v2";
-const ISOLATION_ENDPOINT_REPLAY_ID = "two-actor-session-isolation-endpoint-replay-20260809-v7";
-const PROFILE_ENDPOINT_REPLAY_ID = "two-actor-provider-profile-sharing-endpoint-replay-20260809-v7";
+const ISOLATION_ENDPOINT_REPLAY_ID = "two-actor-session-isolation-endpoint-replay-20260809-v8";
+const PROFILE_ENDPOINT_REPLAY_ID = "two-actor-provider-profile-sharing-endpoint-replay-20260809-v8";
+const RETIRED_ENDPOINT_REPLAY_IDS = new Set([
+  "two-actor-session-isolation-endpoint-replay-20260809-v8",
+  "two-actor-provider-profile-sharing-endpoint-replay-20260809-v8",
+]);
+const RETIRED_ENDPOINT_REPLAY_FILENAMES = new Set([
+  "session-isolation-endpoint-replay.v8.json",
+  "provider-profile-sharing-endpoint-replay.v8.json",
+]);
 const ISOLATION_E2E = "e2e_browser_two_actor_session_isolation";
 const PROFILE_E2E = "e2e_browser_provider_profiles_are_shared_deployment_resources";
 const ISOLATION_REPLAY_E2E = "e2e_browser_two_actor_session_isolation_replays_complete_endpoint_transcript";
@@ -99,6 +109,27 @@ class BrowserStreamObservationFailure extends Error {
   }
 }
 
+class EndpointReplayCaptureIdentityFailure extends Error {
+  readonly classification = "TWO_ACTOR_ENDPOINT_REPLAY_IDENTITY_RETIRED";
+
+  constructor(recordingId: string) {
+    super(
+      `two-actor Endpoint replay capture refused retired recording identity ${recordingId}; `
+        + "configure a new recording_id and destination before any replacement capture",
+    );
+    this.name = "EndpointReplayCaptureIdentityFailure";
+  }
+}
+
+function assertEndpointReplayCaptureIdentity(recordingId: string, destination: string): void {
+  if (
+    RETIRED_ENDPOINT_REPLAY_IDS.has(recordingId)
+    || RETIRED_ENDPOINT_REPLAY_FILENAMES.has(basename(destination))
+  ) {
+    throw new EndpointReplayCaptureIdentityFailure(recordingId);
+  }
+}
+
 class BrowserUiObservationFailure extends Error {
   constructor(
     readonly owningE2e: typeof ISOLATION_E2E | typeof PROFILE_E2E,
@@ -128,12 +159,13 @@ type RetainableBrowserObservationFailure =
   | BrowserUiObservationFailure;
 
 type EndpointReplayCassette = {
-  schema: "zode.web-two-actor-endpoint-replay.v1";
-  version: 1;
+  schema: "zode.web-two-actor-endpoint-replay.v2";
+  version: 2;
   recording_id: string;
   owner: typeof ISOLATION_E2E | typeof PROFILE_E2E;
   boundary: "server_endpoint_http";
   relation: typeof LATER_RELATION;
+  normalization: "capture_wide_ordered_identity_slots.v1";
   purpose: string;
   source_incident: {
     recording_id: string;
@@ -173,20 +205,21 @@ function browserSemanticHeaders(
   headers: Record<string, string>,
   dynamicIds: string[],
   secrets: string[],
+  slots: NormalizationSlots,
 ): Record<string, string> {
-  const allowed = new Set(["accept", "cache-control", "content-length", "content-type", "idempotency-key", "last-event-id", "location"]);
+  const allowed = new Set(["accept", "cache-control", "content-type", "idempotency-key", "last-event-id", "location"]);
   const result: Record<string, string> = {};
   for (const [rawName, rawValue] of Object.entries(headers)) {
     const name = rawName.toLowerCase();
     if (!allowed.has(name)) continue;
-    result[name] = redactForCassette(rawValue, secrets, dynamicIds);
+    result[name] = redactForCassette(rawValue, secrets, dynamicIds, slots);
   }
   return result;
 }
 
-function browserPath(path: string, dynamicIds: string[]): string {
+function browserPath(path: string, dynamicIds: string[], slots: NormalizationSlots): string {
   const url = new URL(path, "http://two-actor.invalid");
-  return normalizePath(`${url.pathname}${url.search}`, dynamicIds);
+  return normalizePath(`${url.pathname}${url.search}`, dynamicIds, slots);
 }
 
 function isRelevantBrowserPath(path: string): boolean {
@@ -202,6 +235,7 @@ function isRelevantBrowserPath(path: string): boolean {
 class ExchangeRecorder {
   private readonly observed: RecordedExchange[] = [];
   private dynamicIds: string[] = [];
+  private readonly normalizationSlots = createNormalizationSlots();
   private firstFailure: { exchange: RecordedExchange; classification: CassetteClassification["kind"] } | undefined;
   private readonly browserRequests = new Map<unknown, RecordedExchange>();
   private readonly pendingCaptures: Promise<void>[] = [];
@@ -234,6 +268,7 @@ class ExchangeRecorder {
       responseBody,
       this.dynamicIds,
       this.secrets,
+      this.normalizationSlots,
     );
     item.sequence = this.observed.length;
     item.response.status = status;
@@ -245,14 +280,24 @@ class ExchangeRecorder {
     page.on("request", (request) => {
       const url = new URL(request.url());
       if (!isRelevantBrowserPath(url.pathname)) return;
-      const requestBody = captureBody(request.postData() ?? undefined, this.secrets, this.dynamicIds);
+      const requestBody = captureBody(
+        request.postData() ?? undefined,
+        this.secrets,
+        this.dynamicIds,
+        this.normalizationSlots,
+      );
       const item: RecordedExchange = {
         sequence: this.observed.length,
         actor,
         method: request.method(),
-        path: browserPath(`${url.pathname}${url.search}`, this.dynamicIds),
+        path: browserPath(`${url.pathname}${url.search}`, this.dynamicIds, this.normalizationSlots),
         request: {
-          semanticHeaders: browserSemanticHeaders(request.headers(), this.dynamicIds, this.secrets),
+          semanticHeaders: browserSemanticHeaders(
+            request.headers(),
+            this.dynamicIds,
+            this.secrets,
+            this.normalizationSlots,
+          ),
           bodyHex: requestBody.bodyHex,
           bodySha256: requestBody.bodySha256,
           canonicalJson: requestBody.canonicalJson,
@@ -276,7 +321,12 @@ class ExchangeRecorder {
       const item = this.browserRequests.get(response.request());
       if (!item) return;
       item.response.status = response.status();
-      item.response.semanticHeaders = browserSemanticHeaders(response.headers(), this.dynamicIds, this.secrets);
+      item.response.semanticHeaders = browserSemanticHeaders(
+        response.headers(),
+        this.dynamicIds,
+        this.secrets,
+        this.normalizationSlots,
+      );
       const contentType = response.headers()["content-type"] ?? "";
       if (/text\/event-stream/i.test(contentType)) return;
       const capture = response.body().then((body) => {
@@ -302,9 +352,19 @@ class ExchangeRecorder {
     termination: CassetteTermination = completed ? "complete" : "disconnect",
   ): void {
     if (item.response.completed || (item.response.status !== 0 && item.response.bodyHex !== "")) return;
-    const responseBody = captureBody(rawBody, this.secrets, this.dynamicIds);
+    const responseBody = captureBody(
+      rawBody,
+      this.secrets,
+      this.dynamicIds,
+      this.normalizationSlots,
+    );
     item.response.status = status;
-    item.response.semanticHeaders = browserSemanticHeaders(headers, this.dynamicIds, this.secrets);
+    item.response.semanticHeaders = browserSemanticHeaders(
+      headers,
+      this.dynamicIds,
+      this.secrets,
+      this.normalizationSlots,
+    );
     item.response.bodyHex = responseBody.bodyHex;
     item.response.bodySha256 = responseBody.bodySha256;
     item.response.canonicalJson = responseBody.canonicalJson;
@@ -385,8 +445,13 @@ class ExchangeRecorder {
     completed = true,
     termination: CassetteTermination = completed ? "complete" : "disconnect",
   ): void {
-    const request = captureBody(requestBody === undefined ? undefined : JSON.stringify(requestBody), this.secrets, this.dynamicIds);
-    const normalizedPath = browserPath(path, this.dynamicIds);
+    const request = captureBody(
+      requestBody === undefined ? undefined : JSON.stringify(requestBody),
+      this.secrets,
+      this.dynamicIds,
+      this.normalizationSlots,
+    );
+    const normalizedPath = browserPath(path, this.dynamicIds, this.normalizationSlots);
     const item = this.observed.find((candidate) =>
       candidate.actor === actor
       && candidate.method === method
@@ -410,7 +475,7 @@ class ExchangeRecorder {
   }
 
   latestExchange(actor: AccessActor, method: string, path: string): RecordedExchange | undefined {
-    const normalizedPath = browserPath(path, this.dynamicIds);
+    const normalizedPath = browserPath(path, this.dynamicIds, this.normalizationSlots);
     return [...this.observed].reverse().find((item) =>
       item.actor === actor && item.method === method && item.path === normalizedPath,
     );
@@ -456,7 +521,6 @@ const MAX_ENDPOINT_REPLAY_FILE_BYTES = 64 * 1024 * 1024;
 const ENDPOINT_REPLAY_HEADERS = new Set([
   "accept",
   "cache-control",
-  "content-length",
   "content-type",
   "idempotency-key",
   "last-event-id",
@@ -540,6 +604,7 @@ const ENDPOINT_REPLAY_TOP_LEVEL_KEYS = [
   "owner",
   "boundary",
   "relation",
+  "normalization",
   "purpose",
   "source_incident",
   "endpoint_exchanges",
@@ -614,12 +679,13 @@ function validateEndpointReplayCassette(
 ): void {
   if (
     !hasExactKeys(replay, ENDPOINT_REPLAY_TOP_LEVEL_KEYS)
-    || replay.schema !== "zode.web-two-actor-endpoint-replay.v1"
-    || replay.version !== 1
+    || replay.schema !== "zode.web-two-actor-endpoint-replay.v2"
+    || replay.version !== 2
     || replay.recording_id !== recordingId
     || replay.owner !== owner
     || replay.boundary !== "server_endpoint_http"
     || replay.relation !== LATER_RELATION
+    || replay.normalization !== "capture_wide_ordered_identity_slots.v1"
     || typeof replay.purpose !== "string"
     || replay.purpose.length === 0
     || replay.purpose.length > 4_096
@@ -914,12 +980,13 @@ async function retainEndpointReplayCandidate(
 ): Promise<string> {
   if (!incident.whole_digest) throw new Error("the source incident cassette has no integrity digest");
   const unsigned = {
-    schema: "zode.web-two-actor-endpoint-replay.v1" as const,
-    version: 1 as const,
+    schema: "zode.web-two-actor-endpoint-replay.v2" as const,
+    version: 2 as const,
     recording_id: recordingId,
     owner,
     boundary: "server_endpoint_http" as const,
     relation: LATER_RELATION,
+    normalization: "capture_wide_ordered_identity_slots.v1" as const,
     purpose:
       "Replay the complete secret-safe Server-to-Endpoint transcript through the same real browser and real processes while retaining the original incident cassette as first-occurrence provenance.",
     source_incident: {
@@ -1968,6 +2035,9 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
   test.setTimeout(120_000);
 
   async function runSessionIsolation(browser: Browser, replay: boolean): Promise<void> {
+    if (!replay && CAPTURE_ENDPOINT_REPLAY) {
+      assertEndpointReplayCaptureIdentity(ISOLATION_ENDPOINT_REPLAY_ID, ISOLATION_ENDPOINT_REPLAY);
+    }
     const cassettePath = ISOLATION_CASSETTE;
     const cassette = await readCassette(
       cassettePath,
@@ -2114,6 +2184,9 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
   }
 
   async function runSharedProviderProfiles(browser: Browser, replay: boolean): Promise<void> {
+    if (!replay && CAPTURE_ENDPOINT_REPLAY) {
+      assertEndpointReplayCaptureIdentity(PROFILE_ENDPOINT_REPLAY_ID, PROFILE_ENDPOINT_REPLAY);
+    }
     const cassettePath = PROFILE_CASSETTE;
     const cassette = await readCassette(
       cassettePath,
