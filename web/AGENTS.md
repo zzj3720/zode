@@ -30,6 +30,9 @@ The root `AGENTS.md`, `docs/ui.md`, and `docs/server-api.md` are authoritative.
   observe the real product only after those actions.
 - HTTP command acceptance is distinct from runtime completion. Durable UI state
   follows Server responses/events; transient token text remains provisional.
+- Re-rendering the same session from durable or transient SSE must preserve an
+  unsent composer draft in browser memory. Clear it only after accepted
+  submission or when opening another session; never persist or mirror it.
 
 ## Product behavior
 

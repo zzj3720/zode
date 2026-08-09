@@ -55,8 +55,11 @@ SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
   tracing/metrics, not session events. If aimux returns a retryable terminal or
   mid-stream error, discard every partial candidate and optionally retry the
   same prepared model step under the configured zode budget, committing the
-  classified retry decision and delay. Retry attempts do not absorb newer
-  deliveries because they are not a new model round.
+  classified retry decision and delay. Runtime publication preserves that
+  durable retry boundary ahead of every transient delta from the next attempt;
+  transport backpressure cannot concatenate failed-attempt and retry text.
+  Retry attempts do not absorb newer deliveries because they are not a new
+  model round.
 - Apply the configured model stream idle timeout to the first provider chunk
   and every later chunk. A dead or silent provider must become a typed bounded
   model-attempt failure and terminal activation, never an indefinitely Working

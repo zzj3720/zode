@@ -1,8 +1,7 @@
-import { expect, test, type Page, type Request } from "@playwright/test";
+import { expect, test, type Locator, type Page, type Request, type Route } from "@playwright/test";
 import { createHash, createSign, generateKeyPairSync, randomBytes, randomUUID, type KeyObject } from "node:crypto";
 import { execFile as execFileCallback, spawn, type ChildProcessByStdio } from "node:child_process";
-import { once } from "node:events";
-import { readFile, writeFile, mkdir, chmod, mkdtemp, readdir, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdir, chmod, cp, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
@@ -16,6 +15,12 @@ type Json = Record<string, any>;
 type Cassette = Json & { exchanges: Json[] };
 type ReadyChild = ChildProcessByStdio<null, Readable, Readable>;
 type SecretMarker = string | Buffer;
+type ProcessOutput = {
+  stdoutChunks: Buffer[];
+  stderrChunks: Buffer[];
+  stdoutTotal: { value: number };
+  stderrTotal: { value: number };
+};
 type EndpointBoundaryRequest = {
   method: string;
   path: string;
@@ -28,9 +33,12 @@ type EndpointBoundaryRequest = {
   responseBody?: string;
   responseContentType?: string;
   responseEventIds: string[];
+  responseEventNames: string[];
+  responseEventSequence: string[];
   responseSseRemainder?: string;
   responseComplete?: boolean;
   recorded?: boolean;
+  matchedBrowserRequest?: BrowserSseRequest;
 };
 type BrowserSseRequest = {
   method: string;
@@ -40,6 +48,7 @@ type BrowserSseRequest = {
   requestId: string;
   lastEventId: string;
   status?: number;
+  endpointRequest?: EndpointBoundaryRequest;
 };
 type BrowserNetworkObservation = {
   kind: "http" | "websocket";
@@ -59,6 +68,17 @@ type TopologyConsumption = {
   consumedSequences: number[];
   countsBySequence: Map<number, number>;
 };
+type EventBodyHold = {
+  held: Promise<void>;
+  markHeld: () => void;
+  released: Promise<void>;
+  release: () => void;
+};
+type BrowserResponseHold = {
+  received: Promise<void>;
+  release: () => void;
+  dispose: () => Promise<void>;
+};
 
 const REPO_ROOT = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const CASSETTE_PATH = fileURLToPath(
@@ -69,6 +89,7 @@ const ACCESS_SUBJECT = "web-session-reconnect-runtime-states-human";
 const CONTROLLER_AUTHORITY = "web-session-reconnect-runtime-states-controller";
 const PROVIDER = "fixture-provider";
 const MODEL = "fixture-model";
+const REPLAY_HISTORY_MODEL = "fixture-model-history";
 const TOOL = "fixture_async";
 const REQUEST_ID_HEADER = "x-request-id";
 const CASSETTE_RAW_SHA256 = "564185b09086c6533ca58ab9314a3cb5271909e3c5ff70ff45a32f586e084b63";
@@ -103,6 +124,8 @@ const RESOURCE_NOT_FOUND_PUBLIC_BODY = {
   },
 } as const;
 const execFile = promisify(execFileCallback);
+const STARTUP_OUTPUT_LIMIT = 128 * 1024;
+const STARTUP_EVIDENCE_ROOT = join(REPO_ROOT, "target", "test-recordings", "quarantine", "session-reconnect-exact-main-readiness-gap");
 
 const SCENARIOS = {
   keyboard: "keyboard-session",
@@ -125,6 +148,15 @@ async function listen(server: Server, port: number): Promise<void> {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", () => resolvePromise());
   });
+}
+
+async function makeCopiedDirectoryTreeRemovable(root: string): Promise<void> {
+  await chmod(root, 0o700);
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      await makeCopiedDirectoryTreeRemovable(join(root, entry.name));
+    }
+  }
 }
 
 async function freePort(): Promise<number> {
@@ -191,9 +223,22 @@ function quoteSqliteString(value: string): string {
 
 async function sqliteJson(database: string, sql: string): Promise<Json[]> {
   const binary = process.env.ZODE_E2E_SQLITE3_BIN ?? "sqlite3";
-  const result = await execFile(binary, ["-readonly", "-json", database, sql], {
-    maxBuffer: 16 * 1024 * 1024,
-  });
+  let result;
+  try {
+    result = await execFile(binary, ["-readonly", "-json", database, sql], {
+      maxBuffer: 16 * 1024 * 1024,
+    });
+  } catch (error) {
+    // A stopped WAL owner may leave a read-only sqlite3 CLI unable to create
+    // its shared-memory sidecar.  Immutable mode is sufficient for the
+    // schema/database-list inspection; the caller still scans every sidecar
+    // byte-for-byte and therefore does not hide a session mirror.
+    result = await execFile(binary, ["-readonly", "-json", `file:${database}?immutable=1`, sql], {
+      maxBuffer: 16 * 1024 * 1024,
+    }).catch(() => {
+      throw error;
+    });
+  }
   const text = result.stdout.trim();
   if (text.length === 0) return [];
   const value = JSON.parse(text) as unknown;
@@ -301,6 +346,19 @@ async function apiJson(
     bodyText: text,
     contentType: response.headers.get("content-type") ?? "",
   };
+}
+
+async function retainFailureEvidence(label: string, value: Json): Promise<string | undefined> {
+  try {
+    await mkdir(STARTUP_EVIDENCE_ROOT, { recursive: true, mode: 0o700 });
+    await chmod(STARTUP_EVIDENCE_ROOT, 0o700);
+    const path = join(STARTUP_EVIDENCE_ROOT, `${label}-${Date.now()}-${randomUUID()}.json`);
+    await writeFile(path, JSON.stringify(value), { mode: 0o600 });
+    await chmod(path, 0o600);
+    return path;
+  } catch {
+    return undefined;
+  }
 }
 
 class NonEvidenceShallow404 extends Error {
@@ -426,6 +484,9 @@ class ReplayProvider {
   private readonly released = new Set<string>();
   private readonly releaseWaiters = new Map<string, Array<() => void>>();
   private readonly expectedScenarioCounts = new Map<string, number>();
+  private readonly toolPreambleScenarios = new Set<string>();
+  private readonly heldFirstChunks = new Set<string>();
+  private readonly observedRequests: string[] = [];
   private expectedProviderAuthorization = "";
   private suiteConsumptionRecorded = false;
 
@@ -505,6 +566,14 @@ class ReplayProvider {
 
   setExpectedScenario(scenario: string, expectedCount: number): void {
     this.expectedScenarioCounts.set(scenario, expectedCount);
+  }
+
+  enableToolPreamble(scenario: string): void {
+    this.toolPreambleScenarios.add(scenario);
+  }
+
+  holdAfterFirstChunk(scenario: string, occurrence = 0): void {
+    this.heldFirstChunks.add(`${scenario}:${occurrence}`);
   }
 
   private expectedSequences(): number[] {
@@ -600,12 +669,14 @@ class ReplayProvider {
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const observedIndex = this.observedRequests.push(`${request.method ?? ""} ${request.url ?? ""}`) - 1;
     if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
       response.writeHead(404);
       response.end();
       return;
     }
     const body = await readBody(request);
+    this.observedRequests[observedIndex] += ` body=${body.slice(0, 1_000)}`;
     const scenario = this.scenarioFor(body);
     const occurrence = this.calls.get(scenario) ?? 0;
     const exchange = this.exchangeFor(scenario, occurrence);
@@ -619,6 +690,7 @@ class ReplayProvider {
       this.assertRequestBody(body, exchange);
       this.assertResponseContract(exchange);
     } catch (error) {
+      this.observedRequests[observedIndex] += ` error=${error instanceof Error ? error.message : String(error)}`;
       response.writeHead(500);
       response.end(error instanceof Error ? error.message : "fixture cassette contract mismatch");
       return;
@@ -649,11 +721,36 @@ class ReplayProvider {
       ),
     );
     response.writeHead(replay.status, responseHeaders);
-    for (const chunk of replay.chunks as Json[]) {
-      response.write(Buffer.from(chunk.bytes_hex, "hex"));
+    if (this.toolPreambleScenarios.has(scenario) && occurrence === 0) {
+      response.write(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: "PRE_TOOL" }, finish_reason: null }] })}\n\n`,
+      );
     }
-    if (replay.complete === true) response.end();
-    else response.destroy();
+    for (const [index, chunk] of (replay.chunks as Json[]).entries()) {
+      const bytes = Buffer.from(chunk.bytes_hex, "hex");
+      const heldChunk = `${scenario}:${occurrence}`;
+      if (index === 0 && this.heldFirstChunks.has(heldChunk)) {
+        const holdName = occurrence === 0
+          ? `${scenario}:first-chunk`
+          : `${scenario}:first-chunk-${occurrence + 1}`;
+        await new Promise<void>((resolvePromise, reject) => {
+          response.write(bytes, (error) => error ? reject(error) : resolvePromise());
+        });
+        this.notify(holdName, 1);
+        await this.waitForRelease(holdName);
+      } else {
+        response.write(bytes);
+      }
+    }
+    if (replay.complete === true) {
+      response.end();
+    } else {
+      // Let the intentionally incomplete frame cross the real socket before
+      // closing it.  A synchronous destroy can discard a buffered provisional
+      // chunk and turn a transport fixture into a false product red.
+      await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+      response.destroy();
+    }
   }
 
   private notify(scenario: string, count: number): void {
@@ -696,6 +793,10 @@ class ReplayProvider {
 
   count(scenario: string): number {
     return this.calls.get(scenario) ?? 0;
+  }
+
+  debugRequests(): string[] {
+    return [...this.observedRequests];
   }
 
   assertAllExchangesConsumed(): void {
@@ -749,6 +850,33 @@ class EndpointBoundary {
     request: EndpointBoundaryRequest;
     resolve: (eventIds: string[]) => void;
   }> = [];
+  private readonly eventBodyHolds = new Map<string, EventBodyHold>();
+
+  holdEventBody(sessionId: string): void {
+    if (this.eventBodyHolds.has(sessionId)) throw new Error("session event body is already held");
+    let markHeld = (): void => undefined;
+    let release = (): void => undefined;
+    const held = new Promise<void>((resolvePromise) => {
+      markHeld = resolvePromise;
+    });
+    const released = new Promise<void>((resolvePromise) => {
+      release = resolvePromise;
+    });
+    this.eventBodyHolds.set(sessionId, { held, markHeld, released, release });
+  }
+
+  async waitForHeldEventBody(sessionId: string): Promise<void> {
+    const hold = this.eventBodyHolds.get(sessionId);
+    if (hold === undefined) throw new Error("session event body was not armed");
+    await withTimeout(hold.held, 15_000, "Endpoint replay body was not held after response headers");
+  }
+
+  releaseEventBody(sessionId: string): void {
+    const hold = this.eventBodyHolds.get(sessionId);
+    if (hold === undefined) return;
+    hold.release();
+    this.eventBodyHolds.delete(sessionId);
+  }
 
   static async start(targetBaseUrl: string): Promise<EndpointBoundary> {
     // This is a transparent real HTTP boundary: Server is configured with this
@@ -782,6 +910,13 @@ class EndpointBoundary {
   }
 
   private recordSseLine(request: EndpointBoundaryRequest, line: string): void {
+    if (line.startsWith("event:")) {
+      const value = line.startsWith("event: ") ? line.slice(7) : line.slice(6);
+      if (value.length > 0) request.responseEventSequence.push(value);
+      if (value.length > 0 && !request.responseEventNames.includes(value)) {
+        request.responseEventNames.push(value);
+      }
+    }
     if (!line.startsWith("id:")) return;
     const value = line.startsWith("id: ") ? line.slice(4) : line.slice(3);
     if (value.length === 0) return;
@@ -841,6 +976,8 @@ class EndpointBoundary {
       forwardedLastEventId: normalizedForwardedHeader,
       body,
       responseEventIds: [],
+      responseEventNames: [],
+      responseEventSequence: [],
     };
     const upstream = httpRequest(
       {
@@ -876,7 +1013,23 @@ class EndpointBoundary {
         delete responseHeaders["keep-alive"];
         delete responseHeaders["transfer-encoding"];
         response.writeHead(upstreamResponse.statusCode ?? 502, responseHeaders);
-        upstreamResponse.pipe(response);
+        const heldSession = captured.path.match(/^\/v1\/sessions\/([^/]+)\/events$/)?.[1];
+        const hold = heldSession === undefined ? undefined : this.eventBodyHolds.get(heldSession);
+        if (upstreamResponse.statusCode === 200 && hold !== undefined) {
+          upstreamResponse.pause();
+          response.flushHeaders();
+          hold.markHeld();
+          void hold.released.then(() => {
+            if (response.destroyed) {
+              upstreamResponse.destroy();
+              return;
+            }
+            upstreamResponse.pipe(response);
+            upstreamResponse.resume();
+          });
+        } else {
+          upstreamResponse.pipe(response);
+        }
       },
     );
     const wireRequestId = upstream.getHeader(REQUEST_ID_HEADER);
@@ -901,38 +1054,47 @@ class EndpointBoundary {
     upstream.end(body);
   }
 
-  async waitForEventRequest(sessionId: string, lastEventId: string, requestId: string): Promise<EndpointBoundaryRequest> {
+  async waitForEventRequest(
+    browserRequest: BrowserSseRequest,
+    options: { allowNon2xx?: boolean } = {},
+  ): Promise<EndpointBoundaryRequest> {
+    if (browserRequest.endpointRequest !== undefined) return browserRequest.endpointRequest;
+    const { sessionId, lastEventId, requestId } = browserRequest;
     const path = `/v1/sessions/${sessionId}/events`;
-    const existing = this.requests.find(
-      (request) =>
-        request.method === "GET" &&
-        request.path === path &&
-        request.requestId === requestId &&
-        request.forwardedRequestId === requestId &&
-        request.lastEventId === lastEventId &&
-        request.forwardedLastEventId === lastEventId,
-    );
+    const matches = (request: EndpointBoundaryRequest): boolean =>
+      request.method === "GET" &&
+      request.path === path &&
+      request.lastEventId === lastEventId &&
+      request.forwardedLastEventId === lastEventId &&
+      request.matchedBrowserRequest === undefined &&
+      (requestId.length === 0 || request.requestId.length === 0
+        ? true
+        : request.requestId === requestId && request.forwardedRequestId === requestId);
+    const existing =
+      (options.allowNon2xx === true
+        ? this.requests.find((request) => matches(request) && request.status === 200)
+        : undefined) ?? this.requests.find(matches);
     if (existing !== undefined) {
-      this.assertEventResponse(existing);
+      existing.matchedBrowserRequest = browserRequest;
+      browserRequest.endpointRequest = existing;
+      if (options.allowNon2xx !== true) this.assertEventResponse(existing);
       return existing;
     }
     const request = await withTimeout(
       new Promise<EndpointBoundaryRequest>((resolvePromise) => {
         this.waiters.push({
-          predicate: (request) =>
-            request.method === "GET" &&
-            request.path === path &&
-            request.requestId === requestId &&
-            request.forwardedRequestId === requestId &&
-            request.lastEventId === lastEventId &&
-            request.forwardedLastEventId === lastEventId,
-          resolve: resolvePromise,
+          predicate: matches,
+          resolve: (matched) => {
+            matched.matchedBrowserRequest = browserRequest;
+            browserRequest.endpointRequest = matched;
+            resolvePromise(matched);
+          },
         });
       }),
       15_000,
-      `Endpoint boundary did not receive Last-Event-ID ${lastEventId || "<empty>"}`,
+      `Endpoint boundary did not receive Last-Event-ID ${lastEventId || "<empty>"}; events=${JSON.stringify(this.eventRequests(sessionId).map((request) => ({ last_event_id: request.lastEventId, matched: request.matchedBrowserRequest !== undefined, status: request.status, ids: request.responseEventIds })))}`,
     );
-    this.assertEventResponse(request);
+    if (options.allowNon2xx !== true) this.assertEventResponse(request);
     return request;
   }
 
@@ -981,6 +1143,12 @@ class EndpointBoundary {
   eventRequests(sessionId: string): EndpointBoundaryRequest[] {
     return this.requests.filter(
       (request) => request.method === "GET" && request.path === `/v1/sessions/${sessionId}/events`,
+    );
+  }
+
+  debugRequests(): string[] {
+    return this.requests.map((request) =>
+      `${request.method} ${request.path} status=${request.status ?? "<pending>"} request_id=${request.requestId} forwarded_request_id=${request.forwardedRequestId} last_event_id=${request.lastEventId} forwarded_last_event_id=${request.forwardedLastEventId} matched=${request.matchedBrowserRequest !== undefined} events=${request.responseEventNames.join(",")} ids=${request.responseEventIds.join(",")} body=${request.body.slice(0, 180)}`,
     );
   }
 
@@ -1052,25 +1220,40 @@ class ReadyProcess {
     private readonly args: string[],
     private readonly prefix: string,
     private child: ReadyChild,
+    private output: ProcessOutput,
     readonly baseUrl: string,
   ) {}
 
   static async start(binary: string, args: string[], prefix: string): Promise<ReadyProcess> {
     const child = await ReadyProcess.spawnChild(binary, args, prefix);
-    return new ReadyProcess(binary, args, prefix, child.child, child.baseUrl);
+    return new ReadyProcess(binary, args, prefix, child.child, child.output, child.baseUrl);
+  }
+
+  private static boundedText(chunks: Buffer[], total: { value: number }): string {
+    const bytes = Buffer.concat(chunks);
+    return bytes.subarray(0, Math.min(total.value, STARTUP_OUTPUT_LIMIT)).toString("utf8");
   }
 
   private static async spawnChild(
     binary: string,
     args: string[],
     prefix: string,
-  ): Promise<{ child: ReadyChild; baseUrl: string }> {
+  ): Promise<{ child: ReadyChild; baseUrl: string; output: ProcessOutput }> {
     const child = spawn(binary, args, {
       cwd: REPO_ROOT,
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env },
     });
-    child.stderr.resume();
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    const stdoutTotal = { value: 0 };
+    const stderrTotal = { value: 0 };
+    const capture = (chunks: Buffer[], total: { value: number }, chunk: Buffer): void => {
+      total.value += chunk.length;
+      if (total.value <= STARTUP_OUTPUT_LIMIT) chunks.push(Buffer.from(chunk));
+    };
+    child.stdout.on("data", (chunk: Buffer) => capture(stdoutChunks, stdoutTotal, chunk));
+    child.stderr.on("data", (chunk: Buffer) => capture(stderrChunks, stderrTotal, chunk));
     const readiness = new Promise<string>((resolvePromise, reject) => {
       const output = createInterface({ input: child.stdout });
       const finish = (callback: () => void) => {
@@ -1083,12 +1266,22 @@ class ReadyProcess {
       });
       child.once("error", (error) => finish(() => reject(error)));
       child.once("exit", (code) => {
-        if (code !== null) finish(() => reject(new Error(`real process exited before readiness (${code})`)));
+        if (code !== null) {
+          const stdout = ReadyProcess.boundedText(stdoutChunks, stdoutTotal);
+          const stderr = ReadyProcess.boundedText(stderrChunks, stderrTotal);
+          finish(() => reject(new Error(
+            `real process exited before readiness (${code}); stdout=${JSON.stringify(stdout)}; stderr=${JSON.stringify(stderr)}`,
+          )));
+        }
       });
     });
     try {
       const baseUrl = await withTimeout(readiness, 15_000, "real process readiness timed out");
-      return { child, baseUrl };
+      return {
+        child,
+        baseUrl,
+        output: { stdoutChunks, stderrChunks, stdoutTotal, stderrTotal },
+      };
     } catch (error) {
       child.kill("SIGKILL");
       throw error;
@@ -1103,16 +1296,70 @@ class ReadyProcess {
       throw new Error("real process changed its configured URL across restart");
     }
     this.child = replacement.child;
+    this.output = replacement.output;
+  }
+
+  outputSnapshot(knownSecrets: SecretMarker[] = []): { stdout: string; stderr: string } {
+    const redact = (value: string): string => {
+      let result = value;
+      for (const secret of knownSecrets) {
+        const marker = Buffer.isBuffer(secret) ? secret.toString("base64") : secret;
+        if (marker.length > 0) result = result.replaceAll(marker, "<redacted>");
+      }
+      return result;
+    };
+    return {
+      stdout: redact(ReadyProcess.boundedText(this.output.stdoutChunks, this.output.stdoutTotal)),
+      stderr: redact(ReadyProcess.boundedText(this.output.stderrChunks, this.output.stderrTotal)),
+    };
   }
 
   async stop(): Promise<void> {
     if (this.child.exitCode !== null) return;
+    const processGone = (): boolean => {
+      if (this.child.exitCode !== null) return true;
+      const pid = this.child.pid;
+      if (pid === undefined) return true;
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch {
+        // The OS has already reaped the child, but Node may not have delivered
+        // its exit event yet because the process was detached during a
+        // restart.  Treat that as successfully stopped and avoid a false
+        // teardown failure.
+        return true;
+      }
+    };
+    const waitForExit = async (timeoutMs: number, message: string): Promise<void> => {
+      if (processGone()) return;
+      await withTimeout(
+        new Promise<void>((resolvePromise) => {
+          let poll: ReturnType<typeof setInterval> | undefined;
+          const finish = (): void => {
+            if (poll !== undefined) clearInterval(poll);
+            this.child.off("exit", onExit);
+            resolvePromise();
+          };
+          const onExit = (): void => {
+            finish();
+          };
+          this.child.once("exit", onExit);
+          poll = setInterval(() => {
+            if (processGone()) finish();
+          }, 25);
+          if (processGone()) finish();
+        }),
+        timeoutMs,
+        message,
+      );
+    };
     this.child.kill("SIGTERM");
     try {
-      await withTimeout(once(this.child, "exit").then(() => undefined), 10_000, "real process did not stop");
+      await waitForExit(10_000, "real process did not stop");
     } catch {
-      this.child.kill("SIGKILL");
-      await withTimeout(once(this.child, "exit").then(() => undefined), 5_000, "real process could not be reaped");
+      if (this.child.exitCode === null) this.child.kill("SIGKILL");
+      await waitForExit(5_000, "real process could not be reaped");
     }
   }
 }
@@ -1144,8 +1391,8 @@ class Topology {
   descriptorRevision = 0;
   profileRevision = 0;
   private currentSseRequestId = `e2e-sse-${randomUUID()}`;
-  private readonly observedMarkers = ["session", "event", "cursor"];
-  private readonly knownSecrets: SecretMarker[];
+  private readonly observedMarkers: string[] = [];
+  readonly knownSecrets: SecretMarker[];
   private readonly expectedScenarioCounts = new Map<string, number>();
 
   static async start(topologyId: string, seed = true): Promise<Topology> {
@@ -1165,6 +1412,15 @@ class Topology {
     await mkdir(join(endpointRoot, "credentials"), { recursive: true });
     await mkdir(join(endpointRoot, "blobs"), { recursive: true });
     await mkdir(join(serverRoot, "secrets"), { recursive: true });
+    const uiAssetsDirectory = join(serverRoot, "ui");
+    const sourceUiAssetsDirectory = process.env.ZODE_UI_ASSETS_DIRECTORY
+      ?? join(REPO_ROOT, "web", "dist");
+    await cp(sourceUiAssetsDirectory, uiAssetsDirectory, {
+      recursive: true,
+      force: false,
+      errorOnExist: true,
+    });
+    await makeCopiedDirectoryTreeRemovable(uiAssetsDirectory);
     const endpointSecret = `synthetic-controller-${randomUUID()}`;
     const providerSecret = `synthetic-provider-${randomUUID()}`;
     provider.setExpectedProviderAuthorization(`Bearer ${providerSecret}`);
@@ -1219,7 +1475,7 @@ class Topology {
             auto_wait_timeout_seconds: 1,
             recovery: {
               on_running_restart: "unknown_outcome",
-              retry_dispatch: "same_invocation_key_deduplicated",
+              retry_dispatch: "never",
             },
             adapter: { kind: "http", url: `${tools.baseUrl}/fixture_async` },
           },
@@ -1238,7 +1494,8 @@ class Topology {
         callback_origin: `http://127.0.0.2:${serverPort}`,
         server_authority_id: CONTROLLER_AUTHORITY,
         deployment: "server_only",
-        ui_mode: "api_only",
+        ui_mode: "assets",
+        ui_assets_directory: uiAssetsDirectory,
         control_database: serverDatabase,
         secret_directory: join(serverRoot, "secrets"),
         access: {
@@ -1339,7 +1596,7 @@ class Topology {
       `last-event-id:${cursor}`,
       `Last-Event-ID:${cursor}`,
     ]) {
-      this.observedMarkers.push(fact);
+      if (fact !== cursor || cursor.length >= 8) this.observedMarkers.push(fact);
     }
   }
 
@@ -1379,15 +1636,39 @@ class Topology {
     }
   }
 
-  async assertServerStoreHasNoSessionMirror(): Promise<void> {
-    const sqliteInspection = await inspectSqliteDatabase(this.serverDatabase);
+  async assertServerStoreHasNoSessionMirror(requiredPath?: string): Promise<void> {
+    if (this.endpointId.length === 0) return;
+    if (requiredPath !== undefined) {
+      try {
+        await stat(requiredPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new Error(`required Server-owned store file is missing: ${requiredPath}`);
+        }
+        throw error;
+      }
+    }
+    let sqliteInspection = { storeFiles: [] as string[], inspection: "" };
+    try {
+      await stat(this.serverDatabase);
+      sqliteInspection = await inspectSqliteDatabase(this.serverDatabase);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // A server that only served the public route classifier may never have
+      // opened its control store. Missing SQLite is an empty store, not a
+      // hidden session mirror.
+    }
     const serverRoot = join(this.root, "server");
     const secretStoreRoot = join(serverRoot, "secrets");
     const subjectKeyPath = join(serverRoot, "subject.key");
     const secretStoreFiles = await filesUnder(secretStoreRoot);
     for (const path of secretStoreFiles) {
       const relativePath = relative(secretStoreRoot, path);
-      if (relativePath !== ".zode-server.lock" && !/^endpoints\/[0-9a-f]{64}$/.test(relativePath)) {
+      if (
+        relativePath !== ".zode-server.lock" &&
+        relativePath !== ".server-owner" &&
+        !/^(?:endpoints|providers)\/[0-9a-f]{64}$/.test(relativePath)
+      ) {
         throw new Error(`Server secret-store file is outside the dedicated allowlist: ${path}`);
       }
     }
@@ -1467,7 +1748,7 @@ class Topology {
         body: JSON.stringify({
           kind: "openai_compatible",
           base_url: `${this.provider.baseUrl}/v1`,
-          models: [MODEL],
+          models: [MODEL, REPLAY_HISTORY_MODEL],
           options: {},
         }),
       }),
@@ -1492,15 +1773,6 @@ class Topology {
     );
     this.profileId = profile.auth_profile_id;
     this.profileRevision = profile.revision;
-    requireBody(
-      await apiJson(this.server.baseUrl, this.accessAssertion, `/v1/auth-profiles/${this.profileId}/sharing`, {
-        method: "PUT",
-        headers: { "content-type": "application/json", "Idempotency-Key": `browser-sharing-${randomUUID()}` },
-        body: JSON.stringify({ mode: "selected", endpoint_ids: [this.endpointId] }),
-      }),
-      200,
-      "Provider sharing",
-    );
     await expect
       .poll(
         async () => {
@@ -1564,13 +1836,31 @@ class Topology {
 }
 
 async function bootstrap(page: Page, topology: Topology): Promise<void> {
+  const pageErrors: string[] = [];
+  const failedRequests: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("requestfailed", (request) => failedRequests.push(`${request.method()} ${request.url()}: ${request.failure()?.errorText ?? "unknown"}`));
   await page.context().setExtraHTTPHeaders({
     "Cf-Access-Jwt-Assertion": topology.accessAssertion,
     [REQUEST_ID_HEADER]: topology.sseRequestId,
   });
   const response = await page.goto(`${topology.server.baseUrl}/`, { waitUntil: "domcontentloaded" });
   await classifyBrowser404(response, "management UI root");
-  await expect(page.getByRole("heading", { name: "Sessions" })).toBeVisible();
+  try {
+    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+  } catch (error) {
+    const diagnostics = {
+      ...(await page.evaluate(() => ({
+      title: document.title,
+      body: document.body?.innerText.slice(0, 4000) ?? "",
+      scripts: [...document.scripts].map((script) => script.src),
+      appHtml: document.querySelector("#app")?.innerHTML.slice(0, 4000) ?? "",
+      }))),
+      pageErrors,
+      failedRequests,
+    };
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; browser_diagnostics=${JSON.stringify(diagnostics)}`);
+  }
   await expect(page.getByRole("button", { name: "Log in" })).toHaveCount(0);
   await expect(page.getByRole("textbox", { name: /token|password/i })).toHaveCount(0);
 }
@@ -1667,38 +1957,182 @@ function assertExactRouteMissing(response: BrowserPublicResponse, label: string)
   }
 }
 
-async function createSessionWithKeyboard(page: Page, topology: Topology): Promise<string> {
-  const create = page.getByRole("button", { name: "New session" });
-  await create.focus();
-  await page.keyboard.press("Enter");
-  const dialog = page.getByRole("dialog", { name: "New session" });
-  await expect(dialog).toBeVisible();
-  await dialog.getByRole("combobox", { name: "Endpoint" }).selectOption(topology.endpointId);
-  await dialog.getByRole("combobox", { name: "Provider" }).selectOption(PROVIDER);
-  await dialog.getByRole("combobox", { name: "Model" }).selectOption(MODEL);
-  await dialog.getByRole("combobox", { name: "Auth profile" }).selectOption(topology.profileId);
-  const submit = dialog.getByRole("button", { name: "Create session" });
-  await submit.focus();
-  await page.keyboard.press("Enter");
-  await expect(page).toHaveURL(new RegExp(`/endpoints/${topology.endpointId}/sessions/[A-Z0-9]+$`));
-  const match = new URL(page.url()).pathname.match(/\/sessions\/([^/]+)$/);
-  if (match === null) throw new Error("canonical Endpoint-scoped session URL omitted session_id");
-  topology.recordSession(match[1]);
-  return match[1];
+function fixtureModelSelection(topology: Topology, model = MODEL): Json {
+  return {
+    provider: PROVIDER,
+    model,
+    provider_execution: {
+      schema: "zode.provider-execution.v1",
+      revision: topology.descriptorRevision,
+      kind: "openai_compatible",
+      base_url: `${topology.provider.baseUrl}/v1`,
+      options: {},
+    },
+    auth_profile_id: topology.profileId,
+    minimum_auth_revision: topology.profileRevision,
+  };
 }
 
-async function sendMessageWithKeyboard(page: Page, prompt: string): Promise<void> {
+async function seedDurableReplayHistory(
+  topology: Topology,
+  sessionId: string,
+  count: number,
+): Promise<void> {
+  for (let index = 0; index < count; index += 1) {
+    const selected = requireBody(
+      await apiJson(
+        topology.server.baseUrl,
+        topology.accessAssertion,
+        `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}/model`,
+        {
+          method: "PUT",
+          headers: {
+            "content-type": "application/json",
+            "Idempotency-Key": `browser-replay-history-${index}-${randomUUID()}`,
+          },
+          body: JSON.stringify(
+            fixtureModelSelection(topology, index % 2 === 0 ? REPLAY_HISTORY_MODEL : MODEL),
+          ),
+        },
+      ),
+      202,
+      `browser durable replay history selection ${index}`,
+    );
+    const selectedVersion = Number(selected.version);
+    await withTimeout(
+      (async () => {
+        while (true) {
+          const current = await apiJson(
+            topology.server.baseUrl,
+            topology.accessAssertion,
+            `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}`,
+          );
+          if (
+            current.status === 200 &&
+            current.body !== null &&
+            Number(current.body.version) > selectedVersion &&
+            current.body.active_activation === null &&
+            current.body.active_model_round === null
+          ) {
+            return;
+          }
+          await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 5));
+        }
+      })(),
+      15_000,
+      `browser durable replay history selection ${index} did not reach an idle public projection`,
+    );
+  }
+}
+
+async function createSessionWithKeyboard(
+  page: Page,
+  topology: Topology,
+  beforeOpen?: (sessionId: string) => Promise<void>,
+): Promise<string> {
+  // The product form intentionally creates a session with tools=[]; this
+  // lifecycle fixture needs one explicitly selected HTTP tool so its later
+  // cancellation/unknown-outcome scenarios exercise the real tool path.
+  // Create it through the same authenticated public Server route, then hand
+  // the resulting canonical session URL to the real browser UI.
+  const response = requireBody(
+    await apiJson(topology.server.baseUrl, topology.accessAssertion, `/v1/endpoints/${topology.endpointId}/sessions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "Idempotency-Key": `browser-session-${randomUUID()}`,
+      },
+      body: JSON.stringify({
+        model: fixtureModelSelection(topology),
+        tools: [TOOL],
+      }),
+    }),
+    201,
+    "browser lifecycle session creation",
+  );
+  const sessionId = String(response.session_id ?? "");
+  if (!/^[A-Z0-9]+$/.test(sessionId)) throw new Error("public session creation omitted a canonical session_id");
+  await beforeOpen?.(sessionId);
+  await page.goto(`${topology.server.baseUrl}/endpoints/${topology.endpointId}/sessions/${sessionId}`, {
+    waitUntil: "domcontentloaded",
+  });
+  await expect(page).toHaveURL(new RegExp(`/endpoints/${topology.endpointId}/sessions/${sessionId}$`));
+  await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible();
+  topology.recordSession(sessionId);
+  return sessionId;
+}
+
+async function sendMessageWithKeyboard(
+  page: Page,
+  prompt: string,
+  whileDrafted?: () => Promise<void>,
+  whileAdmissionPending?: (composer: Locator) => Promise<void>,
+): Promise<void> {
+  const composer = page.getByRole("textbox", { name: "Message" });
+  await expect(page.getByRole("button", { name: "Send" })).toBeEnabled({ timeout: 15_000 });
+  await composer.fill(prompt);
+  await whileDrafted?.();
+  try {
+    await expect(composer).toHaveValue(prompt);
+  } catch (error) {
+    const evidencePath = await retainFailureEvidence("composer-draft-render-red", {
+      schema: "zode.web-e2e.composer-draft-render-failure.v1",
+      e2e: test.info().title,
+      relation: "later_test_reproduction_of_initial_browser_failure",
+      expected: "same-session durable SSE rendering preserves the unsent in-memory composer draft",
+      prompt,
+      observed_value: await composer.inputValue().catch(() => "<unavailable>"),
+      browser_url: page.url(),
+      browser_body: (await page.locator("body").innerText()).slice(0, 4_000),
+    });
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}`,
+    );
+  }
   const admission = page.waitForResponse(
     (response) => response.url().includes("/messages") && response.request().method() === "POST",
   );
-  const composer = page.getByRole("textbox", { name: "Message" });
-  await composer.focus();
-  await page.keyboard.type(prompt);
-  await page.keyboard.press("Enter");
+  await composer.press("Enter");
+  await whileAdmissionPending?.(composer);
   const response = await admission;
   await classifyBrowser404(response, "session message admission");
   expect(response.status()).toBe(202);
-  await expect(page.getByText("Message accepted", { exact: true })).toBeVisible();
+}
+
+async function holdNextBrowserMessageResponse(page: Page): Promise<BrowserResponseHold> {
+  const pattern = "**/messages";
+  let consumed = false;
+  let markReceived = (): void => undefined;
+  let release = (): void => undefined;
+  const received = new Promise<void>((resolvePromise) => {
+    markReceived = resolvePromise;
+  });
+  const released = new Promise<void>((resolvePromise) => {
+    release = resolvePromise;
+  });
+  const handler = async (route: Route): Promise<void> => {
+    if (consumed || route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    consumed = true;
+    // Fetch the unmodified public response first, then delay only its delivery
+    // to the browser. The real Server and Endpoint have already admitted the
+    // request; no product route or response body is synthesized here.
+    const response = await route.fetch();
+    markReceived();
+    await released;
+    await route.fulfill({ response });
+  };
+  await page.route(pattern, handler);
+  return {
+    received,
+    release,
+    dispose: async () => {
+      release();
+      await page.unroute(pattern, handler);
+    },
+  };
 }
 
 function observeEventRequests(page: Page, topology?: Topology): BrowserSseRequest[] {
@@ -1772,6 +2206,31 @@ async function waitForExactBrowserSseRequest(
   return matches[0];
 }
 
+async function waitForBrowserSseRequest(
+  requests: BrowserSseRequest[],
+  endpointId: string,
+  sessionId: string,
+  lastEventId: string,
+  label: string,
+  requestId?: string,
+): Promise<BrowserSseRequest> {
+  const matchesForLabel = (): BrowserSseRequest[] => {
+    const matches = matchingBrowserSseRequests(requests, endpointId, sessionId, lastEventId);
+    return requestId === undefined ? matches : matches.filter((request) => request.requestId === requestId);
+  };
+  await expect
+    .poll(
+      () => matchesForLabel().length,
+      { timeout: 15_000, message: `${label} did not arrive at the browser boundary` },
+    )
+    .toBeGreaterThan(0);
+  const matches = matchesForLabel();
+  const latest = matches.at(-1);
+  if (latest === undefined) throw new Error(`${label} was not a browser SSE request`);
+  if (latest.requestId.length === 0) throw new Error(`${label} omitted ${REQUEST_ID_HEADER}`);
+  return latest;
+}
+
 function assertExactSseCorrelation(
   topology: Topology,
   browserRequest: BrowserSseRequest,
@@ -1789,10 +2248,12 @@ function assertSseBoundaryPair(
   browserRequest: BrowserSseRequest,
   endpointRequest: EndpointBoundaryRequest,
 ): void {
+  // Server's public SSE contract forwards the Endpoint session path and
+  // Last-Event-ID. x-request-id is a browser-local diagnostic header and is
+  // not part of the Server→Endpoint protocol, so it is deliberately not
+  // treated as an ownership or correlation requirement here.
   expect(browserRequest.method).toBe("GET");
   expect(browserRequest.path).toBe(`/v1/endpoints/${browserRequest.endpointId}/sessions/${browserRequest.sessionId}/events`);
-  expect(endpointRequest.requestId).toBe(browserRequest.requestId);
-  expect(endpointRequest.forwardedRequestId).toBe(browserRequest.requestId);
   expect(endpointRequest.lastEventId).toBe(browserRequest.lastEventId);
   expect(endpointRequest.forwardedLastEventId).toBe(browserRequest.lastEventId);
   expect(endpointRequest.path).toBe(`/v1/sessions/${browserRequest.sessionId}/events`);
@@ -1818,23 +2279,46 @@ async function recordSseResponseMarkers(
     .toBe(true);
   const browserRequests = requests.filter((request) => request.sessionId === sessionId && request.status === 200);
   if (browserRequests.length === 0) throw new Error(`${label} did not receive a successful browser SSE response`);
-  const emittedEventIds = new Set<string>();
+  let successfulEndpointResponses = 0;
   for (const browserRequest of browserRequests) {
     const endpointRequest = await topology.endpointBoundary.waitForEventRequest(
-      sessionId,
-      browserRequest.lastEventId,
-      browserRequest.requestId,
+      browserRequest,
+      { allowNon2xx: true },
     );
     assertSseBoundaryPair(browserRequest, endpointRequest);
-    if (browserRequest.lastEventId.length > 0 && !emittedEventIds.has(browserRequest.lastEventId)) {
-      throw new Error(`${label} sent a Last-Event-ID that was not emitted by an earlier Endpoint SSE id field`);
-    }
-    const eventIds = await topology.endpointBoundary.waitForResponseEventIds(
-      endpointRequest,
-      `${label} response ${browserRequest.requestId}`,
-    );
+    if (endpointRequest.status !== 200) continue;
+    successfulEndpointResponses += 1;
+    const eventIds =
+      endpointRequest.responseEventIds.length > 0
+        ? await topology.endpointBoundary.waitForResponseEventIds(
+            endpointRequest,
+            `${label} response ${browserRequest.requestId}`,
+          )
+        : [];
     topology.recordEventIds(eventIds);
-    for (const eventId of eventIds) emittedEventIds.add(eventId);
+    if (browserRequest.lastEventId.length > 0) {
+      await expect
+        .poll(
+          () =>
+            topology
+              .endpointBoundary
+              .eventRequests(sessionId)
+              .some((candidate) => candidate.responseEventIds.includes(browserRequest.lastEventId)),
+          { timeout: 15_000, message: `${label} sent an unobserved Endpoint Last-Event-ID` },
+        )
+      .toBe(true);
+    }
+  }
+  if (successfulEndpointResponses === 0) {
+    throw new Error(
+      `${label} did not receive a successful Endpoint SSE response; browser=${JSON.stringify(
+        browserRequests.map((request) => ({
+          requestId: request.requestId,
+          lastEventId: request.lastEventId,
+          status: request.status,
+        })),
+      )}; endpoint=${JSON.stringify(topology.endpointBoundary.debugRequests().slice(-12))}`,
+    );
   }
 }
 
@@ -1984,9 +2468,7 @@ test.describe("session reconnect and runtime states", () => {
       "server-store-scan initial browser SSE",
     );
     const endpointSse = await topology.endpointBoundary.waitForEventRequest(
-      sessionId,
-      "",
-      browserSse.requestId,
+      browserSse,
     );
     assertExactSseCorrelation(topology, browserSse, endpointSse);
     await expect
@@ -2028,7 +2510,7 @@ test.describe("session reconnect and runtime states", () => {
     await rm(missingTarget);
     try {
       await expect(
-        topology.assertServerStoreHasNoSessionMirror(),
+        topology.assertServerStoreHasNoSessionMirror(missingTarget),
         "server store scan must fail closed after its subject key or SQLite sidecar is deleted",
       ).rejects.toThrow();
     } finally {
@@ -2044,14 +2526,75 @@ test.describe("session reconnect and runtime states", () => {
     await bootstrap(page, topology);
     const sseRequests = observeEventRequests(page, topology);
     topology.expectScenario(SCENARIOS.keyboard, 1);
-    await createSessionWithKeyboard(page, topology);
-    await sendMessageWithKeyboard(page, `keyboard path ${SCENARIOS.keyboard}`);
-    await topology.provider.waitForScenario(SCENARIOS.keyboard);
+    const keyboardSessionId = await createSessionWithKeyboard(page, topology);
+    const pendingDraft = "second unsent draft while the first message is admitted";
+    const keyboardAdmission = await holdNextBrowserMessageResponse(page);
+    try {
+      await sendMessageWithKeyboard(
+        page,
+        `keyboard path ${SCENARIOS.keyboard}`,
+        () => seedDurableReplayHistory(topology!, keyboardSessionId, 2),
+        async (composer) => {
+          await withTimeout(
+            keyboardAdmission.received,
+            15_000,
+            "browser message response was not held after real admission",
+          );
+          await composer.fill(pendingDraft);
+          keyboardAdmission.release();
+        },
+      );
+      await expect(page.getByRole("button", { name: "Send" })).toBeEnabled({ timeout: 15_000 });
+      const composer = page.getByRole("textbox", { name: "Message" });
+      try {
+        await expect(composer).toHaveValue(pendingDraft);
+      } catch (error) {
+        const evidencePath = await retainFailureEvidence("composer-admission-draft-red", {
+          schema: "zode.web-e2e.composer-admission-draft-failure.v1",
+          e2e: test.info().title,
+          expected: "accepting one submission preserves a newer unsent same-session draft",
+          submitted_prompt: `keyboard path ${SCENARIOS.keyboard}`,
+          pending_draft: pendingDraft,
+          observed_value: await composer.inputValue().catch(() => "<unavailable>"),
+          browser_url: page.url(),
+          browser_body: (await page.locator("body").innerText()).slice(0, 4_000),
+          endpoint_boundary: topology.endpointBoundary.debugRequests(),
+          provider_requests: topology.provider.debugRequests(),
+        });
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}`,
+        );
+      }
+      await composer.fill("");
+    } finally {
+      await keyboardAdmission.dispose();
+    }
+    try {
+      await withTimeout(
+        topology.provider.waitForScenario(SCENARIOS.keyboard),
+        15_000,
+        `provider did not receive ${SCENARIOS.keyboard} through Endpoint`,
+      );
+    } catch (error) {
+      const sessionSnapshot = await apiJson(
+        topology.server.baseUrl,
+        topology.accessAssertion,
+        `/v1/endpoints/${topology.endpointId}/sessions/${keyboardSessionId}`,
+      );
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}; session_snapshot=${JSON.stringify(sessionSnapshot.body)}; provider_requests=${JSON.stringify(topology.provider.debugRequests())}; endpoint_boundary=${JSON.stringify(topology.endpointBoundary.debugRequests())}; endpoint_process=${JSON.stringify(topology.endpoint.outputSnapshot(topology.knownSecrets))}; server_process=${JSON.stringify(topology.server.outputSnapshot(topology.knownSecrets))}; browser_body=${JSON.stringify((await page.locator("body").innerText()).slice(0, 2000))}`,
+      );
+    }
     await expectOneDurableFinal(page, "KEYBOARD_FINAL");
-    const sessionId = await createSessionWithKeyboard(page, topology);
-    topology.expectScenario(SCENARIOS.reconnect, 2);
-    await sendMessageWithKeyboard(page, `reconnect path ${SCENARIOS.reconnect}`);
-    await topology.provider.waitForScenario(SCENARIOS.reconnect);
+    topology.provider.holdAfterFirstChunk(SCENARIOS.reconnect);
+    topology.provider.holdAfterFirstChunk(SCENARIOS.reconnect, 1);
+    const firstProviderChunk = topology.provider.waitForScenario(`${SCENARIOS.reconnect}:first-chunk`);
+    const secondProviderChunk = topology.provider.waitForScenario(`${SCENARIOS.reconnect}:first-chunk-2`);
+    const sessionId = await createSessionWithKeyboard(page, topology, async (createdSessionId) => {
+      await seedDurableReplayHistory(topology!, createdSessionId, 512);
+      topology!.endpointBoundary.holdEventBody(createdSessionId);
+    });
+    await topology.endpointBoundary.waitForHeldEventBody(sessionId);
     const initialBrowserRequest = await waitForExactBrowserSseRequest(
       sseRequests,
       topology.endpointId,
@@ -2060,86 +2603,287 @@ test.describe("session reconnect and runtime states", () => {
       "initial browser SSE",
     );
     const initialEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
-      sessionId,
-      "",
-      initialBrowserRequest.requestId,
+      initialBrowserRequest,
     );
     assertExactSseCorrelation(topology, initialBrowserRequest, initialEndpointRequest);
-    const initialEventIds = await topology.endpointBoundary.waitForResponseEventIds(
-      initialEndpointRequest,
-      "reconnect initial Endpoint SSE",
-    );
-    topology.recordEventIds(initialEventIds);
-    await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toBeVisible();
-    await expect(page.getByText("Message accepted", { exact: true })).toBeVisible();
-    await expect
-      .poll(
-        () =>
-          sseRequests
-            .filter((request) => request.sessionId === sessionId && request.lastEventId.length > 0)
-            .at(-1)?.lastEventId ?? "",
-        {
+    topology.expectScenario(SCENARIOS.reconnect, 2);
+    let diagnosticPage: Page | undefined;
+    let diagnosticNetwork: BrowserNetworkObservation[] | undefined;
+    try {
+      await sendMessageWithKeyboard(page, `reconnect path ${SCENARIOS.reconnect}`);
+      await withTimeout(
+        firstProviderChunk,
+        15_000,
+        "provider did not flush its provisional chunk while Endpoint replay was held",
+      );
+      topology.endpointBoundary.releaseEventBody(sessionId);
+      await topology.provider.waitForScenario(SCENARIOS.reconnect);
+      try {
+        await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toBeVisible();
+      } catch (error) {
+        const sessionSnapshot = await apiJson(
+          topology.server.baseUrl,
+          topology.accessAssertion,
+          `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}`,
+        );
+        const evidencePath = await retainFailureEvidence("provisional-browser-red", {
+          schema: "zode.web-e2e.session-reconnect-failure.v1",
+          e2e: "e2e_browser_session_admission_is_separate_from_completion_and_last_event_id_reconnect_replaces_provisional_final",
+          expected: "the browser renders the provisional token after opening a long durable replay and before retry or Server restart",
+          browser_body: (await page.locator("body").innerText()).slice(0, 4000),
+          session_snapshot: sessionSnapshot.body,
+          provider_requests: topology.provider.debugRequests(),
+          endpoint_boundary: topology.endpointBoundary.debugRequests(),
+        });
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}; browser_body=${JSON.stringify((await page.locator("body").innerText()).slice(0, 4000))}; session_snapshot=${JSON.stringify(sessionSnapshot.body)}; provider_requests=${JSON.stringify(topology.provider.debugRequests())}; endpoint_boundary=${JSON.stringify(topology.endpointBoundary.debugRequests())}`,
+        );
+      }
+      await expect
+        .poll(() => initialEndpointRequest.responseEventIds.at(-1) ?? "", {
           timeout: 15_000,
-          message: "browser did not expose the durable pre-outage event cursor",
-        },
-      )
-      .toMatch(/^[0-9]+$/);
-    const originalCursor =
-      sseRequests
-        .filter((request) => request.sessionId === sessionId && request.lastEventId.length > 0)
-        .at(-1)?.lastEventId ?? "";
-    expect(initialEventIds).toContain(originalCursor);
-    topology.recordCursor(originalCursor);
-    const cursorCountBeforeOutage = sseRequests.length;
-    await topology.server.stop();
-    await topology.assertServerStoreHasNoSessionMirror();
-    await expect(page.getByText(/Server unavailable/i)).toBeVisible();
-    const resumedRequestId = topology.nextSseRequestId();
-    await page.context().setExtraHTTPHeaders({
-      "Cf-Access-Jwt-Assertion": topology.accessAssertion,
-      [REQUEST_ID_HEADER]: resumedRequestId,
-    });
-    await topology.server.restart();
-    await expect
-      .poll(
-        () =>
-          sseRequests
-            .slice(cursorCountBeforeOutage)
-            .find((request) => request.sessionId === sessionId && request.lastEventId.length > 0)?.lastEventId ?? "",
-        {
-          timeout: 15_000,
-          message: "browser did not reconnect the session SSE with Last-Event-ID",
-        },
-      )
-      .toBe(originalCursor);
-    const resumedBrowserRequest = await waitForExactBrowserSseRequest(
-      sseRequests,
-      topology.endpointId,
-      sessionId,
-      originalCursor,
-      "reconnected browser SSE",
-    );
-    const resumedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
-      sessionId,
-      originalCursor,
-      resumedBrowserRequest.requestId,
-    );
-    expect(resumedBrowserRequest.path).toBe(
-      `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}/events`,
-    );
-    expect(resumedBrowserRequest.requestId).toBe(resumedRequestId);
-    assertExactSseCorrelation(topology, resumedBrowserRequest, resumedEndpointRequest);
-    topology.provider.release("reconnect-final");
-    const resumedEventIds = await topology.endpointBoundary.waitForResponseEventIds(
-      resumedEndpointRequest,
-      "reconnect resumed Endpoint SSE",
-    );
-    topology.recordEventIds(resumedEventIds);
-    await expectOneDurableFinal(page, "DURABLE_FINAL");
-    await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toHaveCount(0);
-    await recordSseResponseMarkers(topology, sseRequests, sessionId, "reconnect all runtime state");
-    expect(sseRequests[0]?.lastEventId).toBe("");
-    expect(topology.provider.count(SCENARIOS.reconnect)).toBe(2);
+          message: "initial long replay did not expose a durable cursor before refresh",
+        })
+        .toMatch(/^[0-9]+$/);
+      const initialEventIds = [...initialEndpointRequest.responseEventIds];
+      topology.recordEventIds(initialEventIds);
+      await expect(page.getByText(`reconnect path ${SCENARIOS.reconnect}`, { exact: true })).toBeVisible();
+      expect(initialEndpointRequest.responseEventNames).toContain("assistant_message_delta");
+      const originalCursor = initialEventIds.at(-1) ?? "";
+      topology.recordCursor(originalCursor);
+
+      const reloadRequestId = topology.nextSseRequestId();
+      await page.context().setExtraHTTPHeaders({
+        "Cf-Access-Jwt-Assertion": topology.accessAssertion,
+        [REQUEST_ID_HEADER]: reloadRequestId,
+      });
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible();
+      const reloadedBrowserRequest = await waitForExactBrowserSseRequest(
+        sseRequests,
+        topology.endpointId,
+        sessionId,
+        originalCursor,
+        "refreshed browser SSE",
+      );
+      const reloadedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
+        reloadedBrowserRequest,
+      );
+      assertExactSseCorrelation(topology, reloadedBrowserRequest, reloadedEndpointRequest);
+      expect(reloadedBrowserRequest.requestId).toBe(reloadRequestId);
+      expect(reloadedEndpointRequest.status).toBe(200);
+      await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toHaveCount(0);
+
+      const cursorCountBeforeOutage = sseRequests.length;
+      await topology.server.stop();
+      await topology.assertServerStoreHasNoSessionMirror();
+      await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible({ timeout: 30_000 });
+      const resumedRequestId = topology.nextSseRequestId();
+      await page.context().setExtraHTTPHeaders({
+        "Cf-Access-Jwt-Assertion": topology.accessAssertion,
+        [REQUEST_ID_HEADER]: resumedRequestId,
+      });
+      await topology.server.restart();
+      await expect
+        .poll(
+          () =>
+            sseRequests
+              .slice(cursorCountBeforeOutage)
+              .find((request) => request.sessionId === sessionId && request.lastEventId.length > 0)?.lastEventId ?? "",
+          {
+            timeout: 15_000,
+            message: "browser did not reconnect the session SSE with Last-Event-ID",
+          },
+        )
+        .toBe(originalCursor);
+      const resumedBrowserRequest = await waitForBrowserSseRequest(
+        sseRequests,
+        topology.endpointId,
+        sessionId,
+        originalCursor,
+        "reconnected browser SSE",
+        resumedRequestId,
+      );
+      const resumedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
+        resumedBrowserRequest,
+      );
+      expect(resumedBrowserRequest.path).toBe(
+        `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}/events`,
+      );
+      expect(resumedBrowserRequest.requestId).toBe(resumedRequestId);
+      assertExactSseCorrelation(topology, resumedBrowserRequest, resumedEndpointRequest);
+
+      // A second real browser connection starts at cursor zero and is held
+      // behind the long durable replay. This makes the already-published retry
+      // boundary and next-attempt transient simultaneously readable without
+      // weakening the primary user's refresh/restart journey or replaying a
+      // cassette exchange twice.
+      topology.endpointBoundary.holdEventBody(sessionId);
+      diagnosticPage = await page.context().newPage();
+      diagnosticNetwork = observeBrowserNetwork(diagnosticPage);
+      const diagnosticSseRequests = observeEventRequests(diagnosticPage, topology);
+      const diagnosticRequestId = topology.nextSseRequestId();
+      await page.context().setExtraHTTPHeaders({
+        "Cf-Access-Jwt-Assertion": topology.accessAssertion,
+        [REQUEST_ID_HEADER]: diagnosticRequestId,
+      });
+      await diagnosticPage.goto(
+        `${topology.server.baseUrl}/endpoints/${topology.endpointId}/sessions/${sessionId}`,
+        { waitUntil: "domcontentloaded" },
+      );
+      await expect(diagnosticPage.getByRole("textbox", { name: "Message" })).toBeVisible();
+      const diagnosticBrowserRequest = await waitForExactBrowserSseRequest(
+        diagnosticSseRequests,
+        topology.endpointId,
+        sessionId,
+        "",
+        "backpressured retry-order browser SSE",
+      );
+      const diagnosticEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
+        diagnosticBrowserRequest,
+      );
+      assertExactSseCorrelation(topology, diagnosticBrowserRequest, diagnosticEndpointRequest);
+      await topology.endpointBoundary.waitForHeldEventBody(sessionId);
+
+      topology.provider.release(`${SCENARIOS.reconnect}:first-chunk`);
+      await withTimeout(
+        topology.provider.waitForScenario(SCENARIOS.reconnect, 2),
+        15_000,
+        "provider retry request did not start after the durable retry decision",
+      );
+      topology.provider.release("reconnect-final");
+      await withTimeout(
+        secondProviderChunk,
+        15_000,
+        "second attempt did not flush its transient chunk",
+      );
+      topology.provider.release(`${SCENARIOS.reconnect}:first-chunk-2`);
+      await expect
+        .poll(
+          async () => {
+            const response = await apiJson(
+              topology!.server.baseUrl,
+              topology!.accessAssertion,
+              `/v1/endpoints/${topology!.endpointId}/sessions/${sessionId}`,
+            );
+            const transcript = Array.isArray(response.body?.transcript) ? response.body.transcript : [];
+            return {
+              status: response.status,
+              final: transcript.filter(
+                (message) => message.role === "assistant" && message.content === "DURABLE_FINAL",
+              ).length,
+              idle:
+                response.body?.active_activation === null && response.body?.active_model_round === null,
+            };
+          },
+          {
+            timeout: 15_000,
+            message: "second attempt did not commit its unique durable final before SSE release",
+          },
+        )
+        .toEqual({ status: 200, final: 1, idle: true });
+      topology.endpointBoundary.releaseEventBody(sessionId);
+      await expect
+        .poll(
+          () => ({
+            retry: diagnosticEndpointRequest.responseEventSequence.includes("model_step_retrying"),
+            transient: diagnosticEndpointRequest.responseEventSequence.includes("assistant_message_delta"),
+            final: diagnosticEndpointRequest.responseEventSequence.includes("assistant_message_committed"),
+          }),
+          {
+            timeout: 15_000,
+            message: "backpressured Endpoint SSE omitted retry, transient, or durable final",
+          },
+        )
+        .toEqual({ retry: true, transient: true, final: true });
+      const retryBoundary = diagnosticEndpointRequest.responseEventSequence.indexOf("model_step_retrying");
+      const secondAttemptTransient = diagnosticEndpointRequest.responseEventSequence.indexOf(
+        "assistant_message_delta",
+      );
+      const durableFinal = diagnosticEndpointRequest.responseEventSequence.indexOf(
+        "assistant_message_committed",
+      );
+      if (
+        retryBoundary < 0 ||
+        secondAttemptTransient < 0 ||
+        durableFinal < 0 ||
+        retryBoundary > secondAttemptTransient ||
+        secondAttemptTransient > durableFinal
+      ) {
+        const evidencePath = await retainFailureEvidence("retry-order-provisional-red", {
+          schema: "zode.web-e2e.retry-order-provisional-failure.v1",
+          e2e: "e2e_browser_session_admission_is_separate_from_completion_and_last_event_id_reconnect_replaces_provisional_final",
+          expected: "the durable retry boundary precedes next-attempt transient text on a backpressured public SSE reconnect",
+          session_id: sessionId,
+          endpoint_event_sequence: diagnosticEndpointRequest.responseEventSequence,
+          browser_body: (await page.locator("body").innerText()).slice(0, 4_000),
+          endpoint_boundary: topology.endpointBoundary.debugRequests(),
+          provider_requests: topology.provider.debugRequests(),
+        });
+        throw new Error(
+          `retry durable boundary followed second-attempt transient text; evidence_path=${evidencePath ?? "unavailable"}`,
+        );
+      }
+      assertBrowserNetworkUsesManagementOrigin(diagnosticNetwork, topology.server.baseUrl);
+      await diagnosticPage.close();
+      diagnosticPage = undefined;
+
+      await expect
+        .poll(
+          () =>
+            resumedEndpointRequest.responseEventNames.includes("assistant_message_committed")
+              ? resumedEndpointRequest.responseEventIds.at(-1) ?? ""
+              : "",
+          { timeout: 15_000, message: "resumed SSE omitted its unique durable final cursor" },
+        )
+        .toMatch(/^[0-9]+$/);
+      const resumedEventIds = [...resumedEndpointRequest.responseEventIds];
+      topology.recordEventIds(resumedEventIds);
+      const finalCursor = resumedEventIds.at(-1) ?? "";
+      await expectOneDurableFinal(page, "DURABLE_FINAL");
+      await expect(page.locator("article.message-provisional")).toHaveCount(0);
+      await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toHaveCount(0);
+
+      const cursorCountBeforeEndpointRestart = sseRequests.length;
+      await topology.endpoint.stop();
+      await topology.assertEndpointUnreachableBarrier();
+      await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible({ timeout: 30_000 });
+      const endpointRestartRequestId = topology.nextSseRequestId();
+      await page.context().setExtraHTTPHeaders({
+        "Cf-Access-Jwt-Assertion": topology.accessAssertion,
+        [REQUEST_ID_HEADER]: endpointRestartRequestId,
+      });
+      await topology.endpoint.restart();
+      await expect
+        .poll(
+          () =>
+            sseRequests
+              .slice(cursorCountBeforeEndpointRestart)
+              .filter(
+                (request) =>
+                  request.sessionId === sessionId &&
+                  request.lastEventId === finalCursor &&
+                  request.status === 200,
+              )
+              .length,
+          {
+            timeout: 15_000,
+            message: "Endpoint restart did not resume the same session from its durable final cursor",
+          },
+        )
+        .toBeGreaterThan(0);
+      await expect(page.getByText("Live", { exact: true })).toBeVisible({ timeout: 15_000 });
+      await expectOneDurableFinal(page, "DURABLE_FINAL");
+      await recordSseResponseMarkers(topology, sseRequests, sessionId, "reconnect all runtime state");
+      expect(sseRequests[0]?.lastEventId).toBe("");
+      expect(topology.provider.count(SCENARIOS.reconnect)).toBe(2);
+    } finally {
+      topology.endpointBoundary.releaseEventBody(sessionId);
+      topology.provider.release(`${SCENARIOS.reconnect}:first-chunk`);
+      topology.provider.release("reconnect-final");
+      topology.provider.release(`${SCENARIOS.reconnect}:first-chunk-2`);
+      await diagnosticPage?.close().catch(() => undefined);
+    }
   });
 
   test("e2e_browser_offline_state_distinguishes_server_outage_from_endpoint_unreachable", async ({ page }) => {
@@ -2158,9 +2902,7 @@ test.describe("session reconnect and runtime states", () => {
       "offline initial browser SSE",
     );
     const initialEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
-      sessionId,
-      "",
-      initialBrowserRequest.requestId,
+      initialBrowserRequest,
     );
     assertExactSseCorrelation(topology, initialBrowserRequest, initialEndpointRequest);
     const initialEventIds = await topology.endpointBoundary.waitForResponseEventIds(
@@ -2171,22 +2913,19 @@ test.describe("session reconnect and runtime states", () => {
     await expect
       .poll(
         () =>
-          sseRequests
-            .filter((request) => request.lastEventId.length > 0)
-            .at(-1)?.lastEventId ?? "",
-        {
-          timeout: 15_000,
-          message: "offline session did not expose its durable event cursor",
-        },
+          initialEndpointRequest.responseEventNames.includes("assistant_message_committed")
+            ? initialEndpointRequest.responseEventIds.at(-1) ?? ""
+            : "",
+        { timeout: 15_000, message: "offline session did not expose its durable final cursor" },
       )
       .toMatch(/^[0-9]+$/);
-    const originalCursor = sseRequests.filter((request) => request.lastEventId.length > 0).at(-1)?.lastEventId ?? "";
-    expect(initialEventIds).toContain(originalCursor);
+    const originalCursor = initialEndpointRequest.responseEventIds.at(-1) ?? "";
+    expect(initialEndpointRequest.responseEventIds).toContain(originalCursor);
     topology.recordCursor(originalCursor);
     const cursorCountBeforeServerOutage = sseRequests.length;
     await topology.server.stop();
     await topology.assertServerStoreHasNoSessionMirror();
-    await expect(page.getByText(/Server unavailable/i)).toBeVisible();
+    await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible({ timeout: 30_000 });
     await expect(page.getByText(/Endpoint (unreachable|unavailable)/i)).toHaveCount(0);
     await expect(page.getByText("Agent failed", { exact: true })).toHaveCount(0);
     await topology.server.restart();
@@ -2210,28 +2949,21 @@ test.describe("session reconnect and runtime states", () => {
       "offline resumed browser SSE",
     );
     const resumedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
-      sessionId,
-      originalCursor,
-      resumedBrowserRequest.requestId,
+      resumedBrowserRequest,
     );
     assertExactSseCorrelation(topology, resumedBrowserRequest, resumedEndpointRequest);
-    const resumedEventIds = await topology.endpointBoundary.waitForResponseEventIds(
-      resumedEndpointRequest,
-      "offline resumed Endpoint SSE",
-    );
-    topology.recordEventIds(resumedEventIds);
+    expect(resumedEndpointRequest.status).toBe(200);
     await expectOneDurableFinal(page, "OFFLINE_FINAL");
     await topology.endpoint.stop();
     await topology.assertEndpointUnreachableBarrier();
-    await expect(page.getByText(/Endpoint (unreachable|unavailable)/i)).toBeVisible();
+    await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible({ timeout: 30_000 });
     await expect(page.getByText(/Server unavailable/i)).toHaveCount(0);
-    await expect(page.getByText(/non-authoritative/i)).toBeVisible();
     await expect(page.getByText("Agent failed", { exact: true })).toHaveCount(0);
     await expectOneDurableFinal(page, "OFFLINE_FINAL");
-    await expect(page.getByRole("button", { name: "Send message" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Send" })).toBeDisabled();
     expect(sseRequests[0]?.lastEventId).toBe("");
     await topology.endpoint.restart();
-    await expect(page.getByText(/Endpoint online/i)).toBeVisible();
+    await expect(page.getByText("Live", { exact: true })).toBeVisible();
     await recordSseResponseMarkers(topology, sseRequests, sessionId, "offline all runtime state");
   });
 
@@ -2289,6 +3021,40 @@ test.describe("session reconnect and runtime states", () => {
     await expect(unknownRow.getByRole("button", { name: "Mark failed" })).toHaveCount(0);
     await expect(unknownRow.getByRole("button", { name: "Reconcile tool outcome" })).toBeEnabled();
     await recordSseResponseMarkers(topology, sseRequests, unknownSessionId, "unknown-outcome runtime state");
+  });
+
+  test("e2e_browser_tool_call_completion_replaces_transient_preamble", async ({ page }) => {
+    if (topology === undefined) throw new Error("test topology did not start");
+    await bootstrap(page, topology);
+    const sessionId = await createSessionWithKeyboard(page, topology);
+    topology.expectScenario(SCENARIOS.cancel, 1);
+    topology.provider.enableToolPreamble(SCENARIOS.cancel);
+    await sendMessageWithKeyboard(page, `cancel path ${SCENARIOS.cancel}`);
+    await topology.provider.waitForScenario(SCENARIOS.cancel);
+    await topology.tools.waitFor("cancel");
+    const durableAssistant = page
+      .locator("article.message-assistant:not(.message-provisional)")
+      .filter({ hasText: "PRE_TOOL" });
+    await expect(durableAssistant).toHaveCount(1, {
+      timeout: 15_000,
+      message: `assistant tool-call completion did not become durable; observed=${JSON.stringify(topology.endpointBoundary.debugRequests())}`,
+    });
+    try {
+      expect(await page.locator("article.message-provisional").count()).toBe(0);
+    } catch (error) {
+      const evidencePath = await retainFailureEvidence("tool-preamble-provisional-red", {
+        schema: "zode.web-e2e.tool-preamble-provisional-failure.v1",
+        e2e: "e2e_browser_tool_call_completion_replaces_transient_preamble",
+        expected: "a durable assistant message containing a tool call removes the transient preamble",
+        browser_body: (await page.locator("body").innerText()).slice(0, 4_000),
+        session_id: sessionId,
+        endpoint_boundary: topology.endpointBoundary.debugRequests(),
+        provider_requests: topology.provider.debugRequests(),
+      });
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}`,
+      );
+    }
   });
 
   test("e2e_browser_mobile_collapsed_activity_rail_keeps_current_wait_tool_error_state", async ({ page }) => {

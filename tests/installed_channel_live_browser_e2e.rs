@@ -5,6 +5,7 @@ use std::{
     fs::OpenOptions,
     io::{Error, Write},
     path::PathBuf,
+    process::Command as StdCommand,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -86,15 +87,72 @@ async fn run_persistent_state_guard(
     channel_root: &PathBuf,
 ) -> TestResult<()> {
     let lock_path = channel_root.join(".installed-channel-live-smoke.lock");
-    let mut lock = OpenOptions::new()
+    let mut lock = match OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&lock_path)
-        .map_err(|error| {
-            Error::other(format!(
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let lock_bytes = fs::read(&lock_path).map_err(|read_error| {
+                Error::other(format!(
+                    "persistent state guard could not inspect existing channel lock: {read_error}"
+                ))
+            })?;
+            let lock_value: Value = serde_json::from_slice(&lock_bytes).map_err(|parse_error| {
+                Error::other(format!(
+                    "persistent state guard found malformed channel lock: {parse_error}"
+                ))
+            })?;
+            if lock_value["schema"] != "zode.installed-channel-live-smoke-lock.v1" {
+                return Err(Error::other(
+                    "persistent state guard found a lock with an unexpected schema",
+                )
+                .into());
+            }
+            let pid = lock_value["pid"]
+                .as_u64()
+                .filter(|pid| *pid > 0 && *pid <= u32::MAX as u64)
+                .ok_or_else(|| {
+                    Error::other("persistent state guard found a lock without a valid pid")
+                })? as u32;
+            let pid_text = pid.to_string();
+            let owner_alive = StdCommand::new("/bin/ps")
+                .args(["-p", &pid_text, "-o", "pid="])
+                .output()
+                .map(|output| {
+                    output.status.success()
+                        && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+                })
+                .unwrap_or(true);
+            if owner_alive {
+                return Err(Error::other(format!(
+                    "persistent state guard could not reserve channel: live lock owner pid {pid}"
+                ))
+                .into());
+            }
+            fs::remove_file(&lock_path).map_err(|remove_error| {
+                Error::other(format!(
+                    "persistent state guard could not reclaim stale channel lock: {remove_error}"
+                ))
+            })?;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+                .map_err(|retry_error| {
+                    Error::other(format!(
+                        "persistent state guard could not reserve channel after stale-lock reclaim: {retry_error}"
+                    ))
+                })?
+        }
+        Err(error) => {
+            return Err(Error::other(format!(
                 "persistent state guard could not reserve channel: {error}"
             ))
-        })?;
+            .into())
+        }
+    };
     writeln!(
         lock,
         "{{\"schema\":\"zode.installed-channel-live-smoke-lock.v1\",\"pid\":{},\"run_id\":\"persistent-state-guard\",\"started_at_unix_ms\":{}}}",

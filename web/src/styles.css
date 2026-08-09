@@ -592,6 +592,11 @@ textarea:focus-visible {
   white-space: pre-wrap;
 }
 
+.message-provisional {
+  color: #b9c1c2;
+  opacity: 0.86;
+}
+
 .runtime-activity {
   display: grid;
   gap: 7px;

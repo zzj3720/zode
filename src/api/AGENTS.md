@@ -94,6 +94,12 @@ errors, durable admission before acceptance, concurrent commit-order SSE,
 disconnect without runtime cancellation, bounded identity/health/capabilities,
 credential-replica revision/tombstone idempotency without secrets, and
 duplicate tool callback commands producing one public terminal event. The
+`e2e_browser_session_admission_is_separate_from_completion_and_last_event_id_reconnect_replaces_provisional_final`
+anchor must also open a backpressured durable replay, admit new work after the
+browser reports `Live`, observe its transient progress before replay drains,
+and prove that a durable retry boundary is delivered before the next attempt's
+transient text on the same backpressured public reconnect.
+The
 `e2e_session_list_reflects_current_model_selection_after_update` anchor also
 keeps the list's current selection consistent with session GET and the
 `model_selection_changed` SSE event.

@@ -83,6 +83,36 @@ async function waitForAssistantMarkers(page, count, timeoutMs = 20_000) {
   fail(`browser did not render ${count} durable assistant markers after restart`);
 }
 
+async function waitForDurableEventsConnection(page, timeoutMs = 20_000) {
+  await page.getByText('Durable events are connected', { exact: true }).waitFor({ timeout: timeoutMs });
+}
+
+async function sendComposerPrompt(page, prompt) {
+  const input = page.getByPlaceholder('Message Zode');
+  const button = page.getByRole('button', { name: 'Send', exact: true });
+  await input.waitFor({ timeout: 20_000 });
+  const deadline = Date.now() + 20_000;
+  while (!(await button.isEnabled()) && Date.now() < deadline) await page.waitForTimeout(100);
+  if (!(await button.isEnabled())) {
+    fail('browser composer remained disabled after durable SSE reconnect', {
+      body: (await page.locator('body').innerText()).slice(-2_000),
+    });
+  }
+  await input.fill(prompt);
+  const request = page.waitForRequest((candidate) => {
+    if (candidate.method() !== 'POST') return false;
+    try { return new URL(candidate.url()).pathname.endsWith('/messages'); } catch { return false; }
+  }, { timeout: 10_000 }).catch(() => null);
+  await button.click();
+  if (!(await request)) {
+    fail('browser composer click did not issue the public message request', {
+      button_disabled: await button.isDisabled(),
+      input_value: await input.inputValue(),
+      body: (await page.locator('body').innerText()).slice(-2_000),
+    });
+  }
+}
+
 function jsonLine(stdout) {
   for (const line of String(stdout || '').trim().split(/\r?\n/).reverse()) {
     try { return JSON.parse(line); } catch { /* readiness lines precede the result */ }
@@ -404,19 +434,19 @@ async function findOrCreateProfile(page, providerCard, { providerId, profileLabe
   return profileId;
 }
 
-async function rebindPersistentSession(page, { ownedProviderId, modelId, profileId, requests }) {
-  const sessionRequest = requests.slice().reverse().find((request) => {
-    const pathname = new URL(request.url).pathname;
-    return request.method === 'GET'
-      && /^\/v1\/endpoints\/[^/]+\/sessions\/[^/]+$/.test(pathname);
-  });
-  if (!sessionRequest) fail('persistent smoke could not identify its durable session API path');
-  const match = new URL(sessionRequest.url).pathname.match(
-    /^\/v1\/endpoints\/([^/]+)\/sessions\/([^/]+)$/,
+async function rebindPersistentSession(page, {
+  ownedProviderId,
+  modelId,
+  profileId,
+  sessionPath,
+  ownershipMarker,
+}) {
+  const match = String(sessionPath || '').match(
+    /^\/endpoints\/([^/]+)\/sessions\/([^/]+)$/,
   );
   if (!match) fail('persistent smoke session API path was malformed');
   const [endpointId, sessionId] = match.slice(1);
-  return page.evaluate(async ({ endpointId, sessionId, providerId, modelId, profileId }) => {
+  return page.evaluate(async ({ endpointId, sessionId, providerId, modelId, profileId, ownershipMarker, runId }) => {
     const providerResponse = await fetch('/v1/providers', { headers: { accept: 'application/json' } });
     if (!providerResponse.ok) throw new Error(`provider list returned ${providerResponse.status}`);
     const provider = ((await providerResponse.json()).providers || [])
@@ -431,34 +461,93 @@ async function rebindPersistentSession(page, { ownedProviderId, modelId, profile
     const profile = ((await profilesResponse.json()).items || [])
       .find((item) => (item.auth_profile_id || item.profile_id) === profileId);
     if (!profile) throw new Error(`owned profile ${profileId} disappeared`);
-    const response = await fetch(
-      `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}/model`,
-      {
-        method: 'PUT',
-        headers: {
-          accept: 'application/json',
-          'content-type': 'application/json',
-          'Idempotency-Key': `persistent-session-rebind-${providerId}-${sessionId}`,
-        },
-        body: JSON.stringify({
-          provider: providerId,
-          provider_execution: {
-            schema: 'zode.provider-execution.v1',
-            revision: descriptor.revision,
-            kind: descriptor.kind,
-            base_url: descriptor.base_url,
-            options: descriptor.options || {},
-          },
-          model: modelId,
-          auth_profile_id: profile.auth_profile_id || profile.profile_id,
-          minimum_auth_revision: profile.revision,
-        }),
+    const endpointsResponse = await fetch('/v1/endpoints', { headers: { accept: 'application/json' } });
+    if (!endpointsResponse.ok) throw new Error(`endpoint list returned ${endpointsResponse.status}`);
+    const endpoints = (await endpointsResponse.json()).items || [];
+    const staleSessions = [];
+    for (const endpoint of endpoints) {
+      const sessionsResponse = await fetch(
+        `/v1/endpoints/${encodeURIComponent(endpoint.endpoint_id)}/sessions`,
+        { headers: { accept: 'application/json' } },
+      );
+      if (!sessionsResponse.ok) throw new Error(`session list returned ${sessionsResponse.status}`);
+      for (const session of (await sessionsResponse.json()).items || []) {
+        const baseUrl = String(session.model?.provider_execution_base_url || '');
+        let isLoopback = false;
+        try {
+          const parsed = new URL(baseUrl);
+          isLoopback = parsed.protocol === 'http:'
+            && ['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname);
+        } catch { /* malformed selections are left for the guard to report */ }
+        if (session.model?.provider === providerId
+          && session.model?.provider_execution_options?.zode_test_owner === ownershipMarker
+          && isLoopback) {
+          staleSessions.push({ endpointId: endpoint.endpoint_id, sessionId: session.session_id });
+        }
+      }
+    }
+    if (!staleSessions.some((item) => item.endpointId === endpointId && item.sessionId === sessionId)) {
+      throw new Error('persistent smoke session is not marked as test-owned');
+    }
+    const model = {
+      provider: providerId,
+      provider_execution: {
+        schema: 'zode.provider-execution.v1',
+        revision: descriptor.revision,
+        kind: descriptor.kind,
+        base_url: descriptor.base_url,
+        options: descriptor.options || {},
       },
-    );
-    const text = await response.text();
-    if (!response.ok) throw new Error(`persistent session model rebind returned ${response.status}: ${text}`);
-    return { endpoint_id: endpointId, session_id: sessionId, response: text };
-  }, { endpointId, sessionId, providerId: ownedProviderId, modelId, profileId });
+      model: modelId,
+      auth_profile_id: profile.auth_profile_id || profile.profile_id,
+      minimum_auth_revision: profile.revision,
+    };
+    const reboundBaseUrls = [];
+    for (const target of staleSessions) {
+      const response = await fetch(
+        `/v1/endpoints/${encodeURIComponent(target.endpointId)}/sessions/${encodeURIComponent(target.sessionId)}/model`,
+        {
+          method: 'PUT',
+          headers: {
+            accept: 'application/json',
+            'content-type': 'application/json',
+            'Idempotency-Key': `persistent-session-rebind-${runId}-${providerId}-${target.sessionId}`,
+          },
+          body: JSON.stringify(model),
+        },
+      );
+      const text = await response.text();
+      if (!response.ok) throw new Error(`persistent session model rebind returned ${response.status}: ${text}`);
+      let committed = false;
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const snapshot = await fetch(
+          `/v1/endpoints/${encodeURIComponent(target.endpointId)}/sessions/${encodeURIComponent(target.sessionId)}`,
+          { headers: { accept: 'application/json' } },
+        );
+        if (snapshot.ok) {
+          const value = await snapshot.json();
+          if (value?.model?.provider_execution_base_url === descriptor.base_url) {
+            reboundBaseUrls.push(value.model.provider_execution_base_url);
+            committed = true;
+            break;
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      if (!committed) {
+        throw new Error(`persistent session model rebind did not become durable for ${target.sessionId}`);
+      }
+    }
+    return { endpointId, sessionId, reboundCount: staleSessions.length, reboundBaseUrls };
+  }, {
+    endpointId,
+    sessionId,
+    providerId: ownedProviderId,
+    modelId,
+    profileId,
+    ownershipMarker,
+    runId,
+  });
 }
 
 async function startFixtures({ persistent = false } = {}) {
@@ -600,6 +689,7 @@ async function main() {
   let browserResponses = [];
   let failure;
   let browserOrigin = null;
+  let ownedSessionUrl = null;
   let createdProfileId = null;
   let providerStateCleaned = false;
   let persistentOwnershipValidated = false;
@@ -639,6 +729,8 @@ async function main() {
   }
   let streamMarkerVisible = false;
   let durableFinalVisible = false;
+  let reboundSessionCount = 0;
+  let reboundBaseUrls = [];
   try {
     const currentManifest = persistentMode && existsSync(path.join(root, 'current', 'manifest.json'))
       ? JSON.parse(readFileSync(path.join(root, 'current', 'manifest.json'), 'utf8'))
@@ -648,6 +740,16 @@ async function main() {
     const persistentNeedsUpdate = persistentMode
       && persistentHasCurrent
       && currentManifest.revision !== artifactManifest?.revision;
+    // A persistent root may already have a healthy current instance whose
+    // Endpoint config was created without this run's recorder origin.  The
+    // live provider journey must exercise the recorder through the installed
+    // process, so recycle that run-owned channel instance before bootstrap;
+    // local-channel preserves the current artifact/data while the new config
+    // receives the non-secret allowlist from channelEnv.
+    const persistentLiveRestart = persistentMode
+      && liveProviderMode
+      && persistentHasCurrent
+      && !persistentNeedsUpdate;
     const installed = await command(
       process.execPath,
       persistentMode
@@ -655,6 +757,8 @@ async function main() {
           ? [localChannelEntry, 'install', '--artifact', path.resolve(artifact), '--channel-root', root]
           : persistentNeedsUpdate
             ? [localChannelEntry, 'update', '--artifact', path.resolve(artifact), '--channel-root', root]
+            : persistentLiveRestart
+              ? [localChannelEntry, 'stop', '--channel-root', root]
             : [localChannelEntry, 'start', '--channel-root', root]
         : [channelEntry, 'install', '--artifact', path.resolve(artifact), '--release-root', root],
       channelEnv,
@@ -693,8 +797,6 @@ async function main() {
             contentType: 'application/json',
             body: JSON.stringify(staleSession),
           });
-        } else if (blockSecondAssistantEvents && pathname.endsWith('/events')) {
-          await route.abort('failed');
         } else {
           await route.continue();
         }
@@ -744,15 +846,15 @@ async function main() {
     const profileSelect = page.getByLabel('Auth profile');
     await profileSelect.selectOption({ label: profileLabel });
     await page.getByRole('button', { name: 'Start session' }).click();
-    await page.getByPlaceholder('Message Zode').fill(smokePrompt);
-    await page.getByRole('button', { name: 'Send' }).click();
+    await waitForDurableEventsConnection(page);
+    await sendComposerPrompt(page, smokePrompt);
     await page.getByText(expectedAssistantPattern).waitFor({ timeout: 20_000 });
     streamMarkerVisible = true;
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.getByText(expectedAssistantPattern).waitFor({ timeout: 20_000 });
     durableFinalVisible = true;
     if (persistentMode) {
-      const sessionUrl = page.url();
+      ownedSessionUrl = page.url();
       const stoppedForRestart = await command(
         process.execPath,
         [localChannelEntry, 'stop', '--channel-root', root],
@@ -770,7 +872,8 @@ async function main() {
         || new URL(restarted.payload.url).origin !== new URL(browserOrigin).origin) {
         fail('persistent channel restart did not preserve the installed browser origin', restarted);
       }
-      await page.goto(sessionUrl, { waitUntil: 'domcontentloaded' });
+      await page.goto(ownedSessionUrl, { waitUntil: 'domcontentloaded' });
+      await waitForDurableEventsConnection(page);
       await page.getByText(expectedAssistantPattern).waitFor({ timeout: 20_000 });
       if (liveProviderMode) {
         if (process.env.ZODE_TEST_BLOCK_SECOND_ASSISTANT_EVENTS === '1') {
@@ -788,16 +891,17 @@ async function main() {
           }, blockedSessionPath);
           blockSecondAssistantEvents = true;
           await page.reload({ waitUntil: 'domcontentloaded' });
+          await waitForDurableEventsConnection(page);
           await page.getByText(expectedAssistantPattern).waitFor({ timeout: 20_000 });
         }
-        await page.getByPlaceholder('Message Zode').fill(smokePrompt);
-        await page.getByRole('button', { name: 'Send' }).click();
+        await sendComposerPrompt(page, smokePrompt);
         await waitForAssistantMarkers(page, 2);
         await page.reload({ waitUntil: 'domcontentloaded' });
+        await waitForDurableEventsConnection(page);
         await waitForAssistantMarkers(page, 2);
       }
     }
-    if (persistentMode) {
+    if (persistentMode && liveProviderMode) {
       await persistentProviderCleanup(page, {
         ownedProviderId: providerId,
         ownedBaseUrl: fixtures.providerBaseUrl,
@@ -807,8 +911,11 @@ async function main() {
         ownedProviderId: providerId,
         modelId,
         profileId: createdProfileId,
-        requests: browserRequests,
+        sessionPath: new URL(ownedSessionUrl).pathname,
+        ownershipMarker: testOwnershipMarker,
       });
+      reboundSessionCount = rebound.reboundCount;
+      reboundBaseUrls = rebound.reboundBaseUrls || [];
       const reboundSession = await page.evaluate(async ({ endpointId, sessionId }) => {
         const response = await fetch(
           `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}`,
@@ -834,6 +941,8 @@ async function main() {
         ownedProviderId: providerId,
         profileId: createdProfileId,
       });
+      providerStateCleaned = true;
+    } else if (persistentMode) {
       providerStateCleaned = true;
     }
     const edge = new URL(browserOrigin);
@@ -874,11 +983,26 @@ async function main() {
       durable_final_visible_after_reload: durableFinalVisible,
       provider_requests: fixtures.live ? null : fixtures.requests.length,
       browser_management_requests: managementRequests.length,
+      rebound_session_count: reboundSessionCount,
+      rebound_base_urls: reboundBaseUrls,
     }) + '\n');
   } catch (error) {
     failure = error;
     const browserState = page
-      ? { url: page.url(), body_text: await page.locator('body').innerText().catch(() => '') }
+      ? {
+        url: page.url(),
+        body_text: await page.locator('body').innerText().catch(() => ''),
+        provider_profiles: await page.evaluate(async (provider) => {
+          try {
+            const response = await fetch(`/v1/providers/${encodeURIComponent(provider)}/auth-profiles`, {
+              headers: { accept: 'application/json' },
+            });
+            return { status: response.status, body: await response.text() };
+          } catch (error) {
+            return { error: String(error?.message || error) };
+          }
+        }, providerId).catch((error) => ({ error: String(error?.message || error) })),
+      }
       : {};
     preserveFailure(error, {
       artifact: path.resolve(artifact),
@@ -891,7 +1015,7 @@ async function main() {
     process.stderr.write(`${JSON.stringify({ status: 'RED', error: String(error.message || error), details: error.details || {} })}\n`);
     process.exitCode = 1;
   } finally {
-    if (persistentMode && !providerStateCleaned && page) {
+    if (persistentMode && liveProviderMode && !providerStateCleaned && page) {
       try {
         await persistentProviderCleanup(page, {
           ownedProviderId: providerId,
