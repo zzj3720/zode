@@ -1,0 +1,87 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "0003-ca3c6609-6d25-4d4f-b49d-818c480404fe-1228f9ba-2666-401c-8e39-70f8602c1bab",
+  "e2e_name": "e2e_browser_bad_session_retains_history_and_offers_same_session_execution_recovery",
+  "boundary": "browser-capture-set",
+  "first_observed": "relation=later_test_reproduction_of_gap; a recovered Endpoint-owned session exposed its current provider, model, and profile, but the real browser recovery form selected a different execution after refresh",
+  "classification": "BAD_SESSION_RECOVERY_SELECTION_DIVERGED_FROM_CURRENT_EXECUTION__later_test_reproduction_of_gap",
+  "source_digest": "bc0523a90c2d72b2bbb034ff2ec58f5258ef8b0da99458f254f01ddf4ae41a26",
+  "first_failure_recording_id": "000076-1a3f9ffd-fd90-436b-8f9c-9b9f86a80069",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000076-1a3f9ffd-fd90-436b-8f9c-9b9f86a80069",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/endpoints/01KZJ2PS7AWTX2QV7JK75JJKER/sessions/01KZJ2PTZ4MD3423CTKZ4JEARB",
+      "request_headers": {
+        "idempotency-key": "get-c23da2ab-f46a-4eef-b772-2334e220a061",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "content-type": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 4624.458,
+            "data_base64": "eyJhY3RpdmVfYWN0aXZhdGlvbiI6bnVsbCwiYWN0aXZlX21vZGVsX3JvdW5kIjpudWxsLCJkZWxpdmVyeSI6eyJhY2tub3dsZWRnZWRfdGhyb3VnaCI6MSwicGVuZGluZyI6W119LCJsYXN0X21vZGVsX2F0dGVtcHRzX2V4aGF1c3RlZCI6bnVsbCwibW9kZWwiOnsiYXV0aF9hdXRob3JpdHlfaWQiOiJ3ZWItZTJlLWJhZC1zZXNzaW9uLXJlY292ZXJ5IiwiYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS0xNzM1NDQ0MjMzYzhhMzYyZjM0ODIxOGYwZjU2MWExNSIsImF1dGhfcmV2aXNpb24iOjEsIm1vZGVsIjoiYmFkLXNlc3Npb24tcmVjb3ZlcnktbW9kZWwiLCJwcm92aWRlciI6ImJhZC1zZXNzaW9uLXJlY292ZXJ5LWZpeHR1cmUiLCJwcm92aWRlcl9leGVjdXRpb25fYmFzZV91cmwiOiJodHRwOi8vMTI3LjAuMC4xOjYwNzIxL3YxIiwicHJvdmlkZXJfZXhlY3V0aW9uX2tpbmQiOiJvcGVuYWlfY29tcGF0aWJsZSIsInByb3ZpZGVyX2V4ZWN1dGlvbl9vcHRpb25zIjp7fSwicHJvdmlkZXJfZXhlY3V0aW9uX3JldmlzaW9uIjoxLCJwcm92aWRlcl9leGVjdXRpb25fc2NoZW1hIjoiem9kZS5wcm92aWRlci1leGVjdXRpb24udjEifSwic2NoZW1hIjoiem9kZS5zZXNzaW9uLnYxIiwic2Vzc2lvbl9pZCI6IjAxS1pKMlBUWjRNRDM0MjNDVEtaNEpFQVJCIiwic3RhdHVzIjoiaWRsZSIsInRvb2xfY2FsbHMiOltdLCJ0cmFuc2NyaXB0IjpbeyJjb250ZW50IjoiaGlzdG9yeSBiZWZvcmUgZXhlY3V0aW9uIHJlY292ZXJ5IiwibWVzc2FnZV9pZCI6Im1lc3NhZ2Utc2hhMjU2OnYxOmE2Y2IxZjhmOWE5ZTA5NjE0M2M0M2FkMGRmMWQzMzdiN2VjODQ0Y2IxYTM5YWIyOTVhNDIyODk5MzY2NTRjYTEiLCJyb2xlIjoidXNlciIsInRvb2xfY2FsbF9pZCI6bnVsbCwidG9vbF9jYWxscyI6W119LHsiY29udGVudCI6IkUyRV9PSyIsIm1lc3NhZ2VfaWQiOiJhc3Npc3RhbnQ6djE6c2hhMjU2OnYxOjRjMjhkOTE5ODc0ODlmY2YzY2FiOWQ2NzQ3MzMzMmVjYTNmZDZiNmI4NTc5YzYyZmY0OWM4NTQ5NzNiZjEyYjgiLCJyb2xlIjoiYXNzaXN0YW50IiwidG9vbF9jYWxsX2lkIjpudWxsLCJ0b29sX2NhbGxzIjpbXX1dLCJ2ZXJzaW9uIjoxNCwid2FpdCI6bnVsbH0="
+          }
+        ],
+        "outcome": "completed"
+      }
+    },
+    {
+      "sequence": "000002",
+      "recording_id": "000077-9016118f-cea9-4d77-b0b0-aa3e55d7a934",
+      "boundary": "server-endpoint-control",
+      "method": "GET",
+      "path": "/v1/sessions/01KZJ2PTZ4MD3423CTKZ4JEARB",
+      "request_headers": {
+        "accept": "*/*",
+        "host": "127.0.0.1:60739"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 2640.542,
+            "data_base64": "eyJzY2hlbWEiOiJ6b2RlLnNlc3Npb24udjEiLCJzZXNzaW9uX2lkIjoiMDFLWkoyUFRaNE1EMzQyM0NUS1o0SkVBUkIiLCJ2ZXJzaW9uIjoxNCwic3RhdHVzIjoiaWRsZSIsIm1vZGVsIjp7InByb3ZpZGVyIjoiYmFkLXNlc3Npb24tcmVjb3ZlcnktZml4dHVyZSIsInByb3ZpZGVyX2V4ZWN1dGlvbl9zY2hlbWEiOiJ6b2RlLnByb3ZpZGVyLWV4ZWN1dGlvbi52MSIsInByb3ZpZGVyX2V4ZWN1dGlvbl9yZXZpc2lvbiI6MSwicHJvdmlkZXJfZXhlY3V0aW9uX2tpbmQiOiJvcGVuYWlfY29tcGF0aWJsZSIsInByb3ZpZGVyX2V4ZWN1dGlvbl9iYXNlX3VybCI6Imh0dHA6Ly8xMjcuMC4wLjE6NjA3MjEvdjEiLCJwcm92aWRlcl9leGVjdXRpb25fb3B0aW9ucyI6e30sIm1vZGVsIjoiYmFkLXNlc3Npb24tcmVjb3ZlcnktbW9kZWwiLCJhdXRoX2F1dGhvcml0eV9pZCI6IndlYi1lMmUtYmFkLXNlc3Npb24tcmVjb3ZlcnkiLCJhdXRoX3Byb2ZpbGVfaWQiOiJwcm9maWxlLTE3MzU0NDQyMzNjOGEzNjJmMzQ4MjE4ZjBmNTYxYTE1IiwiYXV0aF9yZXZpc2lvbiI6MX0sInRyYW5zY3JpcHQiOlt7Im1lc3NhZ2VfaWQiOiJtZXNzYWdlLXNoYTI1Njp2MTphNmNiMWY4ZjlhOWUwOTYxNDNjNDNhZDBkZjFkMzM3YjdlYzg0NGNiMWEzOWFiMjk1YTQyMjg5OTM2NjU0Y2ExIiwicm9sZSI6InVzZXIiLCJjb250ZW50IjoiaGlzdG9yeSBiZWZvcmUgZXhlY3V0aW9uIHJlY292ZXJ5IiwidG9vbF9jYWxsX2lkIjpudWxsLCJ0b29sX2NhbGxzIjpbXX0seyJtZXNzYWdlX2lkIjoiYXNzaXN0YW50OnYxOnNoYTI1Njp2MTo0YzI4ZDkxOTg3NDg5ZmNmM2NhYjlkNjc0NzMzMzJlY2EzZmQ2YjZiODU3OWM2MmZmNDljODU0OTczYmYxMmI4Iiwicm9sZSI6ImFzc2lzdGFudCIsImNvbnRlbnQiOiJFMkVfT0siLCJ0b29sX2NhbGxfaWQiOm51bGwsInRvb2xfY2FsbHMiOltdfV0sImRlbGl2ZXJ5Ijp7ImFja25vd2xlZGdlZF90aHJvdWdoIjoxLCJwZW5kaW5nIjpbXX0sIndhaXQiOm51bGwsInRvb2xfY2FsbHMiOltdLCJhY3RpdmVfYWN0aXZhdGlvbiI6bnVsbCwiYWN0aXZlX21vZGVsX3JvdW5kIjpudWxsLCJsYXN0X21vZGVsX2F0dGVtcHRzX2V4aGF1c3RlZCI6bnVsbH0="
+          }
+        ],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>",
+    "<secret:access_assertion_11>",
+    "<secret:decoy_profile>",
+    "<secret:recovery_profile>",
+    "<secret:access_assertion_21>",
+    "<secret:access_assertion_30>",
+    "<secret:access_assertion_41>"
+  ],
+  "integrity_sha256": "70a2aca95e097b697268151b41a19183593002811a734076cf4592497c01e3fe"
+}

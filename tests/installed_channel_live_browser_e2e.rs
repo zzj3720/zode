@@ -95,9 +95,9 @@ async fn run_persistent_state_guard(
                 "persistent state guard could not reserve channel: {error}"
             ))
         })?;
-    write!(
+    writeln!(
         lock,
-        "{{\"schema\":\"zode.installed-channel-live-smoke-lock.v1\",\"pid\":{},\"run_id\":\"persistent-state-guard\",\"started_at_unix_ms\":{}}}\n",
+        "{{\"schema\":\"zode.installed-channel-live-smoke-lock.v1\",\"pid\":{},\"run_id\":\"persistent-state-guard\",\"started_at_unix_ms\":{}}}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

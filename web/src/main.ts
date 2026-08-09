@@ -948,6 +948,9 @@ function sessionExecutionRecovery(endpoint: Endpoint, session: Session): HTMLFor
     "Provider",
     state.providers.map((item) => ({ value: item.provider, label: item.provider })),
   );
+  if (session.model && state.providers.some((item) => item.provider === session.model?.provider)) {
+    provider.value = session.model.provider;
+  }
   const model = selectInput("Model", []);
   const profile = selectInput("Auth profile", []);
   const profileHint = node("p", "inline-empty");

@@ -48,6 +48,12 @@ The root `AGENTS.md`, `docs/ui.md`, and `docs/server-api.md` are authoritative.
   says they are valid. Unknown tool outcome is not ordinary failure.
 - Use stable idempotency keys per user mutation and reuse them after an unknown
   response. Multiple tabs must not duplicate the same action.
+- Initialize same-session execution recovery from the Endpoint-owned current
+  provider/model/profile when they remain available. Provider list order may
+  not silently change that selection, and a no-op submission must preserve the
+  current execution across refresh and legal process restart. The real-browser
+  anchor is
+  `e2e_browser_bad_session_retains_history_and_offers_same_session_execution_recovery`.
 - Render stable safe error codes. Never display raw downstream bodies, SQL,
   paths, stderr, authorization headers, or debug chains.
 - Meet keyboard, focus, screen-reader, contrast, status-without-color, and
