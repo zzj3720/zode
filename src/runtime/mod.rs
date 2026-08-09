@@ -185,11 +185,20 @@ pub struct TransientModelEvent {
     pub text: String,
 }
 
+/// One ordered live-publication lane for durable commit notifications and
+/// best-effort model text. Durable facts remain authoritative in storage;
+/// sharing the lane only preserves their causal boundary with transient text.
+#[derive(Clone, Debug)]
+pub enum RuntimeStreamEvent {
+    Durable(Box<EventRecord>),
+    Transient(TransientModelEvent),
+}
+
 const MAX_TRANSIENT_TEXT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug)]
 struct BroadcastModelStreamObserver {
-    publisher: broadcast::Sender<TransientModelEvent>,
+    publisher: broadcast::Sender<RuntimeStreamEvent>,
 }
 
 impl ModelStreamObserver for BroadcastModelStreamObserver {
@@ -204,12 +213,14 @@ impl ModelStreamObserver for BroadcastModelStreamObserver {
                 end -= 1;
             }
             let (chunk, rest) = remaining.split_at(end);
-            let _ = self.publisher.send(TransientModelEvent {
-                session_id: session_id.to_owned(),
-                activation_id: activation_id.to_owned(),
-                round_id: round_id.to_owned(),
-                text: chunk.to_owned(),
-            });
+            let _ = self
+                .publisher
+                .send(RuntimeStreamEvent::Transient(TransientModelEvent {
+                    session_id: session_id.to_owned(),
+                    activation_id: activation_id.to_owned(),
+                    round_id: round_id.to_owned(),
+                    text: chunk.to_owned(),
+                }));
             remaining = rest;
         }
     }
@@ -294,8 +305,7 @@ pub struct Runtime {
     store: Arc<dyn EventStore>,
     model: Arc<dyn ModelExecutor>,
     tools: Arc<dyn ToolExecutor>,
-    publisher: broadcast::Sender<EventRecord>,
-    transient_publisher: broadcast::Sender<TransientModelEvent>,
+    stream_publisher: broadcast::Sender<RuntimeStreamEvent>,
     stream_observer: Arc<dyn ModelStreamObserver>,
     options: RuntimeOptions,
     session_locks: Mutex<HashMap<SessionKey, Arc<AsyncMutex<()>>>>,
@@ -323,17 +333,15 @@ impl Runtime {
         tools: Arc<dyn ToolExecutor>,
         options: RuntimeOptions,
     ) -> Arc<Self> {
-        let (publisher, _) = broadcast::channel(1_024);
-        let (transient_publisher, _) = broadcast::channel(1_024);
+        let (stream_publisher, _) = broadcast::channel(1_024);
         let stream_observer = Arc::new(BroadcastModelStreamObserver {
-            publisher: transient_publisher.clone(),
+            publisher: stream_publisher.clone(),
         });
         Arc::new(Self {
             store,
             model,
             tools,
-            publisher,
-            transient_publisher,
+            stream_publisher,
             stream_observer,
             options: options.bounded(),
             session_locks: Mutex::new(HashMap::new()),
@@ -341,12 +349,8 @@ impl Runtime {
         })
     }
 
-    pub fn publisher(&self) -> broadcast::Sender<EventRecord> {
-        self.publisher.clone()
-    }
-
-    pub fn transient_publisher(&self) -> broadcast::Sender<TransientModelEvent> {
-        self.transient_publisher.clone()
+    pub fn stream_publisher(&self) -> broadcast::Sender<RuntimeStreamEvent> {
+        self.stream_publisher.clone()
     }
 
     /// Validate a session's configured adapter-tool selection against the
@@ -614,7 +618,9 @@ impl Runtime {
             }
         }
         for event in &append.events {
-            let _ = self.publisher.send(event.clone());
+            let _ = self
+                .stream_publisher
+                .send(RuntimeStreamEvent::Durable(Box::new(event.clone())));
         }
     }
 

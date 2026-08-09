@@ -409,7 +409,10 @@ data: {"schema":"zode.transient-event.v1","session_id":"...","activation_id":"..
 
 Transient text is provisional display state only. A durable
 `assistant_message_committed` event replaces it; a reconnect must rely on the
-durable stream and must not duplicate or promote a transient candidate.
+durable stream and must not duplicate or promote a transient candidate. On a
+live stream, a durable `model_step_retrying` boundary precedes every transient
+delta from the next attempt even when durable replay is backpressured; failed-
+attempt text and retry text can never be presented as one candidate.
 
 Durable public kinds include session/message, activation final outcome,
 model-step retry/interruption, wait, and async tool lifecycle facts. A

@@ -43,7 +43,9 @@ use crate::{
         ReplicaInstallRequest, ReplicaMutation, ReplicaStore, ReplicaTombstoneRequest,
         MAX_REPLICA_REQUEST_BYTES,
     },
-    runtime::{CallbackCompletion, Runtime, RuntimeCommandError, TransientModelEvent},
+    runtime::{
+        CallbackCompletion, Runtime, RuntimeCommandError, RuntimeStreamEvent, TransientModelEvent,
+    },
     storage::{
         EventStore, RehydrateError, SessionCreate, SessionCreateCommand, SessionListCursor,
         StoreError, MAX_SESSION_LIST_LIMIT,
@@ -1553,8 +1555,7 @@ async fn stream_events(
         .map_err(ApiError::from_control)?;
     let after = parse_last_event_id(&headers).map_err(ApiError::from_service)?;
     let owner = SessionOwner::new(context.authority_id(), context.subject());
-    let receiver = state.runtime.publisher().subscribe();
-    let transient_receiver = state.runtime.transient_publisher().subscribe();
+    let receiver = state.runtime.stream_publisher().subscribe();
     let store = state.store.clone();
     let id = session_id.clone();
     let replay_owner = owner.clone();
@@ -1575,79 +1576,89 @@ async fn stream_events(
         }
 
         let mut receiver = receiver;
-        let mut transient_receiver = transient_receiver;
+        let mut transient_reliable = true;
         loop {
-            tokio::select! {
-                // Drain provisional provider text before a simultaneously
-                // ready durable commit so the browser cannot render a late
-                // transient candidate after the authoritative final event.
-                biased;
-                transient = transient_receiver.recv() => match transient {
-                    Ok(event) if event.session_id == session_id => {
+            match receiver.recv().await {
+                Ok(RuntimeStreamEvent::Transient(event)) => {
+                    if transient_reliable && event.session_id == session_id {
                         yield Ok::<SseEvent, Infallible>(transient_model_event(event));
                     }
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
-                durable = receiver.recv() => match durable {
-                    Ok(event) if event.stream_id == session_id
-                        && event.global_position > last_position => {
-                        // Publication is a notification, not the ordering authority. A
-                        // concurrent commit may publish a later event before an earlier
-                        // commit's observer runs, so recover the complete durable tail
-                        // before yielding anything from this notification.
-                        let store = state.store.clone();
-                        let id = session_id.clone();
-                        let owner = owner.clone();
-                        match run_blocking(move || {
-                            read_session_events_after(&*store, &owner, &id, last_position)
-                        })
-                        .await
-                        {
-                            Ok(records) => for record in records {
-                                if record.global_position > last_position {
-                                    last_position = record.global_position;
-                                    if let Some(public) = public_event(&record) {
-                                        yield Ok::<SseEvent, Infallible>(sse_event(public));
-                                    }
+                }
+                Ok(RuntimeStreamEvent::Durable(event)) => {
+                    if event.stream_id != session_id || event.global_position <= last_position {
+                        continue;
+                    }
+                    // Publication is a causal notification, while storage is
+                    // still the durable ordering authority. Catch up only
+                    // through this notification so a later committed final
+                    // cannot leapfrog transient text already queued between
+                    // the two durable boundaries.
+                    let notified_position = event.global_position;
+                    let store = state.store.clone();
+                    let id = session_id.clone();
+                    let owner = owner.clone();
+                    match run_blocking(move || {
+                        read_session_events_after(&*store, &owner, &id, last_position)
+                    })
+                    .await
+                    {
+                        Ok(records) => {
+                            for record in records {
+                                if record.global_position > notified_position {
+                                    break;
                                 }
-                            },
-                            Err(_) => {
-                                yield Ok::<SseEvent, Infallible>(SseEvent::default()
-                                    .event("error")
-                                    .data(sse_internal_error_data()));
-                                break;
+                                if record.global_position <= last_position {
+                                    continue;
+                                }
+                                last_position = record.global_position;
+                                if let Some(public) = public_event(&record) {
+                                    yield Ok::<SseEvent, Infallible>(sse_event(public));
+                                }
                             }
+                            transient_reliable = true;
+                        }
+                        Err(_) => {
+                            yield Ok::<SseEvent, Infallible>(SseEvent::default()
+                                .event("error")
+                                .data(sse_internal_error_data()));
+                            break;
                         }
                     }
-                    Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let store = state.store.clone();
-                        let id = session_id.clone();
-                        let owner = owner.clone();
-                        match run_blocking(move || {
-                            read_session_events_after(&*store, &owner, &id, last_position)
-                        })
-                        .await
-                        {
-                            Ok(records) => for record in records {
-                                if record.global_position > last_position {
-                                    last_position = record.global_position;
-                                    if let Some(public) = public_event(&record) {
-                                        yield Ok::<SseEvent, Infallible>(sse_event(public));
-                                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Lag means at least one best-effort transient candidate
+                    // is missing, so suppress provisional text until the next
+                    // target-session durable boundary. Durable facts recover
+                    // losslessly from storage.
+                    transient_reliable = false;
+                    let store = state.store.clone();
+                    let id = session_id.clone();
+                    let owner = owner.clone();
+                    match run_blocking(move || {
+                        read_session_events_after(&*store, &owner, &id, last_position)
+                    })
+                    .await
+                    {
+                        Ok(records) => {
+                            for record in records {
+                                if record.global_position <= last_position {
+                                    continue;
                                 }
-                            },
-                            Err(_) => {
-                                yield Ok::<SseEvent, Infallible>(SseEvent::default()
-                                    .event("error")
-                                    .data(sse_internal_error_data()));
-                                break;
+                                last_position = record.global_position;
+                                if let Some(public) = public_event(&record) {
+                                    yield Ok::<SseEvent, Infallible>(sse_event(public));
+                                }
                             }
                         }
+                        Err(_) => {
+                            yield Ok::<SseEvent, Infallible>(SseEvent::default()
+                                .event("error")
+                                .data(sse_internal_error_data()));
+                            break;
+                        }
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     };

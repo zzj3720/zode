@@ -51,6 +51,7 @@ const state: {
   deletingProfile: { profile: AuthProfile; idempotencyKey: string } | null;
   connection: "Connecting" | "Live" | "Reconnecting" | "Disconnected";
   provisional: { sessionId: string; text: string } | null;
+  composerDraft: { endpointId: string; sessionId: string; text: string } | null;
 } = {
   system: null,
   endpoints: [],
@@ -68,6 +69,7 @@ const state: {
   deletingProfile: null,
   connection: "Disconnected",
   provisional: null,
+  composerDraft: null,
 };
 
 let eventStreamAbort: AbortController | null = null;
@@ -1090,6 +1092,15 @@ function composer(endpointId: string, sessionId: string): HTMLFormElement {
   input.rows = 2;
   input.placeholder = "Message Zode";
   input.setAttribute("aria-label", "Message");
+  if (
+    state.composerDraft?.endpointId === endpointId &&
+    state.composerDraft.sessionId === sessionId
+  ) {
+    input.value = state.composerDraft.text;
+  }
+  input.addEventListener("input", () => {
+    state.composerDraft = input.value ? { endpointId, sessionId, text: input.value } : null;
+  });
   const footer = node("div", "composer-footer");
   const send = submitButton("Send", "arrow-up");
   send.disabled = state.busy || state.connection !== "Live";
@@ -1109,9 +1120,10 @@ function composer(endpointId: string, sessionId: string): HTMLFormElement {
   const submit = async (): Promise<void> => {
     const content = input.value.trim();
     if (!content || state.busy || state.connection !== "Live") return;
+    const submittedDraft = state.composerDraft;
     await withBusy(async () => {
       await sendMessage(endpointId, sessionId, content);
-      input.value = "";
+      if (state.composerDraft === submittedDraft) state.composerDraft = null;
       state.notice = "Message accepted; waiting for durable completion.";
       await loadActiveSession();
     });
@@ -1220,6 +1232,7 @@ async function refreshSessions(): Promise<void> {
 async function openSession(endpointId: string, sessionId: string): Promise<void> {
   if (state.activeSession?.session_id !== sessionId || state.activeEndpointId !== endpointId) {
     state.provisional = null;
+    state.composerDraft = null;
   }
   state.activeEndpointId = endpointId;
   state.activeSession = await getSession(endpointId, sessionId);

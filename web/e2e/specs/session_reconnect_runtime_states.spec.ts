@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Request } from "@playwright/test";
+import { expect, test, type Locator, type Page, type Request, type Route } from "@playwright/test";
 import { createHash, createSign, generateKeyPairSync, randomBytes, randomUUID, type KeyObject } from "node:crypto";
 import { execFile as execFileCallback, spawn, type ChildProcessByStdio } from "node:child_process";
 import { readFile, writeFile, mkdir, chmod, cp, mkdtemp, readdir, rm, stat } from "node:fs/promises";
@@ -34,6 +34,7 @@ type EndpointBoundaryRequest = {
   responseContentType?: string;
   responseEventIds: string[];
   responseEventNames: string[];
+  responseEventSequence: string[];
   responseSseRemainder?: string;
   responseComplete?: boolean;
   recorded?: boolean;
@@ -72,6 +73,11 @@ type EventBodyHold = {
   markHeld: () => void;
   released: Promise<void>;
   release: () => void;
+};
+type BrowserResponseHold = {
+  received: Promise<void>;
+  release: () => void;
+  dispose: () => Promise<void>;
 };
 
 const REPO_ROOT = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -479,7 +485,7 @@ class ReplayProvider {
   private readonly releaseWaiters = new Map<string, Array<() => void>>();
   private readonly expectedScenarioCounts = new Map<string, number>();
   private readonly toolPreambleScenarios = new Set<string>();
-  private readonly heldFirstChunkScenarios = new Set<string>();
+  private readonly heldFirstChunks = new Set<string>();
   private readonly observedRequests: string[] = [];
   private expectedProviderAuthorization = "";
   private suiteConsumptionRecorded = false;
@@ -566,8 +572,8 @@ class ReplayProvider {
     this.toolPreambleScenarios.add(scenario);
   }
 
-  holdAfterFirstChunk(scenario: string): void {
-    this.heldFirstChunkScenarios.add(scenario);
+  holdAfterFirstChunk(scenario: string, occurrence = 0): void {
+    this.heldFirstChunks.add(`${scenario}:${occurrence}`);
   }
 
   private expectedSequences(): number[] {
@@ -722,12 +728,16 @@ class ReplayProvider {
     }
     for (const [index, chunk] of (replay.chunks as Json[]).entries()) {
       const bytes = Buffer.from(chunk.bytes_hex, "hex");
-      if (index === 0 && occurrence === 0 && this.heldFirstChunkScenarios.has(scenario)) {
+      const heldChunk = `${scenario}:${occurrence}`;
+      if (index === 0 && this.heldFirstChunks.has(heldChunk)) {
+        const holdName = occurrence === 0
+          ? `${scenario}:first-chunk`
+          : `${scenario}:first-chunk-${occurrence + 1}`;
         await new Promise<void>((resolvePromise, reject) => {
           response.write(bytes, (error) => error ? reject(error) : resolvePromise());
         });
-        this.notify(`${scenario}:first-chunk`, 1);
-        await this.waitForRelease(`${scenario}:first-chunk`);
+        this.notify(holdName, 1);
+        await this.waitForRelease(holdName);
       } else {
         response.write(bytes);
       }
@@ -902,6 +912,7 @@ class EndpointBoundary {
   private recordSseLine(request: EndpointBoundaryRequest, line: string): void {
     if (line.startsWith("event:")) {
       const value = line.startsWith("event: ") ? line.slice(7) : line.slice(6);
+      if (value.length > 0) request.responseEventSequence.push(value);
       if (value.length > 0 && !request.responseEventNames.includes(value)) {
         request.responseEventNames.push(value);
       }
@@ -966,6 +977,7 @@ class EndpointBoundary {
       body,
       responseEventIds: [],
       responseEventNames: [],
+      responseEventSequence: [],
     };
     const upstream = httpRequest(
       {
@@ -2050,18 +2062,77 @@ async function createSessionWithKeyboard(
   return sessionId;
 }
 
-async function sendMessageWithKeyboard(page: Page, prompt: string): Promise<void> {
+async function sendMessageWithKeyboard(
+  page: Page,
+  prompt: string,
+  whileDrafted?: () => Promise<void>,
+  whileAdmissionPending?: (composer: Locator) => Promise<void>,
+): Promise<void> {
   const composer = page.getByRole("textbox", { name: "Message" });
   await expect(page.getByRole("button", { name: "Send" })).toBeEnabled({ timeout: 15_000 });
+  await composer.fill(prompt);
+  await whileDrafted?.();
+  try {
+    await expect(composer).toHaveValue(prompt);
+  } catch (error) {
+    const evidencePath = await retainFailureEvidence("composer-draft-render-red", {
+      schema: "zode.web-e2e.composer-draft-render-failure.v1",
+      e2e: test.info().title,
+      relation: "later_test_reproduction_of_initial_browser_failure",
+      expected: "same-session durable SSE rendering preserves the unsent in-memory composer draft",
+      prompt,
+      observed_value: await composer.inputValue().catch(() => "<unavailable>"),
+      browser_url: page.url(),
+      browser_body: (await page.locator("body").innerText()).slice(0, 4_000),
+    });
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}`,
+    );
+  }
   const admission = page.waitForResponse(
     (response) => response.url().includes("/messages") && response.request().method() === "POST",
   );
-  await composer.fill(prompt);
-  await expect(composer).toHaveValue(prompt);
   await composer.press("Enter");
+  await whileAdmissionPending?.(composer);
   const response = await admission;
   await classifyBrowser404(response, "session message admission");
   expect(response.status()).toBe(202);
+}
+
+async function holdNextBrowserMessageResponse(page: Page): Promise<BrowserResponseHold> {
+  const pattern = "**/messages";
+  let consumed = false;
+  let markReceived = (): void => undefined;
+  let release = (): void => undefined;
+  const received = new Promise<void>((resolvePromise) => {
+    markReceived = resolvePromise;
+  });
+  const released = new Promise<void>((resolvePromise) => {
+    release = resolvePromise;
+  });
+  const handler = async (route: Route): Promise<void> => {
+    if (consumed || route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    consumed = true;
+    // Fetch the unmodified public response first, then delay only its delivery
+    // to the browser. The real Server and Endpoint have already admitted the
+    // request; no product route or response body is synthesized here.
+    const response = await route.fetch();
+    markReceived();
+    await released;
+    await route.fulfill({ response });
+  };
+  await page.route(pattern, handler);
+  return {
+    received,
+    release,
+    dispose: async () => {
+      release();
+      await page.unroute(pattern, handler);
+    },
+  };
 }
 
 function observeEventRequests(page: Page, topology?: Topology): BrowserSseRequest[] {
@@ -2456,7 +2527,48 @@ test.describe("session reconnect and runtime states", () => {
     const sseRequests = observeEventRequests(page, topology);
     topology.expectScenario(SCENARIOS.keyboard, 1);
     const keyboardSessionId = await createSessionWithKeyboard(page, topology);
-    await sendMessageWithKeyboard(page, `keyboard path ${SCENARIOS.keyboard}`);
+    const pendingDraft = "second unsent draft while the first message is admitted";
+    const keyboardAdmission = await holdNextBrowserMessageResponse(page);
+    try {
+      await sendMessageWithKeyboard(
+        page,
+        `keyboard path ${SCENARIOS.keyboard}`,
+        () => seedDurableReplayHistory(topology!, keyboardSessionId, 2),
+        async (composer) => {
+          await withTimeout(
+            keyboardAdmission.received,
+            15_000,
+            "browser message response was not held after real admission",
+          );
+          await composer.fill(pendingDraft);
+          keyboardAdmission.release();
+        },
+      );
+      await expect(page.getByRole("button", { name: "Send" })).toBeEnabled({ timeout: 15_000 });
+      const composer = page.getByRole("textbox", { name: "Message" });
+      try {
+        await expect(composer).toHaveValue(pendingDraft);
+      } catch (error) {
+        const evidencePath = await retainFailureEvidence("composer-admission-draft-red", {
+          schema: "zode.web-e2e.composer-admission-draft-failure.v1",
+          e2e: test.info().title,
+          expected: "accepting one submission preserves a newer unsent same-session draft",
+          submitted_prompt: `keyboard path ${SCENARIOS.keyboard}`,
+          pending_draft: pendingDraft,
+          observed_value: await composer.inputValue().catch(() => "<unavailable>"),
+          browser_url: page.url(),
+          browser_body: (await page.locator("body").innerText()).slice(0, 4_000),
+          endpoint_boundary: topology.endpointBoundary.debugRequests(),
+          provider_requests: topology.provider.debugRequests(),
+        });
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}`,
+        );
+      }
+      await composer.fill("");
+    } finally {
+      await keyboardAdmission.dispose();
+    }
     try {
       await withTimeout(
         topology.provider.waitForScenario(SCENARIOS.keyboard),
@@ -2475,13 +2587,28 @@ test.describe("session reconnect and runtime states", () => {
     }
     await expectOneDurableFinal(page, "KEYBOARD_FINAL");
     topology.provider.holdAfterFirstChunk(SCENARIOS.reconnect);
+    topology.provider.holdAfterFirstChunk(SCENARIOS.reconnect, 1);
     const firstProviderChunk = topology.provider.waitForScenario(`${SCENARIOS.reconnect}:first-chunk`);
+    const secondProviderChunk = topology.provider.waitForScenario(`${SCENARIOS.reconnect}:first-chunk-2`);
     const sessionId = await createSessionWithKeyboard(page, topology, async (createdSessionId) => {
       await seedDurableReplayHistory(topology!, createdSessionId, 512);
       topology!.endpointBoundary.holdEventBody(createdSessionId);
     });
     await topology.endpointBoundary.waitForHeldEventBody(sessionId);
+    const initialBrowserRequest = await waitForExactBrowserSseRequest(
+      sseRequests,
+      topology.endpointId,
+      sessionId,
+      "",
+      "initial browser SSE",
+    );
+    const initialEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
+      initialBrowserRequest,
+    );
+    assertExactSseCorrelation(topology, initialBrowserRequest, initialEndpointRequest);
     topology.expectScenario(SCENARIOS.reconnect, 2);
+    let diagnosticPage: Page | undefined;
+    let diagnosticNetwork: BrowserNetworkObservation[] | undefined;
     try {
       await sendMessageWithKeyboard(page, `reconnect path ${SCENARIOS.reconnect}`);
       await withTimeout(
@@ -2512,134 +2639,251 @@ test.describe("session reconnect and runtime states", () => {
           `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}; browser_body=${JSON.stringify((await page.locator("body").innerText()).slice(0, 4000))}; session_snapshot=${JSON.stringify(sessionSnapshot.body)}; provider_requests=${JSON.stringify(topology.provider.debugRequests())}; endpoint_boundary=${JSON.stringify(topology.endpointBoundary.debugRequests())}`,
         );
       }
+      await expect
+        .poll(() => initialEndpointRequest.responseEventIds.at(-1) ?? "", {
+          timeout: 15_000,
+          message: "initial long replay did not expose a durable cursor before refresh",
+        })
+        .toMatch(/^[0-9]+$/);
+      const initialEventIds = [...initialEndpointRequest.responseEventIds];
+      topology.recordEventIds(initialEventIds);
+      await expect(page.getByText(`reconnect path ${SCENARIOS.reconnect}`, { exact: true })).toBeVisible();
+      expect(initialEndpointRequest.responseEventNames).toContain("assistant_message_delta");
+      const originalCursor = initialEventIds.at(-1) ?? "";
+      topology.recordCursor(originalCursor);
+
+      const reloadRequestId = topology.nextSseRequestId();
+      await page.context().setExtraHTTPHeaders({
+        "Cf-Access-Jwt-Assertion": topology.accessAssertion,
+        [REQUEST_ID_HEADER]: reloadRequestId,
+      });
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible();
+      const reloadedBrowserRequest = await waitForExactBrowserSseRequest(
+        sseRequests,
+        topology.endpointId,
+        sessionId,
+        originalCursor,
+        "refreshed browser SSE",
+      );
+      const reloadedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
+        reloadedBrowserRequest,
+      );
+      assertExactSseCorrelation(topology, reloadedBrowserRequest, reloadedEndpointRequest);
+      expect(reloadedBrowserRequest.requestId).toBe(reloadRequestId);
+      expect(reloadedEndpointRequest.status).toBe(200);
+      await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toHaveCount(0);
+
+      const cursorCountBeforeOutage = sseRequests.length;
+      await topology.server.stop();
+      await topology.assertServerStoreHasNoSessionMirror();
+      await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible({ timeout: 30_000 });
+      const resumedRequestId = topology.nextSseRequestId();
+      await page.context().setExtraHTTPHeaders({
+        "Cf-Access-Jwt-Assertion": topology.accessAssertion,
+        [REQUEST_ID_HEADER]: resumedRequestId,
+      });
+      await topology.server.restart();
+      await expect
+        .poll(
+          () =>
+            sseRequests
+              .slice(cursorCountBeforeOutage)
+              .find((request) => request.sessionId === sessionId && request.lastEventId.length > 0)?.lastEventId ?? "",
+          {
+            timeout: 15_000,
+            message: "browser did not reconnect the session SSE with Last-Event-ID",
+          },
+        )
+        .toBe(originalCursor);
+      const resumedBrowserRequest = await waitForBrowserSseRequest(
+        sseRequests,
+        topology.endpointId,
+        sessionId,
+        originalCursor,
+        "reconnected browser SSE",
+        resumedRequestId,
+      );
+      const resumedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
+        resumedBrowserRequest,
+      );
+      expect(resumedBrowserRequest.path).toBe(
+        `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}/events`,
+      );
+      expect(resumedBrowserRequest.requestId).toBe(resumedRequestId);
+      assertExactSseCorrelation(topology, resumedBrowserRequest, resumedEndpointRequest);
+
+      // A second real browser connection starts at cursor zero and is held
+      // behind the long durable replay. This makes the already-published retry
+      // boundary and next-attempt transient simultaneously readable without
+      // weakening the primary user's refresh/restart journey or replaying a
+      // cassette exchange twice.
+      topology.endpointBoundary.holdEventBody(sessionId);
+      diagnosticPage = await page.context().newPage();
+      diagnosticNetwork = observeBrowserNetwork(diagnosticPage);
+      const diagnosticSseRequests = observeEventRequests(diagnosticPage, topology);
+      const diagnosticRequestId = topology.nextSseRequestId();
+      await page.context().setExtraHTTPHeaders({
+        "Cf-Access-Jwt-Assertion": topology.accessAssertion,
+        [REQUEST_ID_HEADER]: diagnosticRequestId,
+      });
+      await diagnosticPage.goto(
+        `${topology.server.baseUrl}/endpoints/${topology.endpointId}/sessions/${sessionId}`,
+        { waitUntil: "domcontentloaded" },
+      );
+      await expect(diagnosticPage.getByRole("textbox", { name: "Message" })).toBeVisible();
+      const diagnosticBrowserRequest = await waitForExactBrowserSseRequest(
+        diagnosticSseRequests,
+        topology.endpointId,
+        sessionId,
+        "",
+        "backpressured retry-order browser SSE",
+      );
+      const diagnosticEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
+        diagnosticBrowserRequest,
+      );
+      assertExactSseCorrelation(topology, diagnosticBrowserRequest, diagnosticEndpointRequest);
+      await topology.endpointBoundary.waitForHeldEventBody(sessionId);
+
+      topology.provider.release(`${SCENARIOS.reconnect}:first-chunk`);
+      await withTimeout(
+        topology.provider.waitForScenario(SCENARIOS.reconnect, 2),
+        15_000,
+        "provider retry request did not start after the durable retry decision",
+      );
+      topology.provider.release("reconnect-final");
+      await withTimeout(
+        secondProviderChunk,
+        15_000,
+        "second attempt did not flush its transient chunk",
+      );
+      topology.provider.release(`${SCENARIOS.reconnect}:first-chunk-2`);
+      await expect
+        .poll(
+          async () => {
+            const response = await apiJson(
+              topology!.server.baseUrl,
+              topology!.accessAssertion,
+              `/v1/endpoints/${topology!.endpointId}/sessions/${sessionId}`,
+            );
+            const transcript = Array.isArray(response.body?.transcript) ? response.body.transcript : [];
+            return {
+              status: response.status,
+              final: transcript.filter(
+                (message) => message.role === "assistant" && message.content === "DURABLE_FINAL",
+              ).length,
+              idle:
+                response.body?.active_activation === null && response.body?.active_model_round === null,
+            };
+          },
+          {
+            timeout: 15_000,
+            message: "second attempt did not commit its unique durable final before SSE release",
+          },
+        )
+        .toEqual({ status: 200, final: 1, idle: true });
+      topology.endpointBoundary.releaseEventBody(sessionId);
+      await expect
+        .poll(
+          () => ({
+            retry: diagnosticEndpointRequest.responseEventSequence.includes("model_step_retrying"),
+            transient: diagnosticEndpointRequest.responseEventSequence.includes("assistant_message_delta"),
+            final: diagnosticEndpointRequest.responseEventSequence.includes("assistant_message_committed"),
+          }),
+          {
+            timeout: 15_000,
+            message: "backpressured Endpoint SSE omitted retry, transient, or durable final",
+          },
+        )
+        .toEqual({ retry: true, transient: true, final: true });
+      const retryBoundary = diagnosticEndpointRequest.responseEventSequence.indexOf("model_step_retrying");
+      const secondAttemptTransient = diagnosticEndpointRequest.responseEventSequence.indexOf(
+        "assistant_message_delta",
+      );
+      const durableFinal = diagnosticEndpointRequest.responseEventSequence.indexOf(
+        "assistant_message_committed",
+      );
+      if (
+        retryBoundary < 0 ||
+        secondAttemptTransient < 0 ||
+        durableFinal < 0 ||
+        retryBoundary > secondAttemptTransient ||
+        secondAttemptTransient > durableFinal
+      ) {
+        const evidencePath = await retainFailureEvidence("retry-order-provisional-red", {
+          schema: "zode.web-e2e.retry-order-provisional-failure.v1",
+          e2e: "e2e_browser_session_admission_is_separate_from_completion_and_last_event_id_reconnect_replaces_provisional_final",
+          expected: "the durable retry boundary precedes next-attempt transient text on a backpressured public SSE reconnect",
+          session_id: sessionId,
+          endpoint_event_sequence: diagnosticEndpointRequest.responseEventSequence,
+          browser_body: (await page.locator("body").innerText()).slice(0, 4_000),
+          endpoint_boundary: topology.endpointBoundary.debugRequests(),
+          provider_requests: topology.provider.debugRequests(),
+        });
+        throw new Error(
+          `retry durable boundary followed second-attempt transient text; evidence_path=${evidencePath ?? "unavailable"}`,
+        );
+      }
+      assertBrowserNetworkUsesManagementOrigin(diagnosticNetwork, topology.server.baseUrl);
+      await diagnosticPage.close();
+      diagnosticPage = undefined;
+
+      await expect
+        .poll(
+          () =>
+            resumedEndpointRequest.responseEventNames.includes("assistant_message_committed")
+              ? resumedEndpointRequest.responseEventIds.at(-1) ?? ""
+              : "",
+          { timeout: 15_000, message: "resumed SSE omitted its unique durable final cursor" },
+        )
+        .toMatch(/^[0-9]+$/);
+      const resumedEventIds = [...resumedEndpointRequest.responseEventIds];
+      topology.recordEventIds(resumedEventIds);
+      const finalCursor = resumedEventIds.at(-1) ?? "";
+      await expectOneDurableFinal(page, "DURABLE_FINAL");
+      await expect(page.locator("article.message-provisional")).toHaveCount(0);
+      await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toHaveCount(0);
+
+      const cursorCountBeforeEndpointRestart = sseRequests.length;
+      await topology.endpoint.stop();
+      await topology.assertEndpointUnreachableBarrier();
+      await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible({ timeout: 30_000 });
+      const endpointRestartRequestId = topology.nextSseRequestId();
+      await page.context().setExtraHTTPHeaders({
+        "Cf-Access-Jwt-Assertion": topology.accessAssertion,
+        [REQUEST_ID_HEADER]: endpointRestartRequestId,
+      });
+      await topology.endpoint.restart();
+      await expect
+        .poll(
+          () =>
+            sseRequests
+              .slice(cursorCountBeforeEndpointRestart)
+              .filter(
+                (request) =>
+                  request.sessionId === sessionId &&
+                  request.lastEventId === finalCursor &&
+                  request.status === 200,
+              )
+              .length,
+          {
+            timeout: 15_000,
+            message: "Endpoint restart did not resume the same session from its durable final cursor",
+          },
+        )
+        .toBeGreaterThan(0);
+      await expect(page.getByText("Live", { exact: true })).toBeVisible({ timeout: 15_000 });
+      await expectOneDurableFinal(page, "DURABLE_FINAL");
+      await recordSseResponseMarkers(topology, sseRequests, sessionId, "reconnect all runtime state");
+      expect(sseRequests[0]?.lastEventId).toBe("");
+      expect(topology.provider.count(SCENARIOS.reconnect)).toBe(2);
     } finally {
       topology.endpointBoundary.releaseEventBody(sessionId);
       topology.provider.release(`${SCENARIOS.reconnect}:first-chunk`);
+      topology.provider.release("reconnect-final");
+      topology.provider.release(`${SCENARIOS.reconnect}:first-chunk-2`);
+      await diagnosticPage?.close().catch(() => undefined);
     }
-    const initialBrowserRequest = await waitForExactBrowserSseRequest(
-      sseRequests,
-      topology.endpointId,
-      sessionId,
-      "",
-      "initial browser SSE",
-    );
-    const initialEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
-      initialBrowserRequest,
-    );
-    assertExactSseCorrelation(topology, initialBrowserRequest, initialEndpointRequest);
-    const initialEventIds = await topology.endpointBoundary.waitForResponseEventIds(
-      initialEndpointRequest,
-      "reconnect initial Endpoint SSE",
-    );
-    topology.recordEventIds(initialEventIds);
-    await expect(page.getByText(`reconnect path ${SCENARIOS.reconnect}`, { exact: true })).toBeVisible();
-    expect(initialEndpointRequest.responseEventNames).toContain("assistant_message_delta");
-    await expect
-      .poll(
-        () =>
-          initialEndpointRequest.responseEventNames.includes("model_step_retrying")
-            ? initialEndpointRequest.responseEventIds.at(-1) ?? ""
-            : "",
-        { timeout: 15_000, message: "reconnect did not publish its durable retry boundary" },
-      )
-      .toMatch(/^[0-9]+$/);
-    const originalCursor = initialEndpointRequest.responseEventIds.at(-1) ?? "";
-    expect(originalCursor).toMatch(/^[0-9]+$/);
-    expect(initialEndpointRequest.responseEventIds).toContain(originalCursor);
-    topology.recordCursor(originalCursor);
-    // A retry boundary discards the incomplete model candidate.  The second
-    // attempt may produce different text, so retaining the first provisional
-    // token would make the browser concatenate two attempts and expose a
-    // non-durable assistant message.
-    try {
-      await expect(page.locator("article.message-provisional")).toHaveCount(0, {
-        timeout: 15_000,
-        message: "model_step_retrying must discard the incomplete provisional candidate",
-      });
-    } catch (error) {
-      const evidencePath = await retainFailureEvidence("retry-provisional-red", {
-        schema: "zode.web-e2e.retry-provisional-failure.v1",
-        e2e: "e2e_browser_session_admission_is_separate_from_completion_and_last_event_id_reconnect_replaces_provisional_final",
-        expected: "model_step_retrying discards the incomplete provisional candidate before the next attempt",
-        browser_body: (await page.locator("body").innerText()).slice(0, 4_000),
-        session_id: sessionId,
-        endpoint_boundary: topology.endpointBoundary.debugRequests(),
-        provider_requests: topology.provider.debugRequests(),
-      });
-      throw new Error(
-        `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}`,
-      );
-    }
-    const reloadRequestId = topology.nextSseRequestId();
-    await page.context().setExtraHTTPHeaders({
-      "Cf-Access-Jwt-Assertion": topology.accessAssertion,
-      [REQUEST_ID_HEADER]: reloadRequestId,
-    });
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible();
-    const reloadedBrowserRequest = await waitForExactBrowserSseRequest(
-      sseRequests,
-      topology.endpointId,
-      sessionId,
-      originalCursor,
-      "refreshed browser SSE",
-    );
-    const reloadedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
-      reloadedBrowserRequest,
-    );
-    assertExactSseCorrelation(topology, reloadedBrowserRequest, reloadedEndpointRequest);
-    expect(reloadedBrowserRequest.requestId).toBe(reloadRequestId);
-    expect(reloadedEndpointRequest.status).toBe(200);
-    await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toHaveCount(0);
-    const cursorCountBeforeOutage = sseRequests.length;
-    await topology.server.stop();
-    await topology.assertServerStoreHasNoSessionMirror();
-    await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible({ timeout: 30_000 });
-    const resumedRequestId = topology.nextSseRequestId();
-    await page.context().setExtraHTTPHeaders({
-      "Cf-Access-Jwt-Assertion": topology.accessAssertion,
-      [REQUEST_ID_HEADER]: resumedRequestId,
-    });
-    await topology.server.restart();
-    await expect
-      .poll(
-        () =>
-          sseRequests
-            .slice(cursorCountBeforeOutage)
-            .find((request) => request.sessionId === sessionId && request.lastEventId.length > 0)?.lastEventId ?? "",
-        {
-          timeout: 15_000,
-          message: "browser did not reconnect the session SSE with Last-Event-ID",
-        },
-      )
-      .toBe(originalCursor);
-    const resumedBrowserRequest = await waitForBrowserSseRequest(
-      sseRequests,
-      topology.endpointId,
-      sessionId,
-      originalCursor,
-      "reconnected browser SSE",
-      resumedRequestId,
-    );
-    const resumedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
-      resumedBrowserRequest,
-    );
-    expect(resumedBrowserRequest.path).toBe(
-      `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}/events`,
-    );
-    expect(resumedBrowserRequest.requestId).toBe(resumedRequestId);
-    assertExactSseCorrelation(topology, resumedBrowserRequest, resumedEndpointRequest);
-    topology.provider.release("reconnect-final");
-    const resumedEventIds = await topology.endpointBoundary.waitForResponseEventIds(
-      resumedEndpointRequest,
-      "reconnect resumed Endpoint SSE",
-    );
-    topology.recordEventIds(resumedEventIds);
-    await expectOneDurableFinal(page, "DURABLE_FINAL");
-    await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toHaveCount(0);
-    await recordSseResponseMarkers(topology, sseRequests, sessionId, "reconnect all runtime state");
-    expect(sseRequests[0]?.lastEventId).toBe("");
-    expect(topology.provider.count(SCENARIOS.reconnect)).toBe(2);
   });
 
   test("e2e_browser_offline_state_distinguishes_server_outage_from_endpoint_unreachable", async ({ page }) => {
