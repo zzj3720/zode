@@ -1554,6 +1554,7 @@ async fn stream_events(
     let after = parse_last_event_id(&headers).map_err(ApiError::from_service)?;
     let owner = SessionOwner::new(context.authority_id(), context.subject());
     let receiver = state.runtime.publisher().subscribe();
+    let transient_receiver = state.runtime.transient_publisher().subscribe();
     let store = state.store.clone();
     let id = session_id.clone();
     let replay_owner = owner.clone();
@@ -1574,7 +1575,7 @@ async fn stream_events(
         }
 
         let mut receiver = receiver;
-        let mut transient_receiver = state.runtime.transient_publisher().subscribe();
+        let mut transient_receiver = transient_receiver;
         loop {
             tokio::select! {
                 // Drain provisional provider text before a simultaneously

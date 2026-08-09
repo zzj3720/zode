@@ -67,6 +67,12 @@ type TopologyConsumption = {
   consumedSequences: number[];
   countsBySequence: Map<number, number>;
 };
+type EventBodyHold = {
+  held: Promise<void>;
+  markHeld: () => void;
+  released: Promise<void>;
+  release: () => void;
+};
 
 const REPO_ROOT = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const CASSETTE_PATH = fileURLToPath(
@@ -77,6 +83,7 @@ const ACCESS_SUBJECT = "web-session-reconnect-runtime-states-human";
 const CONTROLLER_AUTHORITY = "web-session-reconnect-runtime-states-controller";
 const PROVIDER = "fixture-provider";
 const MODEL = "fixture-model";
+const REPLAY_HISTORY_MODEL = "fixture-model-history";
 const TOOL = "fixture_async";
 const REQUEST_ID_HEADER = "x-request-id";
 const CASSETTE_RAW_SHA256 = "564185b09086c6533ca58ab9314a3cb5271909e3c5ff70ff45a32f586e084b63";
@@ -472,6 +479,7 @@ class ReplayProvider {
   private readonly releaseWaiters = new Map<string, Array<() => void>>();
   private readonly expectedScenarioCounts = new Map<string, number>();
   private readonly toolPreambleScenarios = new Set<string>();
+  private readonly heldFirstChunkScenarios = new Set<string>();
   private readonly observedRequests: string[] = [];
   private expectedProviderAuthorization = "";
   private suiteConsumptionRecorded = false;
@@ -556,6 +564,10 @@ class ReplayProvider {
 
   enableToolPreamble(scenario: string): void {
     this.toolPreambleScenarios.add(scenario);
+  }
+
+  holdAfterFirstChunk(scenario: string): void {
+    this.heldFirstChunkScenarios.add(scenario);
   }
 
   private expectedSequences(): number[] {
@@ -708,8 +720,17 @@ class ReplayProvider {
         `data: ${JSON.stringify({ choices: [{ delta: { content: "PRE_TOOL" }, finish_reason: null }] })}\n\n`,
       );
     }
-    for (const chunk of replay.chunks as Json[]) {
-      response.write(Buffer.from(chunk.bytes_hex, "hex"));
+    for (const [index, chunk] of (replay.chunks as Json[]).entries()) {
+      const bytes = Buffer.from(chunk.bytes_hex, "hex");
+      if (index === 0 && occurrence === 0 && this.heldFirstChunkScenarios.has(scenario)) {
+        await new Promise<void>((resolvePromise, reject) => {
+          response.write(bytes, (error) => error ? reject(error) : resolvePromise());
+        });
+        this.notify(`${scenario}:first-chunk`, 1);
+        await this.waitForRelease(`${scenario}:first-chunk`);
+      } else {
+        response.write(bytes);
+      }
     }
     if (replay.complete === true) {
       response.end();
@@ -819,6 +840,33 @@ class EndpointBoundary {
     request: EndpointBoundaryRequest;
     resolve: (eventIds: string[]) => void;
   }> = [];
+  private readonly eventBodyHolds = new Map<string, EventBodyHold>();
+
+  holdEventBody(sessionId: string): void {
+    if (this.eventBodyHolds.has(sessionId)) throw new Error("session event body is already held");
+    let markHeld = (): void => undefined;
+    let release = (): void => undefined;
+    const held = new Promise<void>((resolvePromise) => {
+      markHeld = resolvePromise;
+    });
+    const released = new Promise<void>((resolvePromise) => {
+      release = resolvePromise;
+    });
+    this.eventBodyHolds.set(sessionId, { held, markHeld, released, release });
+  }
+
+  async waitForHeldEventBody(sessionId: string): Promise<void> {
+    const hold = this.eventBodyHolds.get(sessionId);
+    if (hold === undefined) throw new Error("session event body was not armed");
+    await withTimeout(hold.held, 15_000, "Endpoint replay body was not held after response headers");
+  }
+
+  releaseEventBody(sessionId: string): void {
+    const hold = this.eventBodyHolds.get(sessionId);
+    if (hold === undefined) return;
+    hold.release();
+    this.eventBodyHolds.delete(sessionId);
+  }
 
   static async start(targetBaseUrl: string): Promise<EndpointBoundary> {
     // This is a transparent real HTTP boundary: Server is configured with this
@@ -953,7 +1001,23 @@ class EndpointBoundary {
         delete responseHeaders["keep-alive"];
         delete responseHeaders["transfer-encoding"];
         response.writeHead(upstreamResponse.statusCode ?? 502, responseHeaders);
-        upstreamResponse.pipe(response);
+        const heldSession = captured.path.match(/^\/v1\/sessions\/([^/]+)\/events$/)?.[1];
+        const hold = heldSession === undefined ? undefined : this.eventBodyHolds.get(heldSession);
+        if (upstreamResponse.statusCode === 200 && hold !== undefined) {
+          upstreamResponse.pause();
+          response.flushHeaders();
+          hold.markHeld();
+          void hold.released.then(() => {
+            if (response.destroyed) {
+              upstreamResponse.destroy();
+              return;
+            }
+            upstreamResponse.pipe(response);
+            upstreamResponse.resume();
+          });
+        } else {
+          upstreamResponse.pipe(response);
+        }
       },
     );
     const wireRequestId = upstream.getHeader(REQUEST_ID_HEADER);
@@ -1016,7 +1080,7 @@ class EndpointBoundary {
         });
       }),
       15_000,
-      `Endpoint boundary did not receive Last-Event-ID ${lastEventId || "<empty>"}; observed=${JSON.stringify(this.debugRequests().slice(-8))}`,
+      `Endpoint boundary did not receive Last-Event-ID ${lastEventId || "<empty>"}; events=${JSON.stringify(this.eventRequests(sessionId).map((request) => ({ last_event_id: request.lastEventId, matched: request.matchedBrowserRequest !== undefined, status: request.status, ids: request.responseEventIds })))}`,
     );
     if (options.allowNon2xx !== true) this.assertEventResponse(request);
     return request;
@@ -1072,7 +1136,7 @@ class EndpointBoundary {
 
   debugRequests(): string[] {
     return this.requests.map((request) =>
-      `${request.method} ${request.path} status=${request.status ?? "<pending>"} request_id=${request.requestId} forwarded_request_id=${request.forwardedRequestId} last_event_id=${request.lastEventId} forwarded_last_event_id=${request.forwardedLastEventId} events=${request.responseEventNames.join(",")} ids=${request.responseEventIds.join(",")} body=${request.body.slice(0, 180)}`,
+      `${request.method} ${request.path} status=${request.status ?? "<pending>"} request_id=${request.requestId} forwarded_request_id=${request.forwardedRequestId} last_event_id=${request.lastEventId} forwarded_last_event_id=${request.forwardedLastEventId} matched=${request.matchedBrowserRequest !== undefined} events=${request.responseEventNames.join(",")} ids=${request.responseEventIds.join(",")} body=${request.body.slice(0, 180)}`,
     );
   }
 
@@ -1672,7 +1736,7 @@ class Topology {
         body: JSON.stringify({
           kind: "openai_compatible",
           base_url: `${this.provider.baseUrl}/v1`,
-          models: [MODEL],
+          models: [MODEL, REPLAY_HISTORY_MODEL],
           options: {},
         }),
       }),
@@ -1881,7 +1945,79 @@ function assertExactRouteMissing(response: BrowserPublicResponse, label: string)
   }
 }
 
-async function createSessionWithKeyboard(page: Page, topology: Topology): Promise<string> {
+function fixtureModelSelection(topology: Topology, model = MODEL): Json {
+  return {
+    provider: PROVIDER,
+    model,
+    provider_execution: {
+      schema: "zode.provider-execution.v1",
+      revision: topology.descriptorRevision,
+      kind: "openai_compatible",
+      base_url: `${topology.provider.baseUrl}/v1`,
+      options: {},
+    },
+    auth_profile_id: topology.profileId,
+    minimum_auth_revision: topology.profileRevision,
+  };
+}
+
+async function seedDurableReplayHistory(
+  topology: Topology,
+  sessionId: string,
+  count: number,
+): Promise<void> {
+  for (let index = 0; index < count; index += 1) {
+    const selected = requireBody(
+      await apiJson(
+        topology.server.baseUrl,
+        topology.accessAssertion,
+        `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}/model`,
+        {
+          method: "PUT",
+          headers: {
+            "content-type": "application/json",
+            "Idempotency-Key": `browser-replay-history-${index}-${randomUUID()}`,
+          },
+          body: JSON.stringify(
+            fixtureModelSelection(topology, index % 2 === 0 ? REPLAY_HISTORY_MODEL : MODEL),
+          ),
+        },
+      ),
+      202,
+      `browser durable replay history selection ${index}`,
+    );
+    const selectedVersion = Number(selected.version);
+    await withTimeout(
+      (async () => {
+        while (true) {
+          const current = await apiJson(
+            topology.server.baseUrl,
+            topology.accessAssertion,
+            `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}`,
+          );
+          if (
+            current.status === 200 &&
+            current.body !== null &&
+            Number(current.body.version) > selectedVersion &&
+            current.body.active_activation === null &&
+            current.body.active_model_round === null
+          ) {
+            return;
+          }
+          await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 5));
+        }
+      })(),
+      15_000,
+      `browser durable replay history selection ${index} did not reach an idle public projection`,
+    );
+  }
+}
+
+async function createSessionWithKeyboard(
+  page: Page,
+  topology: Topology,
+  beforeOpen?: (sessionId: string) => Promise<void>,
+): Promise<string> {
   // The product form intentionally creates a session with tools=[]; this
   // lifecycle fixture needs one explicitly selected HTTP tool so its later
   // cancellation/unknown-outcome scenarios exercise the real tool path.
@@ -1895,19 +2031,7 @@ async function createSessionWithKeyboard(page: Page, topology: Topology): Promis
         "Idempotency-Key": `browser-session-${randomUUID()}`,
       },
       body: JSON.stringify({
-        model: {
-          provider: PROVIDER,
-          model: MODEL,
-          provider_execution: {
-            schema: "zode.provider-execution.v1",
-            revision: topology.descriptorRevision,
-            kind: "openai_compatible",
-            base_url: `${topology.provider.baseUrl}/v1`,
-            options: {},
-          },
-          auth_profile_id: topology.profileId,
-          minimum_auth_revision: topology.profileRevision,
-        },
+        model: fixtureModelSelection(topology),
         tools: [TOOL],
       }),
     }),
@@ -1916,6 +2040,7 @@ async function createSessionWithKeyboard(page: Page, topology: Topology): Promis
   );
   const sessionId = String(response.session_id ?? "");
   if (!/^[A-Z0-9]+$/.test(sessionId)) throw new Error("public session creation omitted a canonical session_id");
+  await beforeOpen?.(sessionId);
   await page.goto(`${topology.server.baseUrl}/endpoints/${topology.endpointId}/sessions/${sessionId}`, {
     waitUntil: "domcontentloaded",
   });
@@ -1926,13 +2051,14 @@ async function createSessionWithKeyboard(page: Page, topology: Topology): Promis
 }
 
 async function sendMessageWithKeyboard(page: Page, prompt: string): Promise<void> {
+  const composer = page.getByRole("textbox", { name: "Message" });
+  await expect(page.getByRole("button", { name: "Send" })).toBeEnabled({ timeout: 15_000 });
   const admission = page.waitForResponse(
     (response) => response.url().includes("/messages") && response.request().method() === "POST",
   );
-  const composer = page.getByRole("textbox", { name: "Message" });
-  await composer.focus();
-  await page.keyboard.type(prompt);
-  await page.keyboard.press("Enter");
+  await composer.fill(prompt);
+  await expect(composer).toHaveValue(prompt);
+  await composer.press("Enter");
   const response = await admission;
   await classifyBrowser404(response, "session message admission");
   expect(response.status()).toBe(202);
@@ -2348,10 +2474,48 @@ test.describe("session reconnect and runtime states", () => {
       );
     }
     await expectOneDurableFinal(page, "KEYBOARD_FINAL");
-    const sessionId = await createSessionWithKeyboard(page, topology);
+    topology.provider.holdAfterFirstChunk(SCENARIOS.reconnect);
+    const firstProviderChunk = topology.provider.waitForScenario(`${SCENARIOS.reconnect}:first-chunk`);
+    const sessionId = await createSessionWithKeyboard(page, topology, async (createdSessionId) => {
+      await seedDurableReplayHistory(topology!, createdSessionId, 512);
+      topology!.endpointBoundary.holdEventBody(createdSessionId);
+    });
+    await topology.endpointBoundary.waitForHeldEventBody(sessionId);
     topology.expectScenario(SCENARIOS.reconnect, 2);
-    await sendMessageWithKeyboard(page, `reconnect path ${SCENARIOS.reconnect}`);
-    await topology.provider.waitForScenario(SCENARIOS.reconnect);
+    try {
+      await sendMessageWithKeyboard(page, `reconnect path ${SCENARIOS.reconnect}`);
+      await withTimeout(
+        firstProviderChunk,
+        15_000,
+        "provider did not flush its provisional chunk while Endpoint replay was held",
+      );
+      topology.endpointBoundary.releaseEventBody(sessionId);
+      await topology.provider.waitForScenario(SCENARIOS.reconnect);
+      try {
+        await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toBeVisible();
+      } catch (error) {
+        const sessionSnapshot = await apiJson(
+          topology.server.baseUrl,
+          topology.accessAssertion,
+          `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}`,
+        );
+        const evidencePath = await retainFailureEvidence("provisional-browser-red", {
+          schema: "zode.web-e2e.session-reconnect-failure.v1",
+          e2e: "e2e_browser_session_admission_is_separate_from_completion_and_last_event_id_reconnect_replaces_provisional_final",
+          expected: "the browser renders the provisional token after opening a long durable replay and before retry or Server restart",
+          browser_body: (await page.locator("body").innerText()).slice(0, 4000),
+          session_snapshot: sessionSnapshot.body,
+          provider_requests: topology.provider.debugRequests(),
+          endpoint_boundary: topology.endpointBoundary.debugRequests(),
+        });
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}; browser_body=${JSON.stringify((await page.locator("body").innerText()).slice(0, 4000))}; session_snapshot=${JSON.stringify(sessionSnapshot.body)}; provider_requests=${JSON.stringify(topology.provider.debugRequests())}; endpoint_boundary=${JSON.stringify(topology.endpointBoundary.debugRequests())}`,
+        );
+      }
+    } finally {
+      topology.endpointBoundary.releaseEventBody(sessionId);
+      topology.provider.release(`${SCENARIOS.reconnect}:first-chunk`);
+    }
     const initialBrowserRequest = await waitForExactBrowserSseRequest(
       sseRequests,
       topology.endpointId,
@@ -2368,28 +2532,7 @@ test.describe("session reconnect and runtime states", () => {
       "reconnect initial Endpoint SSE",
     );
     topology.recordEventIds(initialEventIds);
-    try {
-      await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toBeVisible();
-    } catch (error) {
-      const sessionSnapshot = await apiJson(
-        topology.server.baseUrl,
-        topology.accessAssertion,
-        `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}`,
-      );
-      const evidencePath = await retainFailureEvidence("provisional-browser-red", {
-        schema: "zode.web-e2e.session-reconnect-failure.v1",
-        e2e: "e2e_browser_session_admission_is_separate_from_completion_and_last_event_id_reconnect_replaces_provisional_final",
-        expected: "the browser renders the provisional token before Server restart and replaces it with one durable final after Last-Event-ID reconnect",
-        browser_body: (await page.locator("body").innerText()).slice(0, 4000),
-        session_snapshot: sessionSnapshot.body,
-        provider_requests: topology.provider.debugRequests(),
-        endpoint_boundary: topology.endpointBoundary.debugRequests(),
-      });
-      throw new Error(
-        `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}; browser_body=${JSON.stringify((await page.locator("body").innerText()).slice(0, 4000))}; session_snapshot=${JSON.stringify(sessionSnapshot.body)}; provider_requests=${JSON.stringify(topology.provider.debugRequests())}; endpoint_boundary=${JSON.stringify(topology.endpointBoundary.debugRequests())}`,
-      );
-    }
-    await expect(page.getByText("Message accepted; waiting for durable completion.", { exact: true })).toBeVisible();
+    await expect(page.getByText(`reconnect path ${SCENARIOS.reconnect}`, { exact: true })).toBeVisible();
     expect(initialEndpointRequest.responseEventNames).toContain("assistant_message_delta");
     await expect
       .poll(
