@@ -1,4 +1,4 @@
-import { test, expect, type APIRequestContext, type BrowserContext, type Locator, type Page, type Request as PlaywrightRequest, type Response as PlaywrightResponse } from "@playwright/test";
+import { test, expect, type APIRequestContext, type BrowserContext, type Locator, type Page, type Request as PlaywrightRequest, type Response as PlaywrightResponse, type Route } from "@playwright/test";
 import { createHash, createSign, generateKeyPairSync, randomBytes } from "node:crypto";
 import { createServer, request as httpRequest, type Server as HttpServer } from "node:http";
 import { cpSync, mkdtempSync, mkdirSync, chmodSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -23,6 +23,10 @@ const CASSETTE_PATH = fileURLToPath(
 );
 
 type JsonObject = Record<string, any>;
+type ResponseObservation = {
+  status: () => number;
+  headers: () => Record<string, string>;
+};
 
 type ReadyProcess = {
   child: ChildProcessWithoutNullStreams;
@@ -270,7 +274,13 @@ function startChildProcess(binary: string, args: string[], readyPrefix: string):
   child.once("error", (error) => readyReject(error));
   child.once("exit", (code, signal) => {
     if (!stopped) {
-      readyReject(new Error(`${basename(binary)} exited before readiness (${code ?? "signal"}:${signal ?? ""})`));
+      const typedFailure = stderr.match(
+        /ZODE_SERVER_STARTUP_FAILURE code=[a-z0-9_]+ phase=[a-z0-9_]+(?:: local Endpoint (?:configuration|authority|process|identity|catalog) is unavailable)?/u,
+      )?.[0];
+      readyReject(new Error(
+        `${basename(binary)} exited before readiness (${code ?? "signal"}:${signal ?? ""})`
+        + (typedFailure ? `; ${typedFailure}` : ""),
+      ));
     }
   });
 
@@ -460,8 +470,6 @@ async function startHarness(): Promise<Harness> {
   const remoteListen = `127.0.0.1:${remotePort}`;
   const localBootstrapSecret = join(localRoot, "controller.secret");
   const remoteSecretFile = join(remoteRoot, "controller.secret");
-  writeFileSync(localBootstrapSecret, randomBytes(32), { mode: 0o600 });
-  chmodSync(localBootstrapSecret, 0o600);
   writeFileSync(remoteSecretFile, REMOTE_CONTROL_SECRET);
   chmodSync(remoteSecretFile, 0o600);
   const localConfig = writeEndpointConfig(localRoot, SERVER_AUTHORITY, localBootstrapSecret, localListen);
@@ -649,7 +657,7 @@ function replaceSlots(value: unknown, slots: Record<string, string>): unknown {
 
 function captureFirstOccurrenceEvidence(
   request: PlaywrightRequest,
-  response: PlaywrightResponse,
+  response: ResponseObservation,
   responseBody: string,
   owner: string,
 ): string {
@@ -832,9 +840,9 @@ async function addRemoteEndpoint(
   await page.getByRole("link", { name: /^Endpoints$/i }).click();
   await page.getByRole("button", { name: /add remote endpoint/i }).click();
   const dialog = page.getByRole("dialog");
-  const label = dialog.getByLabel(/^Label$/i);
-  const url = dialog.getByLabel(/reachable URL|base URL/i);
-  const secret = dialog.getByLabel(/control secret/i);
+  const label = dialog.getByLabel(/endpoint label/i);
+  const url = dialog.getByLabel(/endpoint URL/i);
+  const secret = dialog.getByLabel(/controller credential/i);
   await expect(secret).toHaveAttribute("type", "password");
   await label.fill(REMOTE_LABEL);
   await url.fill(remoteBaseUrl);
@@ -844,16 +852,68 @@ async function addRemoteEndpoint(
     .locator('[role="status"], [aria-live="polite"]')
     .filter({ hasText: /probing|checking|connecting/i })
     .first();
+  let releaseResponse = (): void => undefined;
+  let markResponseHeld = (): void => undefined;
+  let settleResponse = (): void => undefined;
+  let rejectResponse = (_error: unknown): void => undefined;
+  let heldResponse: { status: number; headers: Record<string, string>; body: string } | undefined;
+  const responseRelease = new Promise<void>((resolvePromise) => {
+    releaseResponse = resolvePromise;
+  });
+  const responseHeld = new Promise<void>((resolvePromise) => {
+    markResponseHeld = resolvePromise;
+  });
+  const responseSettled = new Promise<void>((resolvePromise, rejectPromise) => {
+    settleResponse = resolvePromise;
+    rejectResponse = rejectPromise;
+  });
+  const holdCreateResponse = async (route: Route): Promise<void> => {
+    const request = route.request();
+    if (request.method() !== "POST" || requestPath(request) !== "/v1/endpoints") {
+      await route.continue();
+      return;
+    }
+    try {
+      const upstream = await route.fetch();
+      const upstreamBody = await upstream.body();
+      heldResponse = {
+        status: upstream.status(),
+        headers: upstream.headers(),
+        body: upstreamBody.toString("utf8"),
+      };
+      markResponseHeld();
+      await responseRelease;
+      await route.fulfill({
+        status: heldResponse.status,
+        headers: heldResponse.headers,
+        body: upstreamBody,
+      });
+      settleResponse();
+    } catch (error) {
+      rejectResponse(error);
+      throw error;
+    }
+  };
+  await page.route("**/v1/endpoints", holdCreateResponse);
   const requestPromise = page.waitForRequest(
     (request) => request.method() === "POST" && requestPath(request) === "/v1/endpoints",
   );
-  const responsePromise = page.waitForResponse(
-    (response) => response.request().method() === "POST" && responsePath(response) === "/v1/endpoints",
-  );
-  const progressPromise = expect(progress).toBeVisible({ timeout: HTTP_TIMEOUT_MS });
-  await dialog.getByRole("button", { name: /add endpoint/i }).click();
-  await progressPromise;
-  const [request, response] = await Promise.all([requestPromise, responsePromise]);
+  try {
+    await dialog.getByRole("button", { name: /add endpoint/i }).click();
+    await responseHeld;
+    await expect(progress).toBeVisible({ timeout: HTTP_TIMEOUT_MS });
+    releaseResponse();
+    await responseSettled;
+  } finally {
+    releaseResponse();
+    await page.unroute("**/v1/endpoints", holdCreateResponse);
+  }
+  if (!heldResponse) throw new Error("remote Endpoint create response barrier did not retain the Server response");
+  const request = await requestPromise;
+  const response: ResponseObservation = {
+    status: () => heldResponse.status,
+    headers: () => heldResponse.headers,
+  };
   const requestBody = request.postDataJSON() as JsonObject;
   expect(request.headers()["idempotency-key"]).toBeTruthy();
   const requestMatchesContract =
@@ -863,7 +923,7 @@ async function addRemoteEndpoint(
     requestBody.control_auth?.secret === REMOTE_CONTROL_SECRET &&
     !Object.prototype.hasOwnProperty.call(requestBody, "endpoint_id");
   expect(requestMatchesContract).toBe(true);
-  const responseBody = await response.text();
+  const responseBody = heldResponse.body;
   assertSafeText(responseBody, REMOTE_CONTROL_SECRET, "remote Endpoint create response");
   const firstFailureExchange = cassette.exchanges[0] as JsonObject;
   const firstFailureBody = Buffer.concat(
@@ -1055,6 +1115,7 @@ test("e2e_remote_endpoint_add_probe_and_endpoint_scoped_session_placement", asyn
     expect(localEndpoint.status).toMatch(/online|degraded/i);
     const localEndpointId = localEndpoint.endpoint_id as string;
     const localEndpointLabel = localEndpoint.label as string;
+    await page.getByRole("link", { name: /^Endpoints$/i }).click();
     await expect(page.getByText(localEndpointLabel, { exact: true })).toBeVisible();
 
     const remoteEndpoint = await addRemoteEndpoint(

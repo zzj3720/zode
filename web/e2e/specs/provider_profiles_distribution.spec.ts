@@ -1513,19 +1513,19 @@ async function addApiKeyProfile(
   makeDefault: boolean,
   proxy: EndpointProxy,
 ): Promise<ProfileResource> {
-  await page.getByRole('button', { name: 'Add API-key profile' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Add API-key profile' });
-  await dialog.getByLabel('Profile label').fill(label);
-  const secret = dialog.getByLabel('API key (write-only)');
+  await page.getByRole('button', { name: 'Add API key profile' }).click();
+  const form = page.locator('form.nested-editor').filter({ hasText: 'Add API key profile' });
+  await form.getByLabel('Profile label').fill(label);
+  const secret = form.getByLabel('API key');
   await expect(secret).toHaveAttribute('type', 'password');
   await secret.fill(apiKey);
   await expect(secret).toHaveAttribute('autocomplete', /off|new-password/);
-  if (makeDefault) await dialog.getByRole('checkbox', { name: 'Make this the default profile' }).check();
-  await dialog.getByRole('checkbox', { name: `Share with ${endpointLabel}` }).check();
+  if (makeDefault) await form.getByRole('checkbox', { name: 'Make this the default profile' }).check();
+  await form.getByRole('checkbox', { name: `Share with ${endpointLabel}` }).check();
   const response = await expectResponseAfter(
     page,
     resolveRoute(seamMatrix.profileCreate, { provider: scenario.provider }),
-    () => dialog.getByRole('button', { name: 'Create API-key profile' }).click(),
+    () => form.getByRole('button', { name: 'Create profile' }).click(),
     `create profile ${label}`,
   );
   const responseBody = (await response.json()) as JsonObject;
@@ -1540,7 +1540,7 @@ async function addApiKeyProfile(
     resolveRoute(seamMatrix.replicaInstall, { profile_id: profileId }),
     `install replica for ${label}`,
   );
-  await expect(dialog).toBeHidden();
+  await expect(form).toHaveCount(0);
   return { card: profileCard(page, label), profileId, revision };
 }
 

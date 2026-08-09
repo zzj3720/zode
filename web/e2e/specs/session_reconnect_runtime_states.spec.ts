@@ -2,7 +2,7 @@ import { expect, test, type Page, type Request } from "@playwright/test";
 import { createHash, createSign, generateKeyPairSync, randomBytes, randomUUID, type KeyObject } from "node:crypto";
 import { execFile as execFileCallback, spawn, type ChildProcessByStdio } from "node:child_process";
 import { once } from "node:events";
-import { readFile, writeFile, mkdir, chmod, mkdtemp, readdir, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdir, chmod, mkdtemp, readdir, rm, cp } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
@@ -672,11 +672,15 @@ class ReplayProvider {
 
   async waitForScenario(scenario: string, count = 1): Promise<void> {
     if ((this.calls.get(scenario) ?? 0) >= count) return;
-    await new Promise<void>((resolvePromise) => {
-      const waiters = this.waiters.get(scenario) ?? [];
-      waiters.push({ count, resolve: resolvePromise });
-      this.waiters.set(scenario, waiters);
-    });
+    await withTimeout(
+      new Promise<void>((resolvePromise) => {
+        const waiters = this.waiters.get(scenario) ?? [];
+        waiters.push({ count, resolve: resolvePromise });
+        this.waiters.set(scenario, waiters);
+      }),
+      15_000,
+      `provider scenario ${scenario} did not reach the retained public exchange`,
+    );
   }
 
   release(name: string): void {
@@ -1219,7 +1223,7 @@ class Topology {
             auto_wait_timeout_seconds: 1,
             recovery: {
               on_running_restart: "unknown_outcome",
-              retry_dispatch: "same_invocation_key_deduplicated",
+              retry_dispatch: "never",
             },
             adapter: { kind: "http", url: `${tools.baseUrl}/fixture_async` },
           },
@@ -1229,6 +1233,14 @@ class Topology {
     );
     const serverDatabase = join(serverRoot, "control.sqlite3");
     const serverConfig = join(serverRoot, "config.json");
+    const sourceUiDirectory = process.env.ZODE_UI_ASSETS_DIRECTORY
+      ?? join(REPO_ROOT, "target", "ci", "product-ui");
+    const confinedUiDirectory = join(serverRoot, "ui");
+    await cp(sourceUiDirectory, confinedUiDirectory, {
+      recursive: true,
+      force: false,
+      errorOnExist: true,
+    });
     await writeFile(
       serverConfig,
       JSON.stringify({
@@ -1238,7 +1250,8 @@ class Topology {
         callback_origin: `http://127.0.0.2:${serverPort}`,
         server_authority_id: CONTROLLER_AUTHORITY,
         deployment: "server_only",
-        ui_mode: "api_only",
+        ui_mode: "assets",
+        ui_assets_directory: confinedUiDirectory,
         control_database: serverDatabase,
         secret_directory: join(serverRoot, "secrets"),
         access: {
@@ -1492,15 +1505,6 @@ class Topology {
     );
     this.profileId = profile.auth_profile_id;
     this.profileRevision = profile.revision;
-    requireBody(
-      await apiJson(this.server.baseUrl, this.accessAssertion, `/v1/auth-profiles/${this.profileId}/sharing`, {
-        method: "PUT",
-        headers: { "content-type": "application/json", "Idempotency-Key": `browser-sharing-${randomUUID()}` },
-        body: JSON.stringify({ mode: "selected", endpoint_ids: [this.endpointId] }),
-      }),
-      200,
-      "Provider sharing",
-    );
     await expect
       .poll(
         async () => {
@@ -1570,7 +1574,7 @@ async function bootstrap(page: Page, topology: Topology): Promise<void> {
   });
   const response = await page.goto(`${topology.server.baseUrl}/`, { waitUntil: "domcontentloaded" });
   await classifyBrowser404(response, "management UI root");
-  await expect(page.getByRole("heading", { name: "Sessions" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Log in" })).toHaveCount(0);
   await expect(page.getByRole("textbox", { name: /token|password/i })).toHaveCount(0);
 }
@@ -1671,13 +1675,13 @@ async function createSessionWithKeyboard(page: Page, topology: Topology): Promis
   const create = page.getByRole("button", { name: "New session" });
   await create.focus();
   await page.keyboard.press("Enter");
-  const dialog = page.getByRole("dialog", { name: "New session" });
-  await expect(dialog).toBeVisible();
-  await dialog.getByRole("combobox", { name: "Endpoint" }).selectOption(topology.endpointId);
-  await dialog.getByRole("combobox", { name: "Provider" }).selectOption(PROVIDER);
-  await dialog.getByRole("combobox", { name: "Model" }).selectOption(MODEL);
-  await dialog.getByRole("combobox", { name: "Auth profile" }).selectOption(topology.profileId);
-  const submit = dialog.getByRole("button", { name: "Create session" });
+  const form = page.locator("form.editor-panel").filter({ hasText: "New session" });
+  await expect(form).toBeVisible();
+  await form.getByRole("combobox", { name: "Endpoint" }).selectOption(topology.endpointId);
+  await form.getByRole("combobox", { name: "Provider" }).selectOption(PROVIDER);
+  await form.getByRole("combobox", { name: "Model" }).selectOption(MODEL);
+  await form.getByRole("combobox", { name: "Auth profile" }).selectOption(topology.profileId);
+  const submit = form.getByRole("button", { name: "Start session" });
   await submit.focus();
   await page.keyboard.press("Enter");
   await expect(page).toHaveURL(new RegExp(`/endpoints/${topology.endpointId}/sessions/[A-Z0-9]+$`));
@@ -1698,7 +1702,7 @@ async function sendMessageWithKeyboard(page: Page, prompt: string): Promise<void
   const response = await admission;
   await classifyBrowser404(response, "session message admission");
   expect(response.status()).toBe(202);
-  await expect(page.getByText("Message accepted", { exact: true })).toBeVisible();
+  await expect(page.getByText("Message accepted; waiting for durable completion.", { exact: true })).toBeVisible();
 }
 
 function observeEventRequests(page: Page, topology?: Topology): BrowserSseRequest[] {

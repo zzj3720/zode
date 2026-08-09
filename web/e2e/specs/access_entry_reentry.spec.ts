@@ -1409,6 +1409,7 @@ class TestStack {
           boundary: "management-access-edge",
           requestPath: firstSse.path,
           responseStatus: firstSse.responseStatus,
+          captureSetId: this.captureSetId,
         })
       : undefined;
     try {
@@ -1767,6 +1768,7 @@ test.describe("Access entry and re-entry", () => {
         const firstFailure = stack.journal.first({
           boundary: "management-access-edge",
           responseStatus: 401,
+          captureSetId,
         });
         if (!firstFailure) throw new Error("Access re-entry capture contained no HTTP 401 exchange");
         const capture = stack.journal.flushCaptureSet(captureSetId, {

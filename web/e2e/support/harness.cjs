@@ -1515,13 +1515,14 @@ class RecordingJournal {
     }
   }
 
-  first({ boundary, requestPath, responseStatus } = {}) {
+  first({ boundary, requestPath, responseStatus, captureSetId } = {}) {
     return [...this.records]
       .sort((left, right) => String(left.recordingId).localeCompare(String(right.recordingId)))
       .find((record) =>
         (boundary === undefined || record.boundary === boundary)
         && (requestPath === undefined || record.path === requestPath)
-        && (responseStatus === undefined || record.response.status === responseStatus));
+        && (responseStatus === undefined || record.response.status === responseStatus)
+        && (captureSetId === undefined || record.captureSetId === captureSetId));
   }
 
   flushCaptureSet(captureSetId, { firstFailureRecordingId } = {}) {

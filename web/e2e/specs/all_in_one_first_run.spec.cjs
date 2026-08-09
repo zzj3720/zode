@@ -2565,7 +2565,9 @@ class Harness {
     this.serverListen = serverListen;
     const installedUiDirectory = path.join(serverRoot, "ui");
     if (!scaffoldCapture) {
-      await fs.cp(path.join(repositoryRoot, "web", "dist"), installedUiDirectory, {
+      const builtUiDirectory = process.env.ZODE_UI_ASSETS_DIRECTORY
+        || path.join(repositoryRoot, "web", "dist");
+      await fs.cp(builtUiDirectory, installedUiDirectory, {
         recursive: true,
         force: false,
         errorOnExist: true,
