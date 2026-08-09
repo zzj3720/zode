@@ -1,6 +1,6 @@
 # Approved common-user E2E matrix
 
-Status: approved Zode behavior map, current protected main `5c5867570c332881f4a62fd0195657532697e2d4`.
+Status: approved Zode behavior map, current protected main `6bb8b14fedf8b5dae866b149cd4f67d6027b28b2`.
 
 This document turns the approved outside-repository adoption baseline into
 Zode-owned black-box anchors. It is a traceability document, not a claim that
@@ -89,19 +89,32 @@ level fixture alone cannot change a row from PARTIAL/BLOCKED to complete.
 
 `locked-build-and-e2e` is the shared protocol/recorder/process evidence job. Its
 green result is deliberately not a product-acceptance result. The separate
-`approved-common-browser-e2e` job checks out the exact merge revision, builds
-the Endpoint, Server, and UI from that checkout, and executes every tracked
-file under `web/e2e/specs/` through Chromium and real child processes. Its
-collection audit is pinned by
+`approved-product-collection` checks out the exact merge revision and derives
+one fail-fast-disabled shard per approved spec from the reviewed manifest.
+Every `approved-common-browser-e2e (...)` shard builds the Endpoint, Server,
+and UI from that same revision and executes its complete spec through Chromium
+and real child processes. A hung spec is bounded to its shard and cannot stop
+the remaining approved specs from producing evidence. The full collection is
+pinned by
 `scripts/ci/approved-product-playwright-manifest.json` to 25 files and 54 test
-identities; any missing/extra file or test, failure, skip, or unrun test fails
-the job. It never reads live-provider credentials. `approved-product-merge-gate`
-requires both jobs, so a shared-only green cannot make a product merge appear
-green. Repository protection must require that aggregate context after its
-first run; the workflow cannot make an unconfigured GitHub branch-protection
-rule required by itself. The product job also uploads a line-progress log next
-to its JSON report; a timeout therefore retains the last real test boundary
-even when Playwright has not reached its final JSON flush.
+identities; any missing/extra file or test, failed shard, failure, skip, unrun,
+or incomplete result report fails the stable aggregate. It never reads
+live-provider credentials. `approved-product-merge-gate` requires shared
+evidence, collection, and every product shard, so a shared-only green cannot
+make a product merge appear green. Repository protection must require that
+aggregate context after its first successful run; the workflow cannot make an
+unconfigured GitHub branch-protection rule required by itself. Each shard also
+uploads a line-progress log next to its JSON report, so a timeout retains the
+last real test boundary without suppressing results from the other specs.
+CI artifacts contain only the collection matrix, progress/result reports, and
+secret-scanned browser evidence. Raw or live recordings under
+`target/test-recordings/` remain runner-local ignored evidence and are never
+uploaded: quarantine members may contain test credentials until they have been
+redacted, replay-verified, and promoted into a reviewed immutable cassette.
+The local equivalent remains `./scripts/ci/verify-approved-product.sh`; setting
+`ZODE_CI_PRODUCT_SPEC=specs/<name>.spec.<cjs|ts>` runs one manifest-approved
+shard through the same build, full-collection audit, browser/process path, and
+identity-complete result audit used in CI.
 
 The current exact-main product gate is expected to expose real fixture or
 product blockers rather than hide them. For example, the session-reconnect

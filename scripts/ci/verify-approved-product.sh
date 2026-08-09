@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 cd "$ROOT"
 UI_DIR=${ZODE_CI_PRODUCT_UI_DIR:-"$ROOT/target/ci/product-ui"}
 PLAYWRIGHT="$ROOT/web/e2e/node_modules/.bin/playwright"
@@ -17,6 +17,7 @@ command -v node >/dev/null 2>&1 || die 'node is required'
 node --check "$ROOT/web/e2e/support/harness.cjs"
 node --check "$ROOT/scripts/ci/assert-product-playwright-list.cjs"
 node --check "$ROOT/scripts/ci/assert-playwright-results.cjs"
+node --check "$ROOT/scripts/ci/product-playwright-matrix.cjs"
 
 printf '%s\n' '== exact-main product build =='
 cargo build --locked --manifest-path "$ROOT/Cargo.toml" --bin zode
@@ -34,14 +35,8 @@ export ZODE_UI_ASSETS_DIRECTORY="$UI_DIR"
 export ZODE_WEB_E2E_UI_MODE=assets
 export PATH="$ROOT/web/node_modules/.bin:$PATH"
 export CI=true
-# The product gate is deterministic and must never discover or consume a live
-# provider credential from a developer shell or CI secret environment.
-unset ZODE_RUN_LIVE_PROVIDER_E2E ZODE_E2E_LIVE_PROVIDER_BASE_URL ZODE_E2E_LIVE_PROVIDER_API_KEY
-unset ZODE_E2E_LIVE_PROVIDER_MODEL ZODE_E2E_LIVE_PROVIDER_ID
-unset ZODE_RELEASE_LIVE_PROVIDER_API_KEY ZODE_RELEASE_PROVIDER_API_KEY ZODE_RELEASE_SECRET_VALUES_JSON
-unset OPENCODE_GO_API_KEY OPENCODE_API_KEY DEEPSEEK_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY
-unset ANTHROPIC_API_KEY GOOGLE_API_KEY GEMINI_API_KEY MISTRAL_API_KEY
-unset TOGETHER_API_KEY XAI_API_KEY GROQ_API_KEY COHERE_API_KEY
+# shellcheck source=scripts/ci/scrub-live-provider-env.sh
+source "$ROOT/scripts/ci/scrub-live-provider-env.sh"
 
 PRODUCT_FILES=()
 while IFS= read -r file; do
@@ -49,25 +44,29 @@ while IFS= read -r file; do
 done < <(find "$ROOT/web/e2e/specs" -type f \( -name '*.spec.cjs' -o -name '*.spec.ts' \) -print | sort)
 (( ${#PRODUCT_FILES[@]} > 0 )) || die 'no approved product Playwright specs were found'
 
-PRODUCT_LIST="$ROOT/target/ci/approved-product-playwright-list.txt"
-PRODUCT_REPORT="$ROOT/target/ci/approved-product-playwright-results.json"
-PRODUCT_PROGRESS="$ROOT/target/ci/approved-product-playwright-progress.log"
-mkdir -p "$(dirname "$PRODUCT_LIST")"
-
 printf '%s\n' '== approved product collection (all specs, no silent subset) =='
-set +e
-(
-  cd "$ROOT/web/e2e"
-  "$PLAYWRIGHT" test --config="$ROOT/web/e2e/playwright.config.cjs" \
-    --project=chromium "${PRODUCT_FILES[@]}" --list --reporter=line
-) >"$PRODUCT_LIST"
-list_status=$?
-set -e
-if ((list_status != 0)); then
-  die "Playwright product collection exited with $list_status"
+"$ROOT/scripts/ci/collect-approved-product.sh"
+
+RUN_FILES=("${PRODUCT_FILES[@]}")
+REPORT_SUFFIX=
+if [[ -n ${ZODE_CI_PRODUCT_SPEC:-} ]]; then
+  approved=false
+  for file in "${PRODUCT_FILES[@]}"; do
+    if [[ $file == "$ZODE_CI_PRODUCT_SPEC" ]]; then
+      approved=true
+      break
+    fi
+  done
+  [[ $approved == true ]] || die "selected product spec is not approved: $ZODE_CI_PRODUCT_SPEC"
+  RUN_FILES=("$ZODE_CI_PRODUCT_SPEC")
+  shard_id=${ZODE_CI_PRODUCT_SHARD_ID:-$(basename "$ZODE_CI_PRODUCT_SPEC")}
+  [[ $shard_id =~ ^[A-Za-z0-9._-]+$ ]] || die 'product shard id contains unsafe characters'
+  REPORT_SUFFIX="-$shard_id"
 fi
-node "$ROOT/scripts/ci/assert-product-playwright-list.cjs" \
-  "$PRODUCT_LIST" "$ROOT/web/e2e/specs" "$ROOT/scripts/ci/approved-product-playwright-manifest.json"
+
+PRODUCT_REPORT="$ROOT/target/ci/approved-product-playwright${REPORT_SUFFIX}-results.json"
+PRODUCT_PROGRESS="$ROOT/target/ci/approved-product-playwright${REPORT_SUFFIX}-progress.log"
+mkdir -p "$(dirname "$PRODUCT_REPORT")"
 
 printf '%s\n' '== approved product real-browser/process E2E =='
 : >"$PRODUCT_REPORT"
@@ -77,7 +76,7 @@ set +e
   cd "$ROOT/web/e2e"
   PLAYWRIGHT_JSON_OUTPUT_FILE="$PRODUCT_REPORT" "$PLAYWRIGHT" test \
     --config="$ROOT/web/e2e/playwright.config.cjs" \
-    --project=chromium "${PRODUCT_FILES[@]}" --reporter=line,json
+    --project=chromium "${RUN_FILES[@]}" --reporter=line,json
 ) >"$PRODUCT_PROGRESS" 2>&1
 playwright_status=$?
 set -e
@@ -86,7 +85,8 @@ set -e
 # every skipped or unrun selected test so platform/readiness gaps cannot become
 # a green product signal.
 set +e
-node "$ROOT/scripts/ci/assert-playwright-results.cjs" "$PRODUCT_REPORT"
+node "$ROOT/scripts/ci/assert-playwright-results.cjs" \
+  "$PRODUCT_REPORT" "$ROOT/scripts/ci/approved-product-playwright-manifest.json" "${RUN_FILES[@]}"
 audit_status=$?
 set -e
 if ((playwright_status != 0)); then
