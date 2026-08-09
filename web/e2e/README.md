@@ -66,8 +66,11 @@ the repository-local version in `package.json` and `pnpm-lock.yaml`; the
 package scripts call the project-local `playwright` binary and `vp run` supplies
 the package bin directory. This keeps the runner and its bundled Chromium at
 the same locked version. Set `ZODE_ENDPOINT_BIN` or
-`ZODE_SERVER_BIN` to use other already-built real binaries. The default paths
-are
+`ZODE_SERVER_BIN` to use other already-built real binaries, and set
+`ZODE_UI_ASSETS_DIRECTORY` to serve an already-built UI tree. Pointing all
+three at one channel-installed immutable release runs the browser scenarios
+against that artifact rather than source-tree product outputs. The default
+paths are
 `target/debug/zode` and `server/target/debug/zode-server`.
 
 The `web` workspace registers `e2e` as this package, so `vp run` resolves the

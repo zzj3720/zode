@@ -137,6 +137,15 @@ async function listen(server: Server, port: number): Promise<void> {
   });
 }
 
+async function makeCopiedDirectoryTreeRemovable(root: string): Promise<void> {
+  await chmod(root, 0o700);
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      await makeCopiedDirectoryTreeRemovable(join(root, entry.name));
+    }
+  }
+}
+
 async function freePort(): Promise<number> {
   const probe = createTcpServer();
   await new Promise<void>((resolvePromise, reject) => {
@@ -1328,11 +1337,14 @@ class Topology {
     await mkdir(join(endpointRoot, "blobs"), { recursive: true });
     await mkdir(join(serverRoot, "secrets"), { recursive: true });
     const uiAssetsDirectory = join(serverRoot, "ui");
-    await cp(join(REPO_ROOT, "web", "dist"), uiAssetsDirectory, {
+    const sourceUiAssetsDirectory = process.env.ZODE_UI_ASSETS_DIRECTORY
+      ?? join(REPO_ROOT, "web", "dist");
+    await cp(sourceUiAssetsDirectory, uiAssetsDirectory, {
       recursive: true,
       force: false,
       errorOnExist: true,
     });
+    await makeCopiedDirectoryTreeRemovable(uiAssetsDirectory);
     const endpointSecret = `synthetic-controller-${randomUUID()}`;
     const providerSecret = `synthetic-provider-${randomUUID()}`;
     provider.setExpectedProviderAuthorization(`Bearer ${providerSecret}`);
