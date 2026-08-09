@@ -1,6 +1,6 @@
 # Approved common-user E2E matrix
 
-Status: approved Zode behavior map, current protected main `6bb8b14fedf8b5dae866b149cd4f67d6027b28b2`.
+Status: approved Zode behavior map, current protected main `bdf024932928b73290d2c9a5d1a612ec46002b11`.
 
 This document turns the approved outside-repository adoption baseline into
 Zode-owned black-box anchors. It is a traceability document, not a claim that
