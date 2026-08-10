@@ -445,11 +445,12 @@ change; changed-body key reuse conflicts. A new-key semantic no-op records and
 returns the current projection without advancing a revision or dispatching
 replica work.
 
-When the explicit Endpoint set changes, one transaction appends the sharing
-revision, advances the profile sequence above every credential, reserved
-refresh revision, install, and tombstone revision, appends installs at that
-revision for every Endpoint still authorized, appends tombstones at the same
-revision for every removed Endpoint, and stores the original response receipt.
+When the sharing mode or explicit Endpoint set changes, one transaction
+appends the sharing revision, advances the profile sequence above every
+credential, reserved refresh revision, install, and tombstone revision,
+appends installs at that revision for every Endpoint still authorized, appends
+tombstones at the same revision for every removed Endpoint, and stores the
+original response receipt.
 The installs re-publish the same Server-authoritative credential at the new
 revision so re-sharing can never send an older credential across a newer
 tombstone. External delivery happens only after this commit and may leave the
