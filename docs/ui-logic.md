@@ -46,7 +46,10 @@ ZodeApplication
 │               └── toolCalls: ReadonlySignal<readonly ToolCall[]>
 └── providers: ReadonlySignal<readonly Provider[]>
     └── Provider
-        └── profiles: ReadonlySignal<readonly AuthProfile[]>
+        ├── profiles: ReadonlySignal<readonly AuthProfile[]>
+        │   └── AuthProfile
+        │       └── refreshOperation: ReadonlySignal<AuthRefreshOperation | null>
+        └── authAttempts: ReadonlySignal<readonly OAuthAttempt[]>
 ```
 
 Identity-bearing resources have one canonical instance:
@@ -56,6 +59,9 @@ Identity-bearing resources have one canonical instance:
   `Endpoint`; a session ID alone is never a lookup key.
 - `Provider` is keyed by provider identity.
 - `AuthProfile` is keyed by Server profile identity and owned by its Provider.
+- `OAuthAttempt` is keyed by Server attempt identity and owned by its Provider.
+- `AuthRefreshOperation` is keyed by Server operation identity and owned by its
+  AuthProfile.
 - `ToolCall` is keyed by the original `tool_call_id` and owned by its Session.
 
 List refresh and newer snapshots reconcile those instances in place. A DTO
@@ -87,10 +93,53 @@ actuation.
 ### `Provider` and `AuthProfile`
 
 `Provider` owns one provider descriptor, model catalog, default selection,
-availability, and canonical AuthProfile registry. `AuthProfile` owns profile
-readiness, revision, sharing, expiry, distribution state, and safe profile
-operations. Secret input is a one-way workflow value and is cleared after
-submission; it is never a durable or public signal.
+availability, canonical AuthProfile registry, and canonical in-progress OAuth
+attempt registry. It exposes only the authentication methods and recovery
+capabilities reported by Server; browser logic never infers an OAuth capability
+from provider name, model kind, UI placement, or test configuration.
+
+`AuthProfile` owns profile readiness, revision, sharing, expiry, distribution
+state, and safe profile operations. It also owns the currently observed
+`AuthRefreshOperation` and the semantic relogin entry for that same profile.
+Successful relogin reconciles the existing canonical AuthProfile instance at a
+new revision; it does not create a second browser identity or silently select a
+replacement profile.
+
+Secret input is a one-way workflow value and is cleared after submission; it
+is never a durable or public signal.
+
+### `OAuthAttempt` and `AuthRefreshOperation`
+
+OAuth attempts and refresh operations are Server-owned resources represented by
+stable browser classes outside the visual lifecycle. Their classes own request
+admission, current safe projection, operation-local event/reconciliation
+lifecycle, terminal-state convergence, stable idempotency, and semantic answer,
+cancel, refresh, and relogin operations. Components neither poll these resources
+nor construct or dispose their streams.
+
+An `OAuthAttempt` belongs to one Provider and may target either a new profile or
+an explicit existing AuthProfile replacement. It exposes safe attempt state,
+prompt metadata, allowed actions, and terminal result as read-only signals. On
+success, Provider reconciles the resulting AuthProfile into its canonical
+registry; failed and cancelled attempts never fabricate a profile.
+
+An authorize ticket is a one-use navigation capability, not observable product
+state. It exists only inside the explicit semantic authorization operation,
+passes directly to a browser-navigation port using full-page `replace`, and is
+never exposed through a signal, component property, DOM value, browser storage,
+history state, log, or cache. Minting a replacement ticket after expiry or
+consumption is another explicit operation on the same active OAuthAttempt.
+
+`AuthRefreshOperation` remains associated with its owning AuthProfile across
+route changes, Server reconnect, and visual rerenders. A response-loss state is
+reconciled from the same Server operation identity. `refresh_unknown` keeps the
+profile fenced until successful same-profile relogin; the browser does not
+blindly retry refresh, invent success, or bypass the fence with another profile.
+
+OAuth-attempt and auth-refresh event streams are resource-local Server control
+streams. They are independent of the Endpoint-wide runtime SSE and never create
+a Session stream, Endpoint cursor, Server session mirror, or second runtime
+event authority.
 
 ### `Endpoint`
 
@@ -144,10 +193,12 @@ The canonical route is
 
 State that exists before a durable resource belongs to a domain-named workflow
 class, not a component hook. New-session, Endpoint registration,
-provider/profile creation, and execution recovery workflows own validation,
-frozen request data, mutation status, stable idempotency key, retry eligibility,
-and safe error state. UI-local state is limited to presentation with no product
-meaning, such as hover or animation progress.
+provider/profile creation, OAuth-attempt creation, and execution recovery
+workflows own validation, frozen request data, mutation status, stable
+idempotency key, retry eligibility, and safe error state. Once Server admits an
+OAuth attempt or refresh operation, its canonical identity-bearing class owns
+the continuing lifecycle. UI-local state is limited to presentation with no
+product meaning, such as hover or animation progress.
 
 ## 4. Signal contract
 
@@ -183,6 +234,10 @@ owning `session_id`. The Endpoint class applies these rules:
 6. On reconnect, send the one Endpoint cursor as `Last-Event-ID`.
 7. After lag, disconnect, or an event for an unknown Session, reconcile bounded
    HTTP projections without implementing a second runtime reducer.
+8. After a successful stream reopen, reconcile the Endpoint's session
+   projection before restoring command availability. A recovered connection
+   cannot leave new-session commands permanently disabled by an earlier
+   unreachable projection.
 
 The v0 cursor is in-memory browser state. A full application reload may open
 without `Last-Event-ID` and consume the subject-filtered replay from the
@@ -249,6 +304,11 @@ Named real-browser/real-process acceptance includes:
 - `e2e_browser_provider_endpoint_and_settings_models_follow_server_authority_without_shadow_state`:
   provider, Endpoint, profile, and settings changes reconcile without stale
   client defaults or a local shadow database.
+- `e2e_browser_write_only_secrets_and_oauth_ticket_non_disclosure`: OAuth
+  attempt, prompt, explicit authorize navigation, cancel, success, refresh,
+  response loss, refresh fence, and same-profile relogin remain Server-owned
+  workflows outside visual lifecycle; tickets and credential values never
+  become observable browser state.
 
 Existing ordinary-chat, same-session recovery, tool/wait/cancel,
 unknown-outcome, Access, restart, accessibility, and secret-nondisclosure E2Es
