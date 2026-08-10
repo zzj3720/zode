@@ -62,6 +62,28 @@ const REPLICA_RECOVERY_PATH: &str = "/v1/auth-replicas/control-profile";
 const REPLICA_RECOVERY_WHOLE_DIGEST: &str =
     "sha256:99c856fa040e320cf97850e5a45d5af9670ed8c0c6a5be91f35b6aebecd63a13";
 
+async fn first_sse_session_id(mut response: Response) -> TestResult<String> {
+    let mut buffer = Vec::new();
+    loop {
+        let chunk = timeout(Duration::from_secs(5), response.chunk())
+            .await??
+            .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "Endpoint SSE ended early"))?;
+        buffer.extend_from_slice(&chunk);
+        while let Some(frame_end) = buffer.windows(2).position(|window| window == b"\n\n") {
+            let frame = buffer.drain(..frame_end + 2).collect::<Vec<_>>();
+            let text = std::str::from_utf8(&frame)?;
+            let Some(data) = text.lines().find_map(|line| line.strip_prefix("data: ")) else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(data)?;
+            return value["session_id"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| Error::other("Endpoint SSE event omitted session_id").into());
+        }
+    }
+}
+
 fn config_for(database: &TempDatabase) -> TestResult<PathBuf> {
     write_endpoint_config(database.path(), Vec::new(), 1)
 }
@@ -2081,23 +2103,18 @@ async fn e2e_subject_ownership_isolates_list_read_sse_and_messages() -> TestResu
     );
     assert!(!body.contains(&first_id));
 
-    let own_sse = authenticated_as(
-        client.get(server.url(&format!("/v1/sessions/{first_id}/events"))),
-        SUBJECT_A,
-    )
-    .send_with_timeout()
-    .await?;
-    assert_eq!(own_sse.status(), StatusCode::OK);
-    drop(own_sse);
-    let cross_sse = authenticated_as(
-        client.get(server.url(&format!("/v1/sessions/{second_id}/events"))),
-        SUBJECT_A,
-    )
-    .send_with_timeout()
-    .await?;
-    let cross_sse_status = cross_sse.status();
-    let cross_sse_body = response_text(cross_sse).await?;
-    assert_eq!(cross_sse_status, StatusCode::NOT_FOUND, "{cross_sse_body}");
+    for (subject, own_id, foreign_id) in [
+        (SUBJECT_A, first_id.as_str(), second_id.as_str()),
+        (SUBJECT_B, second_id.as_str(), first_id.as_str()),
+    ] {
+        let stream = authenticated_as(client.get(server.url("/v1/events")), subject)
+            .send_with_timeout()
+            .await?;
+        assert_eq!(stream.status(), StatusCode::OK);
+        let visible_id = first_sse_session_id(stream).await?;
+        assert_eq!(visible_id, own_id);
+        assert_ne!(visible_id, foreign_id);
+    }
 
     let (status, body) = post_message(
         &client,
@@ -2256,31 +2273,31 @@ async fn e2e_session_authority_ownership_isolates_list_read_message_and_sse() ->
         assert_eq!(status, StatusCode::NOT_FOUND, "{label}: {body}");
     }
 
-    for (label, secret, session_id) in [
+    for (label, secret, own_session, foreign_session) in [
         (
-            "authority A cross SSE",
+            "authority A Endpoint SSE",
             AUTHORITY_A_SECRET,
+            &authority_a_session,
             &authority_b_session,
         ),
         (
-            "authority B cross SSE",
+            "authority B Endpoint SSE",
             AUTHORITY_B_SECRET,
+            &authority_b_session,
             &authority_a_session,
         ),
     ] {
-        let response = authenticated_with_secret(
-            client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
-            secret,
-            SUBJECT_A,
-        )
-        .send_with_timeout()
-        .await?;
-        let status = response.status();
-        let body = response_text(response).await?;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{label}: {body}");
-        assert!(
-            !body.contains(session_id),
-            "{label} disclosed the foreign session"
+        let response =
+            authenticated_with_secret(client.get(server.url("/v1/events")), secret, SUBJECT_A)
+                .send_with_timeout()
+                .await?;
+        assert_eq!(response.status(), StatusCode::OK, "{label}");
+        let visible_id = first_sse_session_id(response).await?;
+        assert_eq!(visible_id, own_session.as_str(), "{label}");
+        assert_ne!(
+            visible_id,
+            foreign_session.as_str(),
+            "{label} disclosed foreign session"
         );
     }
 
@@ -4562,14 +4579,11 @@ async fn e2e_controller_auth_rotation_lost_response_fences_old_secret_and_surviv
     assert_eq!(read_response.status(), StatusCode::OK);
     let read_body = response_text(read_response).await?;
     assert_rotation_secret_free(&read_body, &rotation_markers);
-    let sse_response = authenticated_with_secret(
-        client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
-        new_secret,
-        subject,
-    )
-    .header("Last-Event-ID", "0")
-    .send_with_timeout()
-    .await?;
+    let sse_response =
+        authenticated_with_secret(client.get(server.url("/v1/events")), new_secret, subject)
+            .header("Last-Event-ID", "0")
+            .send_with_timeout()
+            .await?;
     assert_eq!(sse_response.status(), StatusCode::OK);
     drop(sse_response);
     let message_response = authenticated_with_secret(
@@ -4759,7 +4773,7 @@ async fn e2e_controller_secret_is_absent_from_public_logs_sqlite_snapshots_and_b
         let create_body = response_text(create_response).await?;
         assert_rotation_secret_free(&create_body, &markers);
         assert_eq!(create_status, StatusCode::CREATED, "{create_body}");
-        let session_id = serde_json::from_str::<Value>(&create_body)?["session_id"]
+        let _session_id = serde_json::from_str::<Value>(&create_body)?["session_id"]
             .as_str()
             .ok_or_else(|| Error::other("secret nondisclosure create omitted session_id"))?
             .to_owned();
@@ -4804,7 +4818,7 @@ async fn e2e_controller_secret_is_absent_from_public_logs_sqlite_snapshots_and_b
         assert_rotation_secret_free(&new_identity_body, &markers);
 
         let mut events = authenticated_with_secret(
-            client.get(endpoint.url(&format!("/v1/sessions/{session_id}/events"))),
+            client.get(endpoint.url("/v1/events")),
             new_secret,
             SUBJECT_A,
         )

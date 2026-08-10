@@ -849,7 +849,7 @@ fn validate_mutation(
         ReplicaMutation::Install(request) => {
             if request.schema != INSTALL_SCHEMA
                 || request.authority_id != authority_id
-                || request.kind != "api_key"
+                || !matches!(request.kind.as_str(), "api_key" | "oauth")
                 || !supported_credential_schema(&request.credential_schema)
                 || request.secret.encoding != SECRET_ENCODING
                 || request.secret.payload.is_empty()
@@ -960,7 +960,10 @@ fn validate_record(
     }
     match record.status.as_str() {
         "ready"
-            if record.kind.as_deref() == Some("api_key")
+            if record
+                .kind
+                .as_deref()
+                .is_some_and(|kind| matches!(kind, "api_key" | "oauth"))
                 && record
                     .credential_schema
                     .as_deref()

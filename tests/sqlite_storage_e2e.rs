@@ -537,11 +537,9 @@ async fn e2e_sqlite_restart_rebuilds_derived_indexes_and_allows_harmless_extra_i
     assert_eq!(body["version"], 2);
     assert_eq!(body["transcript"][0]["content"], "historical message");
 
-    let response = authenticated(
-        client.get(extra_index_server.url(&format!("/v1/sessions/{session_id}/events"))),
-    )
-    .send_with_timeout()
-    .await?;
+    let response = authenticated(client.get(extra_index_server.url("/v1/events")))
+        .send_with_timeout()
+        .await?;
     assert_eq!(response.status(), StatusCode::OK);
     let events = read_sse_events(response, 2).await?;
     let _ = assert_two_ordered_session_events(&events, &session_id)?;

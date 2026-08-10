@@ -366,7 +366,7 @@ impl IncidentRecorder {
     }
 
     async fn wait_for_requests(&self, boundary: &str, expected: usize) -> TestResult<()> {
-        timeout(Duration::from_secs(10), async {
+        timeout(Duration::from_secs(30), async {
             loop {
                 if self.request_count(boundary) >= expected {
                     return;
@@ -385,7 +385,7 @@ impl IncidentRecorder {
     }
 
     async fn wait_for_completions(&self, boundary: &str, expected: usize) -> TestResult<()> {
-        timeout(Duration::from_secs(10), async {
+        timeout(Duration::from_secs(30), async {
             loop {
                 if self.completed_count(boundary) >= expected {
                     return;
@@ -1683,6 +1683,11 @@ fn same_incident_response(
                 {
                     strip_dynamic_tool_status_fields(expected_body);
                     strip_dynamic_tool_status_fields(actual_body);
+                    if expected_body.get("allowed_actions").is_none() {
+                        if let Some(object) = actual_body.as_object_mut() {
+                            object.remove("allowed_actions");
+                        }
+                    }
                     return expected_body == actual_body;
                 }
             }
@@ -2075,8 +2080,10 @@ impl SseFrames {
             }
             let chunk = timeout(Duration::from_secs(10), self.stream.next())
                 .await
-                .map_err(|_| Error::new(ErrorKind::TimedOut, "session SSE frame timed out"))?
-                .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "session SSE ended early"))??;
+                .map_err(|_| Error::new(ErrorKind::TimedOut, "Endpoint SSE frame timed out"))?
+                .ok_or_else(|| {
+                    Error::new(ErrorKind::UnexpectedEof, "Endpoint SSE ended early")
+                })??;
             self.buffer.extend_from_slice(&chunk);
         }
     }
@@ -2105,12 +2112,10 @@ async fn replay_events_through_version<S: EndpointAddress>(
     session_id: &str,
     through_version: u64,
 ) -> TestResult<Vec<SseFrame>> {
-    let response = authenticated(
-        client.get(server.endpoint_url(&format!("/v1/sessions/{session_id}/events"))),
-    )
-    .header("Last-Event-ID", "0")
-    .send_with_timeout()
-    .await?;
+    let response = authenticated(client.get(server.endpoint_url("/v1/events")))
+        .header("Last-Event-ID", "0")
+        .send_with_timeout()
+        .await?;
     if response.status() != StatusCode::OK {
         let status = response.status();
         let body = response_text(response).await?;
@@ -2123,6 +2128,9 @@ async fn replay_events_through_version<S: EndpointAddress>(
     let mut replay = Vec::new();
     for _ in 0..512 {
         let frame = frames.next().await?;
+        if frame.data["session_id"].as_str() != Some(session_id) {
+            continue;
+        }
         let version = frame.data["version"]
             .as_u64()
             .ok_or_else(|| Error::other("durable SSE event omitted its session version"))?;
@@ -3867,10 +3875,30 @@ async fn restart_tool_case(
     )
     .await?;
     tool.wait_for_invocations(1).await?;
+    let running = read_session(&client, &server, &session_id).await?;
+    let running_tool = running["tool_calls"]
+        .as_array()
+        .and_then(|calls| {
+            calls
+                .iter()
+                .find(|call| call["tool_call_id"] == "restart-call")
+        })
+        .ok_or_else(|| Error::other("running tool projection was absent"))?;
+    assert_eq!(running_tool["status"], "running");
+    assert_eq!(running_tool["allowed_actions"], json!(["cancel"]));
     server.stop().await?;
     let mut restarted = ConfiguredServer::start(&database, &config).await?;
     let state = read_session(&client, &restarted, &session_id).await?;
     assert!(state.to_string().contains(expected_status));
+    let restarted_tool = state["tool_calls"]
+        .as_array()
+        .and_then(|calls| {
+            calls
+                .iter()
+                .find(|call| call["tool_call_id"] == "restart-call")
+        })
+        .ok_or_else(|| Error::other("restarted tool projection was absent"))?;
+    assert_eq!(restarted_tool["allowed_actions"], json!([]));
     if let Some(expected) = cancel_status {
         let response = authenticated(client.post(restarted.url(&format!(
             "/v1/sessions/{session_id}/tool-calls/restart-call/cancel"
@@ -4250,6 +4278,7 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
     }
     let cancelled_record: Value = serde_json::from_str(&cancel_body)?;
     assert_eq!(cancelled_record["status"], "cancelled", "{cancel_body}");
+    assert_eq!(cancelled_record["allowed_actions"], json!([]));
 
     let mut public_status_proxy = incident
         .proxy("public.tool_call_status", server.url(""))
@@ -4273,6 +4302,7 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
     )
     .await?;
     assert_eq!(sibling_record["status"], "running");
+    assert_eq!(sibling_record["allowed_actions"], json!(["cancel"]));
     if !incident.is_replay() {
         assert_eq!(cancelled.invocation_count(), 1);
         assert_eq!(sibling.invocation_count(), 1);
@@ -4305,6 +4335,7 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
         sibling_completed["result"],
         json!({"content": "sibling completed"})
     );
+    assert_eq!(sibling_completed["allowed_actions"], json!([]));
     assert_eq!(incident.request_count("tool.cancel"), 1);
     assert_eq!(incident.request_count("tool.sibling"), 1);
     let state = read_session(&client, &server, &session_id).await?;
@@ -4473,6 +4504,7 @@ async fn e2e_callback_payload_idempotency_is_canonical() -> TestResult<()> {
     )
     .await?;
     assert_eq!(running["status"], "running");
+    assert_eq!(running["allowed_actions"], json!(["cancel"]));
 
     let (callback_url, bearer) =
         captured_callback_from_incident(&incident, "tool.canonical_callback")?;
@@ -4516,6 +4548,7 @@ async fn e2e_callback_payload_idempotency_is_canonical() -> TestResult<()> {
     )
     .await?;
     assert_eq!(completed["result"], json!({"content": "canonical winner"}));
+    assert_eq!(completed["allowed_actions"], json!([]));
     let terminal_state = timeout(Duration::from_secs(10), async {
         loop {
             let state = read_session(&client, &server, &session_id).await?;

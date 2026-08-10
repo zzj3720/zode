@@ -729,14 +729,11 @@ async fn open_roundtrip_events(
     client: &Client,
     server: &TestZode,
     spec: &ProviderRoundtripSpec,
-    session_id: &str,
+    _session_id: &str,
 ) -> TestResult<ProviderRoundtripSse> {
-    let response = authenticated_as(
-        client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
-        &spec.subject,
-    )
-    .send_with_timeout()
-    .await?;
+    let response = authenticated_as(client.get(server.url("/v1/events")), &spec.subject)
+        .send_with_timeout()
+        .await?;
     ensure_roundtrip_headers_secret_free(&response, &spec.forbidden)?;
     if response.status() != StatusCode::OK {
         let status = response.status();
@@ -760,7 +757,10 @@ async fn wait_for_roundtrip_assistant(
         if frame.0 == "assistant_message_committed"
             || frame.1["kind"] == "assistant_message_committed"
         {
-            if frame.1["session_id"] != session_id || !frame.1.to_string().contains(marker) {
+            if frame.1["session_id"] != session_id {
+                continue;
+            }
+            if !frame.1.to_string().contains(marker) {
                 return Err(IoError::other("provider assistant event was invalid").into());
             }
             return Ok(());
@@ -4065,8 +4065,21 @@ fn model_stream(chunks: Vec<bytes::Bytes>) -> AxumResponse {
 }
 
 fn model_large_stream(bytes: usize) -> AxumResponse {
-    let body = bytes::Bytes::from(vec![b'x'; bytes]);
-    model_stream(vec![body])
+    const CHUNK_BYTES: usize = 1024;
+    let mut remaining = bytes;
+    let mut chunks = Vec::new();
+    while remaining > 0 {
+        let length = remaining.min(CHUNK_BYTES);
+        let mut frame = vec![b'x'; length];
+        if length >= 3 {
+            frame[0] = b':';
+            frame[length - 2] = b'\n';
+            frame[length - 1] = b'\n';
+        }
+        chunks.push(bytes::Bytes::from(frame));
+        remaining -= length;
+    }
+    model_stream(chunks)
 }
 
 fn model_stream_with_failure(chunks: Vec<bytes::Bytes>) -> AxumResponse {

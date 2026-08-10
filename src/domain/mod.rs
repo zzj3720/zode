@@ -569,6 +569,8 @@ pub struct AsyncToolCallRecord {
     #[serde(default)]
     pub completion_mode: CompletionMode,
     #[serde(default)]
+    pub retry_dispatch_deduplicated: bool,
+    #[serde(default)]
     pub progress: Option<DurablePayload>,
     #[serde(default)]
     pub result: Option<DurablePayload>,
@@ -2282,9 +2284,13 @@ impl SessionState {
                 match record.status {
                     AsyncToolStatus::Planned => record.status = AsyncToolStatus::Running,
                     AsyncToolStatus::Running => return Ok(()),
+                    AsyncToolStatus::UnknownOutcome if record.retry_dispatch_deduplicated => {
+                        record.status = AsyncToolStatus::Running
+                    }
                     _ => {
                         return Err(DomainError::InvalidState(
-                            "only a planned tool call can become running".into(),
+                            "only a planned or safely reconcilable tool call can become running"
+                                .into(),
                         ))
                     }
                 }

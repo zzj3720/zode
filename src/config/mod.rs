@@ -746,9 +746,14 @@ fn validate_tools(
         if matches!(
             value.recovery.retry_dispatch,
             RetryDispatch::SameInvocationKeyDeduplicated
-        ) {
+        ) && !(matches!(value.completion_mode, CompletionMode::Response)
+            && matches!(
+                value.recovery.on_running_restart,
+                RunningRestart::UnknownOutcome
+            ))
+        {
             return Err(ConfigError::Invalid(
-                "HTTP tools cannot claim deduplicated retry dispatch",
+                "deduplicated retry dispatch requires response completion with unknown-outcome restart recovery",
             ));
         }
         if matches!(value.completion_mode, CompletionMode::Response)

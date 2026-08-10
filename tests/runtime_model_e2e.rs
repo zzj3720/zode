@@ -1105,11 +1105,10 @@ async fn open_events(
 async fn open_events_with_cursor(
     client: &Client,
     server: &ConfiguredServer,
-    session_id: &str,
+    _session_id: &str,
     last_event_id: Option<&str>,
 ) -> TestResult<SseFrames> {
-    let request =
-        authenticated(client.get(server.url(&format!("/v1/sessions/{session_id}/events"))));
+    let request = authenticated(client.get(server.url("/v1/events")));
     let request = if let Some(last_event_id) = last_event_id {
         request.header("Last-Event-ID", last_event_id)
     } else {
@@ -1918,7 +1917,7 @@ async fn e2e_credential_bearing_model_base_url_is_rejected_without_side_effects(
 
         let sse_response = authenticated(
             client
-                .get(server.url(&format!("/v1/sessions/{session_id}/events")))
+                .get(server.url("/v1/events"))
                 .header("Last-Event-ID", "0"),
         )
         .send_with_timeout()
@@ -2281,13 +2280,10 @@ async fn e2e_restart_reconciles_failed_attempt_after_prior_activation_exhaustion
         "field recovery reached the provider"
     );
     let client = support::http_client()?;
-    let response = authenticated_as(
-        client.get(server.url(&format!("/v1/sessions/{FIELD_RECOVERY_SESSION_ID}/events"))),
-        FIELD_RECOVERY_SUBJECT,
-    )
-    .header("Last-Event-ID", &cursor)
-    .send_with_timeout()
-    .await?;
+    let response = authenticated_as(client.get(server.url("/v1/events")), FIELD_RECOVERY_SUBJECT)
+        .header("Last-Event-ID", &cursor)
+        .send_with_timeout()
+        .await?;
     assert_response_headers_secret_free(&response, &[TEST_PROVIDER_SECRET]);
     assert_eq!(response.status(), StatusCode::OK);
     let mut events = SseFrames::new(response);

@@ -13,6 +13,90 @@ use support::{
     authenticated, authenticated_as, db_blocking, http_client, install_test_replica, require_ulid,
     response_json, response_text, write_endpoint_config, ConfiguredServer, HttpRequestExt,
 };
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_endpoint_event_stream_multiplexes_owned_sessions_and_reconnects_once(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let database_path = test_database("endpoint-wide-events")?;
+    let mut server = TestServer::start(&database_path).await?;
+    let client = http_client()?;
+    let subject = "endpoint-stream-owner";
+    let other_subject = "endpoint-stream-other-owner";
+
+    let (first_session, _) =
+        create_subject_session(&client, &server, subject, "endpoint-stream-first").await?;
+    let (_hidden_session, _) =
+        create_subject_session(&client, &server, other_subject, "endpoint-stream-hidden").await?;
+
+    let initial_stream = authenticated_as(client.get(server.url("/v1/events")), subject)
+        .header("Last-Event-ID", "0")
+        .send_with_timeout()
+        .await?;
+    assert_eq!(initial_stream.status(), StatusCode::OK);
+    assert!(initial_stream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream")));
+
+    let (second_session, _) =
+        create_subject_session(&client, &server, subject, "endpoint-stream-second").await?;
+    let initial_events = read_sse_events(initial_stream, 2).await?;
+    assert_eq!(initial_events[0].event, "session_created");
+    assert_eq!(initial_events[0].data["session_id"], first_session);
+    assert_eq!(initial_events[1].event, "session_created");
+    assert_eq!(initial_events[1].data["session_id"], second_session);
+    let first_id = initial_events[0].id.parse::<u64>()?;
+    let second_id = initial_events[1].id.parse::<u64>()?;
+    assert_eq!(
+        second_id,
+        first_id + 2,
+        "unowned event position was not filtered"
+    );
+
+    let replay = authenticated_as(client.get(server.url("/v1/events")), subject)
+        .header("Last-Event-ID", &initial_events[0].id)
+        .send_with_timeout()
+        .await?;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replayed = read_sse_events(replay, 1).await?;
+    assert_eq!(replayed, vec![initial_events[1].clone()]);
+
+    let resumed = authenticated_as(client.get(server.url("/v1/events")), subject)
+        .header("Last-Event-ID", &initial_events[1].id)
+        .send_with_timeout()
+        .await?;
+    assert_eq!(resumed.status(), StatusCode::OK);
+    let _ = create_subject_session(
+        &client,
+        &server,
+        other_subject,
+        "endpoint-stream-hidden-after-reconnect",
+    )
+    .await?;
+    let (third_session, _) =
+        create_subject_session(&client, &server, subject, "endpoint-stream-third").await?;
+    let resumed_events = read_sse_events(resumed, 1).await?;
+    assert_eq!(resumed_events[0].event, "session_created");
+    assert_eq!(resumed_events[0].data["session_id"], third_session);
+    assert_eq!(
+        resumed_events[0].id.parse::<u64>()?,
+        second_id + 2,
+        "reconnected Endpoint stream exposed or lost another subject's position"
+    );
+
+    let removed_session_stream = authenticated_as(
+        client.get(server.url(&format!("/v1/sessions/{first_session}/events"))),
+        subject,
+    )
+    .send_with_timeout()
+    .await?;
+    assert_eq!(removed_session_stream.status(), StatusCode::NOT_FOUND);
+
+    server.stop().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_create_message_sse_reconnect_get_restart(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -41,30 +125,27 @@ async fn e2e_create_message_sse_reconnect_get_restart(
     assert_eq!(message["accepted"], true);
     assert_eq!(message["version"], 2);
 
-    let response =
-        authenticated(client.get(server.url(&format!("/v1/sessions/{session_id}/events"))))
-            .send_with_timeout()
-            .await?;
+    let response = authenticated(client.get(server.url("/v1/events")))
+        .send_with_timeout()
+        .await?;
     assert_eq!(response.status(), StatusCode::OK);
     let events = read_sse_events(response, 2).await?;
     let (_first_id, second_id) = assert_two_ordered_session_events(&events, &session_id)?;
     assert_eq!(events[1].data["schema"], "zode.event.v1");
 
-    let response =
-        authenticated(client.get(server.url(&format!("/v1/sessions/{session_id}/events"))))
-            .header("Last-Event-ID", &events[0].id)
-            .send_with_timeout()
-            .await?;
+    let response = authenticated(client.get(server.url("/v1/events")))
+        .header("Last-Event-ID", &events[0].id)
+        .send_with_timeout()
+        .await?;
     assert_eq!(response.status(), StatusCode::OK);
     let replay = read_sse_events(response, 1).await?;
     assert_eq!(replay[0].id, events[1].id);
     assert_eq!(replay[0].event, "message_appended");
 
-    let sse_response =
-        authenticated(client.get(server.url(&format!("/v1/sessions/{session_id}/events"))))
-            .header("Last-Event-ID", &events[1].id)
-            .send_with_timeout()
-            .await?;
+    let sse_response = authenticated(client.get(server.url("/v1/events")))
+        .header("Last-Event-ID", &events[1].id)
+        .send_with_timeout()
+        .await?;
     assert_eq!(sse_response.status(), StatusCode::OK);
     let response =
         authenticated(client.post(server.url(&format!("/v1/sessions/{session_id}/messages"))))
@@ -255,13 +336,10 @@ async fn e2e_message_unknown_field_is_rejected_without_effect(
     let (session_id, _) =
         create_subject_session(&client, &server, subject, "unknown-field-create").await?;
 
-    let initial_response = authenticated_as(
-        client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
-        subject,
-    )
-    .header("Last-Event-ID", "0")
-    .send_with_timeout()
-    .await?;
+    let initial_response = authenticated_as(client.get(server.url("/v1/events")), subject)
+        .header("Last-Event-ID", "0")
+        .send_with_timeout()
+        .await?;
     assert_eq!(initial_response.status(), StatusCode::OK);
     let initial = read_sse_events(initial_response, 1).await?.remove(0);
     let before_response = authenticated_as(
@@ -312,13 +390,10 @@ async fn e2e_malformed_message_json_is_rejected_without_effect(
     let (session_id, _) =
         create_subject_session(&client, &server, subject, "malformed-message-create").await?;
 
-    let initial_response = authenticated_as(
-        client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
-        subject,
-    )
-    .header("Last-Event-ID", "0")
-    .send_with_timeout()
-    .await?;
+    let initial_response = authenticated_as(client.get(server.url("/v1/events")), subject)
+        .header("Last-Event-ID", "0")
+        .send_with_timeout()
+        .await?;
     assert_eq!(initial_response.status(), StatusCode::OK);
     let initial = read_sse_events(initial_response, 1).await?.remove(0);
     let before_response = authenticated_as(
@@ -459,13 +534,10 @@ async fn e2e_message_replay_only_replays_receipt_without_new_event(
         "idempotency_receipt_not_found"
     );
 
-    let events = authenticated_as(
-        client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
-        subject,
-    )
-    .header("Last-Event-ID", "0")
-    .send_with_timeout()
-    .await?;
+    let events = authenticated_as(client.get(server.url("/v1/events")), subject)
+        .header("Last-Event-ID", "0")
+        .send_with_timeout()
+        .await?;
     assert_eq!(events.status(), StatusCode::OK);
     let records = read_sse_events(events, 2).await?;
     assert_eq!(records[0].event, "session_created");
@@ -517,7 +589,7 @@ async fn e2e_create_receipt_lookup_precedes_current_admission(
 
     let events = authenticated(
         client
-            .get(server.url(&format!("/v1/sessions/{session_id}/events")))
+            .get(server.url("/v1/events"))
             .header("Last-Event-ID", "0"),
     )
     .send_with_timeout()
@@ -610,7 +682,7 @@ async fn e2e_create_receipt_projection_rebuilds_from_verified_creation_event(
 
     let events = authenticated(
         client
-            .get(server.url(&format!("/v1/sessions/{session_id}/events")))
+            .get(server.url("/v1/events"))
             .header("Last-Event-ID", "0"),
     )
     .send_with_timeout()
@@ -666,7 +738,7 @@ async fn e2e_create_receipt_projection_rebuilds_from_verified_creation_event(
 
     let replay_events = authenticated(
         client
-            .get(restarted.url(&format!("/v1/sessions/{session_id}/events")))
+            .get(restarted.url("/v1/events"))
             .header("Last-Event-ID", "0"),
     )
     .send_with_timeout()
@@ -696,16 +768,15 @@ async fn e2e_conflicting_create_receipt_projection_fails_closed(
     let first_session = require_ulid(&first_body)?.to_owned();
     let first_events = authenticated(
         client
-            .get(server.url(&format!("/v1/sessions/{first_session}/events")))
+            .get(server.url("/v1/events"))
             .header("Last-Event-ID", "0"),
     )
     .send_with_timeout()
     .await?;
     assert_eq!(first_events.status(), StatusCode::OK);
-    assert_eq!(
-        read_sse_events(first_events, 1).await?[0].event,
-        "session_created"
-    );
+    let first_event = read_sse_events(first_events, 1).await?.remove(0);
+    assert_eq!(first_event.event, "session_created");
+    assert_eq!(first_event.data["session_id"], first_session);
 
     let second = authenticated(client.post(server.url("/v1/sessions")))
         .header("Idempotency-Key", "conflicting-receipt-second")
@@ -717,16 +788,15 @@ async fn e2e_conflicting_create_receipt_projection_fails_closed(
     let second_session = require_ulid(&second_body)?.to_owned();
     let second_events = authenticated(
         client
-            .get(server.url(&format!("/v1/sessions/{second_session}/events")))
-            .header("Last-Event-ID", "0"),
+            .get(server.url("/v1/events"))
+            .header("Last-Event-ID", &first_event.id),
     )
     .send_with_timeout()
     .await?;
     assert_eq!(second_events.status(), StatusCode::OK);
-    assert_eq!(
-        read_sse_events(second_events, 1).await?[0].event,
-        "session_created"
-    );
+    let second_event = read_sse_events(second_events, 1).await?.remove(0);
+    assert_eq!(second_event.event, "session_created");
+    assert_eq!(second_event.data["session_id"], second_session);
 
     server.stop().await?;
     let database_file = database.path().to_owned();
@@ -839,7 +909,7 @@ async fn e2e_ownerless_session_history_fails_closed(
     let session_id = require_ulid(&body)?.to_owned();
     let events = authenticated(
         client
-            .get(server.url(&format!("/v1/sessions/{session_id}/events")))
+            .get(server.url("/v1/events"))
             .header("Last-Event-ID", "0"),
     )
     .send_with_timeout()
@@ -1106,13 +1176,10 @@ async fn e2e_sse_concurrent_commits_are_replayed_in_durable_order(
     let (session_id, _) =
         create_subject_session(&client, &server, subject, "sse-commit-order-create").await?;
 
-    let stream = authenticated_as(
-        client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
-        subject,
-    )
-    .header("Last-Event-ID", "0")
-    .send_with_timeout()
-    .await?;
+    let stream = authenticated_as(client.get(server.url("/v1/events")), subject)
+        .header("Last-Event-ID", "0")
+        .send_with_timeout()
+        .await?;
     assert_eq!(stream.status(), StatusCode::OK);
 
     const MESSAGE_COUNT: usize = 12;
@@ -1173,16 +1240,13 @@ async fn e2e_invalid_last_event_id_is_malformed_request(
     let mut server = TestServer::start(&database_path).await?;
     let client = http_client()?;
     let subject = "invalid-cursor-subject";
-    let (session_id, _) =
+    let (_session_id, _) =
         create_subject_session(&client, &server, subject, "invalid-cursor-create").await?;
 
-    let response = authenticated_as(
-        client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
-        subject,
-    )
-    .header("Last-Event-ID", "nope")
-    .send_with_timeout()
-    .await?;
+    let response = authenticated_as(client.get(server.url("/v1/events")), subject)
+        .header("Last-Event-ID", "nope")
+        .send_with_timeout()
+        .await?;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = response_json(response).await?;
     assert_eq!(body["error"]["code"], "malformed_request");
@@ -1283,13 +1347,10 @@ async fn e2e_session_list_reflects_current_model_selection_after_update(
         .as_str()
         .ok_or_else(|| Error::new(ErrorKind::InvalidData, "model create omitted session_id"))?;
 
-    let sse_response = authenticated_as(
-        client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
-        subject,
-    )
-    .header("Last-Event-ID", "1")
-    .send_with_timeout()
-    .await?;
+    let sse_response = authenticated_as(client.get(server.url("/v1/events")), subject)
+        .header("Last-Event-ID", "1")
+        .send_with_timeout()
+        .await?;
     assert_eq!(sse_response.status(), StatusCode::OK);
 
     let updated_model = json!({
@@ -1382,7 +1443,7 @@ async fn e2e_concurrent_create_receipt_and_event_are_atomic(
 
     let sse_response = authenticated(
         client
-            .get(server.url(&format!("/v1/sessions/{session_id}/events")))
+            .get(server.url("/v1/events"))
             .header("Last-Event-ID", "0"),
     )
     .send_with_timeout()
@@ -1453,11 +1514,7 @@ async fn e2e_session_ownership_safe_not_found_and_ordered_sse(
         (subject_a, session_b.as_str()),
         (subject_b, session_a.as_str()),
     ] {
-        for resource in [
-            OwnershipResource::Read,
-            OwnershipResource::Message,
-            OwnershipResource::Events,
-        ] {
+        for resource in [OwnershipResource::Read, OwnershipResource::Message] {
             assert_subject_safe_not_found(
                 &client, &server, subject, cross_id, missing, resource, &markers,
             )
@@ -1465,12 +1522,9 @@ async fn e2e_session_ownership_safe_not_found_and_ordered_sse(
         }
     }
 
-    let own_sse = authenticated_as(
-        client.get(server.url(&format!("/v1/sessions/{session_a}/events"))),
-        subject_a,
-    )
-    .send_with_timeout()
-    .await?;
+    let own_sse = authenticated_as(client.get(server.url("/v1/events")), subject_a)
+        .send_with_timeout()
+        .await?;
     assert_eq!(own_sse.status(), StatusCode::OK);
 
     let own_message = authenticated_as(

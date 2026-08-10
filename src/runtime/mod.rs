@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::{
@@ -194,11 +194,111 @@ pub enum RuntimeStreamEvent {
     Transient(TransientModelEvent),
 }
 
+#[derive(Clone, Debug)]
+pub struct RuntimeStreamMessage {
+    pub sequence: u64,
+    pub event: RuntimeStreamEvent,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeStreamFence {
+    pub sequence: u64,
+    pub durable_position: u64,
+    pub retry_barriers: BTreeMap<String, u64>,
+}
+
+pub struct RuntimeStreamSubscription {
+    pub receiver: broadcast::Receiver<RuntimeStreamMessage>,
+    pub fence: RuntimeStreamFence,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeStreamPublisherState {
+    sequence: u64,
+    durable_position: u64,
+    retry_barriers: BTreeMap<String, u64>,
+}
+
+/// Orders every live runtime publication and creates a replay/live fence while
+/// publication is paused. Durable storage remains authoritative; the internal
+/// sequence exists only to discard messages already covered by one replay
+/// fence without reordering later transient progress.
+#[derive(Debug)]
+pub struct RuntimeStreamPublisher {
+    sender: broadcast::Sender<RuntimeStreamMessage>,
+    state: Mutex<RuntimeStreamPublisherState>,
+}
+
+impl RuntimeStreamPublisher {
+    fn new(capacity: usize) -> Arc<Self> {
+        let (sender, _) = broadcast::channel(capacity);
+        Arc::new(Self {
+            sender,
+            state: Mutex::new(RuntimeStreamPublisherState::default()),
+        })
+    }
+
+    pub fn subscribe_with_fence<E>(
+        &self,
+        read_durable_head: impl FnOnce() -> Result<u64, E>,
+    ) -> Result<RuntimeStreamSubscription, E> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let receiver = self.sender.subscribe();
+        state.durable_position = state.durable_position.max(read_durable_head()?);
+        Ok(RuntimeStreamSubscription {
+            receiver,
+            fence: RuntimeStreamFence {
+                sequence: state.sequence,
+                durable_position: state.durable_position,
+                retry_barriers: state.retry_barriers.clone(),
+            },
+        })
+    }
+
+    fn publish(&self, event: RuntimeStreamEvent) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.sequence = state
+            .sequence
+            .checked_add(1)
+            .expect("runtime stream publication sequence exhausted");
+        if let RuntimeStreamEvent::Durable(record) = &event {
+            state.durable_position = state.durable_position.max(record.global_position);
+            match &record.event {
+                SessionEvent::ModelStepRetryScheduled { .. } => {
+                    state
+                        .retry_barriers
+                        .insert(record.stream_id.clone(), record.global_position);
+                }
+                SessionEvent::MessageAppended { message, .. }
+                    if message.role == TranscriptRole::Assistant =>
+                {
+                    state.retry_barriers.remove(&record.stream_id);
+                }
+                SessionEvent::ModelAttemptsExhausted { .. }
+                | SessionEvent::ActivationFinished { .. } => {
+                    state.retry_barriers.remove(&record.stream_id);
+                }
+                _ => {}
+            }
+        }
+        let _ = self.sender.send(RuntimeStreamMessage {
+            sequence: state.sequence,
+            event,
+        });
+    }
+}
+
 const MAX_TRANSIENT_TEXT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug)]
 struct BroadcastModelStreamObserver {
-    publisher: broadcast::Sender<RuntimeStreamEvent>,
+    publisher: Arc<RuntimeStreamPublisher>,
 }
 
 impl ModelStreamObserver for BroadcastModelStreamObserver {
@@ -213,9 +313,8 @@ impl ModelStreamObserver for BroadcastModelStreamObserver {
                 end -= 1;
             }
             let (chunk, rest) = remaining.split_at(end);
-            let _ = self
-                .publisher
-                .send(RuntimeStreamEvent::Transient(TransientModelEvent {
+            self.publisher
+                .publish(RuntimeStreamEvent::Transient(TransientModelEvent {
                     session_id: session_id.to_owned(),
                     activation_id: activation_id.to_owned(),
                     round_id: round_id.to_owned(),
@@ -305,7 +404,7 @@ pub struct Runtime {
     store: Arc<dyn EventStore>,
     model: Arc<dyn ModelExecutor>,
     tools: Arc<dyn ToolExecutor>,
-    stream_publisher: broadcast::Sender<RuntimeStreamEvent>,
+    stream_publisher: Arc<RuntimeStreamPublisher>,
     stream_observer: Arc<dyn ModelStreamObserver>,
     options: RuntimeOptions,
     session_locks: Mutex<HashMap<SessionKey, Arc<AsyncMutex<()>>>>,
@@ -333,7 +432,7 @@ impl Runtime {
         tools: Arc<dyn ToolExecutor>,
         options: RuntimeOptions,
     ) -> Arc<Self> {
-        let (stream_publisher, _) = broadcast::channel(1_024);
+        let stream_publisher = RuntimeStreamPublisher::new(1_024);
         let stream_observer = Arc::new(BroadcastModelStreamObserver {
             publisher: stream_publisher.clone(),
         });
@@ -349,7 +448,7 @@ impl Runtime {
         })
     }
 
-    pub fn stream_publisher(&self) -> broadcast::Sender<RuntimeStreamEvent> {
+    pub fn stream_publisher(&self) -> Arc<RuntimeStreamPublisher> {
         self.stream_publisher.clone()
     }
 
@@ -442,26 +541,112 @@ impl Runtime {
     }
 
     pub async fn reconcile_tool_call(
-        &self,
+        self: &Arc<Self>,
         owner: SessionOwner,
         session_id: String,
         tool_call_id: String,
         action: String,
         command_id: String,
     ) -> Result<AsyncToolCallRecord, RuntimeCommandError> {
+        if action != "retry_dispatch" || command_id.is_empty() {
+            return Err(RuntimeCommandError::Invalid("reconcile_action"));
+        }
+        let current = self
+            .read_tool_call(owner.clone(), session_id.clone(), tool_call_id.clone())
+            .await?
+            .ok_or(RuntimeCommandError::NotFound)?;
+        if !current.retry_dispatch_deduplicated
+            || current.completion_mode != CompletionMode::ProcessLocal
+        {
+            return Err(RuntimeCommandError::Conflict);
+        }
+        let definitions = self
+            .tools
+            .definitions(std::slice::from_ref(&current.tool_name))
+            .map_err(|_| RuntimeCommandError::Conflict)?;
+        definitions
+            .first()
+            .filter(|definition| {
+                definition.name == current.tool_name
+                    && definition.completion_mode == CompletionMode::ProcessLocal
+                    && definition.running_restart == RunningRestartPolicy::UnknownOutcome
+                    && definition.retry_dispatch
+                        == RetryDispatchPolicy::SameInvocationKeyDeduplicated
+            })
+            .ok_or(RuntimeCommandError::Conflict)?;
+        let call = ToolCall {
+            tool_call_id: current.tool_call_id.clone(),
+            tool_name: current.tool_name.clone(),
+            input: current.input.clone(),
+        };
+        let input = inline_tool_input(&call)
+            .map_err(|_| RuntimeCommandError::Invalid("reconcile_tool_input"))?;
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
+        let append_owner = owner.clone();
+        let append_session_id = session_id.clone();
+        let append_tool_call_id = tool_call_id.clone();
+        let append_command_id = command_id.clone();
+        let (record, admitted) = tokio::task::spawn_blocking(move || {
             reconcile_tool_call_blocking(
                 &*store,
-                &owner,
-                &session_id,
-                &tool_call_id,
-                &action,
-                &command_id,
+                &append_owner,
+                &append_session_id,
+                &append_tool_call_id,
+                &append_command_id,
             )
         })
         .await
-        .map_err(|_| RuntimeCommandError::Backend)?
+        .map_err(|_| RuntimeCommandError::Backend)??;
+        let Some((append, state)) = admitted else {
+            return Ok(record);
+        };
+        self.observe_commit(&append, &state).await;
+
+        let invocation = ToolInvocation {
+            tool_call_id: call.tool_call_id.clone(),
+            tool_name: call.tool_name.clone(),
+            input,
+            callback_url: None,
+            callback_bearer: None,
+        };
+        let executor = self.tools.clone();
+        let runtime = Arc::clone(self);
+        let batch_identity = format!("tool-reconcile:v1:{command_id}");
+        tokio::spawn(async move {
+            match executor.execute(invocation).await {
+                Ok(result)
+                    if !result.is_error
+                        && result.completion == ToolExecutionCompletion::Response =>
+                {
+                    if let Err(error) = runtime
+                        .append_background_tool_result(
+                            owner,
+                            session_id,
+                            batch_identity,
+                            call,
+                            Ok(result),
+                        )
+                        .await
+                    {
+                        tracing::warn!(error, "reconciled tool completion append failed");
+                    }
+                }
+                _ => {
+                    if let Err(error) = runtime
+                        .restore_retry_dispatch_unknown(
+                            owner,
+                            session_id,
+                            batch_identity,
+                            call.tool_call_id,
+                        )
+                        .await
+                    {
+                        tracing::warn!(error, "reconciled tool uncertainty append failed");
+                    }
+                }
+            }
+        });
+        Ok(record)
     }
 
     pub async fn queue_startup_recovery(self: &Arc<Self>) -> Result<(), &'static str> {
@@ -618,9 +803,8 @@ impl Runtime {
             }
         }
         for event in &append.events {
-            let _ = self
-                .stream_publisher
-                .send(RuntimeStreamEvent::Durable(Box::new(event.clone())));
+            self.stream_publisher
+                .publish(RuntimeStreamEvent::Durable(Box::new(event.clone())));
         }
     }
 
@@ -1757,6 +1941,31 @@ impl Runtime {
         }
         Ok(())
     }
+
+    async fn restore_retry_dispatch_unknown(
+        &self,
+        owner: SessionOwner,
+        session_id: String,
+        batch_identity: String,
+        tool_call_id: String,
+    ) -> Result<(), &'static str> {
+        let store = self.store.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            append_retry_dispatch_unknown_blocking(
+                &*store,
+                &owner,
+                &session_id,
+                &batch_identity,
+                &tool_call_id,
+            )
+        })
+        .await
+        .map_err(|_| "retry_dispatch_unknown_join")??;
+        if let Some((append, state)) = result {
+            self.observe_commit(&append, &state).await;
+        }
+        Ok(())
+    }
 }
 
 fn unresolved_user(state: &SessionState) -> Option<&TranscriptMessage> {
@@ -1805,6 +2014,12 @@ fn provider_transcript(state: &SessionState) -> Vec<TranscriptMessage> {
         });
     let mut projected =
         Vec::with_capacity(state.transcript.len() + usize::from(placeholder.is_some()));
+    let existing_tool_results = state
+        .transcript
+        .iter()
+        .filter(|message| message.role == TranscriptRole::Tool)
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect::<HashSet<_>>();
     for original in &state.transcript {
         if placeholder_target
             .as_deref()
@@ -1830,6 +2045,29 @@ fn provider_transcript(state: &SessionState) -> Vec<TranscriptMessage> {
             }
         }
         projected.push(message);
+        if original.role == TranscriptRole::Assistant {
+            for call in &original.tool_calls {
+                if existing_tool_results.contains(call.tool_call_id.as_str()) {
+                    continue;
+                }
+                let Some(content) = state
+                    .async_tool_calls
+                    .get(&call.tool_call_id)
+                    .and_then(terminal_tool_content)
+                else {
+                    continue;
+                };
+                projected.push(TranscriptMessage {
+                    message_id: stable_digest("provider-terminal-tool-result", &call.tool_call_id),
+                    role: TranscriptRole::Tool,
+                    content,
+                    tool_call_id: Some(call.tool_call_id.clone()),
+                    tool_calls: Vec::new(),
+                    dedupe_key: None,
+                    source_queue_id: None,
+                });
+            }
+        }
     }
     projected
 }
@@ -2907,6 +3145,9 @@ fn append_tool_batch_blocking(
                 completion_mode: definition
                     .map(|definition| definition.completion_mode.clone())
                     .unwrap_or(CompletionMode::ProcessLocal),
+                retry_dispatch_deduplicated: definition.is_some_and(|definition| {
+                    definition.retry_dispatch == RetryDispatchPolicy::SameInvocationKeyDeduplicated
+                }),
                 progress: None,
                 result: None,
                 error: None,
@@ -3146,7 +3387,16 @@ fn append_tool_results_blocking(
             if let Some(wait) = final_wait {
                 drafts.push(EventDraft::new(
                     format!("wait-set:v1:{batch_identity}"),
-                    SessionEvent::WaitSet { wait },
+                    SessionEvent::WaitSet { wait: wait.clone() },
+                ));
+                drafts.push(EventDraft::new(
+                    format!("wait-timer:v1:{batch_identity}"),
+                    SessionEvent::WaitTimerScheduled {
+                        timer: crate::domain::WaitTimerIntent {
+                            wait_id: wait.wait_id,
+                            deadline_ms: wait.deadline_ms,
+                        },
+                    },
                 ));
             }
         }
@@ -3855,25 +4105,102 @@ fn reconcile_tool_call_blocking(
     owner: &SessionOwner,
     session_id: &str,
     tool_call_id: &str,
-    action: &str,
     command_id: &str,
-) -> Result<AsyncToolCallRecord, RuntimeCommandError> {
-    if action != "retry_dispatch" || command_id.is_empty() {
-        return Err(RuntimeCommandError::Invalid("reconcile_action"));
+) -> Result<(AsyncToolCallRecord, Option<(AppendResult, SessionState)>), RuntimeCommandError> {
+    for _ in 0..16 {
+        let state = store
+            .rehydrate_owned(owner, session_id)
+            .map_err(|_| RuntimeCommandError::NotFound)?;
+        let Some(record) = state.async_tool_calls.get(tool_call_id).cloned() else {
+            return Err(RuntimeCommandError::NotFound);
+        };
+        if !record.retry_dispatch_deduplicated
+            || record.completion_mode != CompletionMode::ProcessLocal
+        {
+            return Err(RuntimeCommandError::Conflict);
+        }
+        let event_id = format!("tool-retry-dispatch:{tool_call_id}:{command_id}");
+        match store.append_owned(
+            owner,
+            session_id,
+            state.stream_version,
+            command_id,
+            &[EventDraft::new(
+                event_id,
+                SessionEvent::AsyncToolCallRunning {
+                    tool_call_id: tool_call_id.to_owned(),
+                },
+            )],
+        ) {
+            Ok(append) => {
+                let state = store
+                    .rehydrate_owned(owner, session_id)
+                    .map_err(|_| RuntimeCommandError::Backend)?;
+                let record = state
+                    .async_tool_calls
+                    .get(tool_call_id)
+                    .cloned()
+                    .ok_or(RuntimeCommandError::NotFound)?;
+                let admitted = (!append.replayed).then_some((append, state));
+                return Ok((record, admitted));
+            }
+            Err(StoreError::OptimisticConcurrency { .. }) => continue,
+            Err(StoreError::Domain(_))
+            | Err(StoreError::CommandIdempotencyConflict { .. })
+            | Err(StoreError::EventIdempotencyConflict { .. }) => {
+                return Err(RuntimeCommandError::Conflict)
+            }
+            Err(_) => return Err(RuntimeCommandError::Backend),
+        }
     }
-    let state = store
-        .rehydrate_owned(owner, session_id)
-        .map_err(|_| RuntimeCommandError::NotFound)?;
-    let Some(record) = state.async_tool_calls.get(tool_call_id).cloned() else {
-        return Err(RuntimeCommandError::NotFound);
-    };
-    // Unknown outcomes are intentionally not manually rewritable.  A safe
-    // retry requires an adapter-declared idempotency policy and is dispatched
-    // only by the runtime executor, never by this command seam.
-    if record.status == AsyncToolStatus::UnknownOutcome {
-        return Err(RuntimeCommandError::Conflict);
+    Err(RuntimeCommandError::Conflict)
+}
+
+fn append_retry_dispatch_unknown_blocking(
+    store: &dyn EventStore,
+    owner: &SessionOwner,
+    session_id: &str,
+    batch_identity: &str,
+    tool_call_id: &str,
+) -> Result<Option<(AppendResult, SessionState)>, &'static str> {
+    for _ in 0..16 {
+        let state = store
+            .rehydrate_owned(owner, session_id)
+            .map_err(|_| "retry_dispatch_unknown_rehydrate")?;
+        let Some(record) = state.async_tool_calls.get(tool_call_id) else {
+            return Ok(None);
+        };
+        if record.status != AsyncToolStatus::Running {
+            return Ok(None);
+        }
+        let command_id = format!("tool-retry-unknown-command:v1:{batch_identity}:{tool_call_id}");
+        let event_id = format!("tool-retry-unknown-event:v1:{batch_identity}:{tool_call_id}");
+        match store.append_owned(
+            owner,
+            session_id,
+            state.stream_version,
+            &command_id,
+            &[EventDraft::new(
+                event_id,
+                SessionEvent::AsyncToolCallUnknownOutcome {
+                    tool_call_id: tool_call_id.to_owned(),
+                    reason: "retry_dispatch_uncertain".to_owned(),
+                },
+            )],
+        ) {
+            Ok(append) => {
+                let state = store
+                    .rehydrate_owned(owner, session_id)
+                    .map_err(|_| "retry_dispatch_unknown_rehydrate")?;
+                return Ok(Some((append, state)));
+            }
+            Err(StoreError::OptimisticConcurrency { .. }) => continue,
+            Err(StoreError::CommandIdempotencyConflict { .. })
+            | Err(StoreError::EventIdempotencyConflict { .. }) => return Ok(None),
+            Err(_) => return Err("retry_dispatch_unknown_append"),
+        }
     }
-    Ok(record)
+    Err("retry_dispatch_unknown_concurrency")
 }
 
 fn parse_callback_payload(
