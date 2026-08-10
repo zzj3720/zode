@@ -394,6 +394,13 @@ Endpoint aimux.
   revision, clears the fence, and restores a direct Endpoint model request;
 - tombstone while Endpoint is offline, reconnect, reconcile once, and prevent
   future provider calls without fallback;
+- `e2e_auth_profile_sharing_removal_survives_offline_endpoint_and_server_restart`
+  changes one profile's sharing through the Access-protected Server API while
+  one authorized Endpoint is offline, proves the accepted response contains a
+  durable removal projection, restarts Server, restores the same Endpoint,
+  observes the retained tombstone acknowledgement, and proves the removed
+  Endpoint cannot use or resurrect the credential while another still-shared
+  Endpoint retains the current revision;
 - delete a profile or remove one Endpoint from sharing while it is offline,
   restart Server, race the retained tombstone with an older install, and prove
   the older credential cannot resurrect;

@@ -48,6 +48,7 @@ ZodeApplication
     └── Provider
         ├── profiles: ReadonlySignal<readonly AuthProfile[]>
         │   └── AuthProfile
+        │       ├── sharing: ProfileSharingWorkflow
         │       └── refreshOperation: ReadonlySignal<AuthRefreshOperation | null>
         └── authAttempts: ReadonlySignal<readonly OAuthAttempt[]>
 ```
@@ -104,6 +105,13 @@ state, and safe profile operations. It also owns the currently observed
 Successful relogin reconciles the existing canonical AuthProfile instance at a
 new revision; it does not create a second browser identity or silently select a
 replacement profile.
+
+`ProfileSharingWorkflow` owns the editable Endpoint selection, mutation state,
+frozen request, and stable idempotency identity for one AuthProfile. It begins
+from the profile's current Server projection, remains outside visual lifecycle,
+and retries an unknown response with the same key and body. After confirmed
+admission it reconciles the owning Provider/AuthProfile projection; components
+never infer replica installs or tombstones from checkbox state.
 
 Secret input is a one-way workflow value and is cleared after submission; it
 is never a durable or public signal.

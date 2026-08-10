@@ -423,6 +423,39 @@ silently authorize future Endpoints; adding a new Endpoint creates an explicit
 distribution plan visible to the user before secret transfer. A future
 `all_including_future` policy requires a separate user-approved design.
 
+`PUT /v1/auth-profiles/{profile_id}/sharing` accepts the sharing object itself:
+
+```json
+{
+  "mode": "selected",
+  "endpoint_ids": ["endpoint-local"]
+}
+```
+
+`none` requires an empty list, `selected` requires a non-empty list, and
+`all_current` requires an empty input list that Server expands atomically to
+the sorted IDs of all currently enabled Endpoints. The expanded explicit IDs
+are returned in the profile projection and remain the durable plan; Endpoints
+added later are not included automatically.
+
+The mutation requires `Idempotency-Key` and returns `202` with the complete
+`zode.auth-profile.v1` projection after durable admission. A matching replay
+returns that exact original status and body even if replica states later
+change; changed-body key reuse conflicts. A new-key semantic no-op records and
+returns the current projection without advancing a revision or dispatching
+replica work.
+
+When the explicit Endpoint set changes, one transaction appends the sharing
+revision, advances the profile sequence above every credential, reserved
+refresh revision, install, and tombstone revision, appends installs at that
+revision for every Endpoint still authorized, appends tombstones at the same
+revision for every removed Endpoint, and stores the original response receipt.
+The installs re-publish the same Server-authoritative credential at the new
+revision so re-sharing can never send an older credential across a newer
+tombstone. External delivery happens only after this commit and may leave the
+returned distribution projection `pending` or `unreachable` until the normal
+reconciler receives Endpoint acknowledgements.
+
 Deleting a profile or removing an Endpoint from sharing atomically appends the
 higher per-Endpoint tombstone operations defined in `docs/auth-replication.md`.
 Those operations outlive the visible profile/sharing row and remain
