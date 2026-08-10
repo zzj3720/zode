@@ -327,11 +327,15 @@ Endpoints are exact HTTPS URLs, except loopback HTTP is allowed for local test
 or development fixtures; credentials, fragments, and pre-existing query values
 are rejected. `client_secret_file`, when present, is resolved relative to the
 Server config and must be a private regular file outside SQLite. Scopes are
-bounded, sorted, and unique. `refresh_recovery` is exactly
-`same_operation_id_idempotent`, `exact_result_reconcile`, or `none` and is
-frozen into each admitted refresh operation. Duplicate provider entries or an
-unsupported adapter fail startup. Environment variables and browser input
-cannot install or override an adapter.
+bounded, sorted, and unique. For the generic
+`oauth2_authorization_code_pkce` adapter, `refresh_recovery` is exactly
+`same_operation_id_idempotent` or `none` and is frozen into each admitted
+refresh operation. `exact_result_reconcile` requires a provider-specific
+adapter with a separately validated exact-result readback contract; the generic
+adapter rejects that value before public bind instead of advertising an
+unimplemented recovery path. Duplicate provider entries or an unsupported
+adapter fail startup. Environment variables and browser input cannot install
+or override an adapter.
 
 This catalog is Server management configuration, not Endpoint execution
 configuration. It is never copied into `provider_execution.options` or an auth

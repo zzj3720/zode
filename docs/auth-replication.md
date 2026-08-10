@@ -248,6 +248,13 @@ exact credential material needed for execution. Merely learning that a refresh
 token was consumed is not reconciliation because it cannot recover a rotated
 secret.
 
+The v0 generic `oauth2_authorization_code_pkce` adapter implements only
+`same_operation_id_idempotent` and `none`. It rejects
+`exact_result_reconcile` before Server public bind because its configuration
+contains no provider-specific exact-result readback protocol. A future adapter
+may use that capability only together with its explicit readback contract and
+real-process recovery E2E.
+
 With capability `none`, unknown dispatch appends
 `refresh_unknown/reauth_required`, keeps the last known revision as current,
 never publishes the reserved revision, and never blindly reuses the old refresh
@@ -360,8 +367,13 @@ Endpoint aimux.
 - `e2e_browser_provider_profile_default_action_updates_server_pointer` creates
   two profiles through the real management UI, changes the provider-scoped
   default, and verifies the Server-owned pointer and non-secret projection;
-- complete one OAuth profile on Server, distribute the execution credential,
-  restart both Endpoints, and run sessions without another login;
+- `e2e_oauth_profile_and_refresh_distribute_current_revision_to_endpoint`
+  completes an OAuth profile through the public management origin, proves the
+  selected real Endpoint acknowledges revision 1, refreshes the same profile,
+  and proves that Endpoint acknowledges the new current revision rather than
+  remaining on a stale or pending replica;
+- complete one OAuth profile on Server, restart both Endpoints after the
+  execution credential is ready, and run sessions without another login;
 - crash Endpoint before and after secret promotion and prove one revision and
   no secret leakage;
 - race revisions N and N+1 and prove N cannot overwrite or resurrect N+1;
@@ -371,6 +383,10 @@ Endpoint aimux.
   kill/restart Server, retry the same operation, and prove one new revision, one
   distribution per Endpoint, replay of the original safe result, and a direct
   Endpoint model request using the refreshed credential;
+- `e2e_oauth_refresh_retries_uncertain_idempotent_operation_without_server_restart`
+  proves the same durable operation also retries and converges while the Server
+  process remains alive, using one provider operation identity and one profile
+  revision;
 - with a non-idempotent rotating refresh fixture, consume and drop the response,
   then prove `refresh_unknown/reauth_required`, no blind retry or guessed
   revision; submit a new refresh key and prove `409 reauth_required` with no
