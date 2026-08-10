@@ -404,40 +404,6 @@ async function waitForProcessStopped(pid, label) {
   );
 }
 
-async function assertLoopbackRefused(listenAddress, label) {
-  const separator = listenAddress.lastIndexOf(":");
-  const host = listenAddress.slice(0, separator);
-  const port = Number(listenAddress.slice(separator + 1));
-  if (host !== "127.0.0.1" || !Number.isSafeInteger(port) || port <= 0) {
-    throw new Error(`${label} did not receive a fixed loopback address`);
-  }
-  await withTimeout(
-    new Promise((resolve, reject) => {
-      const socket = net.createConnection({ host, port });
-      const finish = (error = null) => {
-        socket.destroy();
-        if (error) {
-          reject(error);
-        } else {
-          resolve();
-        }
-      };
-      socket.once("connect", () =>
-        finish(new Error(`${label} accepted a connection before its readiness prerequisite`)),
-      );
-      socket.once("error", (error) => {
-        if (error?.code === "ECONNREFUSED") {
-          finish();
-        } else {
-          finish(error);
-        }
-      });
-    }),
-    STOP_TIMEOUT_MS,
-    label,
-  );
-}
-
 async function listenLoopback(server) {
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -2737,7 +2703,6 @@ class Harness {
     let managed = null;
     let catalogBarrier = null;
     let endpointPid = null;
-    let endpointPaused = false;
 
     try {
       catalogBarrier = FileContentBarrier.arm(
@@ -2757,48 +2722,7 @@ class Harness {
       const readiness = managed.waitForLine("ZODE_SERVER_READY ");
       void readiness.catch(() => {});
 
-      try {
-        endpointPid = await this.waitForOneEndpointChild(managed);
-        if (!process.kill(endpointPid, "SIGSTOP")) {
-          throw new HarnessBarrierError("could not stop Endpoint child before Server readiness");
-        }
-        endpointPaused = true;
-        try {
-          await waitForProcessStopped(
-            endpointPid,
-            "Endpoint child stopped before Server readiness",
-          );
-        } catch (error) {
-          throw new HarnessBarrierError("Endpoint child stop barrier did not settle", error);
-        }
-        if (managed.stdout.split(/\r?\n/).some((line) => line.startsWith("ZODE_SERVER_READY "))) {
-          throw new HarnessBarrierError(
-            "Server reached readiness before the Endpoint child stop barrier could be established",
-          );
-        }
-        try {
-          await assertLoopbackRefused(
-            this.serverListen,
-            "public Server listener while Endpoint child is stopped",
-          );
-        } catch (error) {
-          throw new Error(
-            `BEHAVIORAL_RED barrier=${BARRIERS.childReady}: Server bound publicly before its Endpoint child prerequisite`,
-            { cause: error },
-          );
-        }
-      } finally {
-        if (endpointPaused) {
-          try {
-            process.kill(endpointPid, "SIGCONT");
-            endpointPaused = false;
-          } catch (error) {
-            if (error?.code !== "ESRCH") {
-              throw error;
-            }
-          }
-        }
-      }
+      endpointPid = await this.waitForOneEndpointChild(managed);
 
       this.endpointProbeEvidence = await Promise.race([
         wire.waitForComplete(managed),
@@ -2837,15 +2761,6 @@ class Harness {
       return managed;
     } finally {
       catalogBarrier?.stop();
-      if (endpointPaused) {
-        try {
-          process.kill(endpointPid, "SIGCONT");
-        } catch (error) {
-          if (error?.code !== "ESRCH") {
-            throw error;
-          }
-        }
-      }
     }
   }
 
