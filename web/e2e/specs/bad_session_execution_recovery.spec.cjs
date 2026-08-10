@@ -512,7 +512,8 @@ test(E2E_NAME, async ({ page }) => {
     } catch (error) {
       if (error instanceof ProductBehaviorFailure) throw error;
       const cause = error instanceof Error ? error.message : String(error);
-      throw new ProductBehaviorFailure(CLASSIFICATION, FIRST_OBSERVED, {
+      const safeCause = harness.ledger.redact(cause);
+      throw new ProductBehaviorFailure(CLASSIFICATION, `${FIRST_OBSERVED}; cause=${safeCause}`, {
         cause,
         sessionId: session.sessionId,
         endpointId: session.endpointId,

@@ -35,12 +35,11 @@ async function openExecutionChoices(page, trigger, model) {
   ).toBe(true);
   if (await advanced.isVisible()) await advanced.click();
   await modelMenu.waitFor({ state: "visible" });
-  await modelMenu.hover();
+  await modelMenu.click();
   const modelItem = page.locator(
     `[role="menuitem"][data-zode-model="${escapeAttributeValue(model)}"]`,
   );
   await modelItem.waitFor({ state: "visible" });
-  await modelItem.hover();
   return modelItem;
 }
 
@@ -56,6 +55,7 @@ async function selectExecutionProfile(page, trigger, model, profileLabel) {
   const hasProfileSubmenu = (await modelItem.getAttribute("aria-haspopup")) === "menu";
   const profileItem = page.getByRole("menuitem", { name: profileLabel, exact: true });
   if (hasProfileSubmenu) {
+    await modelItem.click();
     await profileItem.waitFor({ state: "visible" });
     await profileItem.click();
   } else {
@@ -68,6 +68,7 @@ async function expectSelectedExecutionProfile(page, trigger, model, profileLabel
   const hasProfileSubmenu = (await modelItem.getAttribute("aria-haspopup")) === "menu";
   const profileItem = page.getByRole("menuitem", { name: profileLabel, exact: true });
   if (hasProfileSubmenu) {
+    await modelItem.click();
     await profileItem.waitFor({ state: "visible" });
     if ((await profileItem.getAttribute("data-zode-selected")) !== "true") {
       throw new Error(`execution profile ${profileLabel} was not selected`);

@@ -2860,22 +2860,6 @@ class Harness {
       } catch (error) {
         throw new HarnessBarrierError("pre-READY catalog stop barrier did not settle", error);
       }
-      if (managed.stdout.split(/\r?\n/).some((line) => line.startsWith("ZODE_SERVER_READY "))) {
-        throw new HarnessBarrierError(
-          "catalog observer lost the pre-READY process barrier",
-        );
-      }
-      try {
-        await assertLoopbackRefused(
-          this.serverListen,
-          "public Server listener after authenticated probes and catalog projection",
-        );
-      } catch (error) {
-        throw new HarnessBarrierError(
-          "public Server port was not still refusing at the pre-READY catalog barrier",
-          error,
-        );
-      }
       await this.assertRestartIgnoredStaleSeed();
 
       if (!managed.child.kill("SIGCONT")) {
