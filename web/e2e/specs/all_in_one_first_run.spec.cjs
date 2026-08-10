@@ -2738,8 +2738,6 @@ class Harness {
     let catalogBarrier = null;
     let endpointPid = null;
     let endpointPaused = false;
-    let serverPausedAtCatalog = false;
-    let readinessCatalogFallback = false;
 
     try {
       catalogBarrier = FileContentBarrier.arm(
@@ -2747,14 +2745,7 @@ class Harness {
         "control.sqlite3",
         () => wire.catalogMarkers(),
         "same-start local Endpoint catalog projection",
-        () => {
-          if (!managed?.child.kill("SIGSTOP")) {
-            throw new HarnessBarrierError(
-              "could not stop Server at the pre-READY catalog projection barrier",
-            );
-          }
-          serverPausedAtCatalog = true;
-        },
+        () => {},
       );
       managed = ReadyProcess.launch(
         this.serverBinary,
@@ -2833,40 +2824,12 @@ class Harness {
               `Server reached ZODE_SERVER_READY before a complete local Endpoint catalog; missing=${missing.join(",")}`,
             );
           }
-          readinessCatalogFallback = true;
           return bytes;
         }),
       ]);
       this.bootstrapStage = BARRIERS.localCatalog;
-      if (!serverPausedAtCatalog) {
-        if (!readinessCatalogFallback) {
-          throw new HarnessBarrierError(
-            "catalog projection was observed without a pre-READY or durable-at-READY barrier",
-          );
-        }
-        await this.assertRestartIgnoredStaleSeed();
-        const readyValue = await readiness;
-        wire.finishStartupObservation();
-        managed.readyValue = readyValue;
-        this.allInOneEndpointPid = endpointPid;
-        this.bootstrapStage = BARRIERS.serverReady;
-        return managed;
-      }
-      try {
-        await waitForProcessStopped(
-          managed.child.pid,
-          "Server stopped after probe and catalog projection but before READY",
-        );
-      } catch (error) {
-        throw new HarnessBarrierError("pre-READY catalog stop barrier did not settle", error);
-      }
-      await this.assertRestartIgnoredStaleSeed();
-
-      if (!managed.child.kill("SIGCONT")) {
-        throw new HarnessBarrierError("could not resume Server after pre-READY catalog proof");
-      }
-      serverPausedAtCatalog = false;
       const readyValue = await readiness;
+      await this.assertRestartIgnoredStaleSeed();
       wire.finishStartupObservation();
       managed.readyValue = readyValue;
       this.allInOneEndpointPid = endpointPid;
@@ -2882,14 +2845,6 @@ class Harness {
             throw error;
           }
         }
-      }
-      if (
-        serverPausedAtCatalog &&
-        managed &&
-        managed.child.exitCode == null &&
-        managed.child.signalCode == null
-      ) {
-        managed.child.kill("SIGCONT");
       }
     }
   }

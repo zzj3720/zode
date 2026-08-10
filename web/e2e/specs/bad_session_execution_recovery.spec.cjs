@@ -365,12 +365,20 @@ test(E2E_NAME, async ({ page }) => {
     expect(message.status).toBe(202);
     await expect.poll(async () => page.evaluate(async (requestPath) => {
       const response = await fetch(requestPath, { headers: { accept: "application/json" } });
-      if (!response.ok) return false;
+      if (!response.ok) return { user: 0, assistant: 0 };
       const body = await response.json();
-      return body.transcript?.some((item) => item.content === "history before execution recovery") === true;
+      const transcript = Array.isArray(body.transcript) ? body.transcript : [];
+      return {
+        user: transcript.filter(
+          (item) => item.role === "user" && item.content === "history before execution recovery",
+        ).length,
+        assistant: transcript.filter(
+          (item) => item.role === "assistant" && item.content === "E2E_OK",
+        ).length,
+      };
     }, `/v1/endpoints/${encodeURIComponent(session.endpointId)}/sessions/${encodeURIComponent(session.sessionId)}`), {
       timeout: 20_000,
-    }).toBe(true);
+    }).toEqual({ user: 1, assistant: 1 });
     captureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 128 });
     const deleted = await page.evaluate(async ({ provider, profileId }) => {
       const response = await fetch(
