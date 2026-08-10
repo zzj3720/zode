@@ -506,15 +506,36 @@ test(E2E_NAME, async ({ page }) => {
       const messageInput = page.getByRole("textbox", { name: "Message", exact: true });
       await messageInput.fill("continue after execution recovery");
       await messageInput.press("Enter");
-      await expect(page.getByText("E2E_OK", { exact: true })).toBeVisible({ timeout: 30_000 });
+      await expect(page.getByText("E2E_OK", { exact: true })).toHaveCount(2, {
+        timeout: 30_000,
+      });
       await expect.poll(async () => page.evaluate(async (requestPath) => {
         const response = await fetch(requestPath, { headers: { accept: "application/json" } });
-        if (!response.ok) return false;
+        if (!response.ok) return { status: response.status };
         const body = await response.json();
-        return body.transcript?.some((item) => item.role === "assistant" && item.content === "E2E_OK") === true;
+        const transcript = Array.isArray(body.transcript) ? body.transcript : [];
+        return {
+          status: response.status,
+          sessionStatus: body.status,
+          activeActivation: body.active_activation ?? null,
+          activeModelRound: body.active_model_round ?? null,
+          continuedUser: transcript.filter(
+            (item) => item.role === "user" && item.content === "continue after execution recovery",
+          ).length,
+          assistant: transcript.filter(
+            (item) => item.role === "assistant" && item.content === "E2E_OK",
+          ).length,
+        };
       }, `/v1/endpoints/${encodeURIComponent(session.endpointId)}/sessions/${encodeURIComponent(session.sessionId)}`), {
         timeout: 20_000,
-      }).toBe(true);
+      }).toEqual({
+        status: 200,
+        sessionStatus: "idle",
+        activeActivation: null,
+        activeModelRound: null,
+        continuedUser: 1,
+        assistant: 2,
+      });
       const beforeRestart = await managementJson(page, "GET", sessionPath);
       expect(beforeRestart.status, "beforeRestart session read").toBe(200);
       expect(beforeRestart.body.session_id).toBe(session.sessionId);
