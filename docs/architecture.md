@@ -610,6 +610,16 @@ blocked. Worker handoffs include the owning clause and exact frozen test names.
 - Every behavioral defect first receives the smallest red public E2E in the
   owning suite before production changes.
 
+The complete browser product collection is frozen by
+`scripts/ci/approved-product-playwright-manifest.json`. CI first proves that
+the checkout and Playwright collection exactly match that manifest, then runs
+every listed scenario against one exact-revision Server, Endpoint, and built
+UI. The stable `required-product-gate` aggregate fails if the shared
+build/evidence gate or the complete product matrix fails; skipped,
+interrupted, unrun, flaky, missing, or unlisted scenarios cannot satisfy it.
+Main branch protection must require that aggregate rather than a narrower
+test or build-only job.
+
 Required cross-component scenarios include:
 
 | Area | Required E2E |
