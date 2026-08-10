@@ -233,9 +233,11 @@ protected management origin.
 
 ## Append-only storage
 
-The session event stream is the only source of truth. Current state is a
-deterministic projection of semantic events. Do not store a mutable session JSON
-record as an alternative authority.
+Each session's append-only durable event log is the only source of truth for
+that session. It is a storage/runtime concept, not a transport connection: the
+public SSE transport is the single Endpoint-wide stream defined below. Current
+session state is a deterministic projection of semantic events. Do not store a
+mutable session JSON record as an alternative authority.
 
 - Use typed semantic events such as `InputQueued`, `WaitSet`,
   `AsyncToolCallStarted`, and `AsyncToolCallCompleted`; do not use generic JSON

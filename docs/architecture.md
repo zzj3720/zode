@@ -316,7 +316,8 @@ neither recorder nor replay support.
 Endpoint owns:
 
 - durable session command admission and semantic idempotency;
-- one append-only event stream and snapshots per session;
+- one append-only durable event log and snapshots per session, distinct from
+  the single Endpoint-wide public SSE transport;
 - activation, model retry, async tool, wait, timer, callback, and recovery
   state machines;
 - provider execution adapters through aimux;
