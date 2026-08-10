@@ -325,6 +325,39 @@ async function processCommand(pid) {
   return result.stdout.trim();
 }
 
+function linuxTcpAddress(port) {
+  return `0100007F:${port.toString(16).padStart(4, "0").toUpperCase()}`;
+}
+
+async function assertLinuxTcpClientOwnedByProcess(socket, expectedPid, label) {
+  const local = linuxTcpAddress(socket.remotePort);
+  const remote = linuxTcpAddress(socket.localPort);
+  const table = await fs.readFile("/proc/net/tcp", "utf8");
+  const row = table
+    .split(/\r?\n/)
+    .map((line) => line.trim().split(/\s+/))
+    .find((columns) =>
+      columns[1] === local &&
+      columns[2] === remote &&
+      columns[3] === "01",
+    );
+  const inode = row?.[9];
+  if (!inode) {
+    throw new Error(`${label} had no matching established Linux TCP socket`);
+  }
+  const descriptors = await fs.readdir(`/proc/${expectedPid}/fd`);
+  for (const descriptor of descriptors) {
+    try {
+      if (await fs.readlink(`/proc/${expectedPid}/fd/${descriptor}`) === `socket:[${inode}]`) {
+        return;
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  throw new Error(`${label} did not originate from the supervised Server process`);
+}
+
 async function assertTcpClientOwnedByProcess(socket, expectedPid, label) {
   if (
     socket.remoteAddress !== "127.0.0.1" ||
@@ -334,6 +367,10 @@ async function assertTcpClientOwnedByProcess(socket, expectedPid, label) {
     !Number.isSafeInteger(expectedPid)
   ) {
     throw new HarnessBarrierError(`${label} did not expose a loopback process-owned socket`);
+  }
+  if (process.platform === "linux") {
+    await assertLinuxTcpClientOwnedByProcess(socket, expectedPid, label);
+    return;
   }
   const result = await commandOutput(
     "/usr/sbin/lsof",
