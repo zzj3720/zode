@@ -1874,6 +1874,13 @@ class EndpointProbeWire {
     );
   }
 
+  completedEvidence() {
+    if (!this.completeSettled || this.errors.length > 0 || this.exchanges.size !== 2) {
+      return null;
+    }
+    return this.safeEvidence();
+  }
+
   async waitForComplete(process) {
     return withTimeout(
       Promise.race([
@@ -2762,6 +2769,10 @@ class Harness {
       this.endpointProbeEvidence = await Promise.race([
         wire.waitForComplete(managed),
         readiness.then(() => {
+          const evidence = wire.completedEvidence();
+          if (evidence) {
+            return evidence;
+          }
           throw new HarnessBarrierError(
             "Server reached ZODE_SERVER_READY before its authenticated Endpoint probes",
           );
