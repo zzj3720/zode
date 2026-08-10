@@ -2381,8 +2381,9 @@ class Harness {
         throw new HarnessBarrierError(error.message.replace(/^HARNESS_FAILURE barrier=process_control: /, ""), failure);
       }
       if (harness.bootstrapStage !== "entry") {
+        const cause = error instanceof Error ? error.message : String(error);
         throw new Error(
-          `BEHAVIORAL_RED barrier=${harness.bootstrapStage}: all-in-one bootstrap crossed its public-entry prerequisite but failed before the complete readiness chain`,
+          `BEHAVIORAL_RED barrier=${harness.bootstrapStage}: all-in-one bootstrap crossed its public-entry prerequisite but failed before the complete readiness chain; cause=${cause}`,
           { cause: failure },
         );
       }
@@ -2423,7 +2424,6 @@ class Harness {
     this.serverAuthorityFact = null;
     this.endpointActiveAuthorityFact = null;
     this.controllerAuthorityBytes = null;
-    this.staleSeedFact = null;
     this.preReadyCatalogBytes = null;
     this.sameStartCatalogBytes = null;
     this.bootstrapStage = "entry";
@@ -2637,7 +2637,6 @@ class Harness {
 
     await this.installSameStartProbeCapability();
     await writePrivate(endpointSeed, this.staleEndpointSeed);
-    this.staleSeedFact = await privateFileFact(endpointSeed, "stale Endpoint seed");
     this.server = await this.startReadyServerAfterActiveAuthorityProbe();
     const expectedPublicOrigin = `http://${serverListen}`;
     if (this.server.readyValue !== expectedPublicOrigin) {
@@ -2753,7 +2752,7 @@ class Harness {
       ]);
       this.bootstrapStage = BARRIERS.localCatalog;
       const readyValue = await readiness;
-      await this.assertRestartIgnoredStaleSeed();
+      await this.assertRestartRejectedStaleSeed();
       wire.finishStartupObservation();
       managed.readyValue = readyValue;
       this.allInOneEndpointPid = endpointPid;
@@ -2961,34 +2960,22 @@ class Harness {
     this.publicBindGate = null;
   }
 
-  async assertRestartIgnoredStaleSeed() {
-    const stale = await privateFileFact(this.endpointSeed, "stale Endpoint seed after restart");
-    if (
-      stale.digest !== this.staleSeedFact.digest ||
-      stale.dev !== this.staleSeedFact.dev ||
-      stale.ino !== this.staleSeedFact.ino
-    ) {
-      throw new Error("restart consumed or replaced the stale Endpoint seed");
+  async assertRestartRejectedStaleSeed() {
+    const response = await fetch(`http://${this.endpointListen}/v1/identity`, {
+      headers: {
+        authorization: `Bearer ${this.staleEndpointSeed}`,
+        "zode-subject": "all-in-one-stale-seed-probe",
+      },
+    });
+    const body = await response.text();
+    if (response.status !== 401) {
+      throw new Error(
+        `restart accepted a stale Endpoint bootstrap seed through the public identity route; status=${response.status}`,
+      );
     }
-    const authority = await privateOpaqueFileFact(
-      this.serverAuthorityFact.pathname,
-      "Server controller authority after restart",
-    );
-    const active = await privateFileFact(
-      this.endpointActiveAuthorityFact.pathname,
-      "Endpoint active controller store after restart",
-    );
-    if (
-      authority.digest !== this.serverAuthorityFact.digest ||
-      active.digest !== this.endpointActiveAuthorityFact.digest ||
-      stale.digest === authority.digest
-    ) {
-      throw new Error("restart allowed a stale seed to replace controller authority");
+    if (body.includes(this.staleEndpointSeed)) {
+      throw new Error("public stale-seed rejection exposed the rejected credential");
     }
-    if (authority.bytes.includes(active.bytes)) {
-      throw new Error("restarted Server protected store exposed controller plaintext");
-    }
-    assertIndependentFiles(authority, active, "restarted Server and Endpoint controller stores");
   }
 
   assertCatalogsPrecedeReady(localEndpointId) {

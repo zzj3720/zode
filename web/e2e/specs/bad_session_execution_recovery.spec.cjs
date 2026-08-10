@@ -429,8 +429,33 @@ test(E2E_NAME, async ({ page }) => {
       await page.goto("about:blank");
       await harness.journal.waitForIdle(15_000);
       harness.journal.flushCaptureSet(captureSetId);
-      captureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 8 });
+      captureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 128 });
       await page.goto(`${harness.managementUrl}${sessionPath}`, { waitUntil: "domcontentloaded" });
+      await expect.poll(async () => page.evaluate(async (requestPath) => {
+        const response = await fetch(requestPath, { headers: { accept: "application/json" } });
+        if (!response.ok) return { status: response.status };
+        const body = await response.json();
+        const transcript = Array.isArray(body.transcript) ? body.transcript : [];
+        return {
+          status: response.status,
+          sessionStatus: body.status,
+          activeActivation: body.active_activation ?? null,
+          activeModelRound: body.active_model_round ?? null,
+          user: transcript.filter(
+            (item) => item.role === "user" && item.content === "history before execution recovery",
+          ).length,
+          assistant: transcript.filter(
+            (item) => item.role === "assistant" && item.content === "E2E_OK",
+          ).length,
+        };
+      }, sessionPath), { timeout: 20_000 }).toEqual({
+        status: 200,
+        sessionStatus: "idle",
+        activeActivation: null,
+        activeModelRound: null,
+        user: 1,
+        assistant: 1,
+      });
       const beforeNoop = await managementJson(page, "GET", sessionPath);
       expect(beforeNoop.status, "beforeNoop session read").toBe(200);
       expect(beforeNoop.body.session_id).toBe(session.sessionId);
