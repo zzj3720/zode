@@ -248,36 +248,68 @@ impl SessionProxy {
         validate_idempotency_key(idempotency_key)?;
         let target = self.endpoint_target(endpoint_id).await?;
         let path = format!("/v1/sessions/{session_id}/messages");
-        match self
-            .send_json(
-                &target,
-                actor,
-                reqwest::Method::POST,
-                &path,
-                JsonRequest {
-                    idempotency_key: Some(idempotency_key),
-                    body: Some(&body),
-                    replay_only: true,
-                },
-            )
-            .await?
-        {
-            EndpointJson::Public(response) => return Ok(response),
-            EndpointJson::ReceiptMiss => {}
-        }
-        self.send_json(
+        self.forward_idempotent_json(
             &target,
             actor,
             reqwest::Method::POST,
             &path,
+            idempotency_key,
+            &body,
+        )
+        .await
+    }
+
+    pub(crate) async fn get_tool_call(
+        &self,
+        actor: &ActorContext,
+        endpoint_id: &str,
+        session_id: &str,
+        tool_call_id: &str,
+    ) -> Result<ProxyJson, SessionProxyError> {
+        validate_path_identifier(session_id)?;
+        validate_callback_id(tool_call_id)?;
+        let target = self.endpoint_target(endpoint_id).await?;
+        self.send_json(
+            &target,
+            actor,
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{session_id}/tool-calls/{tool_call_id}"),
             JsonRequest {
-                idempotency_key: Some(idempotency_key),
-                body: Some(&body),
+                idempotency_key: None,
+                body: None,
                 replay_only: false,
             },
         )
         .await
         .and_then(public_only)
+    }
+
+    pub(crate) async fn cancel_tool_call(
+        &self,
+        actor: &ActorContext,
+        endpoint_id: &str,
+        session_id: &str,
+        tool_call_id: &str,
+        idempotency_key: &str,
+        body: Value,
+    ) -> Result<ProxyJson, SessionProxyError> {
+        let path = tool_command_path(session_id, tool_call_id, "cancel")?;
+        self.forward_tool_command(actor, endpoint_id, &path, idempotency_key, body)
+            .await
+    }
+
+    pub(crate) async fn reconcile_tool_call(
+        &self,
+        actor: &ActorContext,
+        endpoint_id: &str,
+        session_id: &str,
+        tool_call_id: &str,
+        idempotency_key: &str,
+        body: Value,
+    ) -> Result<ProxyJson, SessionProxyError> {
+        let path = tool_command_path(session_id, tool_call_id, "reconcile")?;
+        self.forward_tool_command(actor, endpoint_id, &path, idempotency_key, body)
+            .await
     }
 
     pub(crate) async fn select_model(
@@ -349,10 +381,8 @@ impl SessionProxy {
         &self,
         actor: &ActorContext,
         endpoint_id: &str,
-        session_id: &str,
         last_event_id: Option<&str>,
     ) -> Result<Response<Body>, SessionProxyError> {
-        validate_path_identifier(session_id)?;
         if last_event_id.is_some_and(|value| {
             value.is_empty()
                 || value.len() > 128
@@ -361,12 +391,8 @@ impl SessionProxy {
             return Err(SessionProxyError::Invalid);
         }
         let target = self.endpoint_target(endpoint_id).await?;
-        let mut request = self.authorized_request(
-            &target,
-            actor,
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{session_id}/events"),
-        )?;
+        let mut request =
+            self.authorized_request(&target, actor, reqwest::Method::GET, "/v1/events")?;
         if let Some(last_event_id) = last_event_id {
             request = request.header("last-event-id", last_event_id);
         }
@@ -549,6 +575,68 @@ impl SessionProxy {
         })
     }
 
+    async fn forward_tool_command(
+        &self,
+        actor: &ActorContext,
+        endpoint_id: &str,
+        path: &str,
+        idempotency_key: &str,
+        body: Value,
+    ) -> Result<ProxyJson, SessionProxyError> {
+        validate_idempotency_key(idempotency_key)?;
+        let target = self.endpoint_target(endpoint_id).await?;
+        self.forward_idempotent_json(
+            &target,
+            actor,
+            reqwest::Method::POST,
+            path,
+            idempotency_key,
+            &body,
+        )
+        .await
+    }
+
+    async fn forward_idempotent_json(
+        &self,
+        target: &EndpointTarget,
+        actor: &ActorContext,
+        method: reqwest::Method,
+        path: &str,
+        idempotency_key: &str,
+        body: &Value,
+    ) -> Result<ProxyJson, SessionProxyError> {
+        match self
+            .send_json(
+                target,
+                actor,
+                method.clone(),
+                path,
+                JsonRequest {
+                    idempotency_key: Some(idempotency_key),
+                    body: Some(body),
+                    replay_only: true,
+                },
+            )
+            .await?
+        {
+            EndpointJson::Public(response) => return Ok(response),
+            EndpointJson::ReceiptMiss => {}
+        }
+        self.send_json(
+            target,
+            actor,
+            method,
+            path,
+            JsonRequest {
+                idempotency_key: Some(idempotency_key),
+                body: Some(body),
+                replay_only: false,
+            },
+        )
+        .await
+        .and_then(public_only)
+    }
+
     async fn endpoint_target(
         &self,
         endpoint_id: &str,
@@ -672,6 +760,18 @@ impl SessionProxy {
     }
 }
 
+fn tool_command_path(
+    session_id: &str,
+    tool_call_id: &str,
+    action: &str,
+) -> Result<String, SessionProxyError> {
+    validate_path_identifier(session_id)?;
+    validate_callback_id(tool_call_id)?;
+    Ok(format!(
+        "/v1/sessions/{session_id}/tool-calls/{tool_call_id}/{action}"
+    ))
+}
+
 fn validate_descriptor(
     model: &CreateModelSelection,
     descriptor: &ProviderDescriptorRecord,
@@ -703,14 +803,14 @@ fn validate_profile(
     }
     if profile.profile_id != model.auth_profile_id
         || profile.provider != model.provider
-        || profile.kind != "api_key"
+        || !matches!(profile.kind.as_str(), "api_key" | "oauth")
         || profile.revision < model.minimum_auth_revision
     {
         return Err(SessionProxyError::Invalid);
     }
     let endpoint_ids: Vec<String> = serde_json::from_str(&profile.endpoint_ids_json)
         .map_err(|_| SessionProxyError::Internal)?;
-    if profile.sharing_mode != "selected" || !endpoint_ids.iter().any(|id| id == endpoint_id) {
+    if profile.sharing_mode == "none" || !endpoint_ids.iter().any(|id| id == endpoint_id) {
         return Err(SessionProxyError::AuthReplicaUnavailable);
     }
     let replica = replicas

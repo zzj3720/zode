@@ -17,6 +17,8 @@ const MAX_ID_BYTES: usize = 256;
 const MAX_URL_BYTES: usize = 2 * 1024;
 const MAX_PATH_BYTES: usize = 4 * 1024;
 const MAX_AUDIENCES: usize = 16;
+const MAX_PROVIDER_AUTH_ADAPTERS: usize = 64;
+const MAX_OAUTH_SCOPES: usize = 64;
 
 #[derive(Debug, Error)]
 pub(crate) enum ConfigError {
@@ -48,6 +50,8 @@ pub(crate) struct ServerConfig {
     control_database: PathBuf,
     secret_directory: PathBuf,
     access: AccessConfig,
+    #[serde(default)]
+    provider_auth_adapters: Vec<ProviderAuthAdapterConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -112,6 +116,28 @@ pub(crate) struct AccessConfig {
     jwks_url: String,
     subject_key_file: PathBuf,
     subject_key_version: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderAuthAdapterConfig {
+    provider: String,
+    kind: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    client_id: String,
+    client_secret_file: Option<PathBuf>,
+    #[serde(default)]
+    scopes: Vec<String>,
+    refresh_recovery: RefreshRecovery,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RefreshRecovery {
+    SameOperationIdIdempotent,
+    ExactResultReconcile,
+    None,
 }
 
 impl ServerConfig {
@@ -202,6 +228,10 @@ impl ServerConfig {
 
     pub(crate) fn access(&self) -> &AccessConfig {
         &self.access
+    }
+
+    pub(crate) fn provider_auth_adapters(&self) -> &[ProviderAuthAdapterConfig] {
+        &self.provider_auth_adapters
     }
 
     fn validate_and_resolve(&mut self, base: PathBuf) -> Result<(), ConfigError> {
@@ -298,7 +328,106 @@ impl ServerConfig {
             )?;
         }
 
-        self.access.validate()
+        self.access.validate()?;
+        if self.provider_auth_adapters.len() > MAX_PROVIDER_AUTH_ADAPTERS {
+            return Err(ConfigError::Invalid(
+                "provider_auth_adapters contains too many entries",
+            ));
+        }
+        let mut providers = HashSet::with_capacity(self.provider_auth_adapters.len());
+        for adapter in &mut self.provider_auth_adapters {
+            adapter.validate_and_resolve(&base)?;
+            if !providers.insert(adapter.provider.as_str()) {
+                return Err(ConfigError::Invalid(
+                    "provider_auth_adapters contains a duplicate provider",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ProviderAuthAdapterConfig {
+    pub(crate) fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub(crate) fn authorization_endpoint(&self) -> &str {
+        &self.authorization_endpoint
+    }
+
+    pub(crate) fn token_endpoint(&self) -> &str {
+        &self.token_endpoint
+    }
+
+    pub(crate) fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    pub(crate) fn client_secret_file(&self) -> Option<&Path> {
+        self.client_secret_file.as_deref()
+    }
+
+    pub(crate) fn scopes(&self) -> &[String] {
+        &self.scopes
+    }
+
+    pub(crate) fn refresh_recovery(&self) -> RefreshRecovery {
+        self.refresh_recovery
+    }
+
+    fn validate_and_resolve(&mut self, base: &Path) -> Result<(), ConfigError> {
+        if self.kind != "oauth2_authorization_code_pkce"
+            || !valid_identifier(&self.provider, MAX_ID_BYTES)
+        {
+            return Err(ConfigError::Invalid(
+                "provider_auth_adapters contains an invalid adapter",
+            ));
+        }
+        if self.refresh_recovery == RefreshRecovery::ExactResultReconcile {
+            return Err(ConfigError::Invalid(
+                "generic OAuth adapter refresh recovery is unsupported",
+            ));
+        }
+        self.authorization_endpoint = validate_oauth_endpoint(&self.authorization_endpoint)?;
+        self.token_endpoint = validate_oauth_endpoint(&self.token_endpoint)?;
+        validate_text(
+            &self.client_id,
+            MAX_ID_BYTES,
+            "provider auth client_id is invalid",
+        )?;
+        if self.scopes.len() > MAX_OAUTH_SCOPES {
+            return Err(ConfigError::Invalid(
+                "provider auth scopes contains too many entries",
+            ));
+        }
+        let mut previous = None;
+        for scope in &self.scopes {
+            validate_text(scope, MAX_ID_BYTES, "provider auth scope is invalid")?;
+            if previous.is_some_and(|value: &str| value >= scope.as_str()) {
+                return Err(ConfigError::Invalid(
+                    "provider auth scopes must be sorted and unique",
+                ));
+            }
+            previous = Some(scope.as_str());
+        }
+        if let Some(configured) = &self.client_secret_file {
+            let resolved =
+                resolve_path(base, configured, "provider auth client secret is invalid")?;
+            require_private_regular_file(&resolved, "provider auth client secret is invalid")?;
+            self.client_secret_file = Some(resolved);
+        }
+        Ok(())
+    }
+}
+
+impl RefreshRecovery {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::SameOperationIdIdempotent => "same_operation_id_idempotent",
+            Self::ExactResultReconcile => "exact_result_reconcile",
+            Self::None => "none",
+        }
     }
 }
 
@@ -612,6 +741,27 @@ fn validate_access_url(value: &str) -> Result<Url, ConfigError> {
     Ok(url)
 }
 
+fn validate_oauth_endpoint(value: &str) -> Result<String, ConfigError> {
+    validate_text(value, MAX_URL_BYTES, "provider auth endpoint is invalid")?;
+    let url =
+        Url::parse(value).map_err(|_| ConfigError::Invalid("provider auth endpoint is invalid"))?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.host().is_none()
+        || url.path() == "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::Invalid("provider auth endpoint is invalid"));
+    }
+    match url.scheme() {
+        "https" => {}
+        "http" if is_loopback(&url) => {}
+        _ => return Err(ConfigError::Invalid("provider auth endpoint is invalid")),
+    }
+    Ok(url.to_string())
+}
+
 fn is_loopback(url: &Url) -> bool {
     match url.host() {
         Some(Host::Ipv4(address)) => address.is_loopback(),
@@ -631,6 +781,14 @@ fn validate_text(value: &str, max_bytes: usize, error: &'static str) -> Result<(
     } else {
         Ok(())
     }
+}
+
+fn valid_identifier(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn config_directory(config_path: &Path) -> Result<PathBuf, ConfigError> {
@@ -713,6 +871,19 @@ fn require_regular_file(path: &Path, error: &'static str) -> Result<(), ConfigEr
     let metadata = fs::symlink_metadata(path).map_err(ConfigError::Read)?;
     if !metadata.file_type().is_file() {
         return Err(ConfigError::Invalid(error));
+    }
+    Ok(())
+}
+
+fn require_private_regular_file(path: &Path, error: &'static str) -> Result<(), ConfigError> {
+    require_regular_file(path, error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = fs::symlink_metadata(path).map_err(ConfigError::Read)?;
+        if metadata.nlink() != 1 || metadata.permissions().mode() & 0o077 != 0 {
+            return Err(ConfigError::Invalid(error));
+        }
     }
     Ok(())
 }

@@ -4,7 +4,7 @@ use std::{
     error::Error,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use axum::{extract::State, http::StatusCode, routing::get, Router};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -44,6 +45,7 @@ const CATALOG_ENDPOINT_LABEL: &str = "Access Catalog Endpoint";
 const JWKS_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
 const CHILD_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const FIXTURE_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const IDENTITY_MARKERS: &[&str] = &[
     HUMAN_SUB,
     SERVICE_NAME,
@@ -703,8 +705,11 @@ fn e2e_server_endpoint_protocol_compatibility_matrix() -> TestResult {
                     MatrixExpectation::Accepted { revision } => {
                         if create.status != 201 {
                             return Err(io::Error::other(format!(
-                                "protocol matrix case {} expected HTTP 201, got {}",
-                                case.name, create.status
+                                "protocol matrix case {} expected HTTP 201, got {}; safe body={}; observed JWKS requests={}",
+                                case.name,
+                                create.status,
+                                String::from_utf8_lossy(&create.body),
+                                jwks.request_count()
                             ))
                             .into());
                         }
@@ -722,8 +727,11 @@ fn e2e_server_endpoint_protocol_compatibility_matrix() -> TestResult {
                                 != "endpoint_unavailable"
                         {
                             return Err(io::Error::other(format!(
-                                "protocol matrix case {} did not fail closed at the Server boundary",
-                                case.name
+                                "protocol matrix case {} did not fail closed at the Server boundary: status={}; safe body={}; observed JWKS requests={}",
+                                case.name,
+                                create.status,
+                                String::from_utf8_lossy(&create.body),
+                                jwks.request_count()
                             ))
                             .into());
                         }
@@ -1573,14 +1581,19 @@ impl CountingProxy {
                         let changed = Arc::clone(&thread_changed);
                         let protocol_matrix_variant = Arc::clone(&thread_protocol_matrix_variant);
                         workers.push(thread::spawn(move || {
-                            let _ = proxy_counted_request(
+                            if let Err(error) = proxy_counted_request(
                                 stream,
                                 &host,
                                 upstream_port,
                                 &requests,
                                 &changed,
                                 &protocol_matrix_variant,
-                            );
+                            ) {
+                                eprintln!(
+                                    "COUNTING_PROXY_IO_ERROR kind={:?} message={error}",
+                                    error.kind()
+                                );
+                            }
                         }));
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1756,8 +1769,8 @@ fn proxy_counted_request(
     changed: &(Mutex<()>, Condvar),
     protocol_matrix_variant: &Mutex<Option<ProtocolMatrixVariant>>,
 ) -> io::Result<()> {
-    client.set_read_timeout(Some(Duration::from_secs(5)))?;
-    client.set_write_timeout(Some(Duration::from_secs(5)))?;
+    client.set_read_timeout(Some(FIXTURE_IO_TIMEOUT))?;
+    client.set_write_timeout(Some(FIXTURE_IO_TIMEOUT))?;
     let request = read_bounded_http_request(&mut client)?;
     let path = request_target_path(&request)?;
     let protocol_matrix_variant = *protocol_matrix_variant
@@ -1774,17 +1787,17 @@ fn proxy_counted_request(
     }
     let request = request_with_connection_close(&request)?;
     let mut upstream = TcpStream::connect((upstream_host, upstream_port))?;
-    upstream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    upstream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    upstream.set_read_timeout(Some(FIXTURE_IO_TIMEOUT))?;
+    upstream.set_write_timeout(Some(FIXTURE_IO_TIMEOUT))?;
     upstream.write_all(&request)?;
     requests.fetch_add(1, Ordering::AcqRel);
     changed.1.notify_all();
-    let mut response = Vec::new();
-    upstream.read_to_end(&mut response)?;
+    let mut response = read_bounded_http_response(&mut upstream)?;
     if let Some(variant) = protocol_matrix_variant {
         response = mutate_protocol_matrix_response(&path, &response, variant)?;
     }
-    client.write_all(&response)
+    client.write_all(&response)?;
+    client.shutdown(Shutdown::Write)
 }
 
 fn request_has_header(request: &[u8], expected: &str) -> bool {
@@ -1980,6 +1993,93 @@ fn read_bounded_http_request(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     }
     request.truncate(required);
     Ok(request)
+}
+
+fn read_bounded_http_response(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let header_end = loop {
+        if let Some(end) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+            break end;
+        }
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Endpoint proxy response ended before headers",
+            ));
+        }
+        response.extend_from_slice(&chunk[..read]);
+        if response.len() > MAX_RESPONSE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Endpoint proxy response exceeded its bound",
+            ));
+        }
+    };
+    let header_text = std::str::from_utf8(&response[..header_end]).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Endpoint proxy response headers were not UTF-8",
+        )
+    })?;
+    let content_length = header_text
+        .split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| {
+            value.trim().parse::<usize>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Endpoint proxy response content length was invalid",
+                )
+            })
+        })
+        .transpose()?;
+    let Some(content_length) = content_length else {
+        loop {
+            let read = stream.read(&mut chunk)?;
+            if read == 0 {
+                return Ok(response);
+            }
+            response.extend_from_slice(&chunk[..read]);
+            if response.len() > MAX_RESPONSE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Endpoint proxy response exceeded its bound",
+                ));
+            }
+        }
+    };
+    let required = header_end
+        .checked_add(4)
+        .and_then(|value| value.checked_add(content_length))
+        .filter(|required| *required <= MAX_RESPONSE_BYTES)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Endpoint proxy response content length exceeded its bound",
+            )
+        })?;
+    while response.len() < required {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Endpoint proxy response ended before its declared body",
+            ));
+        }
+        response.extend_from_slice(&chunk[..read]);
+        if response.len() > MAX_RESPONSE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Endpoint proxy response exceeded its bound",
+            ));
+        }
+    }
+    response.truncate(required);
+    Ok(response)
 }
 
 impl QuarantineCapture {
@@ -4442,6 +4542,14 @@ struct JwksFixture {
     join: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+struct JwksHttpState {
+    rotated: Arc<AtomicBool>,
+    failure: Arc<AtomicBool>,
+    requests: Arc<AtomicUsize>,
+    response_gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
 impl JwksFixture {
     fn start() -> TestResult<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -4457,40 +4565,63 @@ impl JwksFixture {
         let thread_requests = Arc::clone(&requests);
         let thread_response_gate = Arc::clone(&response_gate);
         let thread_stop = Arc::clone(&stop);
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
         let join = thread::spawn(move || {
-            let mut workers = Vec::new();
-            while !thread_stop.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let rotated = Arc::clone(&thread_rotated);
-                        let failure = Arc::clone(&thread_failure);
-                        let requests = Arc::clone(&thread_requests);
-                        let response_gate = Arc::clone(&thread_response_gate);
-                        workers.push(thread::spawn(move || {
-                            let _ = serve_jwks_connection(
-                                stream,
-                                &rotated,
-                                &failure,
-                                &requests,
-                                &response_gate,
-                            );
-                        }));
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(4)
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!("JWKS fixture runtime failed: {error}")));
+                    return;
                 }
-            }
-            let (held, released) = &*thread_response_gate;
-            if let Ok(mut held) = held.lock() {
-                *held = false;
-                released.notify_all();
-            }
-            for worker in workers {
-                let _ = worker.join();
-            }
+            };
+            runtime.block_on(async move {
+                let listener = match tokio::net::TcpListener::from_std(listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        let _ =
+                            ready_tx.send(Err(format!("JWKS fixture listener failed: {error}")));
+                        return;
+                    }
+                };
+                let router =
+                    Router::new()
+                        .route("/jwks", get(serve_jwks))
+                        .with_state(JwksHttpState {
+                            rotated: thread_rotated,
+                            failure: thread_failure,
+                            requests: thread_requests,
+                            response_gate: thread_response_gate,
+                        });
+                if ready_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                let result = axum::serve(listener, router)
+                    .with_graceful_shutdown(async move {
+                        while !thread_stop.load(Ordering::Acquire) {
+                            tokio::time::sleep(POLL_INTERVAL).await;
+                        }
+                    })
+                    .await;
+                if let Err(error) = result {
+                    eprintln!("JWKS_FIXTURE_SERVER_ERROR {error}");
+                }
+            });
         });
+        match ready_rx.recv_timeout(JWKS_BARRIER_TIMEOUT) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(io::Error::other(error).into()),
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("JWKS fixture readiness failed: {error}"),
+                )
+                .into())
+            }
+        }
         Ok(Self {
             address,
             rotated,
@@ -4577,63 +4708,35 @@ impl Drop for JwksFixture {
             self.response_gate.1.notify_all();
         }
         self.stop.store(true, Ordering::Release);
-        let _ = TcpStream::connect(self.address);
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
     }
 }
 
-fn serve_jwks_connection(
-    mut stream: TcpStream,
-    rotated: &AtomicBool,
-    failure: &AtomicBool,
-    requests: &AtomicUsize,
-    response_gate: &(Mutex<bool>, Condvar),
-) -> io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let mut request = Vec::new();
-    let mut chunk = [0u8; 2048];
-    while !request.windows(4).any(|window| window == b"\r\n\r\n") && request.len() < 64 * 1024 {
-        let read = stream.read(&mut chunk)?;
-        if read == 0 {
-            break;
-        }
-        request.extend_from_slice(&chunk[..read]);
-    }
-    let request_text = String::from_utf8_lossy(&request);
-    let path = request_text
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("");
-    let (status, body) = if path == "/jwks" {
-        requests.fetch_add(1, Ordering::AcqRel);
-        response_gate.1.notify_all();
-        let mut held = response_gate
-            .0
-            .lock()
-            .map_err(|_| io::Error::other("JWKS response gate lock poisoned"))?;
+async fn serve_jwks(State(state): State<JwksHttpState>) -> (StatusCode, String) {
+    state.requests.fetch_add(1, Ordering::AcqRel);
+    state.response_gate.1.notify_all();
+    let response_gate = Arc::clone(&state.response_gate);
+    let released = tokio::task::block_in_place(move || {
+        let (held, changed) = &*response_gate;
+        let mut held = held.lock().map_err(|_| ())?;
         while *held {
-            held = response_gate
-                .1
-                .wait(held)
-                .map_err(|_| io::Error::other("JWKS response gate lock poisoned"))?;
+            held = changed.wait(held).map_err(|_| ())?;
         }
-        drop(held);
-        if failure.load(Ordering::Acquire) {
-            ("503 Service Unavailable", String::new())
-        } else {
-            ("200 OK", jwks_document(rotated.load(Ordering::Acquire)))
-        }
+        Ok::<(), ()>(())
+    });
+    if released.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
+    }
+    if state.failure.load(Ordering::Acquire) {
+        (StatusCode::SERVICE_UNAVAILABLE, String::new())
     } else {
-        ("404 Not Found", String::new())
-    };
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(response.as_bytes())
+        (
+            StatusCode::OK,
+            jwks_document(state.rotated.load(Ordering::Acquire)),
+        )
+    }
 }
 
 fn jwks_document(rotated: bool) -> String {
