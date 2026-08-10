@@ -2126,14 +2126,13 @@ async fn replay_events_through_version<S: EndpointAddress>(
         let version = frame.data["version"]
             .as_u64()
             .ok_or_else(|| Error::other("durable SSE event omitted its session version"))?;
-        if version > through_version {
-            return Err(Error::other(format!(
-                "session event replay skipped target version {through_version} and reached {version}"
-            ))
-            .into());
-        }
         replay.push(frame);
-        if version == through_version {
+        // Public SSE deliberately omits private stream facts.  A GET version
+        // may therefore land between a private event and the next public
+        // frame; the first public frame at or beyond the internal lower bound
+        // is the durable barrier we can observe without inventing a private
+        // event on the wire.
+        if version >= through_version {
             return Ok(replay);
         }
     }

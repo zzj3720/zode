@@ -388,6 +388,18 @@ function processEntry(pid) {
   return listPids().find((entry) => entry.pid === pid) || null;
 }
 
+function processCommand(pid) {
+  if (process.platform === 'win32') return null;
+  const result = spawnSync('ps', ['-p', String(pid), '-o', 'command='], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    maxBuffer: 64 * 1024,
+  });
+  if (result.status !== 0 || typeof result.stdout !== 'string') return null;
+  const command = result.stdout.trim();
+  return command || null;
+}
+
 function processGroupEntries(pgid) {
   return listPids().filter((entry) => entry.pgid === pgid);
 }
@@ -442,7 +454,16 @@ async function validateProcessOwner(locator) {
     throw ownerMismatch();
   }
   if (entry.pgid !== locator.process_group_id) throw ownerMismatch();
-  if (basename(entry.comm.trim()) !== basename(locator.executable_path)) throw ownerMismatch();
+  const executableName = basename(locator.executable_path);
+  if (basename(entry.comm.trim()) !== executableName) {
+    // A test wrapper launched through an interpreter (for example a Node
+    // `.cjs` server wrapper) reports the interpreter as `comm`, while the
+    // command line still contains the exact, hashed wrapper path.  Accept
+    // that shape only when the full locator path is present; an arbitrary
+    // process whose arguments merely contain the basename is not enough.
+    const command = processCommand(locator.pid);
+    if (!command || !command.split(/\s+/u).includes(locator.executable_path)) throw ownerMismatch();
+  }
 
   const startedAt = processStartTimeUnixMs(locator.pid);
   if (startedAt === null || Math.abs(startedAt - locator.started_at_unix_ms) > PROCESS_START_TIME_TOLERANCE_MS) {

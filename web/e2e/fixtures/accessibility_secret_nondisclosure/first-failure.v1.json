@@ -1,13 +1,17 @@
 {
-  "schema": "zode.http-incident-cassette.v1",
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
   "recording_id": "000002-bddde4d8-0dc2-4dca-8baf-9b8afd38b47c",
   "e2e_name": "e2e_browser_write_only_secrets_and_oauth_ticket_non_disclosure",
   "boundary": "management-access-edge",
   "first_observed": "safe public response captured from the first real browser exchange",
   "classification": "PRODUCT_ROUTE_MISSING_SHALLOW_404",
+  "first_failure_recording_id": "000002-bddde4d8-0dc2-4dca-8baf-9b8afd38b47c",
   "exchanges": [
     {
-      "sequence": "000002-bddde4d8-0dc2-4dca-8baf-9b8afd38b47c",
+      "sequence": "000001",
+      "recording_id": "000002-bddde4d8-0dc2-4dca-8baf-9b8afd38b47c",
+      "boundary": "management-access-edge",
       "method": "GET",
       "path": "/",
       "request_headers": {
@@ -40,5 +44,5 @@
     "status": 200,
     "safe_outcome": "management_ui_bootstrapped"
   },
-  "integrity_sha256": "31d0664fa94395d574bc42d329ecac0ee16ac6310d34adc7a1cdb633cf88117c"
+  "integrity_sha256": "6d16b70fea21423b76aee227a4b662d5f5cd22ab3a4de261c47583be8d05efbc"
 }

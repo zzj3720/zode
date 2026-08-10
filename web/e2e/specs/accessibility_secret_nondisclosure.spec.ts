@@ -20,7 +20,7 @@ const {
   ProductBehaviorFailure,
   ProductRouteMissing,
 } = require("../support/harness.cjs") as {
-  createWebE2EHarness: () => Promise<RealWebE2EHarness>;
+  createWebE2EHarness: (options?: { includeServerOrigins?: boolean }) => Promise<RealWebE2EHarness>;
   HarnessFailure: new (...args: never[]) => Error;
   ProductBehaviorFailure: new (
     classification: string,
@@ -47,6 +47,14 @@ const PROVIDER_ID = "browser-e2e-provider";
 const PROVIDER_MODEL = "browser-e2e-model";
 const NAMED_E2E =
   "e2e_browser_write_only_secrets_and_oauth_ticket_non_disclosure";
+const LATER_REPRODUCTION_RELATION = "later_test_reproduction_of_gap";
+const HTTP_REPLAYABLE_FAILURE_CLASSIFICATIONS = new Set([
+  "PRODUCT_ROUTE_MISSING_SHALLOW_404",
+  "BROWSER_BOOTSTRAP_BEHAVIOR_FAILURE",
+  "ENDPOINT_CREATE_RESPONSE_FAILURE",
+  "PROVIDER_DESCRIPTOR_RESPONSE_FAILURE",
+  "PROVIDER_PROFILE_RESPONSE_FAILURE",
+]);
 const INCIDENT_FIXTURE = fileURLToPath(
   new URL(
     "../fixtures/accessibility_secret_nondisclosure/first-failure.v1.json",
@@ -88,9 +96,14 @@ type RealWebE2EHarness = {
   controllerSecret: string;
   providerSecret: string;
   ledger: { add: (label: string, value: string) => void };
+  beginCaptureSet: (options: {
+    e2eName: string;
+    maxMembers: number;
+  }) => string;
   captureAndReplayFailure: (
     error: Error,
     e2eName: string,
+    options?: { relation?: typeof LATER_REPRODUCTION_RELATION },
   ) => Promise<unknown>;
   journal: {
     replay: (
@@ -121,7 +134,11 @@ function assertMarkerAbsent(label: string, values: unknown[]): void {
   ) {
     // Never include the received value in this error.  Playwright may surface
     // the error in a report that is itself part of the secret-scan boundary.
-    throw new Error(`${label} contained the synthetic secret marker`);
+    throw new ProductBehaviorFailure(
+      "SECRET_MARKER_EXPOSED",
+      "a public browser or Server surface contained a synthetic secret marker",
+      { label },
+    );
   }
 }
 
@@ -131,7 +148,7 @@ async function activeElementDescriptor(page: Page): Promise<{
 }> {
   return page.evaluate(() => {
     const element = document.activeElement as HTMLElement | null;
-    if (!element) return { name: "", role: "" };
+    if (!element || element === document.body) return { name: "", role: "" };
 
     const labelledBy = element
       .getAttribute("aria-labelledby")
@@ -150,10 +167,8 @@ async function activeElementDescriptor(page: Page): Promise<{
       element.getAttribute("placeholder"),
       element.textContent,
     ]
-      .filter(Boolean)
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
+      .map((value) => value?.replace(/\s+/g, " ").trim() ?? "")
+      .find(Boolean) ?? "";
 
     const explicitRole = element.getAttribute("role");
     const implicitRole =
@@ -202,7 +217,60 @@ async function assertVisibleFocus(page: Page, label: string): Promise<void> {
   });
 
   if (!state.focused || !state.visible || !state.focusVisible || !state.styled) {
-    throw new Error(`${label} did not expose a visible keyboard focus ring`);
+    const active = await activeElementDescriptor(page);
+    throw new ProductBehaviorFailure(
+      "KEYBOARD_FOCUS_VISIBILITY_FAILURE",
+      "the current keyboard target did not expose the required visible focus ring",
+      {
+        label,
+        active_role: /^[a-z][a-z0-9_-]{0,31}$/.test(active.role)
+          ? active.role
+          : "unavailable",
+      },
+    );
+  }
+}
+
+async function assertFocusRestored(
+  page: Page,
+  trigger: Locator,
+  details: {
+    label: string;
+    method?: string;
+    path?: string;
+    stage: string;
+    status?: number;
+  },
+): Promise<void> {
+  let focused = false;
+  try {
+    if (await trigger.count() === 1) {
+      focused = await trigger.evaluate((node) => node === document.activeElement);
+    }
+  } catch {
+    focused = false;
+  }
+  if (!focused) {
+    const active = await activeElementDescriptor(page);
+    throw new ProductBehaviorFailure(
+      "KEYBOARD_FOCUS_RESTORATION_FAILURE",
+      "a completed or cancelled keyboard action did not restore focus to its trigger",
+      {
+        ...details,
+        active_role: /^[a-z][a-z0-9_-]{0,31}$/.test(active.role)
+          ? active.role
+          : "unavailable",
+      },
+    );
+  }
+  try {
+    await assertVisibleFocus(page, details.label);
+  } catch {
+    throw new ProductBehaviorFailure(
+      "KEYBOARD_FOCUS_RESTORATION_FAILURE",
+      "the restored keyboard trigger did not expose its visible focus indication",
+      details,
+    );
   }
 }
 
@@ -224,10 +292,19 @@ async function tabTo(
 ): Promise<void> {
   for (let index = 0; index < maxTabs; index += 1) {
     await page.keyboard.press("Tab");
+    const descriptor = await activeElementDescriptor(page);
+    // Chromium may briefly return keyboard focus from browser chrome to the
+    // document body.  Body is not a user-operable target; keep traversing and
+    // require every actual control we encounter to expose its focus ring.
+    if (descriptor.role === "" && descriptor.name === "") continue;
     await assertVisibleFocus(page, label);
-    if (targetMatches(await activeElementDescriptor(page), target)) return;
+    if (targetMatches(descriptor, target)) return;
   }
-  throw new Error(`${label} was not reachable from the keyboard`);
+  throw new ProductBehaviorFailure(
+    "KEYBOARD_TARGET_UNREACHABLE",
+    "the expected public control was not reachable from the keyboard",
+    { label },
+  );
 }
 
 async function tabToWithin(
@@ -247,7 +324,11 @@ async function tabToWithin(
       return;
     }
   }
-  throw new Error(`${label} was not reachable inside its dialog`);
+  throw new ProductBehaviorFailure(
+    "KEYBOARD_EDITOR_TARGET_UNREACHABLE",
+    "the expected public editor control was not reachable from the keyboard",
+    { label },
+  );
 }
 
 async function assertDialogFocusTrap(
@@ -258,7 +339,13 @@ async function assertDialogFocusTrap(
   const initiallyInside = await dialog.evaluate((node) =>
     node.contains(document.activeElement),
   );
-  if (!initiallyInside) throw new Error(`${label} did not move focus into the dialog`);
+  if (!initiallyInside) {
+    throw new ProductBehaviorFailure(
+      "KEYBOARD_DIALOG_FOCUS_FAILURE",
+      "keyboard activation did not move focus into the opened dialog",
+      { label },
+    );
+  }
   await assertVisibleFocus(page, `${label} initial focus`);
   for (let index = 0; index < 8; index += 1) {
     await page.keyboard.press("Tab");
@@ -266,7 +353,13 @@ async function assertDialogFocusTrap(
     const inside = await dialog.evaluate((node) =>
       node.contains(document.activeElement),
     );
-    if (!inside) throw new Error(`${label} allowed focus to escape the dialog`);
+    if (!inside) {
+      throw new ProductBehaviorFailure(
+        "KEYBOARD_DIALOG_FOCUS_TRAP_FAILURE",
+        "forward keyboard traversal escaped the opened dialog",
+        { label },
+      );
+    }
   }
   for (let index = 0; index < 4; index += 1) {
     await page.keyboard.press("Shift+Tab");
@@ -274,7 +367,13 @@ async function assertDialogFocusTrap(
     const inside = await dialog.evaluate((node) =>
       node.contains(document.activeElement),
     );
-    if (!inside) throw new Error(`${label} allowed reverse focus to escape the dialog`);
+    if (!inside) {
+      throw new ProductBehaviorFailure(
+        "KEYBOARD_DIALOG_FOCUS_TRAP_FAILURE",
+        "reverse keyboard traversal escaped the opened dialog",
+        { label },
+      );
+    }
   }
 }
 
@@ -507,16 +606,44 @@ async function flushEvidence(evidence: BrowserEvidence): Promise<string[]> {
   return values;
 }
 
+async function readSecretScanSurface<T>(
+  label: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (
+      error instanceof HarnessFailure
+      || (error && typeof error === "object" && "classification" in error)
+    ) {
+      throw error;
+    }
+    throw new ProductBehaviorFailure(
+      "SECRET_SCAN_READ_FAILURE",
+      "a required secret-scan surface could not be read",
+      { label },
+    );
+  }
+}
+
 async function assertNoSecretMarker(
   page: Page,
   evidence: BrowserEvidence,
   phase: string,
 ): Promise<void> {
-  const surface = await pageSecretSurface(page);
+  const surface = await readSecretScanSurface(
+    `${phase}: page surface`,
+    () => pageSecretSurface(page),
+  );
   assertSecretSurfaceAbsent(phase, surface);
+  const cookies = await readSecretScanSurface(
+    `${phase}: browser cookies`,
+    () => page.context().cookies(),
+  );
   assertMarkerAbsent(
     `${phase}: browser cookies`,
-    await page.context().cookies(),
+    cookies,
   );
   assertMarkerAbsent(`${phase}: URL/history`, [
     ...surface.urlHistory,
@@ -526,7 +653,11 @@ async function assertNoSecretMarker(
     ...evidence.history,
   ]);
   assertMarkerAbsent(`${phase}: console`, evidence.console);
-  assertMarkerAbsent(`${phase}: Server responses/downloads`, await flushEvidence(evidence));
+  const responseEvidence = await readSecretScanSurface(
+    `${phase}: Server responses/downloads`,
+    () => flushEvidence(evidence),
+  );
+  assertMarkerAbsent(`${phase}: Server responses/downloads`, responseEvidence);
 }
 
 function assertSecretSurfaceAbsent(phase: string, surface: SecretSurface): void {
@@ -546,7 +677,10 @@ function assertBrowserStayedOnManagementServer(
       url.startsWith(harness.providerProxy.baseUrl),
   );
   if (directBoundaryRequest) {
-    throw new Error("the browser called Endpoint/provider instead of the management Server");
+    throw new ProductBehaviorFailure(
+      "BROWSER_BYPASSED_MANAGEMENT_SERVER",
+      "the browser called an Endpoint or provider boundary instead of the management Server",
+    );
   }
 }
 
@@ -759,7 +893,7 @@ async function loadIncidentFixture(): Promise<{
   };
   const exchange = fixture.exchanges?.[0];
   if (
-    fixture.schema !== "zode.http-incident-cassette.v1" ||
+    fixture.schema !== "zode.http-incident-recording.v1" ||
     fixture.e2e_name !== NAMED_E2E ||
     fixture.boundary !== "management-access-edge" ||
     typeof fixture.first_observed !== "string" ||
@@ -791,11 +925,125 @@ async function loadIncidentFixture(): Promise<{
   };
 }
 
-function toSafeHarnessFailure(error: unknown): Error {
-  if (error instanceof HarnessFailure) return error;
+function safeErrorClassification(error: unknown): string {
+  if (
+    error
+    && typeof error === "object"
+    && "classification" in error
+    && typeof error.classification === "string"
+    && /^[A-Z][A-Z0-9_]{0,95}$/.test(error.classification)
+  ) {
+    return error.classification;
+  }
+  if (error instanceof Error) {
+    const name = error.name.replace(/[^A-Za-z0-9_]/g, "_").slice(0, 64);
+    return `NATIVE_${name || "ERROR"}`;
+  }
+  return "UNKNOWN_BROWSER_FAILURE";
+}
+
+function safeErrorContext(error: unknown): string {
+  if (!error || typeof error !== "object" || !("details" in error)) return "";
+  const details = error.details;
+  if (!details || typeof details !== "object") return "";
+  const fields: string[] = [];
+  if (
+    "label" in details
+    && typeof details.label === "string"
+    && /^[A-Za-z0-9][A-Za-z0-9 .:/_-]{0,95}$/.test(details.label)
+    && !activeSecretMarkers.some((marker) => details.label.includes(marker))
+  ) {
+    fields.push(`label=${details.label}`);
+  }
+  if (
+    "stage" in details
+    && typeof details.stage === "string"
+    && /^[a-z][a-z0-9-]{0,63}$/.test(details.stage)
+  ) {
+    fields.push(`stage=${details.stage}`);
+  }
+  if (
+    "status" in details
+    && typeof details.status === "number"
+    && Number.isInteger(details.status)
+    && details.status >= 100
+    && details.status <= 599
+  ) {
+    fields.push(`status=${details.status}`);
+  }
+  if (
+    "active_role" in details
+    && typeof details.active_role === "string"
+    && /^[a-z][a-z0-9_-]{0,31}$/.test(details.active_role)
+  ) {
+    fields.push(`active_role=${details.active_role}`);
+  }
+  if (
+    "count" in details
+    && typeof details.count === "number"
+    && Number.isInteger(details.count)
+    && details.count >= 0
+    && details.count <= 99
+  ) {
+    fields.push(`count=${details.count}`);
+  }
+  return fields.length === 0 ? "" : ` [${fields.join(", ")}]`;
+}
+
+function toSafeHarnessFailure(error: unknown, stage: string): Error {
+  const classification = safeErrorClassification(error);
+  const sourceDetails = error && typeof error === "object" && "details" in error
+    && error.details && typeof error.details === "object"
+    ? error.details
+    : undefined;
+  const details: Record<string, unknown> = {
+    stage,
+  };
+  if (
+    sourceDetails
+    && "method" in sourceDetails
+    && typeof sourceDetails.method === "string"
+    && /^[A-Z]{3,10}$/.test(sourceDetails.method)
+  ) {
+    details.method = sourceDetails.method;
+  }
+  if (
+    sourceDetails
+    && "path" in sourceDetails
+    && typeof sourceDetails.path === "string"
+    && /^\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{0,511}$/.test(sourceDetails.path)
+    && !activeSecretMarkers.some((marker) => sourceDetails.path.includes(marker))
+  ) {
+    details.path = sourceDetails.path;
+  }
+  if (
+    sourceDetails
+    && "status" in sourceDetails
+    && typeof sourceDetails.status === "number"
+    && Number.isInteger(sourceDetails.status)
+    && sourceDetails.status >= 100
+    && sourceDetails.status <= 599
+  ) {
+    details.status = sourceDetails.status;
+  }
+  if (
+    details.method === undefined
+    && classification === "PRODUCT_ROUTE_MISSING_SHALLOW_404"
+    && details.path !== undefined
+    && details.status !== undefined
+  ) {
+    details.method = "GET";
+  }
+  details.browserBehaviorReplayRequired = !(
+    HTTP_REPLAYABLE_FAILURE_CLASSIFICATIONS.has(classification)
+    && typeof details.method === "string"
+    && typeof details.path === "string"
+    && typeof details.status === "number"
+  );
   return new ProductBehaviorFailure(
-    "BROWSER_UI_BEHAVIOR_FAILURE",
+    classification,
     "the named browser scenario failed through the real management Server",
+    details,
   );
 }
 
@@ -805,7 +1053,6 @@ async function replayTrackedCassette(
   try {
     await harness.journal.replay(INCIDENT_FIXTURE, {
       baseUrl: harness.managementUrl,
-      headers: { accept: "text/html" },
     });
   } catch (error) {
     const details =
@@ -816,12 +1063,19 @@ async function replayTrackedCassette(
       error &&
       typeof error === "object" &&
       "classification" in error &&
-      error.classification === "REPLAY_MISMATCH" &&
-      details &&
-      typeof details === "object" &&
-      "actualStatus" in details &&
-      details.actualStatus === 200
+      (error.classification === "REPLAY_MISMATCH" ||
+        error.classification === "REPLAY_RESPONSE_HEADER_MISMATCH") &&
+      (error.classification === "REPLAY_RESPONSE_HEADER_MISMATCH" ||
+        (details &&
+          typeof details === "object" &&
+          "actualStatus" in details &&
+          details.actualStatus === 200))
     ) {
+      // The retained cassette is the pre-fix 404.  The public browser
+      // assertion above already proved the repaired route is 200; a strict
+      // replay therefore fails at the first differing response field (status
+      // or headers), both of which are valid evidence that the old exchange
+      // no longer matches.
       return;
     }
     throw error;
@@ -833,12 +1087,23 @@ async function withRealServerBrowserHarness<T>(
   run: (
     harness: RealWebE2EHarness,
     evidence: BrowserEvidence,
+    setStage: (stage: string) => void,
   ) => Promise<T>,
+  { failureRelation }: {
+    failureRelation?: typeof LATER_REPRODUCTION_RELATION;
+  } = {},
 ): Promise<T> {
   let harness: RealWebE2EHarness | undefined;
   let primaryFailure: unknown;
+  let currentStage = "harness-startup";
   try {
-    harness = await createWebE2EHarness();
+    harness = await createWebE2EHarness({ includeServerOrigins: true });
+    if (failureRelation !== undefined) {
+      harness.beginCaptureSet({
+        e2eName: `${NAMED_E2E}__${failureRelation}`,
+        maxMembers: 64,
+      });
+    }
     harness.ledger.add("synthetic_api_key", SYNTHETIC_SECRET_MARKER);
     activeSecretMarkers = [
       SYNTHETIC_SECRET_MARKER,
@@ -849,39 +1114,79 @@ async function withRealServerBrowserHarness<T>(
       page,
       new URL(harness.managementUrl).origin,
     );
-    return await run(harness, evidence);
+    return await run(harness, evidence, (stage) => {
+      if (!/^[a-z][a-z0-9-]{0,63}$/.test(stage)) {
+        throw new Error("browser evidence stage is invalid");
+      }
+      currentStage = stage;
+    });
   } catch (error) {
     primaryFailure = error;
     if (!harness) throw error;
 
-    let replayStage = "runtime-cassette";
+    const safeFailure = toSafeHarnessFailure(error, currentStage);
+    let captured: unknown;
     try {
-      await harness.captureAndReplayFailure(
-        toSafeHarnessFailure(error),
+      captured = await harness.captureAndReplayFailure(
+        safeFailure,
         NAMED_E2E,
+        { relation: failureRelation },
       );
-      replayStage = "tracked-cassette";
-      await replayTrackedCassette(harness);
-    } catch (replayError) {
-      // Do not expose a request, response, or secret-bearing error.  The
-      // first failure remains the primary browser assertion below.
+    } catch (captureError) {
       const classification =
-        replayError &&
-        typeof replayError === "object" &&
-        "classification" in replayError &&
-        typeof replayError.classification === "string"
-          ? replayError.classification
-          : replayError instanceof Error
-            ? `NATIVE_${replayError.name}_${
-                "code" in replayError && typeof replayError.code === "string"
-                  ? replayError.code
+        captureError &&
+        typeof captureError === "object" &&
+        "classification" in captureError &&
+        typeof captureError.classification === "string"
+          ? captureError.classification
+          : captureError instanceof Error
+            ? `NATIVE_${captureError.name}_${
+                "code" in captureError && typeof captureError.code === "string"
+                  ? captureError.code
                   : "NO_CODE"
               }`
-            : "UNKNOWN_REPLAY_FAILURE";
-      throw new Error(`the first browser failure could not be replayed safely (${replayStage}:${classification})`);
+            : "UNKNOWN_CAPTURE_FAILURE";
+      throw new Error(`the browser failure context could not be durably sealed (${classification})`);
+    }
+    if (!captured || typeof captured !== "object") {
+      throw new Error(
+        `the browser failure evidence remained incomplete (BROWSER_FAILURE_EVIDENCE_GAP:${currentStage})`,
+      );
+    }
+    if (
+      "browserBehaviorReplayRequired" in captured
+      && captured.browserBehaviorReplayRequired === true
+    ) {
+      if (
+        !("captureSet" in captured)
+        || !captured.captureSet
+        || typeof captured.captureSet !== "object"
+        || !("records" in captured.captureSet)
+        || !Array.isArray(captured.captureSet.records)
+        || captured.captureSet.records.length === 0
+      ) {
+        throw new Error(
+          `the browser failure evidence remained incomplete (BROWSER_FAILURE_EVIDENCE_GAP:${currentStage})`,
+        );
+      }
+      throw new Error(
+        `the named browser scenario failed at ${currentStage} (${safeErrorClassification(error)})${safeErrorContext(error)}; its public context was durably sealed but same-entry Chromium replay is still required before product repair`,
+      );
+    }
+    if (
+      !("record" in captured)
+      || !captured.record
+      || !("captureSet" in captured)
+      || !captured.captureSet
+      || !("cassettePath" in captured)
+      || typeof captured.cassettePath !== "string"
+    ) {
+      throw new Error(
+        `the browser HTTP failure evidence remained incomplete (BROWSER_FAILURE_EVIDENCE_GAP:${currentStage})`,
+      );
     }
     throw new Error(
-      "the named browser scenario failed; its first real exchange was retained and replayed",
+      `the named browser scenario failed at ${currentStage} (${safeErrorClassification(error)})${safeErrorContext(error)}; its exact public HTTP exchange was retained and same-entry replayed`,
     );
   } finally {
     try {
@@ -894,9 +1199,70 @@ async function withRealServerBrowserHarness<T>(
   }
 }
 
-async function openApiKeyDialog(page: Page): Promise<{
+async function resolveKeyboardEditor(
+  page: Page,
+  headingName: string,
+  label: string,
+  activationTrigger: Locator,
+): Promise<{ editor: Locator }> {
+  const heading = page.getByRole("heading", { name: headingName, exact: true });
+  await expect(heading).toHaveCount(1);
+  await expect(heading).toBeVisible();
+
+  const dialogs = page.getByRole("dialog").filter({ has: heading });
+  const dialogCount = await dialogs.count();
+  if (dialogCount > 1) {
+    throw new ProductBehaviorFailure(
+      "KEYBOARD_EDITOR_NOT_UNIQUE",
+      "keyboard activation exposed more than one matching dialog",
+      { label, count: dialogCount },
+    );
+  }
+  if (dialogCount === 1) {
+    const dialog = dialogs.first();
+    await expect(dialog).toBeVisible();
+    await assertDialogFocusTrap(page, dialog, label);
+    return { editor: dialog };
+  }
+
+  const forms = page.locator("form:visible").filter({ has: heading });
+  const formCount = await forms.count();
+  if (formCount !== 1) {
+    throw new ProductBehaviorFailure(
+      "KEYBOARD_EDITOR_NOT_UNIQUE",
+      "keyboard activation did not expose exactly one matching semantic editor",
+      { label, count: formCount },
+    );
+  }
+  const form = forms.first();
+  await expect(form).toBeVisible();
+  const focusEnteredForm = await form.evaluate((node) =>
+    node.contains(document.activeElement),
+  );
+  let triggerRetainedFocus = false;
+  try {
+    if (await activationTrigger.count() === 1) {
+      triggerRetainedFocus = await activationTrigger.evaluate((node) =>
+        node === document.activeElement,
+      );
+    }
+  } catch {
+    triggerRetainedFocus = false;
+  }
+  if (!focusEnteredForm && !triggerRetainedFocus) {
+    throw new ProductBehaviorFailure(
+      "KEYBOARD_EDITOR_FOCUS_FAILURE",
+      "keyboard activation left neither the trigger nor the opened semantic form focused",
+      { label },
+    );
+  }
+  await assertVisibleFocus(page, `${label} initial focus`);
+  return { editor: form };
+}
+
+async function openApiKeyEditor(page: Page): Promise<{
   trigger: Locator;
-  dialog: Locator;
+  editor: Locator;
 }> {
   const trigger = page.getByRole("button", {
     name: /add (an? )?(api[ -]?key )?profile|new (api[ -]?key )?profile/i,
@@ -907,10 +1273,13 @@ async function openApiKeyDialog(page: Page): Promise<{
     "API-key profile trigger",
   );
   await page.keyboard.press("Enter");
-  const dialog = page.getByRole("dialog").last();
-  await expect(dialog).toBeVisible();
-  await assertDialogFocusTrap(page, dialog, "API-key profile dialog");
-  return { trigger, dialog };
+  const result = await resolveKeyboardEditor(
+    page,
+    "Add API key profile",
+    "API-key profile editor",
+    trigger,
+  );
+  return { trigger, ...result };
 }
 
 test.describe(
@@ -942,6 +1311,7 @@ test.describe(
           throw new ProductBehaviorFailure(
             "BROWSER_BOOTSTRAP_BEHAVIOR_FAILURE",
             "the real management Server browser entry returned an unexpected status",
+            { method: "GET", path: cassette.request.path, status },
           );
         }
         await replayTrackedCassette(harness);
@@ -954,7 +1324,8 @@ test.describe(
     test(
       "e2e_browser_write_only_secrets_and_oauth_ticket_non_disclosure__write_only_provider_profile_distribution_session_create_and_chat",
       async ({ page }, testInfo) => {
-        await withRealServerBrowserHarness(page, async (harness, evidence) => {
+        await withRealServerBrowserHarness(page, async (harness, evidence, setStage) => {
+          setStage("browser-bootstrap");
           const cassette = await loadIncidentFixture();
           expect(cassette.request.path).toBe("/");
           expect(cassette.first_observed.status).toBeLessThan(500);
@@ -976,15 +1347,19 @@ test.describe(
             throw new ProductBehaviorFailure(
               "BROWSER_BOOTSTRAP_BEHAVIOR_FAILURE",
               "the real management Server browser entry returned an unexpected status",
+              { method: "GET", path: "/", status },
             );
           }
           await replayTrackedCassette(harness);
           await expect(page.getByRole("navigation")).toBeVisible();
           await recordHistory(page, evidence);
 
+          setStage("endpoint-navigation");
           await tabTo(page, { name: /^endpoints$/i }, "Endpoints navigation");
+          setStage("endpoint-navigation-activate");
           await page.keyboard.press("Enter");
-          await expect(page.getByRole("heading", { name: /endpoints/i })).toBeVisible();
+          setStage("endpoint-navigation-render");
+          await expect(page.getByRole("heading", { name: "Endpoints", exact: true, level: 1 })).toBeVisible();
           const endpointTrigger = page.getByRole("button", {
             name: /add remote endpoint|add endpoint|new endpoint/i,
           }).first();
@@ -994,6 +1369,7 @@ test.describe(
             "remote Endpoint creation trigger",
           );
           await page.keyboard.press("Enter");
+          setStage("endpoint-dialog");
           const endpointDialog = page.getByRole("dialog").last();
           await expect(endpointDialog).toBeVisible();
           await tabToWithin(
@@ -1031,20 +1407,48 @@ test.describe(
             { role: "button", name: /add endpoint|create endpoint|save endpoint/i },
             "Endpoint creation submit",
           );
+          setStage("endpoint-submit");
+          const endpointResponsePromise = page.waitForResponse(
+            (candidate) => candidate.request().method() === "POST"
+              && new URL(candidate.url()).pathname === "/v1/endpoints",
+          );
           await page.keyboard.press("Enter");
+          const endpointResponse = await endpointResponsePromise;
+          if (endpointResponse.status() !== 201) {
+            throw new ProductBehaviorFailure(
+              "ENDPOINT_CREATE_RESPONSE_FAILURE",
+              "the public Endpoint create command returned an unexpected status",
+              {
+                method: "POST",
+                path: "/v1/endpoints",
+                stage: "endpoint-submit",
+                status: endpointResponse.status(),
+              },
+            );
+          }
+          setStage("endpoint-post-submit");
           await expect(endpointDialog).toBeHidden({ timeout: 30_000 });
-          await expect(endpointTrigger).toBeFocused();
-          await assertVisibleFocus(page, "restored Endpoint trigger focus");
+          await assertFocusRestored(page, endpointTrigger, {
+            label: "restored Endpoint trigger focus",
+            method: "POST",
+            path: "/v1/endpoints",
+            stage: "endpoint-post-submit",
+            status: 201,
+          });
           await assertWriteOnlySecretControls(page);
           await assertTextStatus(page, "Endpoint control credential submission");
           await assertNoSecretMarker(page, evidence, "after Endpoint control credential submission");
           assertBrowserStayedOnManagementServer(evidence, harness);
           await recordHistory(page, evidence);
 
+          setStage("provider-navigation");
           await tabTo(page, { name: /^providers$/i }, "Providers navigation");
+          setStage("provider-navigation-activate");
           await page.keyboard.press("Enter");
-          await expect(page.getByRole("heading", { name: /providers/i })).toBeVisible();
+          setStage("provider-navigation-render");
+          await expect(page.getByRole("heading", { name: "Providers", exact: true, level: 1 })).toBeVisible();
 
+          setStage("provider-trigger");
           await tabTo(
             page,
             { role: "button", name: /configure provider|add provider/i },
@@ -1054,61 +1458,143 @@ test.describe(
             name: /configure provider|add provider/i,
           }).first();
           await page.keyboard.press("Enter");
-          const providerDialog = page.getByRole("dialog").last();
-          await expect(providerDialog).toBeVisible();
+          setStage("provider-form-visible");
+          const { editor: providerEditor } = await resolveKeyboardEditor(
+            page,
+            "Configure provider",
+            "provider configuration editor",
+            providerTrigger,
+          );
+          setStage("provider-name-field");
           await tabToWithin(
             page,
-            providerDialog,
+            providerEditor,
             { role: "textbox", name: /provider name|provider id|name/i },
             "provider name field",
           );
           await page.keyboard.type(PROVIDER_ID);
+          setStage("provider-kind-field");
           await tabToWithin(
             page,
-            providerDialog,
+            providerEditor,
             { role: "combobox", name: /provider kind|adapter/i },
             "provider kind selector",
           );
           await page.keyboard.type("openai_compatible");
-          await page.keyboard.press("Enter");
+          await expect(
+            providerEditor.getByRole("combobox", { name: "Provider kind", exact: true }),
+          ).toHaveValue("openai_compatible");
+          setStage("provider-base-url-field");
           await tabToWithin(
             page,
-            providerDialog,
+            providerEditor,
             { role: "textbox", name: /execution base url|base url/i },
             "provider execution base URL field",
           );
           await page.keyboard.type(`${harness.providerProxy.baseUrl}/v1`);
+          setStage("provider-model-field");
           await tabToWithin(
             page,
-            providerDialog,
-            { role: "textbox", name: /^model$|model catalog/i },
+            providerEditor,
+            { role: "textbox", name: /^models?$|model catalog/i },
             "provider model field",
           );
           await page.keyboard.type(PROVIDER_MODEL);
           await tabToWithin(
             page,
-            providerDialog,
+            providerEditor,
             { role: "button", name: /save provider|create provider/i },
             "provider descriptor submit",
           );
+          setStage("provider-submit");
+          const providerResponsePromise = page.waitForResponse(
+            (candidate) => candidate.request().method() === "PUT"
+              && new URL(candidate.url()).pathname === `/v1/providers/${PROVIDER_ID}`,
+          );
           await page.keyboard.press("Enter");
-          await expect(providerDialog).toBeHidden({ timeout: 30_000 });
-          await expect(providerTrigger).toBeFocused();
-          await assertVisibleFocus(page, "restored provider trigger focus");
+          const providerResponse = await providerResponsePromise;
+          if (providerResponse.status() !== 200) {
+            throw new ProductBehaviorFailure(
+              "PROVIDER_DESCRIPTOR_RESPONSE_FAILURE",
+              "the public provider descriptor command returned an unexpected status",
+              {
+                method: "PUT",
+                path: `/v1/providers/${PROVIDER_ID}`,
+                stage: "provider-submit",
+                status: providerResponse.status(),
+              },
+            );
+          }
+          setStage("provider-form-close");
+          await expect(providerEditor).toBeHidden({ timeout: 30_000 });
+          setStage("provider-focus-restore");
+          await assertFocusRestored(page, providerTrigger, {
+            label: "restored provider trigger focus",
+            method: "PUT",
+            path: `/v1/providers/${PROVIDER_ID}`,
+            stage: "provider-focus-restore",
+            status: 200,
+          });
+          setStage("provider-status");
           await assertTextStatus(page, "provider descriptor submission");
+          setStage("provider-secret-scan");
           await assertNoSecretMarker(page, evidence, "after provider descriptor submission");
+          setStage("provider-boundary-check");
           assertBrowserStayedOnManagementServer(evidence, harness);
 
-          const firstDialog = await openApiKeyDialog(page);
-          await page.keyboard.press("Escape");
-          await expect(firstDialog.dialog).toBeHidden();
-          await expect(firstDialog.trigger).toBeFocused();
-          await assertVisibleFocus(page, "restored API-key trigger focus");
-
-          const { trigger: profileTrigger, dialog } = await openApiKeyDialog(page);
+          setStage("provider-open-cancel");
+          await page.keyboard.press("Enter");
+          const { editor: providerCancelEditor } = await resolveKeyboardEditor(
+            page,
+            "Configure provider",
+            "provider configuration editor",
+            providerTrigger,
+          );
           await tabToWithin(
             page,
-            dialog,
+            providerCancelEditor,
+            { role: "button", name: /^cancel$/i },
+            "provider configuration cancel",
+          );
+          setStage("provider-cancel");
+          await page.keyboard.press("Enter");
+          await expect(providerCancelEditor).toBeHidden();
+          setStage("provider-cancel-focus-restore");
+          await assertFocusRestored(page, providerTrigger, {
+            label: "restored provider trigger focus after cancel",
+            stage: "provider-cancel-focus-restore",
+          });
+
+          setStage("profile-open-cancel");
+          const firstEditor = await openApiKeyEditor(page);
+          await tabToWithin(
+            page,
+            firstEditor.editor,
+            { role: "button", name: /^cancel$/i },
+            "API-key profile cancel",
+          );
+          setStage("profile-cancel");
+          await page.keyboard.press("Enter");
+          await expect(firstEditor.editor).toBeHidden();
+          setStage("profile-cancel-focus-restore");
+          await assertFocusRestored(page, firstEditor.trigger, {
+            label: "restored API-key trigger focus",
+            stage: "profile-cancel-focus-restore",
+          });
+
+          setStage("profile-open-submit");
+          await page.keyboard.press("Enter");
+          const { editor: profileEditor } = await resolveKeyboardEditor(
+            page,
+            "Add API key profile",
+            "API-key profile editor",
+            firstEditor.trigger,
+          );
+          const profileTrigger = firstEditor.trigger;
+          setStage("profile-create");
+          await tabToWithin(
+            page,
+            profileEditor,
             { role: "textbox", name: /label|profile name/i },
             "profile label field",
           );
@@ -1116,18 +1602,18 @@ test.describe(
 
           await tabToWithin(
             page,
-            dialog,
+            profileEditor,
             { role: "textbox", name: /api[ -]?key|secret/i },
             "provider API-key field",
           );
           await expect(
-            dialog.getByRole("textbox", { name: /api[ -]?key|secret/i }).first(),
+            profileEditor.getByRole("textbox", { name: /api[ -]?key|secret/i }).first(),
           ).toHaveAttribute("type", "password");
           await page.keyboard.type(SYNTHETIC_SECRET_MARKER);
 
           await tabToWithin(
             page,
-            dialog,
+            profileEditor,
             { role: "checkbox", name: /this machine|built-in|local endpoint|share with|remote endpoint/i },
             "Endpoint distribution target",
           );
@@ -1135,23 +1621,47 @@ test.describe(
 
           await tabToWithin(
             page,
-            dialog,
+            profileEditor,
             { role: "button", name: /create|save|add profile/i },
             "API-key profile submit",
           );
+          const profilePath = `/v1/providers/${PROVIDER_ID}/auth-profiles`;
+          const profileResponsePromise = page.waitForResponse(
+            (candidate) => candidate.request().method() === "POST"
+              && new URL(candidate.url()).pathname === profilePath,
+          );
           await page.keyboard.press("Enter");
-          await expect(dialog).toBeHidden({ timeout: 30_000 });
-          await expect(profileTrigger).toBeFocused();
-          await assertVisibleFocus(page, "restored API-key profile trigger focus");
+          const profileResponse = await profileResponsePromise;
+          if (profileResponse.status() !== 201) {
+            throw new ProductBehaviorFailure(
+              "PROVIDER_PROFILE_RESPONSE_FAILURE",
+              "the public API-key profile command returned an unexpected status",
+              {
+                method: "POST",
+                path: profilePath,
+                stage: "profile-create",
+                status: profileResponse.status(),
+              },
+            );
+          }
+          await expect(profileEditor).toBeHidden({ timeout: 30_000 });
+          await assertFocusRestored(page, profileTrigger, {
+            label: "restored API-key profile trigger focus",
+            method: "POST",
+            path: profilePath,
+            stage: "profile-create",
+            status: 201,
+          });
           await assertWriteOnlySecretControls(page);
           await assertTextStatus(page, "profile distribution");
           await assertNoSecretMarker(page, evidence, "after API-key profile submission");
           assertBrowserStayedOnManagementServer(evidence, harness);
           await recordHistory(page, evidence);
 
+          setStage("session-create");
           await tabTo(page, { name: /^sessions$/i }, "Sessions navigation");
           await page.keyboard.press("Enter");
-          await expect(page.getByRole("heading", { name: /sessions/i })).toBeVisible();
+          await expect(page.getByRole("heading", { name: "Sessions", exact: true, level: 1 })).toBeVisible();
           await tabTo(
             page,
             { role: "button", name: /new session|create session|start session/i },
@@ -1213,6 +1723,7 @@ test.describe(
           assertBrowserStayedOnManagementServer(evidence, harness);
           await attachLiveRegionObserver(page);
 
+          setStage("session-chat");
           await tabTo(
             page,
             { role: "textbox", name: /message|send a message|chat|prompt/i },
@@ -1248,7 +1759,7 @@ test.describe(
           assertBrowserStayedOnManagementServer(evidence, harness);
           await recordHistory(page, evidence);
           await captureSecretSafeArtifacts(page, page.context(), testInfo, false);
-        });
+        }, { failureRelation: LATER_REPRODUCTION_RELATION });
       },
     );
   },

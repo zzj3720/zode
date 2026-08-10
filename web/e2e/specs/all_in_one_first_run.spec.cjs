@@ -39,6 +39,16 @@ const USER_MESSAGE = LIVE_PROVIDER
 const LATER_GAP_RELATION = "later_test_reproduction_of_gap";
 const CAPTURE_LATER_GAP = process.env.ZODE_UI_CAPTURE_LATER_RECONNECT_GAP === "1";
 const RECONNECT_FAILURE = "UI_SSE_RECONNECT_STATUS_STUCK";
+const PROFILE_SELECTION_FAILURE = "ALL_IN_ONE_AUTH_PROFILE_OPTION_MISSING";
+const PROFILE_READINESS_FAILURE = "ALL_IN_ONE_AUTH_PROFILE_READY_NOT_VISIBLE";
+const PROFILE_SELECTION_EVIDENCE_GAP =
+  "target/test-recordings/quarantine/local-evidence-gaps/all-in-one-auth-profile-selection-first-gap.v1.json";
+const RECONNECT_EVIDENCE_GAP =
+  "target/test-recordings/quarantine/local-evidence-gaps/all-in-one-sse-live-and-child-reap-first-run-evidence-gap.v1.json";
+const LATER_GAP_EVIDENCE_PATHS = new Set([
+  PROFILE_SELECTION_EVIDENCE_GAP,
+  RECONNECT_EVIDENCE_GAP,
+]);
 const SERVER_AUTHORITY_ID = "server-all-in-one-ui-e2e";
 const SAME_START_CAPABILITY_TOOL = "all_in_one_same_start_probe";
 const BARRIERS = Object.freeze({
@@ -1386,9 +1396,17 @@ class LaterGapCapture {
     }
   }
 
-  async flushFailure({ classification, firstObserved } = {}) {
+  async flushFailure({
+    classification,
+    firstObserved,
+    originalEvidenceGap = RECONNECT_EVIDENCE_GAP,
+    browserBehaviorReplayRequired = false,
+  } = {}) {
     if (this.flushed) {
       return this.flushed;
+    }
+    if (!LATER_GAP_EVIDENCE_PATHS.has(originalEvidenceGap)) {
+      throw new Error("later reproduction did not name an approved evidence gap");
     }
     const failure = this.firstFailure ?? this.lastRecord;
     if (!this.captureSetId || !failure) {
@@ -1416,11 +1434,11 @@ class LaterGapCapture {
       owning_e2e: E2E,
       recording_id: this.captureSetId,
       relation: LATER_GAP_RELATION,
-      original_evidence_gap:
-        "target/test-recordings/quarantine/local-evidence-gaps/all-in-one-sse-live-and-child-reap-first-run-evidence-gap.v1.json",
+      original_evidence_gap: originalEvidenceGap,
       classification: safeClassification,
       first_failure_recording_id: failure.recordingId,
       first_observed: safeFirstObserved,
+      browser_behavior_replay_required: browserBehaviorReplayRequired,
       raw_exchange_retained: true,
       source_digest: capture.sourceDigest,
       do_not_relabel_as_first: true,
@@ -2565,7 +2583,9 @@ class Harness {
     this.serverListen = serverListen;
     const installedUiDirectory = path.join(serverRoot, "ui");
     if (!scaffoldCapture) {
-      await fs.cp(path.join(repositoryRoot, "web", "dist"), installedUiDirectory, {
+      const builtUiDirectory = process.env.ZODE_UI_ASSETS_DIRECTORY
+        || path.join(repositoryRoot, "web", "dist");
+      await fs.cp(builtUiDirectory, installedUiDirectory, {
         recursive: true,
         force: false,
         errorOnExist: true,
@@ -3493,7 +3513,7 @@ async function downloadedEvidence(downloads) {
   return evidence.join("\n");
 }
 
-async function waitForProviderProfileReady(page, endpointId) {
+async function waitForProviderProfileReady(page, endpointId, endpointLabel) {
   let selected = null;
   await expect
     .poll(async () => {
@@ -3505,6 +3525,9 @@ async function waitForProviderProfileReady(page, endpointId) {
       selected = items?.find((profile) => profile.label === "UI E2E profile") ?? null;
       if (!selected?.profile_id) {
         return "profile:missing";
+      }
+      if (selected.status !== "ready") {
+        return `profile:${selected.status ?? "missing"}`;
       }
       const replicas = await browserJson(page, `/v1/auth-profiles/${selected.profile_id}/replicas`);
       if (replicas.status !== 200) {
@@ -3518,6 +3541,38 @@ async function waitForProviderProfileReady(page, endpointId) {
       return "ready";
     })
     .toBe("ready");
+  try {
+    const profileRows = page.locator(".profile-row:visible").filter({ hasText: selected.label });
+    await expect(profileRows).toHaveCount(1);
+    const profileRow = profileRows.first();
+    await expect(profileRow).toBeVisible();
+    const distributionRows = profileRow.getByRole("group", {
+      name: endpointLabel,
+      exact: true,
+    });
+    await expect(distributionRows).toHaveCount(1);
+    const endpointDistribution = distributionRows.first();
+    await expect(endpointDistribution).toBeVisible();
+    const endpointStatus = endpointDistribution.locator(":scope > .status-badge");
+    await expect(endpointStatus).toHaveCount(1);
+    await expect(endpointStatus).toBeVisible();
+    await expect(endpointStatus).toHaveText(/^ready$/i);
+  } catch {
+    throw new ProductBehaviorFailure(
+      PROFILE_READINESS_FAILURE,
+      `relation=${LATER_GAP_RELATION}; the public profile and replica APIs reported ready but the matching profile readiness was not visible in the real browser`,
+      {
+        relation: LATER_GAP_RELATION,
+        originalEvidenceGap: PROFILE_SELECTION_EVIDENCE_GAP,
+        browserBehaviorReplayRequired: true,
+        firstObserved: {
+          relation: LATER_GAP_RELATION,
+          public_profile_and_replica_state: "ready",
+          browser_profile_readiness: "not_visible",
+        },
+      },
+    );
+  }
   return selected;
 }
 
@@ -3721,7 +3776,11 @@ test(E2E, async ({ playwright }) => {
       ],
       "profile save",
     );
-    const profile = await waitForProviderProfileReady(page, localEndpoint.endpoint_id);
+    const profile = await waitForProviderProfileReady(
+      page,
+      localEndpoint.endpoint_id,
+      localEndpoint.label,
+    );
     const retainedApiKey = page.getByLabel("API key", { exact: true });
     if ((await retainedApiKey.count()) > 0 && (await retainedApiKey.first().isVisible())) {
       expect(await retainedApiKey.first().inputValue()).toBe("");
@@ -3747,7 +3806,29 @@ test(E2E, async ({ playwright }) => {
     await selectVisible(page, ["Endpoint"], localEndpoint.endpoint_id, "Endpoint placement");
     await selectVisible(page, ["Provider"], PROVIDER_ID, "provider selection");
     await selectVisible(page, ["Model"], MODEL_ID, "model selection");
-    await selectVisible(page, ["Auth profile", "Profile"], profile.profile_id, "profile selection");
+    try {
+      await selectVisible(
+        page,
+        ["Auth profile", "Profile"],
+        profile.profile_id,
+        "profile selection",
+      );
+    } catch {
+      throw new ProductBehaviorFailure(
+        PROFILE_SELECTION_FAILURE,
+        `relation=${LATER_GAP_RELATION}; the public profile and replica APIs reported ready but the real browser session form exposed no matching auth-profile option`,
+        {
+          relation: LATER_GAP_RELATION,
+          originalEvidenceGap: PROFILE_SELECTION_EVIDENCE_GAP,
+          browserBehaviorReplayRequired: true,
+          firstObserved: {
+            relation: LATER_GAP_RELATION,
+            public_profile_and_replica_state: "ready",
+            browser_auth_profile_option: "missing",
+          },
+        },
+      );
+    }
     await clickVisible(
       page,
       [
@@ -3942,13 +4023,28 @@ test(E2E, async ({ playwright }) => {
           );
         }
         await harness.edge.finishActiveSseAfterBrowserContextClose();
+        const failureDetails =
+          primaryError instanceof ProductBehaviorFailure ? primaryError.details : {};
         const retained = await harness.retainLaterGapFailure({
           classification: reconnectFailureObserved
             ? RECONNECT_FAILURE
-            : "MANAGEMENT_BROWSER_PRE_RECONNECT_FAILURE",
+            : primaryError instanceof ProductBehaviorFailure
+              ? primaryError.classification
+              : "MANAGEMENT_BROWSER_PRE_RECONNECT_FAILURE",
           firstObserved: reconnectFailureObserved
             ? undefined
-            : `relation=${LATER_GAP_RELATION}; the complete real browser suite stopped before the SSE reconnect assertion`,
+            : primaryError instanceof ProductBehaviorFailure
+              ? failureDetails.firstObserved ?? {
+                  relation: LATER_GAP_RELATION,
+                  product_behavior_failure: primaryError.classification,
+                }
+              : `relation=${LATER_GAP_RELATION}; the complete real browser suite stopped before the SSE reconnect assertion`,
+          originalEvidenceGap:
+            typeof failureDetails.originalEvidenceGap === "string"
+              ? failureDetails.originalEvidenceGap
+              : RECONNECT_EVIDENCE_GAP,
+          browserBehaviorReplayRequired:
+            failureDetails.browserBehaviorReplayRequired === true,
         });
         if (retained) {
           process.stderr.write(`ZODE_E2E_LATER_GAP_CAPTURE ${retained.root}\n`);

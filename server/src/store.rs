@@ -1424,6 +1424,22 @@ impl ControlStore {
         Ok(())
     }
 
+    pub(crate) fn mark_install_replicas_unreachable(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "UPDATE auth_replica_operations
+                 SET status = 'unreachable'
+                 WHERE endpoint_id = ?1 AND kind = 'install' AND status != 'removed'",
+                [endpoint_id],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        Ok(())
+    }
+
     pub(crate) fn complete_profile_create(
         &self,
         operation: &ProfileCreateOperation,
@@ -1876,6 +1892,59 @@ impl ControlStore {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| StoreError::Integrity)?;
         Ok(records)
+    }
+
+    pub(crate) fn list_distributing_profile_ids(&self) -> Result<Vec<String>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT profile_id
+                 FROM auth_profile_create_operations
+                 WHERE phase = 'distributing'
+                 ORDER BY created_at_ms ASC, profile_id ASC
+                 LIMIT 101",
+            )
+            .map_err(|_| StoreError::Internal)?;
+        let records = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| StoreError::Internal)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| StoreError::Integrity)?;
+        if records.len() > 100 {
+            return Err(StoreError::Internal);
+        }
+        Ok(records)
+    }
+
+    pub(crate) fn complete_profile_create_by_id(
+        &self,
+        profile_id: &str,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let pending = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM auth_replica_operations
+                 WHERE profile_id = ?1 AND revision = 1 AND kind = 'install'
+                   AND status != 'ready'",
+                [profile_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| StoreError::Internal)?;
+        if pending != 0 {
+            return Err(StoreError::Conflict);
+        }
+        transaction
+            .execute(
+                "UPDATE auth_profile_create_operations SET phase = 'complete'
+                 WHERE profile_id = ?1 AND phase = 'distributing'",
+                [profile_id],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok(())
     }
 
     pub(crate) fn list_auth_tombstones_for_reconciliation(

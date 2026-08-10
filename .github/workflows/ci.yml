@@ -62,5 +62,128 @@ jobs:
           if-no-files-found: ignore
           path: |
             target/ci
-            target/test-recordings
             target/web-e2e-playwright
+
+  approved-product-collection:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.product-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout exact merge revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install locked web dependencies
+        run: pnpm --dir web install --frozen-lockfile
+
+      - name: Audit full product collection and construct shards
+        id: product-matrix
+        run: |
+          ./scripts/ci/collect-approved-product.sh
+          printf 'matrix=%s\n' "$(tr -d '\n' < target/ci/approved-product-playwright-matrix.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload approved product collection evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zode-ci-approved-product-collection-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            target/ci/approved-product-playwright-list.txt
+            target/ci/approved-product-playwright-matrix.json
+
+  approved-common-browser-e2e:
+    name: approved-common-browser-e2e (${{ matrix.id }})
+    needs: approved-product-collection
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.approved-product-collection.outputs.matrix) }}
+    steps:
+      - name: Checkout exact merge revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            server
+
+      - name: Install locked web dependencies
+        run: pnpm --dir web install --frozen-lockfile
+
+      - name: Install pinned Chromium
+        run: pnpm --dir web/e2e exec playwright install --with-deps chromium
+
+      - name: Run approved common-user product gate
+        env:
+          ZODE_CI_PRODUCT_SPEC: ${{ matrix.file }}
+          ZODE_CI_PRODUCT_SHARD_ID: ${{ matrix.id }}
+        run: ./scripts/ci/verify-approved-product.sh
+
+      - name: Upload approved product evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zode-ci-approved-product-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          path: |
+            target/ci
+            target/web-e2e-playwright
+
+  approved-product-merge-gate:
+    if: always()
+    needs:
+      - locked-build-and-e2e
+      - approved-product-collection
+      - approved-common-browser-e2e
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require shared evidence and approved product gates
+        env:
+          SHARED_RESULT: ${{ needs.locked-build-and-e2e.result }}
+          COLLECTION_RESULT: ${{ needs.approved-product-collection.result }}
+          PRODUCT_RESULT: ${{ needs.approved-common-browser-e2e.result }}
+        run: |
+          printf 'shared_evidence=%s product_collection=%s approved_product=%s\n' \
+            "$SHARED_RESULT" "$COLLECTION_RESULT" "$PRODUCT_RESULT"
+          test "$SHARED_RESULT" = success
+          test "$COLLECTION_RESULT" = success
+          test "$PRODUCT_RESULT" = success

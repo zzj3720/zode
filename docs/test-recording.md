@@ -54,7 +54,9 @@ Recordings have three storage classes:
 
 1. `target/test-recordings/quarantine/<run-id>/` contains restrictive `0600`
    raw test captures while redaction is being verified. It is ignored and may
-   contain test credentials; production traffic must never enter it.
+   contain test credentials; production traffic must never enter it. Raw
+   quarantine and ignored live recordings remain on the test host and must
+   never be uploaded as CI artifacts.
 2. `target/test-recordings/live/<run-id>/` contains secret-scanned successful
    live recordings used for local performance analysis or fixture review. It
    remains ignored.

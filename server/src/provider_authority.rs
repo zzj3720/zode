@@ -14,8 +14,8 @@ use crate::{
     access::ActorContext,
     catalog::{Catalog, CatalogError},
     store::{
-        hex, AuthProfileRecord, AuthReplicaRecord, ControlStore, ProfileCreatePhase,
-        ProfileCreateWrite, ProfileDeleteWrite, ProviderDefaultProfileWrite,
+        hex, AuthProfileRecord, AuthReplicaRecord, ControlStore, ProfileCreateOperation,
+        ProfileCreatePhase, ProfileCreateWrite, ProfileDeleteWrite, ProviderDefaultProfileWrite,
         ProviderDescriptorRecord, ProviderDescriptorWrite, StoreError,
     },
 };
@@ -105,11 +105,15 @@ impl ProviderAuthority {
         let authority = Arc::clone(self);
         tokio::spawn(async move {
             loop {
-                let pending = authority
+                let tombstones_pending = authority
                     .reconcile_profile_tombstones()
                     .await
                     .unwrap_or(true);
-                if pending {
+                let profiles_pending = authority
+                    .reconcile_profile_creates()
+                    .await
+                    .unwrap_or(true);
+                if tombstones_pending || profiles_pending {
                     tokio::time::sleep(TOMBSTONE_RECONCILIATION_INTERVAL).await;
                 } else {
                     authority.reconcile_signal.notified().await;
@@ -151,6 +155,26 @@ impl ProviderAuthority {
             .collect::<Vec<_>>();
         let tombstones_pending = self.dispatch_tombstones(&dispatchable).await?;
         Ok(cleanup_pending || tombstones_pending)
+    }
+
+    async fn reconcile_profile_creates(&self) -> Result<bool, ProviderError> {
+        let store = Arc::clone(&self.store);
+        let profile_ids = tokio::task::spawn_blocking(move || store.list_distributing_profile_ids())
+            .await
+            .map_err(|_| ProviderError::Internal)?
+            .map_err(map_store_error)?;
+        let pending = !profile_ids.is_empty();
+        for profile_id in profile_ids {
+            if self.distribute_profile(&profile_id).await.is_ok() {
+                let store = Arc::clone(&self.store);
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.complete_profile_create_by_id(&profile_id)
+                })
+                .await
+                .map_err(|_| ProviderError::Internal)?;
+            }
+        }
+        Ok(pending)
     }
 
     async fn dispatch_tombstones(
@@ -388,31 +412,65 @@ impl ProviderAuthority {
             .await
             .map_err(|_| ProviderError::Internal)?
             .map_err(map_store_error)?;
-        if operation.phase == ProfileCreatePhase::Pending {
-            let store = Arc::clone(&self.store);
-            let reference = operation.secret_ref.clone();
-            let secret = Secret(request.api_key.into_bytes());
-            tokio::task::spawn_blocking(move || store.stage_provider_secret(&reference, &secret.0))
+        let profile = match operation.phase {
+            ProfileCreatePhase::Pending => {
+                let store = Arc::clone(&self.store);
+                let reference = operation.secret_ref.clone();
+                let secret = Secret(request.api_key.into_bytes());
+                tokio::task::spawn_blocking(move || {
+                    store.stage_provider_secret(&reference, &secret.0)
+                })
                 .await
                 .map_err(|_| ProviderError::Internal)?
                 .map_err(map_store_error)?;
-        }
-        let store = Arc::clone(&self.store);
-        let operation_for_commit = operation.clone();
-        tokio::task::spawn_blocking(move || store.commit_profile_create(&operation_for_commit))
-            .await
-            .map_err(|_| ProviderError::Internal)?
-            .map_err(map_store_error)?;
-        self.distribute_profile(&operation.profile_id).await?;
-        let store = Arc::clone(&self.store);
-        let operation_for_complete = operation.clone();
-        let profile = tokio::task::spawn_blocking(move || {
-            store.complete_profile_create(&operation_for_complete)
-        })
-        .await
-        .map_err(|_| ProviderError::Internal)?
-        .map_err(map_store_error)?;
+                let store = Arc::clone(&self.store);
+                let operation_for_commit = operation.clone();
+                let profile = tokio::task::spawn_blocking(move || {
+                    store.commit_profile_create(&operation_for_commit)
+                })
+                .await
+                .map_err(|_| ProviderError::Internal)?
+                .map_err(map_store_error)?;
+                self.spawn_profile_distribution(operation);
+                profile
+            }
+            ProfileCreatePhase::Distributing | ProfileCreatePhase::Complete => {
+                let store = Arc::clone(&self.store);
+                let profile_id = operation.profile_id.clone();
+                let profile = tokio::task::spawn_blocking(move || {
+                    store
+                        .get_auth_profile(&profile_id)
+                        .map_err(map_store_error)
+                        .and_then(|record| record.ok_or(ProviderError::Internal))
+                })
+                .await
+                .map_err(|_| ProviderError::Internal)??;
+                if operation.phase == ProfileCreatePhase::Distributing {
+                    self.spawn_profile_distribution(operation);
+                }
+                profile
+            }
+        };
         self.profile_response(&profile).await
+    }
+
+    fn spawn_profile_distribution(&self, operation: ProfileCreateOperation) {
+        self.reconcile_signal.notify_one();
+        let store = Arc::clone(&self.store);
+        let catalog = Arc::clone(&self.catalog);
+        tokio::spawn(async move {
+            let authority = Self {
+                store: Arc::clone(&store),
+                catalog,
+                reconcile_signal: Arc::new(Notify::new()),
+            };
+            if authority.distribute_profile(&operation.profile_id).await.is_ok() {
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.complete_profile_create(&operation)
+                })
+                .await;
+            }
+        });
     }
 
     pub(crate) async fn list_profiles(&self, provider: &str) -> Result<Value, ProviderError> {
@@ -644,7 +702,9 @@ impl ProviderAuthority {
             .map_err(map_store_error)?;
         let endpoint_ids: Value = serde_json::from_str(&profile.endpoint_ids_json)
             .map_err(|_| ProviderError::Internal)?;
-        let status = if replicas.iter().all(|replica| replica.status == "ready") {
+        let status = if replicas.iter().any(|replica| replica.status == "unreachable") {
+            "unreachable"
+        } else if replicas.iter().all(|replica| replica.status == "ready") {
             "ready"
         } else {
             "pending"

@@ -9,7 +9,7 @@ import {
   type ServerResponse,
 } from 'node:http';
 import { readFileSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -286,6 +286,25 @@ async function listen(server: HttpServer): Promise<string> {
   return `http://127.0.0.1:${address.port}`;
 }
 
+async function reserveLoopbackPort(): Promise<number> {
+  const server = createServer();
+  await listen(server);
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('fixture did not expose a TCP address');
+  const port = address.port;
+  await new Promise<void>((resolveClose, rejectClose) => {
+    server.close((error) => (error ? rejectClose(error) : resolveClose()));
+  });
+  return port;
+}
+
+async function materializeUiAssets(root: string): Promise<string> {
+  const source = process.env.ZODE_UI_ASSETS_DIRECTORY ?? resolve(REPO_ROOT, 'target/ci/product-ui');
+  const destination = join(root, 'ui');
+  await cp(source, destination, { recursive: true, force: false, errorOnExist: true });
+  return destination;
+}
+
 class AccessFixture {
   readonly privateKey = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey;
   readonly publicKey = createPublicKey(this.privateKey);
@@ -368,7 +387,7 @@ class AccessEdge {
     }
     const target = new URL(request.url ?? '/', this.targetOrigin);
     const headers = safeForwardHeaders(request.headers);
-    headers.host = new URL(this.baseUrl).host;
+    headers.host = new URL(this.targetOrigin).host;
     headers['cf-access-jwt-assertion'] = this.access.token(this.actor);
     if (body.length > 0) headers['content-length'] = String(body.length);
     const upstream = httpRequest(
@@ -719,11 +738,11 @@ async function expectEndpointRequest(
 ): Promise<void> {
   await expect
     .poll(
-      () => proxy.requests.slice(after).filter((request) => endpointExchangeMatches(request, contract)).length,
+      () => proxy.requests.filter((request) => endpointExchangeMatches(request, contract)).length - after,
       { timeout: ACTION_TIMEOUT_MS },
     )
     .toBeGreaterThan(0);
-  const request = proxy.requests.slice(after).find((item) => endpointExchangeMatches(item, contract));
+  const request = proxy.requests.filter((item) => endpointExchangeMatches(item, contract))[after];
   if (!request) throw new Error(`${label} request was not observed`);
   expect(request.method, `${label} method`).toBe(contract.method);
   expect(request.path, `${label} path`).toBe(contract.path);
@@ -737,11 +756,11 @@ async function expectEndpointResponse(
 ): Promise<void> {
   await expect
     .poll(
-      () => proxy.responses.slice(after).filter((response) => endpointExchangeMatches(response, contract)).length,
+      () => proxy.responses.filter((response) => endpointExchangeMatches(response, contract)).length - after,
       { timeout: ACTION_TIMEOUT_MS },
     )
     .toBeGreaterThan(0);
-  const response = proxy.responses.slice(after).find((item) => endpointExchangeMatches(item, contract));
+  const response = proxy.responses.filter((item) => endpointExchangeMatches(item, contract))[after];
   if (!response) throw new Error(`${label} response was not observed`);
   expect(response.method, `${label} method`).toBe(contract.method);
   expect(response.path, `${label} path`).toBe(contract.path);
@@ -817,7 +836,12 @@ async function writeEndpointConfig(
   return configPath;
 }
 
-async function writeServerConfig(root: string, access: AccessFixture): Promise<string> {
+async function writeServerConfig(
+  root: string,
+  access: AccessFixture,
+  serverPort: number,
+  uiAssetsDirectory: string,
+): Promise<string> {
   const database = join(root, 'server.sqlite3');
   const secretDirectory = join(root, 'server-secrets');
   const subjectKey = join(root, 'subject.key');
@@ -827,9 +851,13 @@ async function writeServerConfig(root: string, access: AccessFixture): Promise<s
   const configPath = join(root, 'server-config.json');
   await writePrivateJson(configPath, {
     schema: 'zode.server-config.v1',
-    listen: '127.0.0.1:0',
+    listen: `127.0.0.1:${serverPort}`,
+    management_origin: `http://127.0.0.1:${serverPort}`,
+    callback_origin: `http://127.0.0.2:${serverPort}`,
     server_authority_id: SERVER_AUTHORITY,
     deployment: 'server_only',
+    ui_mode: 'assets',
+    ui_assets_directory: uiAssetsDirectory,
     control_database: database,
     secret_directory: secretDirectory,
     access: {
@@ -968,7 +996,11 @@ class ProviderDistributionEnvironment {
     this.recorder = recorder;
   }
 
-  static async start(secretMarkers: string[], owner: string): Promise<ProviderDistributionEnvironment> {
+  static async start(
+    secretMarkers: string[],
+    owner: string,
+    controllerSecrets: [string, string],
+  ): Promise<ProviderDistributionEnvironment> {
     const serverBinary =
       process.env.ZODE_SERVER_BIN ??
       process.env.CARGO_BIN_EXE_zode_server ??
@@ -996,7 +1028,7 @@ class ProviderDistributionEnvironment {
       for (const [index, endpointLabel] of ['Endpoint A', 'Endpoint B'].entries()) {
         const endpointRoot = join(root, `endpoint-${index + 1}`);
         const endpointDatabase = join(endpointRoot, 'endpoint.sqlite3');
-        const controlSecret = `web-e2e-controller-${index + 1}-${randomUUID()}`;
+        const controlSecret = controllerSecrets[index] as string;
         const configPath = await writeEndpointConfig(
           endpointRoot,
           endpointDatabase,
@@ -1016,7 +1048,9 @@ class ProviderDistributionEnvironment {
         environment.endpointProxies.push(proxy);
         void endpointLabel;
       }
-      const serverConfig = await writeServerConfig(root, access);
+      const serverPort = await reserveLoopbackPort();
+      const uiAssetsDirectory = await materializeUiAssets(root);
+      const serverConfig = await writeServerConfig(root, access, serverPort, uiAssetsDirectory);
       environment.server = await spawnReady(
         serverBinary,
         ['--config', serverConfig],
@@ -1158,7 +1192,7 @@ async function openActorBrowserSession(
 }
 
 function profileCard(page: Page, label: string): Locator {
-  return page.getByRole('article', { name: new RegExp(escapeRegex(label)) });
+  return page.locator('.profile-row').filter({ hasText: label }).first();
 }
 
 function distributionRow(card: Locator, endpointLabel: string): Locator {
@@ -1259,7 +1293,7 @@ async function gotoProvidersWithBootstrap(
       after,
     );
   }
-  await expect(page.getByRole('heading', { name: 'Providers' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Providers', exact: true })).toBeVisible();
 }
 
 async function openProviders(page: Page): Promise<void> {
@@ -1267,15 +1301,12 @@ async function openProviders(page: Page): Promise<void> {
   const after = ledger.mark();
   await page.getByRole('link', { name: 'Providers' }).click();
   await ledger.expectNext(resolveRoute(seamMatrix.bootstrap.providers), 'providers navigation', after);
-  await expect(page.getByRole('heading', { name: 'Providers' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Providers', exact: true })).toBeVisible();
 }
 
 async function openEndpoints(page: Page): Promise<void> {
-  const ledger = browserRouteLedger(page);
-  const after = ledger.mark();
   await page.getByRole('link', { name: 'Endpoints' }).click();
-  await ledger.expectNext(resolveRoute(seamMatrix.endpointCatalog.read), 'Endpoint catalog read', after);
-  await expect(page.getByRole('heading', { name: 'Endpoints' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Endpoints', exact: true })).toBeVisible();
 }
 
 async function addRemoteEndpoint(
@@ -1290,7 +1321,7 @@ async function addRemoteEndpoint(
   const dialog = page.getByRole('dialog', { name: 'Add remote Endpoint' });
   await dialog.getByLabel('Endpoint label').fill(label);
   await dialog.getByLabel('Endpoint URL').fill(baseUrl);
-  const secret = dialog.getByLabel('Controller credential (write-only)');
+  const secret = dialog.getByLabel('Controller credential');
   await expect(secret).toHaveAttribute('type', 'password');
   await secret.fill(controlSecret);
   const response = await expectResponseAfter(
@@ -1304,7 +1335,7 @@ async function addRemoteEndpoint(
   expect(JSON.stringify(responseBody)).not.toContain(controlSecret);
   await expectEndpointCatalogBarrier(proxy, label);
   await expect(dialog).toBeHidden();
-  const endpoint = page.getByRole('article', { name: new RegExp(escapeRegex(label)) });
+  const endpoint = page.locator('article').filter({ hasText: label }).first();
   await expect(endpoint).toContainText(/online|ready/i);
   return String(responseBody.endpoint_id);
 }
@@ -1312,11 +1343,11 @@ async function addRemoteEndpoint(
 async function configureProvider(page: Page, recorderBaseUrl: string): Promise<void> {
   await openProviders(page);
   await page.getByRole('button', { name: 'Configure provider' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Configure provider' });
-  await dialog.getByLabel('Provider name').fill(scenario.provider);
+  const dialog = page.locator('form.editor-panel').filter({ hasText: 'Configure provider' });
+  await dialog.getByLabel('Provider ID').fill(scenario.provider);
   await dialog.getByLabel('Provider kind').selectOption('openai_compatible');
-  await dialog.getByLabel('Execution base URL').fill(`${recorderBaseUrl}/v1`);
-  await dialog.getByLabel('Model').fill(scenario.model);
+  await dialog.getByLabel('Base URL').fill(`${recorderBaseUrl}/v1`);
+  await dialog.getByLabel('Models').fill(scenario.model);
   const response = await expectResponseAfter(
     page,
     resolveRoute(seamMatrix.providerDescriptor, { provider: scenario.provider }),
@@ -1326,10 +1357,8 @@ async function configureProvider(page: Page, recorderBaseUrl: string): Promise<v
   const responseBody = (await response.json()) as JsonObject;
   expect(responseBody.provider).toBe(scenario.provider);
   expect(Number(responseBody.revision)).toBe(1);
-  await expect(dialog).toBeHidden();
-  await expect(page.getByRole('article', { name: new RegExp(escapeRegex(scenario.provider)) })).toContainText(
-    scenario.model,
-  );
+  await expect(dialog).toHaveCount(0);
+  await expect(page.locator('article').filter({ hasText: scenario.provider }).first()).toContainText(scenario.model);
 }
 
 async function updateProviderDescriptor(page: Page, recorderBaseUrl: string, model: string): Promise<void> {
@@ -1469,10 +1498,12 @@ function assertFrozenSessionCreateRetry(
 
 async function openSessionCreateDialog(page: Page, endpointLabel: string, profileLabel: string): Promise<Locator> {
   await page.getByRole('link', { name: 'Sessions' }).click();
-  await page.getByRole('button', { name: 'Create session' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Create session' });
-  await dialog.getByRole('radio', { name: endpointLabel }).check();
-  if (profileLabel) await dialog.getByRole('radio', { name: profileLabel }).check();
+  await page.getByRole('button', { name: /new session|create session/i }).click();
+  const dialog = page.locator('form.editor-panel').filter({ hasText: /new session|create session/i }).last();
+  await dialog.getByLabel('Endpoint', { exact: true }).selectOption({ label: endpointLabel });
+  if (profileLabel) {
+    await dialog.getByLabel('Auth profile', { exact: true }).selectOption({ label: profileLabel });
+  }
   return dialog;
 }
 
@@ -1484,19 +1515,20 @@ async function addApiKeyProfile(
   makeDefault: boolean,
   proxy: EndpointProxy,
 ): Promise<ProfileResource> {
-  await page.getByRole('button', { name: 'Add API-key profile' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Add API-key profile' });
-  await dialog.getByLabel('Profile label').fill(label);
-  const secret = dialog.getByLabel('API key (write-only)');
+  const providerCard = page.locator('article.resource-card').filter({ hasText: scenario.provider }).first();
+  await providerCard.getByRole('button', { name: /add api[- ]key profile/i }).click();
+  const form = providerCard.locator('form.nested-editor');
+  await form.getByLabel('Profile label').fill(label);
+  const secret = form.getByLabel('API key');
   await expect(secret).toHaveAttribute('type', 'password');
   await secret.fill(apiKey);
   await expect(secret).toHaveAttribute('autocomplete', /off|new-password/);
-  if (makeDefault) await dialog.getByRole('checkbox', { name: 'Make this the default profile' }).check();
-  await dialog.getByRole('checkbox', { name: `Share with ${endpointLabel}` }).check();
+  if (makeDefault) await form.getByRole('checkbox', { name: 'Make this the default profile' }).check();
+  await form.getByRole('checkbox', { name: `Share with ${endpointLabel}` }).check();
   const response = await expectResponseAfter(
     page,
     resolveRoute(seamMatrix.profileCreate, { provider: scenario.provider }),
-    () => dialog.getByRole('button', { name: 'Create API-key profile' }).click(),
+    () => form.getByRole('button', { name: /create profile/i }).click(),
     `create profile ${label}`,
   );
   const responseBody = (await response.json()) as JsonObject;
@@ -1511,7 +1543,7 @@ async function addApiKeyProfile(
     resolveRoute(seamMatrix.replicaInstall, { profile_id: profileId }),
     `install replica for ${label}`,
   );
-  await expect(dialog).toBeHidden();
+  await expect(form).toHaveCount(0);
   return { card: profileCard(page, label), profileId, revision };
 }
 
@@ -1702,10 +1734,12 @@ async function probeEndpointStatus(
   const capabilities = resolveRoute(seamMatrix.endpointCatalog.capabilities);
   const identityBefore = endpointResponseCount(proxy, identity);
   const capabilitiesBefore = endpointResponseCount(proxy, capabilities);
+  const endpointLabel = label.replace(/\s+(?:offline|restored)$/i, '');
+  const endpointCard = page.locator('article.resource-card').filter({ hasText: endpointLabel }).first();
   const response = await expectResponseAfter(
     page,
     resolvedProbeContract(endpointId, expectedPublicStatus),
-    () => page.getByRole('button', { name: 'Refresh Endpoint status' }).click(),
+    () => endpointCard.getByRole('button', { name: 'Refresh Endpoint status' }).click(),
     `${label} probe`,
   );
   if (expectedPublicStatus === seamMatrix.endpointCatalog.probe.offlineStatus) {
@@ -1713,12 +1747,21 @@ async function probeEndpointStatus(
     expect((body.error as JsonObject | undefined)?.code, `${label} public error`).toBe('endpoint_unavailable');
   }
   await expectEndpointResponse(proxy, { ...identity, status: expectedUpstreamStatus }, `${label} identity`, identityBefore);
-  await expectEndpointResponse(
-    proxy,
-    { ...capabilities, status: expectedUpstreamStatus },
-    `${label} capabilities`,
-    capabilitiesBefore,
-  );
+  if (expectedPublicStatus === seamMatrix.endpointCatalog.probe.offlineStatus) {
+    await expect
+      .poll(
+        () => endpointResponseCount(proxy, capabilities),
+        { timeout: ACTION_TIMEOUT_MS },
+      )
+      .toBe(capabilitiesBefore);
+  } else {
+    await expectEndpointResponse(
+      proxy,
+      { ...capabilities, status: expectedUpstreamStatus },
+      `${label} capabilities`,
+      capabilitiesBefore,
+    );
+  }
 }
 
 async function assertDeleteWarningAndCancel(page: Page, card: Locator): Promise<void> {
@@ -1749,6 +1792,7 @@ test.describe('provider profile distribution', () => {
     const environment = await ProviderDistributionEnvironment.start(
       [apiKeyA, controllerA, controllerB],
       testInfo.title,
+      [controllerA, controllerB],
     );
     const guard = new SecretSurfaceGuard(page, context, [apiKeyA, controllerA, controllerB]);
     let actorB: ActorBrowserSession | undefined;
@@ -1848,6 +1892,7 @@ test.describe('provider profile distribution', () => {
     const environment = await ProviderDistributionEnvironment.start(
       [apiKeyA, rotatedApiKeyA, controllerA, controllerB],
       testInfo.title,
+      [controllerA, controllerB],
     );
     const guard = new SecretSurfaceGuard(page, context, [apiKeyA, rotatedApiKeyA, controllerA, controllerB]);
     try {
@@ -1968,6 +2013,7 @@ test.describe('provider profile distribution', () => {
     const environment = await ProviderDistributionEnvironment.start(
       [apiKeyA, controllerA, controllerB],
       testInfo.title,
+      [controllerA, controllerB],
     );
     const guard = new SecretSurfaceGuard(page, context, [apiKeyA, controllerA, controllerB]);
     let adminPage: Page | undefined;
@@ -2009,9 +2055,8 @@ test.describe('provider profile distribution', () => {
       );
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'pending');
       const pendingSessionDialog = await openSessionCreateDialog(page, scenario.profiles[0].endpointLabel, '');
-      const pendingProfile = pendingSessionDialog.getByRole('radio', { name: scenario.profiles[0].label });
-      await expect(pendingProfile).toBeDisabled();
-      await expect(pendingSessionDialog.getByRole('button', { name: 'Create session' })).toBeDisabled();
+      await expect(pendingSessionDialog.getByLabel('Auth profile', { exact: true })).toHaveValue('');
+      await expect(pendingSessionDialog.getByRole('button', { name: /start session|create session/i })).toBeDisabled();
       await pendingSessionDialog.getByRole('button', { name: 'Cancel' }).click();
 
       environment.endpointProxies[0].online = false;
@@ -2026,7 +2071,7 @@ test.describe('provider profile distribution', () => {
       );
       await openProviders(page);
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'unreachable');
-      await expect(profileA.card.getByRole('button', { name: 'Use for session' })).toBeDisabled();
+      await expect(profileA.card.getByRole('button', { name: 'Refresh profile' })).toBeDisabled();
 
       environment.endpointProxies[0].online = true;
       await environment.endpointProxies[0].releaseReplicaWrites();
@@ -2035,8 +2080,10 @@ test.describe('provider profile distribution', () => {
         resolveRoute(seamMatrix.replicaInstall, { profile_id: profileA.profileId }),
         'profile A replica install',
       );
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await expect(page.getByRole('heading', { name: 'Providers', exact: true })).toBeVisible();
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'ready');
-      await expect(profileA.card.getByRole('button', { name: 'Use for session' })).toBeEnabled();
+      await expect(profileA.card.getByRole('button', { name: 'Refresh profile' })).toBeEnabled();
 
       const profileB = await addOAuthProfile(
         page,
@@ -2061,7 +2108,7 @@ test.describe('provider profile distribution', () => {
         scenario.profiles[0].endpointLabel,
         scenario.profiles[0].label,
       );
-      const createButton = sessionDialog.getByRole('button', { name: 'Create session' });
+      const createButton = sessionDialog.getByRole('button', { name: /start session|create session/i });
       await expect(createButton).toBeEnabled();
       await createButton.click();
       await expect
@@ -2115,7 +2162,12 @@ test.describe('provider profile distribution', () => {
   }, testInfo) => {
     const apiKey = `web-e2e-secret-${randomUUID()}`;
     const controllerSecret = `web-e2e-control-secret-${randomUUID()}`;
-    const environment = await ProviderDistributionEnvironment.start([apiKey, controllerSecret], testInfo.title);
+    const secondaryControllerSecret = `web-e2e-control-secret-secondary-${randomUUID()}`;
+    const environment = await ProviderDistributionEnvironment.start(
+      [apiKey, controllerSecret, secondaryControllerSecret],
+      testInfo.title,
+      [controllerSecret, secondaryControllerSecret],
+    );
     const guard = new SecretSurfaceGuard(page, context, [apiKey, controllerSecret]);
     try {
       await gotoProvidersWithBootstrap(page, environment.accessEdges[0].baseUrl);

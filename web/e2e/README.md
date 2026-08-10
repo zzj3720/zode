@@ -139,6 +139,18 @@ endpoint. Completed replay exchanges are counted only after the terminal
 response is consumed; recorded disconnects flush their status and partial
 chunks before cutting the connection.
 
+A later reproduction arms its capture set before the browser request with an
+E2E owner suffixed by `later_test_reproduction_of_gap`. Passing that relation
+to `captureAndReplayFailure` binds the same relation to a promoted HTTP
+cassette's classification and `first_observed`; an unknown or unarmed relation
+fails closed. A keyboard, focus, or other DOM-only failure sets
+`browserBehaviorReplayRequired`: the harness may seal its complete public HTTP
+context and optional exact method/path/status member, but it does not promote
+an HTTP cassette or claim that HTTP replay reproduced browser behavior. A
+cancel action without a public mutation carries no borrowed request identity.
+Promotion remains blocked until the same real Chromium/public-entry behavior
+has its own replay proof.
+
 Sensitive query parameters are redacted pair-by-pair from the wire request
 target. Their original percent escapes, order, and duplicate occurrences are
 retained behind distinct safe slots (for example, `query_code_0` and
@@ -201,6 +213,54 @@ remain held through request-body read, dispatch, and terminal response, so a
 later browser request cannot overtake a held body. The edge is test-only and
 runs with recording disabled, so replay cannot append members to a sealed
 capture set.
+
+For a streaming response, `proxyHttp` durably appends each response chunk to
+the armed capture before forwarding that chunk downstream; it does not wait
+for an indefinite SSE response to terminate before exposing already-durable
+bytes. A downstream close first seals `client_disconnected` in the journal and
+then destroys the upstream request, so both successful terminals and browser
+disconnects remain recoverable without turning the proxy into a production
+dependency.
+
+The two-actor browser scenarios retain their original shallow public incident
+cassettes as immutable provenance; those cassettes are not rewritten into a
+later full-flow oracle. A complete later reproduction uses
+`zode.web-two-actor-endpoint-replay.v2` and explicitly declares
+`capture_wide_ordered_identity_slots.v1`: one normalization state spans the
+whole capture and replay, so equal IDs remain equal and distinct IDs cannot
+collapse merely because they appeared in different bodies or exchanges. The
+earlier v8 candidates used per-body slot numbering and are therefore
+ineligible as exact transcripts; they are never rewritten or relabeled. A
+replacement requires a new recording ID from the unchanged real Chromium
+journey after its current UI blocker is removed. Enabling capture while the
+configured identity still names retired v8 evidence fails before any product
+child is spawned or candidate is created, so a later run cannot silently reuse
+that provenance.
+
+Two explicit approved-product replay identities remain pinned and fail closed
+while that v2 cassette is absent or invalid. Once a new candidate is captured,
+they reload its immutable bytes, drive the unchanged real Chromium flow
+through real Server and Endpoint processes, and verify every request
+fingerprint, complete response bytes, identity relation, and terminal outcome.
+A missing, legacy, or corrupt replay is therefore a merge-gate failure rather
+than an optional local mode. Independent request fingerprints may arrive in a
+different transport order, while repeated identical fingerprints retain their
+recorded occurrence order and every exchange must be consumed. Dynamic
+loopback ports, resource IDs, opaque lifecycle IDs, message IDs, and wall-clock
+fields use capture-wide ordered synthetic slots; public event kinds, event
+IDs/versions, content, status, headers, and termination remain exact.
+
+Capture normalizes each complete response once and records that safe result as
+one logical chunk. Validation canonically decodes every request, response, and
+chunk, checks their digests, requires ordered chunks to concatenate to the
+complete response, and scans bounded raw and decoded bytes for credential
+markers. Canonical JSON and exact schema keys reject duplicate-key or unknown
+field smuggling. Explicit promotion reads a stable validated 0600 quarantine
+candidate, fsyncs a 0444 temporary inode, and publishes that inode with an
+atomic create-new hard link; cleanup is bound to the same inode and never
+deletes an existing or swapped file. Replay rejects symlinks and safely
+normalizes Git's 0644 checkout mode to 0444 only after the cassette integrity
+has passed.
 
 Raw process logs and quarantine captures are test-only artifacts. They are
 created with restrictive permissions and are never printed on failure. The
