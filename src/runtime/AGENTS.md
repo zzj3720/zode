@@ -144,8 +144,11 @@ without duplicated wake effects.
 Long-task acceptance additionally requires one session to perform repeated
 model/tool work, create a durable agent-authored handoff, enter a fresh context
 that actively reads the handoff and required paginated history, restart Endpoint
-after the handoff, preserve its complete public transcript, avoid duplicate
-external effects, and reach one durable final without another user command.
+before and after a handoff request, preserve its complete public transcript,
+materialize input admitted during the handoff before the first fresh-context
+request, replay the exact prepared handoff envelope across restart, avoid
+duplicate external effects, and reach one durable final without another user
+command.
 
 Stable executable anchors are:
 
@@ -161,8 +164,10 @@ Stable executable anchors are:
   no new client command, plus
   `e2e_long_task_continues_until_final`,
   `e2e_long_task_writes_handoff_and_continues_in_fresh_context`, and
+  `e2e_delivery_admitted_during_handoff_reaches_first_fresh_context`,
+  `e2e_handoff_restart_replays_frozen_request_and_queued_input`, and
   `e2e_context_handoff_restart_reuses_committed_document` for autonomous
-  continuation and bounded provider context;
+  continuation, bounded provider context, concurrent input, and restart;
 - model retry/recovery:
   `e2e_model_pre_stream_rate_limit_is_one_logical_request`,
   `e2e_model_partial_stream_retry_has_no_partial_tool_effect`,

@@ -35,7 +35,10 @@ use support::{
     TempDatabase, TestResult, ToolFixture, ToolScript, HTTP_INCIDENT_RECORDING_SCHEMA,
     LLM_HTTP_RECORDING_SCHEMA, TEST_PROVIDER_SECRET,
 };
-use tokio::{sync::Notify, time::timeout};
+use tokio::{
+    sync::Notify,
+    time::{sleep, timeout},
+};
 
 const TOMBSTONE_PROVIDER_SECRET: &str = "tombstone-provider-secret-runtime-e2e";
 const PARTIAL_TOOL_INPUT_INCIDENT: &str = concat!(
@@ -3162,6 +3165,319 @@ async fn e2e_long_task_writes_handoff_and_continues_in_fresh_context() -> TestRe
     }
 
     server.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_delivery_admitted_during_handoff_reaches_first_fresh_context() -> TestResult<()> {
+    const HANDOFF_DOCUMENT: &str =
+        "CONCURRENT_HANDOFF_DOCUMENT: preserve the same task and consume newly admitted input.";
+    const CONCURRENT_INPUT: &str = "CONCURRENT_INPUT_DURING_HANDOFF";
+    const FINAL: &str = "CONCURRENT_HANDOFF_TASK_COMPLETE";
+    let database = TempDatabase::new("runtime-context-handoff-concurrent-delivery")?;
+    let handoff_hold = ModelHold::new();
+    let scripts = vec![
+        ModelScript::tool_call("concurrent-handoff-tool", "fixture_tool", r#"{"stage":0}"#),
+        ModelScript::final_text(FINAL),
+    ];
+    let mut model = ModelFixture::start_with_handoff_request_holds(
+        scripts,
+        HANDOFF_DOCUMENT,
+        vec![handoff_hold.clone()],
+    )
+    .await?;
+    let mut tool = ToolFixture::start(vec![ToolScript::Response(json!({
+        "status": "completed",
+        "result": {
+            "content": format!(
+                "concurrent stage complete; {}",
+                "concurrent-handoff-source ".repeat(600)
+            )
+        }
+    }))])
+    .await?;
+    let config = config_file_with_context_handoff(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        2,
+        24_000,
+        14_000,
+        1_024,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-context-handoff-concurrent-delivery",
+    )
+    .await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "context-handoff-concurrent-initial",
+        "complete stage zero and preserve any input admitted during handoff",
+    )
+    .await?;
+
+    if let Err(error) = handoff_hold.wait_entered().await {
+        let state = get_session(&client, &server, &session_id).await?;
+        return Err(Error::other(format!(
+            "handoff request was not reached: error={error}, model_requests={}, tool_invocations={}, active_activation={}, active_model_round={}, context_handoff={}",
+            model.request_count(),
+            tool.invocation_count(),
+            state["active_activation"],
+            state["active_model_round"],
+            state["context_handoff"],
+        ))
+        .into());
+    }
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "context-handoff-concurrent-input",
+        CONCURRENT_INPUT,
+    )
+    .await?;
+    handoff_hold.release();
+
+    let final_state = timeout(Duration::from_secs(30), async {
+        loop {
+            let state = get_session(&client, &server, &session_id).await?;
+            if state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "concurrent handoff task did not finish",
+        )
+    })??;
+
+    let requests = (0..model.request_count())
+        .filter_map(|index| model.request(index))
+        .collect::<Vec<_>>();
+    let handoff_index = requests
+        .iter()
+        .position(provider_request_is_context_handoff)
+        .ok_or_else(|| Error::other("concurrent delivery did not trigger a handoff"))?;
+    let first_fresh = requests
+        .get(handoff_index + 1)
+        .ok_or_else(|| Error::other("handoff did not start a fresh context"))?;
+    assert!(
+        first_fresh.to_string().contains(CONCURRENT_INPUT),
+        "the first fresh-context request omitted input durably admitted during handoff"
+    );
+    assert_eq!(model.handoff_request_count(), 1);
+    assert_eq!(model.conversation_request_count(), 2);
+    let transcript = final_state["transcript"]
+        .as_array()
+        .ok_or_else(|| Error::other("concurrent handoff omitted transcript"))?;
+    assert_eq!(
+        transcript
+            .iter()
+            .filter(|message| message["content"] == CONCURRENT_INPUT)
+            .count(),
+        1
+    );
+    assert_eq!(
+        transcript
+            .iter()
+            .filter(|message| message["content"] == FINAL)
+            .count(),
+        1,
+        "concurrent handoff did not converge to one durable final"
+    );
+    assert_eq!(
+        transcript
+            .last()
+            .and_then(|message| message["content"].as_str()),
+        Some(FINAL)
+    );
+
+    server.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_handoff_restart_replays_frozen_request_and_queued_input() -> TestResult<()> {
+    const HANDOFF_DOCUMENT: &str =
+        "INFLIGHT_RESTART_HANDOFF: resume the same task after restart and consume queued input.";
+    const QUEUED_INPUT: &str = "QUEUED_DURING_INFLIGHT_HANDOFF";
+    const FINAL: &str = "INFLIGHT_HANDOFF_RESTART_COMPLETE";
+    let database = TempDatabase::new("runtime-context-handoff-inflight-restart")?;
+    let first_handoff_hold = ModelHold::new();
+    let retry_handoff_hold = ModelHold::new();
+    let scripts = vec![
+        ModelScript::tool_call("inflight-handoff-tool", "fixture_tool", r#"{"stage":0}"#),
+        ModelScript::final_text(FINAL),
+    ];
+    let mut model = ModelFixture::start_with_handoff_request_holds(
+        scripts,
+        HANDOFF_DOCUMENT,
+        vec![first_handoff_hold.clone(), retry_handoff_hold.clone()],
+    )
+    .await?;
+    let mut tool = ToolFixture::start(vec![ToolScript::Response(json!({
+        "status": "completed",
+        "result": {
+            "content": format!(
+                "restart stage complete; {}",
+                "inflight-handoff-source ".repeat(600)
+            )
+        }
+    }))])
+    .await?;
+    let config = config_file_with_context_handoff(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        2,
+        24_000,
+        14_000,
+        1_024,
+    )?;
+    let mut original_config: Value = serde_json::from_slice(&fs::read(&config)?)?;
+    original_config["runtime"]["model_stream_idle_timeout_ms"] = json!(1_000);
+    fs::write(&config, serde_json::to_vec_pretty(&original_config)?)?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-context-handoff-inflight-restart",
+    )
+    .await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "context-handoff-inflight-initial",
+        "complete stage zero and survive a restart during handoff",
+    )
+    .await?;
+
+    if let Err(error) = first_handoff_hold.wait_entered().await {
+        let state = get_session(&client, &server, &session_id).await?;
+        return Err(Error::other(format!(
+            "initial handoff request was not reached: error={error}, model_requests={}, tool_invocations={}, state={state}",
+            model.request_count(),
+            tool.invocation_count(),
+        ))
+        .into());
+    }
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "context-handoff-inflight-queued",
+        QUEUED_INPUT,
+    )
+    .await?;
+    server.stop().await?;
+    first_handoff_hold.release();
+
+    let mut changed_config: Value = serde_json::from_slice(&fs::read(&config)?)?;
+    changed_config["runtime"]["model_step_max_attempts"] = json!(1);
+    changed_config["runtime"]["model_context_handoff_document_tokens"] = json!(64);
+    changed_config["runtime"]["model_stream_idle_timeout_ms"] = json!(10);
+    fs::write(&config, serde_json::to_vec_pretty(&changed_config)?)?;
+    let mut restarted = ConfiguredServer::start(&database, &config).await?;
+    if let Err(error) = retry_handoff_hold.wait_entered().await {
+        let state = get_session(&client, &restarted, &session_id).await?;
+        return Err(Error::other(format!(
+            "prepared handoff request was not retried after restart: error={error}, model_requests={}, state={state}",
+            model.request_count(),
+        ))
+        .into());
+    }
+    sleep(Duration::from_millis(100)).await;
+    let held_state = get_session(&client, &restarted, &session_id).await?;
+    retry_handoff_hold.release();
+    assert!(
+        !held_state["active_activation"].is_null(),
+        "prepared handoff retry did not retain its original stream timeout: state={held_state}"
+    );
+    assert_eq!(
+        held_state["active_model_round"]["purpose"],
+        "context_handoff"
+    );
+    assert_eq!(
+        held_state["active_model_round"]["request"]["maximum_attempts"], 2,
+        "prepared handoff retry did not retain its original attempt budget"
+    );
+
+    let requests = (0..model.request_count())
+        .filter_map(|index| model.request(index))
+        .filter(provider_request_is_context_handoff)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requests.len(),
+        2,
+        "restart did not retry one prepared handoff request"
+    );
+    assert_eq!(
+        requests[0], requests[1],
+        "restart reconstructed a different provider request instead of replaying the prepared envelope"
+    );
+
+    let final_state = timeout(Duration::from_secs(30), async {
+        loop {
+            let state = get_session(&client, &restarted, &session_id).await?;
+            if state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "in-flight handoff restart did not finish",
+        )
+    })??;
+    let post_handoff_request = (0..model.request_count())
+        .filter_map(|index| model.request(index))
+        .find(|request| {
+            !provider_request_is_context_handoff(request)
+                && request.to_string().contains(QUEUED_INPUT)
+        })
+        .ok_or_else(|| Error::other("restart did not deliver queued input to fresh context"))?;
+    assert!(post_handoff_request.to_string().contains(QUEUED_INPUT));
+    let transcript = final_state["transcript"]
+        .as_array()
+        .ok_or_else(|| Error::other("in-flight handoff restart omitted transcript"))?;
+    assert_eq!(
+        transcript
+            .iter()
+            .filter(|message| message["content"] == FINAL)
+            .count(),
+        1,
+        "in-flight handoff restart did not converge to one durable final"
+    );
+    assert_eq!(
+        tool.invocation_count(),
+        1,
+        "restart duplicated the completed tool effect"
+    );
+
+    restarted.stop().await?;
     assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
     model.stop().await?;
     tool.stop().await?;

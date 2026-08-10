@@ -3809,6 +3809,7 @@ struct ModelState {
     scripts: std::sync::Mutex<Vec<ModelScript>>,
     handoff_document: Option<String>,
     handoff_requests: AtomicU64,
+    hold_handoff_requests: std::sync::Mutex<Vec<ModelHold>>,
     hold_after_handoff: std::sync::Mutex<Option<ModelHold>>,
     requests: std::sync::Mutex<Vec<Value>>,
     headers: std::sync::Mutex<Vec<Value>>,
@@ -3829,14 +3830,14 @@ pub struct ModelFixture {
 
 impl ModelFixture {
     pub async fn start(scripts: Vec<ModelScript>) -> TestResult<Self> {
-        Self::start_inner(scripts, None, None).await
+        Self::start_inner(scripts, None, Vec::new(), None).await
     }
 
     pub async fn start_with_handoff(
         scripts: Vec<ModelScript>,
         document: impl Into<String>,
     ) -> TestResult<Self> {
-        Self::start_inner(scripts, Some(document.into()), None).await
+        Self::start_inner(scripts, Some(document.into()), Vec::new(), None).await
     }
 
     pub async fn start_with_handoff_hold(
@@ -3844,18 +3845,34 @@ impl ModelFixture {
         document: impl Into<String>,
         hold_after_handoff: ModelHold,
     ) -> TestResult<Self> {
-        Self::start_inner(scripts, Some(document.into()), Some(hold_after_handoff)).await
+        Self::start_inner(
+            scripts,
+            Some(document.into()),
+            Vec::new(),
+            Some(hold_after_handoff),
+        )
+        .await
+    }
+
+    pub async fn start_with_handoff_request_holds(
+        scripts: Vec<ModelScript>,
+        document: impl Into<String>,
+        hold_handoff_requests: Vec<ModelHold>,
+    ) -> TestResult<Self> {
+        Self::start_inner(scripts, Some(document.into()), hold_handoff_requests, None).await
     }
 
     async fn start_inner(
         scripts: Vec<ModelScript>,
         handoff_document: Option<String>,
+        hold_handoff_requests: Vec<ModelHold>,
         hold_after_handoff: Option<ModelHold>,
     ) -> TestResult<Self> {
         let state = std::sync::Arc::new(ModelState {
             scripts: std::sync::Mutex::new(scripts),
             handoff_document,
             handoff_requests: AtomicU64::new(0),
+            hold_handoff_requests: std::sync::Mutex::new(hold_handoff_requests),
             hold_after_handoff: std::sync::Mutex::new(hold_after_handoff),
             requests: std::sync::Mutex::new(Vec::new()),
             headers: std::sync::Mutex::new(Vec::new()),
@@ -4025,7 +4042,20 @@ async fn model_request(
     if is_handoff {
         if let Some(document) = &state.handoff_document {
             state.handoff_requests.fetch_add(1, Ordering::SeqCst);
-            return execute_model_script(ModelScript::final_text(document.clone())).await;
+            let hold = {
+                let mut holds = state
+                    .hold_handoff_requests
+                    .lock()
+                    .expect("model fixture handoff hold mutex poisoned");
+                (!holds.is_empty()).then(|| holds.remove(0))
+            };
+            let script = match hold {
+                Some(hold) => {
+                    ModelScript::hold_entered(hold, ModelScript::final_text(document.clone()))
+                }
+                None => ModelScript::final_text(document.clone()),
+            };
+            return execute_model_script(script).await;
         }
     }
     if state.handoff_requests.load(Ordering::SeqCst) > 0 {

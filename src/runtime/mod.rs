@@ -9,6 +9,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
 
@@ -38,7 +39,7 @@ pub const WAIT_FOR_TOOL_NAME: &str = "wait_for";
 pub const READ_CONTEXT_HANDOFF_TOOL_NAME: &str = "read_context_handoff";
 pub const READ_SESSION_HISTORY_TOOL_NAME: &str = "read_session_history";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
@@ -49,14 +50,16 @@ pub struct ToolDefinition {
     pub retry_dispatch: RetryDispatchPolicy,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RunningRestartPolicy {
     UnknownOutcome,
     RuntimeRestarted,
     AwaitCallback,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RetryDispatchPolicy {
     Never,
     SameInvocationKeyDeduplicated,
@@ -208,6 +211,19 @@ pub struct ModelRequest {
     pub max_output_tokens: Option<u32>,
     pub stream_idle_timeout: Duration,
     pub stream_observer: Arc<dyn ModelStreamObserver>,
+}
+
+const PREPARED_MODEL_ENVELOPE_SCHEMA: &str = "zode.model-request-envelope.v2";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PreparedModelEnvelope {
+    schema: String,
+    transcript: Vec<TranscriptMessage>,
+    tools: Vec<ToolDefinition>,
+    provider: String,
+    model: String,
+    max_output_tokens: Option<u32>,
+    stream_idle_timeout_ms: u64,
 }
 
 /// Receives provider text deltas for transient browser observation only. The
@@ -1586,14 +1602,24 @@ impl Runtime {
         selection: &SessionModelSelection,
         mut state: SessionState,
     ) -> Result<SessionState, &'static str> {
+        let mut completed_handoff = false;
         loop {
             if state.active_activation.is_none() {
                 return Ok(state);
             }
             if state.pending_context_handoff.is_some() {
+                let previous_handoff_id = state
+                    .latest_context_handoff
+                    .as_ref()
+                    .map(|handoff| handoff.handoff_id.clone());
                 state = self
                     .run_context_handoff(owner, session_id, selection, &state)
                     .await?;
+                completed_handoff |= state
+                    .latest_context_handoff
+                    .as_ref()
+                    .map(|handoff| &handoff.handoff_id)
+                    != previous_handoff_id.as_ref();
                 continue;
             }
 
@@ -1605,6 +1631,21 @@ impl Runtime {
             let transcript = provider_context(&state)?;
             let input_tokens = model_context_tokens(&transcript, &tools)?;
             if input_tokens <= self.options.model_context_handoff_at_tokens {
+                if completed_handoff && !state.delivery_queue.is_empty() {
+                    let (append, next_state) = materialize_boundary(
+                        self.store.clone(),
+                        owner.clone(),
+                        session_id.to_owned(),
+                        state,
+                    )
+                    .await?;
+                    if let Some(append) = append {
+                        self.observe_commit(&append, &next_state).await;
+                    }
+                    state = next_state;
+                    completed_handoff = false;
+                    continue;
+                }
                 return Ok(state);
             }
 
@@ -1644,39 +1685,30 @@ impl Runtime {
         if &plan.selection != selection {
             return Err("context_handoff_selection_changed");
         }
-        let source = context_handoff_source(state, &plan)?;
-        let source_digest = stable_digest(
-            "context-handoff-source",
-            &serde_json::to_string(&source).map_err(|_| "context_handoff_source_encode")?,
-        );
-        if source_digest != plan.source_digest
-            || model_context_tokens(&source, &[])? != plan.source_tokens
-            || plan.source_tokens > self.options.model_context_input_tokens
-        {
-            return self
-                .finish_context_handoff_plan_failure(
-                    owner,
-                    session_id,
-                    state.clone(),
-                    "context handoff source is invalid or exceeds its input budget",
-                    None,
-                )
-                .await;
-        }
-
-        let mut request = ModelRequest {
-            owner: owner.clone(),
-            session_id: session_id.to_owned(),
-            activation_id: plan.activation_id.clone(),
-            round_id: plan.plan_id.clone(),
-            selection: selection.clone(),
-            transcript: source,
-            tools: Vec::new(),
-            max_output_tokens: Some(self.options.model_context_handoff_document_tokens),
-            stream_idle_timeout: self.options.model_stream_idle_timeout,
-            stream_observer: Arc::new(SilentModelStreamObserver),
+        let silent_observer: Arc<dyn ModelStreamObserver> = Arc::new(SilentModelStreamObserver);
+        let mut request = match prepared_request_from_state(
+            owner,
+            session_id,
+            selection,
+            state,
+            ModelRequestPurpose::ContextHandoff,
+            silent_observer.clone(),
+        )? {
+            Some(request) => request,
+            None => ModelRequest {
+                owner: owner.clone(),
+                session_id: session_id.to_owned(),
+                activation_id: plan.activation_id.clone(),
+                round_id: plan.plan_id.clone(),
+                selection: selection.clone(),
+                transcript: context_handoff_source(state, &plan)?,
+                tools: Vec::new(),
+                max_output_tokens: Some(self.options.model_context_handoff_document_tokens),
+                stream_idle_timeout: self.options.model_stream_idle_timeout,
+                stream_observer: silent_observer.clone(),
+            },
         };
-        let (prep_commits, _prepared_state, request_identity) = prepare_model_round(
+        let (prep_commits, prepared_state, request_identity) = prepare_model_round(
             self.store.clone(),
             owner.clone(),
             session_id.to_owned(),
@@ -1690,11 +1722,42 @@ impl Runtime {
             },
         )
         .await?;
-        request.activation_id = request_identity.activation_id.clone();
-        request.round_id = request_identity.round_id.clone();
         for (append, commit_state) in &prep_commits {
             self.observe_commit(append, commit_state).await;
         }
+        request = prepared_request_from_state(
+            owner,
+            session_id,
+            selection,
+            &prepared_state,
+            ModelRequestPurpose::ContextHandoff,
+            silent_observer,
+        )?
+        .unwrap_or(request);
+        request.activation_id = request_identity.activation_id.clone();
+        request.round_id = request_identity.round_id.clone();
+        let source_digest = stable_digest(
+            "context-handoff-source",
+            &serde_json::to_string(&request.transcript)
+                .map_err(|_| "context_handoff_source_encode")?,
+        );
+        if source_digest != plan.source_digest
+            || model_context_tokens(&request.transcript, &request.tools)? != plan.source_tokens
+            || !request.tools.is_empty()
+        {
+            return self
+                .finish_context_handoff_plan_failure(
+                    owner,
+                    session_id,
+                    prepared_state,
+                    "context handoff source conflicts with its durable plan",
+                    None,
+                )
+                .await;
+        }
+        let document_token_limit = request
+            .max_output_tokens
+            .ok_or("context_handoff_output_limit_missing")?;
         let execution = self
             .execute_prepared_model_request(
                 owner,
@@ -1716,7 +1779,7 @@ impl Runtime {
         let document_tokens = model_context_text_tokens(&document);
         if !outcome.tool_calls.is_empty()
             || document.is_empty()
-            || document_tokens > u64::from(self.options.model_context_handoff_document_tokens)
+            || document_tokens > u64::from(document_token_limit)
         {
             let current =
                 rehydrate(self.store.clone(), owner.clone(), session_id.to_owned()).await?;
@@ -1840,7 +1903,7 @@ impl Runtime {
             stream_idle_timeout: self.options.model_stream_idle_timeout,
             stream_observer: self.stream_observer.clone(),
         };
-        let (prep_commits, _prepared_state, request_identity) = prepare_model_round(
+        let (prep_commits, prepared_state, request_identity) = prepare_model_round(
             self.store.clone(),
             owner.clone(),
             session_id.to_owned(),
@@ -1854,15 +1917,25 @@ impl Runtime {
             },
         )
         .await?;
+        for (append, commit_state) in &prep_commits {
+            self.observe_commit(append, commit_state).await;
+        }
+        request = prepared_request_from_state(
+            owner,
+            session_id,
+            selection,
+            &prepared_state,
+            ModelRequestPurpose::Conversation,
+            self.stream_observer.clone(),
+        )?
+        .unwrap_or(request);
         // `prepare_model_round` derives the durable round identity from the
-        // committed stream version.  Use that identity for transient browser
+        // committed stream version. Use that identity for transient browser
         // observations too; the caller's follow-up identity is only the
         // deterministic input to that derivation.
         request.activation_id = request_identity.activation_id.clone();
         request.round_id = request_identity.round_id.clone();
-        for (append, commit_state) in &prep_commits {
-            self.observe_commit(append, commit_state).await;
-        }
+        let tools = request.tools.clone();
         let execution = self
             .execute_prepared_model_request(
                 owner,
@@ -3042,6 +3115,66 @@ struct ToolBatchInput {
     tool_calls: Vec<ToolCall>,
 }
 
+fn request_from_prepared_envelope(
+    owner: &SessionOwner,
+    session_id: &str,
+    selection: &SessionModelSelection,
+    record: &crate::domain::ModelRequestRecord,
+    stream_observer: Arc<dyn ModelStreamObserver>,
+) -> Result<Option<ModelRequest>, &'static str> {
+    let DurablePayload::Inline(payload) = &record.envelope else {
+        return Ok(None);
+    };
+    if payload.value().get("schema").and_then(Value::as_str) != Some(PREPARED_MODEL_ENVELOPE_SCHEMA)
+    {
+        // Pre-v2 envelopes remain recoverable through the legacy
+        // reconstruction path. Every newly prepared request uses v2 and is
+        // replayed exclusively from these durable bytes.
+        return Ok(None);
+    }
+    let envelope = serde_json::from_value::<PreparedModelEnvelope>(payload.value().clone())
+        .map_err(|_| "prepared_model_envelope_decode")?;
+    if envelope.schema != PREPARED_MODEL_ENVELOPE_SCHEMA
+        || envelope.provider != selection.provider
+        || envelope.model != selection.model
+        || envelope.stream_idle_timeout_ms == 0
+    {
+        return Err("prepared_model_envelope_conflict");
+    }
+    Ok(Some(ModelRequest {
+        owner: owner.clone(),
+        session_id: session_id.to_owned(),
+        activation_id: record.activation_id.clone(),
+        round_id: record.round_id.clone(),
+        selection: selection.clone(),
+        transcript: envelope.transcript,
+        tools: envelope.tools,
+        max_output_tokens: envelope.max_output_tokens,
+        stream_idle_timeout: Duration::from_millis(envelope.stream_idle_timeout_ms),
+        stream_observer,
+    }))
+}
+
+fn prepared_request_from_state(
+    owner: &SessionOwner,
+    session_id: &str,
+    selection: &SessionModelSelection,
+    state: &SessionState,
+    purpose: ModelRequestPurpose,
+    stream_observer: Arc<dyn ModelStreamObserver>,
+) -> Result<Option<ModelRequest>, &'static str> {
+    let Some(round) = state.active_model_round.as_ref() else {
+        return Ok(None);
+    };
+    if round.purpose != purpose {
+        return Ok(None);
+    }
+    let Some(record) = round.request.as_ref() else {
+        return Ok(None);
+    };
+    request_from_prepared_envelope(owner, session_id, selection, record, stream_observer)
+}
+
 async fn append_runtime_event(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
@@ -3286,12 +3419,18 @@ async fn prepare_model_round(
                 })
             })
             .collect::<Vec<_>>();
-        let envelope_json = json!({
-            "transcript": request.transcript,
-            "tools": tool_schema,
-            "provider": selection.provider,
-            "model": selection.model,
-        });
+        let stream_idle_timeout_ms = u64::try_from(request.stream_idle_timeout.as_millis())
+            .map_err(|_| "model_stream_idle_timeout")?;
+        let envelope_json = serde_json::to_value(PreparedModelEnvelope {
+            schema: PREPARED_MODEL_ENVELOPE_SCHEMA.to_owned(),
+            transcript: request.transcript.clone(),
+            tools: request.tools.clone(),
+            provider: selection.provider.clone(),
+            model: selection.model.clone(),
+            max_output_tokens: request.max_output_tokens,
+            stream_idle_timeout_ms,
+        })
+        .map_err(|_| "model_envelope")?;
         let envelope = DurablePayload::inline(envelope_json).map_err(|_| "model_envelope")?;
         let provider_execution_fingerprint = stable_digest(
             "provider-execution",
@@ -3306,11 +3445,11 @@ async fn prepare_model_round(
             "model-tools",
             &serde_json::to_string(&tool_schema).map_err(|_| "tool_fingerprint")?,
         );
+        let envelope_fingerprint =
+            serde_json::to_string(&envelope).map_err(|_| "model_envelope_fingerprint")?;
         let request_fingerprint = stable_digest(
             "model-request",
-            &format!(
-                "{provider_execution_fingerprint}:{prompt_fingerprint}:{tool_schema_fingerprint}"
-            ),
+            &format!("{provider_execution_fingerprint}:{envelope_fingerprint}"),
         );
         let append = append_runtime_event(
             store.clone(),
@@ -3340,6 +3479,11 @@ async fn prepare_model_round(
         .active_model_round
         .as_ref()
         .ok_or("model_round_missing_after_prepare")?;
+    let maximum_attempts = round
+        .request
+        .as_ref()
+        .map(|request| request.maximum_attempts)
+        .ok_or("model_request_missing_after_prepare")?;
     let attempt_number = round
         .retry
         .as_ref()

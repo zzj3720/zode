@@ -390,11 +390,15 @@ and fingerprint, model/profile selection, maximum zode attempt count, minimum
 auth-replica revision, prompt and tool-schema
 fingerprints, and a reference to the complete bounded, credential-free
 model-neutral request envelope from which the aimux adapter constructs its
-call. Large envelopes use the immutable blob store. The logical request is
-prepared once. Immediately before each call to aimux, zode resolves the exact
-ready credential replica and commits `ModelAttemptStarted` with a fresh attempt
-ID, monotonic attempt number, and concrete auth revision. Authorization headers
-and credential material are never part of the envelope or event.
+call. The envelope includes the full provider-neutral transcript and tool
+definitions plus request controls such as the maximum output tokens and stream
+idle timeout; recovery cannot rebuild those controls from newer runtime
+configuration under the same request identity. Large envelopes use the
+immutable blob store. The logical request is prepared once. Immediately before
+each call to aimux, zode resolves the exact ready credential replica and commits
+`ModelAttemptStarted` with a fresh attempt ID, monotonic attempt number, and
+concrete auth revision. Authorization headers and credential material are never
+part of the envelope or event.
 
 ### Durable agent handoff and fresh context generations
 
@@ -448,6 +452,13 @@ history, advance twice, or silently fall back to the old unbounded prompt. If a
 valid bounded handoff cannot be produced before the provider input ceiling, the
 activation ends with a typed handoff failure rather than truncating history,
 sending an over-budget request, or pretending the task completed.
+
+Input admitted while the handoff request is active remains a durable queued
+delivery and cannot alter that already prepared request. Immediately after the
+handoff commits, Endpoint materializes those deliveries in order and includes
+them in the first request of the fresh generation. Restart preserves both the
+frozen handoff request and the queued delivery, so it neither strands the
+session nor lets the successor act before seeing accepted input.
 
 Credential resolution reads only the exact installed profile selected for the
 session and the newest ready revision satisfying its required minimum. It never
@@ -789,7 +800,7 @@ The main scenario groups are:
 | --- | --- | --- |
 | HTTP/event store | create, message, semantic idempotency, GET/list ownership, one Endpoint-wide ordered SSE across owned sessions, reconnect, restart | `e2e_endpoint_event_stream_multiplexes_owned_sessions_and_reconnects_once`; `e2e_create_message_sse_reconnect_get_restart`; `e2e_create_generates_ulid_and_binds_idempotency_payload`; `e2e_concurrent_create_receipt_and_event_are_atomic`; `e2e_session_ownership_safe_not_found_and_ordered_sse` |
 | Snapshot/recovery | bounded snapshot-plus-tail restore, every configured runtime/API snapshot cadence point, corrupt fallback, dirty-index repair, healthy read-only startup | `sqlite_storage_e2e::e2e_sqlite_snapshot_cursor_follows_public_commits`; `sqlite_storage_e2e::e2e_snapshot_cannot_override_event_stream`; `sqlite_storage_e2e::e2e_corrupt_latest_snapshot_falls_back`; `e2e_runtime_commits_honor_snapshot_cadence_and_restart`; `sqlite_storage_e2e::e2e_sqlite_restart_rebuilds_derived_indexes_and_allows_harmless_extra_index`; storage-corruption cases in `reviewer_findings_e2e` |
-| Model activation and context growth | real aimux fake provider, final assistant event, input/completion arriving mid-request steers the next round when one exists, otherwise wakes the next activation; active model change remains deferred to the next activation; no numeric round ceiling truncates autonomous work; before token exhaustion the current agent writes a durable handoff, the fresh context reads that document and paginated original history through runtime-owned tools, and restart resumes the same session/task without a new client command; every accepted input and assistant round remains durably ordered | `e2e_golden_assembled_model_tool_loop_survives_restart`; `e2e_round_boundary_steering_waits_for_the_next_model_round`; `e2e_round_boundary_final_defers_steering_to_next_activation`; `e2e_long_task_continues_until_final`; `e2e_long_task_writes_handoff_and_continues_in_fresh_context`; `e2e_context_handoff_restart_reuses_committed_document`; `e2e_concurrent_inputs_preserve_both_assistant_rounds`; `e2e_restart_recovers_queued_input_without_another_command` |
+| Model activation and context growth | real aimux fake provider, final assistant event, input/completion arriving mid-request steers the next round when one exists, otherwise wakes the next activation; active model change remains deferred to the next activation; no numeric round ceiling truncates autonomous work; before token exhaustion the current agent writes a durable handoff, the fresh context reads that document and paginated original history through runtime-owned tools, input accepted while the handoff is active reaches the first fresh-context request, and restart replays the exact prepared handoff request before resuming the same session/task without a new client command; every accepted input and assistant round remains durably ordered | `e2e_golden_assembled_model_tool_loop_survives_restart`; `e2e_round_boundary_steering_waits_for_the_next_model_round`; `e2e_round_boundary_final_defers_steering_to_next_activation`; `e2e_long_task_continues_until_final`; `e2e_long_task_writes_handoff_and_continues_in_fresh_context`; `e2e_delivery_admitted_during_handoff_reaches_first_fresh_context`; `e2e_handoff_restart_replays_frozen_request_and_queued_input`; `e2e_context_handoff_restart_reuses_committed_document`; `e2e_concurrent_inputs_preserve_both_assistant_rounds`; `e2e_restart_recovers_queued_input_without_another_command` |
 | Model retry | aimux bounded pre-stream retry remains one logical runtime request; after stream establishment zode owns bounded step retry; first-chunk/chunk-idle disconnects become typed terminal failures without a stuck activation; a restart after a persisted failure fact completes the missing retry or terminal boundary; no partial assistant/tool effect; hard-crash interrupted-attempt recovery | `e2e_model_pre_stream_rate_limit_is_one_logical_request`; `e2e_model_partial_stream_retry_has_no_partial_tool_effect`; `e2e_provider_process_exit_finishes_activation_without_stuck_working`; `e2e_restart_reconciles_failed_model_attempt_before_retry_schedule`; `e2e_restart_reconciles_failed_model_attempt_before_terminal_finish`; `e2e_hard_crash_recovery_exhausts_one_model_attempt_and_keeps_delivery_runnable`; `e2e_hard_crash_after_retry_fact_claims_one_scheduled_attempt` |
 | Tool batch | configured ordinary adapter arguments are schema-valid and invalid ones fail before side effects; the runtime-owned `wait_for` contract is unchanged; fast/slow/failing concurrent calls, provider-order results, one shared foreground window | `e2e_invalid_model_tool_arguments_are_rejected_before_side_effect`; `e2e_mixed_tool_batch_is_concurrent_ordered_and_waits_once`; existing `e2e_explicit_wait_*` anchors |
 | Async/wait | early result, auto wait, explicit-wait precedence, user/timer race, completion wake, timeout without cancel, maximum 600 seconds | `e2e_explicit_wait_last_wins_without_skipping_ordinary_tool`; `e2e_explicit_wait_zero_is_rejected`; `e2e_explicit_wait_above_maximum_is_rejected`; `e2e_explicit_wait_legacy_high_value_is_rejected`; `e2e_auto_wait_timeout_does_not_cancel_running_tool`; `e2e_two_session_waits_do_not_cross` |
