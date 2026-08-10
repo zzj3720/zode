@@ -24,7 +24,6 @@ pub const MAX_SELECTED_TOOLS: usize = 256;
 pub const MAX_OPAQUE_CONTINUATION_BYTES: usize = 64 * 1024;
 pub const MAX_OPAQUE_CONTINUATIONS: usize = 8;
 pub const MAX_PROVIDER_EXECUTION_OPTIONS_BYTES: usize = 64 * 1024;
-pub const MAX_MODEL_ROUNDS_PER_ACTIVATION: u32 = 64;
 pub const MAX_MODEL_ATTEMPTS_PER_STEP: u32 = 32;
 pub const MAX_MODEL_FINGERPRINT_BYTES: usize = 512;
 
@@ -59,13 +58,18 @@ pub struct ActiveActivation {
     pub selection_version: u64,
     pub minimum_auth_revision: u64,
     pub started_at_ms: i64,
-    pub rounds_started: u32,
+    /// Retained only so schema-v1 state digests remain compatible with
+    /// existing durable streams. This counter never gates execution.
+    #[serde(default, rename = "rounds_started")]
+    pub legacy_rounds_started: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ActiveModelRound {
     pub activation_id: String,
     pub round_id: String,
+    #[serde(default, skip_serializing_if = "ModelRequestPurpose::is_conversation")]
+    pub purpose: ModelRequestPurpose,
     pub delivery_through_queue_id: u64,
     pub started_at_ms: i64,
     #[serde(default)]
@@ -113,6 +117,20 @@ pub enum ModelAttemptOutcome {
     Completed,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRequestPurpose {
+    #[default]
+    Conversation,
+    ContextHandoff,
+}
+
+impl ModelRequestPurpose {
+    fn is_conversation(&self) -> bool {
+        *self == Self::Conversation
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ModelRetrySchedule {
     pub activation_id: String,
@@ -126,6 +144,37 @@ pub struct ModelRetrySchedule {
     pub not_before_ms: i64,
     pub maximum_attempts: u32,
     pub error_class: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ContextHandoffPlan {
+    pub plan_id: String,
+    pub activation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_handoff_id: Option<String>,
+    pub next_generation: u64,
+    pub covered_through_message_id: String,
+    pub source_digest: String,
+    pub source_tokens: u64,
+    pub token_accounting_version: u32,
+    pub selection: SessionModelSelection,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ContextHandoffDocument {
+    pub handoff_id: String,
+    pub plan_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_handoff_id: Option<String>,
+    pub next_generation: u64,
+    pub covered_through_message_id: String,
+    pub source_digest: String,
+    pub document: DurablePayload,
+    pub document_digest: String,
+    pub source_tokens: u64,
+    pub document_tokens: u64,
+    pub token_accounting_version: u32,
+    pub selection: SessionModelSelection,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -543,6 +592,7 @@ pub struct ToolError {
 pub enum ModelAttemptErrorClass {
     AuthReplicaUnavailable,
     InvalidToolArguments,
+    ContextHandoffFailed,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -689,8 +739,21 @@ pub enum SessionEvent {
     ModelRoundStarted {
         activation_id: String,
         round_id: String,
+        #[serde(default)]
+        purpose: ModelRequestPurpose,
         delivery_through_queue_id: u64,
         started_at_ms: i64,
+    },
+    ContextHandoffPlanned {
+        plan: ContextHandoffPlan,
+    },
+    ContextHandoffCreated {
+        handoff: ContextHandoffDocument,
+    },
+    ContextHandoffFailed {
+        plan_id: String,
+        error: ModelAttemptError,
+        finished_at_ms: i64,
     },
     ModelRequestPrepared {
         activation_id: String,
@@ -832,6 +895,9 @@ impl SessionEvent {
             Self::MessageAppended { .. } => "message_appended",
             Self::ActivationStarted { .. } => "activation_started",
             Self::ModelRoundStarted { .. } => "model_round_started",
+            Self::ContextHandoffPlanned { .. } => "context_handoff_planned",
+            Self::ContextHandoffCreated { .. } => "context_handoff_created",
+            Self::ContextHandoffFailed { .. } => "context_handoff_failed",
             Self::ModelRequestPrepared { .. } => "model_request_prepared",
             Self::ModelAttemptStarted { .. } => "model_attempt_started",
             Self::ModelAttemptFailedFact { .. } => "model_attempt_failed",
@@ -913,6 +979,7 @@ impl SessionEvent {
             Self::ModelRoundStarted {
                 activation_id,
                 round_id,
+                purpose: _,
                 delivery_through_queue_id,
                 started_at_ms,
             } => {
@@ -924,6 +991,21 @@ impl SessionEvent {
                         "model round delivery boundary must be positive".into(),
                     ));
                 }
+            }
+            Self::ContextHandoffPlanned { plan } => {
+                validate_context_handoff_plan(plan)?;
+            }
+            Self::ContextHandoffCreated { handoff } => {
+                validate_context_handoff_document(handoff)?;
+            }
+            Self::ContextHandoffFailed {
+                plan_id,
+                error,
+                finished_at_ms,
+            } => {
+                validate_identifier("context handoff plan_id", plan_id)?;
+                validate_model_error(error)?;
+                validate_non_negative_timestamp("context handoff finished_at_ms", *finished_at_ms)?;
             }
             Self::ModelRequestPrepared {
                 activation_id,
@@ -1209,6 +1291,12 @@ pub struct SessionState {
     pub active_activation: Option<ActiveActivation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_model_round: Option<ActiveModelRound>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_context_handoff: Option<ContextHandoffPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_context_handoff: Option<ContextHandoffDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_context_handoff_failure: Option<ModelAttemptError>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub callback_bindings: BTreeMap<String, AsyncCallbackBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1242,6 +1330,9 @@ impl SessionState {
             async_tool_calls: BTreeMap::new(),
             active_activation: None,
             active_model_round: None,
+            pending_context_handoff: None,
+            latest_context_handoff: None,
+            last_context_handoff_failure: None,
             callback_bindings: BTreeMap::new(),
             last_model_attempts_exhausted: None,
             stream_version: 0,
@@ -1519,6 +1610,93 @@ impl SessionState {
                 return Err(DomainError::InvalidState(
                     "active model round belongs to another activation".into(),
                 ));
+            }
+        }
+        if let Some(plan) = &self.pending_context_handoff {
+            validate_context_handoff_plan(plan)?;
+            let Some(activation) = &self.active_activation else {
+                return Err(DomainError::InvalidState(
+                    "pending context handoff requires an active activation".into(),
+                ));
+            };
+            if plan.activation_id != activation.activation_id
+                || activation.selection.model.as_ref() != Some(&plan.selection)
+            {
+                return Err(DomainError::InvalidState(
+                    "pending context handoff belongs to another activation".into(),
+                ));
+            }
+            if plan.previous_handoff_id.as_deref()
+                != self
+                    .latest_context_handoff
+                    .as_ref()
+                    .map(|handoff| handoff.handoff_id.as_str())
+            {
+                return Err(DomainError::InvalidState(
+                    "pending context handoff has a stale parent".into(),
+                ));
+            }
+            let expected_generation = self
+                .latest_context_handoff
+                .as_ref()
+                .map_or(2, |handoff| handoff.next_generation.saturating_add(1));
+            if plan.next_generation != expected_generation {
+                return Err(DomainError::InvalidState(
+                    "pending context handoff has an invalid generation".into(),
+                ));
+            }
+            if !self
+                .transcript
+                .iter()
+                .any(|message| message.message_id == plan.covered_through_message_id)
+            {
+                return Err(DomainError::InvalidState(
+                    "pending context handoff boundary is absent from history".into(),
+                ));
+            }
+        }
+        if let Some(handoff) = &self.latest_context_handoff {
+            validate_context_handoff_document(handoff)?;
+            if !self
+                .transcript
+                .iter()
+                .any(|message| message.message_id == handoff.covered_through_message_id)
+            {
+                return Err(DomainError::InvalidState(
+                    "context handoff boundary is absent from history".into(),
+                ));
+            }
+        }
+        if let Some(error) = &self.last_context_handoff_failure {
+            validate_model_error(error)?;
+        }
+        if let Some(round) = &self.active_model_round {
+            match round.purpose {
+                ModelRequestPurpose::Conversation => {
+                    let completed = round
+                        .attempt
+                        .as_ref()
+                        .is_some_and(|attempt| attempt.outcome == ModelAttemptOutcome::Completed);
+                    if self.pending_context_handoff.is_some() && !completed {
+                        return Err(DomainError::InvalidState(
+                            "pending context handoff requires a handoff round".into(),
+                        ));
+                    }
+                }
+                ModelRequestPurpose::ContextHandoff => {
+                    let completed = round
+                        .attempt
+                        .as_ref()
+                        .is_some_and(|attempt| attempt.outcome == ModelAttemptOutcome::Completed);
+                    if self.pending_context_handoff.is_none()
+                        && !completed
+                        && self.last_context_handoff_failure.is_none()
+                    {
+                        return Err(DomainError::InvalidState(
+                            "active context handoff round has no durable plan".into(),
+                        ));
+                    }
+                }
             }
         }
         if self.async_tool_calls.len() > MAX_ASYNC_TOOL_CALLS {
@@ -1840,13 +2018,14 @@ impl SessionState {
                     selection_version: *selection_version,
                     minimum_auth_revision: *minimum_auth_revision,
                     started_at_ms: *started_at_ms,
-                    rounds_started: 0,
+                    legacy_rounds_started: 0,
                 });
                 self.active_model_round = None;
             }
             SessionEvent::ModelRoundStarted {
                 activation_id,
                 round_id,
+                purpose,
                 delivery_through_queue_id,
                 started_at_ms,
             } => {
@@ -1873,26 +2052,115 @@ impl SessionState {
                     // its immutable facts in the event stream.
                     self.active_model_round = None;
                 }
-                activation.rounds_started = activation
-                    .rounds_started
-                    .checked_add(1)
-                    .ok_or(DomainError::VersionOverflow)?;
-                if activation.rounds_started > MAX_MODEL_ROUNDS_PER_ACTIVATION {
-                    return Err(DomainError::CollectionTooLarge {
-                        field: "model rounds per activation",
-                        items: activation.rounds_started as usize,
-                        max: MAX_MODEL_ROUNDS_PER_ACTIVATION as usize,
-                    });
-                }
+                activation.legacy_rounds_started =
+                    activation.legacy_rounds_started.saturating_add(1);
                 self.active_model_round = Some(ActiveModelRound {
                     activation_id: activation_id.clone(),
                     round_id: round_id.clone(),
+                    purpose: purpose.clone(),
                     delivery_through_queue_id: *delivery_through_queue_id,
                     started_at_ms: *started_at_ms,
                     request: None,
                     attempt: None,
                     retry: None,
                 });
+            }
+            SessionEvent::ContextHandoffPlanned { plan } => {
+                let activation = self.active_activation.as_ref().ok_or_else(|| {
+                    DomainError::InvalidState(
+                        "context handoff plan has no active activation".into(),
+                    )
+                })?;
+                if plan.activation_id != activation.activation_id
+                    || activation.selection.model.as_ref() != Some(&plan.selection)
+                {
+                    return Err(DomainError::InvalidState(
+                        "context handoff plan belongs to another activation".into(),
+                    ));
+                }
+                if plan.previous_handoff_id.as_deref()
+                    != self
+                        .latest_context_handoff
+                        .as_ref()
+                        .map(|handoff| handoff.handoff_id.as_str())
+                {
+                    return Err(DomainError::InvalidState(
+                        "context handoff plan has a stale parent".into(),
+                    ));
+                }
+                let expected_generation = self
+                    .latest_context_handoff
+                    .as_ref()
+                    .map_or(2, |handoff| handoff.next_generation.saturating_add(1));
+                if plan.next_generation != expected_generation {
+                    return Err(DomainError::InvalidState(
+                        "context handoff plan has an invalid generation".into(),
+                    ));
+                }
+                if !self
+                    .transcript
+                    .iter()
+                    .any(|message| message.message_id == plan.covered_through_message_id)
+                {
+                    return Err(DomainError::InvalidState(
+                        "context handoff plan boundary is absent from history".into(),
+                    ));
+                }
+                if let Some(existing) = &self.pending_context_handoff {
+                    if existing == plan {
+                        return Ok(());
+                    }
+                    return Err(DomainError::InvalidState(
+                        "context handoff already has a pending plan".into(),
+                    ));
+                }
+                self.pending_context_handoff = Some(plan.clone());
+                self.last_context_handoff_failure = None;
+            }
+            SessionEvent::ContextHandoffCreated { handoff } => {
+                let plan = self.pending_context_handoff.as_ref().ok_or_else(|| {
+                    DomainError::InvalidState("context handoff document has no pending plan".into())
+                })?;
+                if handoff.plan_id != plan.plan_id
+                    || handoff.previous_handoff_id != plan.previous_handoff_id
+                    || handoff.next_generation != plan.next_generation
+                    || handoff.covered_through_message_id != plan.covered_through_message_id
+                    || handoff.source_digest != plan.source_digest
+                    || handoff.source_tokens != plan.source_tokens
+                    || handoff.token_accounting_version != plan.token_accounting_version
+                    || handoff.selection != plan.selection
+                {
+                    return Err(DomainError::InvalidState(
+                        "context handoff document conflicts with its durable plan".into(),
+                    ));
+                }
+                if let Some(existing) = &self.latest_context_handoff {
+                    if existing.handoff_id == handoff.handoff_id && existing == handoff {
+                        self.pending_context_handoff = None;
+                        return Ok(());
+                    }
+                    if Some(existing.handoff_id.as_str()) != handoff.previous_handoff_id.as_deref()
+                    {
+                        return Err(DomainError::InvalidState(
+                            "context handoff document has a stale parent".into(),
+                        ));
+                    }
+                }
+                self.latest_context_handoff = Some(handoff.clone());
+                self.pending_context_handoff = None;
+                self.last_context_handoff_failure = None;
+            }
+            SessionEvent::ContextHandoffFailed { plan_id, error, .. } => {
+                let plan = self.pending_context_handoff.as_ref().ok_or_else(|| {
+                    DomainError::InvalidState("context handoff failure has no pending plan".into())
+                })?;
+                if plan.plan_id != *plan_id {
+                    return Err(DomainError::InvalidState(
+                        "context handoff failure belongs to another plan".into(),
+                    ));
+                }
+                self.pending_context_handoff = None;
+                self.last_context_handoff_failure = Some(error.clone());
             }
             SessionEvent::ModelRequestPrepared {
                 activation_id,
@@ -2911,6 +3179,60 @@ fn validate_model_error(error: &ModelAttemptError) -> Result<(), DomainError> {
     validate_bounded_text("model error message", &error.message)
 }
 
+fn validate_context_handoff_plan(plan: &ContextHandoffPlan) -> Result<(), DomainError> {
+    validate_identifier("context handoff plan_id", &plan.plan_id)?;
+    validate_identifier("context handoff activation_id", &plan.activation_id)?;
+    if let Some(previous_handoff_id) = &plan.previous_handoff_id {
+        validate_identifier("previous context handoff_id", previous_handoff_id)?;
+    }
+    validate_identifier(
+        "context handoff covered message_id",
+        &plan.covered_through_message_id,
+    )?;
+    validate_model_fingerprint("context handoff source digest", &plan.source_digest)?;
+    if plan.next_generation < 2 || plan.source_tokens == 0 || plan.token_accounting_version == 0 {
+        return Err(DomainError::InvalidState(
+            "context handoff plan has invalid generation or token accounting".into(),
+        ));
+    }
+    SessionSelection {
+        model: Some(plan.selection.clone()),
+        tools: Vec::new(),
+        callback_base_url: None,
+    }
+    .validate()
+}
+
+fn validate_context_handoff_document(handoff: &ContextHandoffDocument) -> Result<(), DomainError> {
+    validate_identifier("context handoff_id", &handoff.handoff_id)?;
+    validate_identifier("context handoff plan_id", &handoff.plan_id)?;
+    if let Some(previous_handoff_id) = &handoff.previous_handoff_id {
+        validate_identifier("previous context handoff_id", previous_handoff_id)?;
+    }
+    validate_identifier(
+        "context handoff covered message_id",
+        &handoff.covered_through_message_id,
+    )?;
+    validate_model_fingerprint("context handoff source digest", &handoff.source_digest)?;
+    validate_model_fingerprint("context handoff document digest", &handoff.document_digest)?;
+    handoff.document.validate()?;
+    if handoff.next_generation < 2
+        || handoff.source_tokens == 0
+        || handoff.document_tokens == 0
+        || handoff.token_accounting_version == 0
+    {
+        return Err(DomainError::InvalidState(
+            "context handoff document has invalid generation or token accounting".into(),
+        ));
+    }
+    SessionSelection {
+        model: Some(handoff.selection.clone()),
+        tools: Vec::new(),
+        callback_base_url: None,
+    }
+    .validate()
+}
+
 fn validate_non_negative_timestamp(field: &'static str, value: i64) -> Result<(), DomainError> {
     if value < 0 {
         Err(DomainError::InvalidTimestamp { field })
@@ -2981,13 +3303,6 @@ fn validate_active_activation(activation: &ActiveActivation) -> Result<(), Domai
         ));
     }
     validate_non_negative_timestamp("activation started_at_ms", activation.started_at_ms)?;
-    if activation.rounds_started > MAX_MODEL_ROUNDS_PER_ACTIVATION {
-        return Err(DomainError::CollectionTooLarge {
-            field: "model rounds per activation",
-            items: activation.rounds_started as usize,
-            max: MAX_MODEL_ROUNDS_PER_ACTIVATION as usize,
-        });
-    }
     Ok(())
 }
 

@@ -962,7 +962,6 @@ pub fn write_endpoint_config(
         }],
         "runtime": {
             "tool_foreground_ms": 100,
-            "max_rounds_per_activation": 8,
             "model_step_max_attempts": max_attempts,
             "model_retry_base_ms": 1,
             "model_retry_max_ms": 10,
@@ -3808,6 +3807,9 @@ impl ModelScript {
 
 struct ModelState {
     scripts: std::sync::Mutex<Vec<ModelScript>>,
+    handoff_document: Option<String>,
+    handoff_requests: AtomicU64,
+    hold_after_handoff: std::sync::Mutex<Option<ModelHold>>,
     requests: std::sync::Mutex<Vec<Value>>,
     headers: std::sync::Mutex<Vec<Value>>,
     request_phase: std::sync::Mutex<ModelRequestPhase>,
@@ -3827,8 +3829,34 @@ pub struct ModelFixture {
 
 impl ModelFixture {
     pub async fn start(scripts: Vec<ModelScript>) -> TestResult<Self> {
+        Self::start_inner(scripts, None, None).await
+    }
+
+    pub async fn start_with_handoff(
+        scripts: Vec<ModelScript>,
+        document: impl Into<String>,
+    ) -> TestResult<Self> {
+        Self::start_inner(scripts, Some(document.into()), None).await
+    }
+
+    pub async fn start_with_handoff_hold(
+        scripts: Vec<ModelScript>,
+        document: impl Into<String>,
+        hold_after_handoff: ModelHold,
+    ) -> TestResult<Self> {
+        Self::start_inner(scripts, Some(document.into()), Some(hold_after_handoff)).await
+    }
+
+    async fn start_inner(
+        scripts: Vec<ModelScript>,
+        handoff_document: Option<String>,
+        hold_after_handoff: Option<ModelHold>,
+    ) -> TestResult<Self> {
         let state = std::sync::Arc::new(ModelState {
             scripts: std::sync::Mutex::new(scripts),
+            handoff_document,
+            handoff_requests: AtomicU64::new(0),
+            hold_after_handoff: std::sync::Mutex::new(hold_after_handoff),
             requests: std::sync::Mutex::new(Vec::new()),
             headers: std::sync::Mutex::new(Vec::new()),
             request_phase: std::sync::Mutex::new(ModelRequestPhase::default()),
@@ -3855,6 +3883,15 @@ impl ModelFixture {
             .lock()
             .expect("model fixture request mutex poisoned")
             .len()
+    }
+
+    pub fn handoff_request_count(&self) -> u64 {
+        self.state.handoff_requests.load(Ordering::SeqCst)
+    }
+
+    pub fn conversation_request_count(&self) -> usize {
+        self.request_count()
+            .saturating_sub(self.handoff_request_count() as usize)
     }
 
     pub fn request(&self, index: usize) -> Option<Value> {
@@ -3949,6 +3986,10 @@ async fn model_request(
 ) -> AxumResponse {
     let request = serde_json::from_slice::<Value>(&body)
         .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned()));
+    let is_handoff = value_contains_string(
+        &request,
+        "Write a standalone handoff document for a fresh agent context",
+    );
     {
         // Keep the requests -> phase lock order and end both guards before
         // this async handler reaches its await point.
@@ -3981,6 +4022,24 @@ async fn model_request(
                 .collect(),
         ));
     state.request_seen.notify_waiters();
+    if is_handoff {
+        if let Some(document) = &state.handoff_document {
+            state.handoff_requests.fetch_add(1, Ordering::SeqCst);
+            return execute_model_script(ModelScript::final_text(document.clone())).await;
+        }
+    }
+    if state.handoff_requests.load(Ordering::SeqCst) > 0 {
+        let hold = {
+            state
+                .hold_after_handoff
+                .lock()
+                .expect("model fixture post-handoff hold mutex poisoned")
+                .take()
+        };
+        if let Some(hold) = hold {
+            return execute_model_script(ModelScript::stream_hold(hold)).await;
+        }
+    }
     let script = {
         let mut scripts = state
             .scripts
@@ -3993,6 +4052,19 @@ async fn model_request(
         }
     };
     execute_model_script(script).await
+}
+
+fn value_contains_string(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(text) => text.contains(needle),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_contains_string(value, needle)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| value_contains_string(value, needle)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
 }
 
 async fn execute_model_script(mut script: ModelScript) -> AxumResponse {

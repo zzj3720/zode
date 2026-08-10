@@ -185,6 +185,16 @@ activation; if no round follows they wake a later activation. Detailed
 round-boundary, atomicity, wait, retry, and recovery rules are owned by
 `src/runtime/AGENTS.md`.
 
+The complete append-only transcript is the public history authority, but it is
+not sent unbounded to a provider. Before a provider context reaches its token
+threshold, the current agent writes a durable handoff document and Endpoint
+starts a fresh context generation for the same session and task. The fresh
+generation does not receive the old transcript or handoff body implicitly; it
+uses runtime-owned read-only tools to open the handoff and page or inspect
+history as needed. No numeric round count may terminate unfinished work, and a
+context-generation change must continue without another client command.
+Server and Web own neither transcript, handoff, nor context-generation state.
+
 ## Provider execution and authentication boundary
 
 All production LLM requests execute on Endpoint through aimux and go directly
@@ -295,7 +305,8 @@ Snapshots optimize replay; they are never an alternative authority.
   time alone. Keep the threshold configurable and small in E2E tests.
 - Snapshots do not advance the public event cursor and are not emitted as
   normal SSE domain events.
-- Storage snapshots and model-context compaction are separate mechanisms.
+- Storage snapshots and model-context handoff generations are separate
+  mechanisms.
 
 Every reducer or event-schema change must preserve deterministic full replay
 and snapshot-plus-tail replay. Prefer versioned events and explicit upcasters;

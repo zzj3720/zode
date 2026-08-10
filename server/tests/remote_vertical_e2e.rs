@@ -460,7 +460,6 @@ fn write_endpoint_config(
         }],
         "runtime": {
             "tool_foreground_ms": 100,
-            "max_rounds_per_activation": 8,
             "model_step_max_attempts": 1,
             "model_retry_base_ms": 1,
             "model_retry_max_ms": 10,

@@ -555,6 +555,7 @@ impl AimuxProvider {
             });
         let options = CallOptions {
             tools: Some(tools),
+            max_output_tokens: request.max_output_tokens,
             provider_options,
             timeout: Some(TimeoutConfiguration {
                 total_ms: None,

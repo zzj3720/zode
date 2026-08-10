@@ -943,6 +943,46 @@ fn config_file(
     Ok(path)
 }
 
+fn config_file_with_context_handoff(
+    database: &Path,
+    model_url: &str,
+    tool_url: Option<&str>,
+    max_attempts: u64,
+    input_tokens: u64,
+    handoff_at_tokens: u64,
+    handoff_document_tokens: u64,
+) -> TestResult<PathBuf> {
+    let path = config_file(database, model_url, tool_url, max_attempts)?;
+    let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    config["runtime"]["model_context_input_tokens"] = json!(input_tokens);
+    config["runtime"]["model_context_handoff_at_tokens"] = json!(handoff_at_tokens);
+    config["runtime"]["model_context_handoff_document_tokens"] = json!(handoff_document_tokens);
+    fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    Ok(path)
+}
+
+fn provider_request_is_context_handoff(request: &Value) -> bool {
+    request
+        .to_string()
+        .contains("Write a standalone handoff document for a fresh agent context")
+}
+
+fn observed_provider_context_upper_bound(request: &Value) -> TestResult<u64> {
+    let messages = request["messages"]
+        .as_array()
+        .ok_or_else(|| Error::other("provider request omitted messages"))?;
+    let tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    Ok(256_u64
+        .saturating_add(serde_json::to_vec(messages)?.len() as u64)
+        .saturating_add(serde_json::to_vec(tools)?.len() as u64)
+        .saturating_add(64_u64.saturating_mul(messages.len() as u64))
+        .saturating_add(128_u64.saturating_mul(tools.len() as u64)))
+}
+
 fn model_selection(provider_url: &str, schema: &str, revision: u64) -> Value {
     json!({
         "provider": "fixture-provider",
@@ -2875,66 +2915,391 @@ async fn e2e_invalid_model_tool_arguments_are_rejected_before_side_effect() -> T
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e_max_rounds_per_activation_stops_tool_feedback_loop() -> TestResult<()> {
-    let database = TempDatabase::new("runtime-max-rounds")?;
-    let mut model = ModelFixture::start(vec![
-        ModelScript::tool_call("call-round-limit", "fixture_tool", r#"{"value":"one"}"#),
-        ModelScript::final_text("unexpected second round"),
-    ])
-    .await?;
-    let mut tool = ToolFixture::start(vec![ToolScript::Response(json!({
-        "status": "completed",
-        "result": {"content": "tool result"}
-    }))])
-    .await?;
-    let config = config_file(
+async fn e2e_long_task_continues_until_final() -> TestResult<()> {
+    let database = TempDatabase::new("runtime-long-task")?;
+    let task_stages = (0..40)
+        .map(|index| {
+            ModelScript::tool_call(
+                format!("call-long-task-{index}"),
+                "fixture_tool",
+                format!(r#"{{"stage":{index}}}"#),
+            )
+        })
+        .chain(std::iter::once(ModelScript::final_text(
+            "LONG_TASK_COMPLETE",
+        )))
+        .collect::<Vec<_>>();
+    let tool_stages = (0..40)
+        .map(|index| {
+            ToolScript::Response(json!({
+                "status": "completed",
+                "result": {"content": format!("stage {index} complete")}
+            }))
+        })
+        .collect::<Vec<_>>();
+    let mut model = ModelFixture::start(task_stages).await?;
+    let mut tool = ToolFixture::start(tool_stages).await?;
+    let config = config_file_with_context_handoff(
         &database,
         &model.provider_url(),
         Some(&tool.adapter_url()),
         1,
+        1_000_000,
+        900_000,
+        4_096,
     )?;
-    let mut config_value: Value = serde_json::from_slice(&fs::read(&config)?)?;
-    config_value["runtime"]["max_rounds_per_activation"] = json!(1);
-    fs::write(&config, serde_json::to_vec_pretty(&config_value)?)?;
 
     let mut server = ConfiguredServer::start(&database, &config).await?;
     let client = support::http_client()?;
     let session_id =
-        create_session(&client, &server, &model.provider_url(), "create-max-rounds").await?;
-    let mut events = open_events(&client, &server, &session_id).await?;
+        create_session(&client, &server, &model.provider_url(), "create-long-task").await?;
     post_message(
         &client,
         &server,
         &session_id,
-        "max-rounds-message",
-        "run the bounded tool loop",
+        "long-task-message",
+        "complete every task stage and then finish",
     )
     .await?;
 
-    tokio::select! {
-        result = model.wait_for_requests(2) => {
-            result?;
-            return Err(Error::other(
-                "activation exceeded configured max_rounds_per_activation",
-            ).into());
+    model.wait_for_requests(1).await?;
+    let state = match timeout(Duration::from_secs(60), async {
+        loop {
+            let state = get_session(&client, &server, &session_id).await?;
+            if state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
         }
-        result = next_event_with_kind(&mut events, "activation_finished") => {
-            result?;
+    })
+    .await
+    {
+        Ok(state) => state?,
+        Err(_) => {
+            let state = get_session(&client, &server, &session_id).await?;
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "long task did not reach a terminal state: model_requests={}, tool_invocations={}, state={state}",
+                    model.request_count(),
+                    tool.invocation_count(),
+                ),
+            )
+            .into());
         }
-    }
-    tool.wait_for_invocations(1).await?;
-    assert_eq!(model.request_count(), 1);
-    let state = get_session(&client, &server, &session_id).await?;
+    };
     assert_eq!(state["status"], "idle");
     assert!(state["active_activation"].is_null());
     assert!(state["active_model_round"].is_null());
-    assert!(state["transcript"]
-        .as_array()
-        .is_some_and(|messages| messages
-            .iter()
-            .all(|message| { message["content"] != "unexpected second round" })));
-    assert_eq!(tool.invocation_count(), 1);
+    assert_eq!(
+        state["transcript"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .and_then(|message| message["content"].as_str()),
+        Some("LONG_TASK_COMPLETE"),
+        "long task stopped before its final: model_requests={}, tool_invocations={}, state={state}",
+        model.request_count(),
+        tool.invocation_count(),
+    );
+    assert_eq!(model.request_count(), 41);
+    assert_eq!(tool.invocation_count(), 40);
     server.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_long_task_writes_handoff_and_continues_in_fresh_context() -> TestResult<()> {
+    const INPUT_TOKENS: u64 = 24_000;
+    const HANDOFF_AT_TOKENS: u64 = 14_000;
+    const HANDOFF_DOCUMENT: &str = "HANDOFF_DOCUMENT_MARKER: stage zero completed durably; inspect the original user request, then finish the same task without asking the user to repeat it.";
+    const USER_MARKER: &str = "ORIGINAL_USER_HISTORY_MARKER";
+    let database = TempDatabase::new("runtime-long-task-context-handoff")?;
+    let scripts = vec![
+        ModelScript::tool_call("call-context-task-0", "fixture_tool", r#"{"stage":0}"#),
+        ModelScript::tool_call("read-handoff-0", "read_context_handoff", r#"{}"#),
+        ModelScript::tool_call("read-history-0", "read_session_history", r#"{"limit":16}"#),
+        ModelScript::tool_call("call-context-task-1", "fixture_tool", r#"{"stage":1}"#),
+        ModelScript::tool_call("read-handoff-1", "read_context_handoff", r#"{}"#),
+        ModelScript::tool_call("read-history-1", "read_session_history", r#"{"limit":16}"#),
+        ModelScript::final_text("HANDOFF_LONG_TASK_COMPLETE"),
+    ];
+    let mut model = ModelFixture::start_with_handoff(scripts, HANDOFF_DOCUMENT).await?;
+    let mut tool = ToolFixture::start(
+        (0..2)
+            .map(|stage| {
+                ToolScript::Response(json!({
+                    "status": "completed",
+                    "result": {
+                        "content": format!(
+                            "stage {stage} durable output; {}",
+                            "large-context-result ".repeat(600)
+                        )
+                    }
+                }))
+            })
+            .collect(),
+    )
+    .await?;
+    let config = config_file_with_context_handoff(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+        INPUT_TOKENS,
+        HANDOFF_AT_TOKENS,
+        1_024,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-context-handoff-task",
+    )
+    .await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "context-handoff-task-message",
+        &format!("{USER_MARKER}: complete every durable stage and then finish"),
+    )
+    .await?;
+
+    let state = timeout(Duration::from_secs(45), async {
+        loop {
+            let state = get_session(&client, &server, &session_id).await?;
+            let final_visible = state["transcript"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .and_then(|message| message["content"].as_str())
+                == Some("HANDOFF_LONG_TASK_COMPLETE");
+            if final_visible && state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| Error::new(ErrorKind::TimedOut, "handoff long task did not finish"))??;
+
+    let observed_bounds = (0..model.request_count())
+        .filter_map(|index| model.request(index))
+        .map(|request| observed_provider_context_upper_bound(&request))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        model.handoff_request_count(),
+        2,
+        "handoff threshold was not crossed; observed provider contexts={observed_bounds:?}"
+    );
+    assert_eq!(model.conversation_request_count(), 7);
+    assert_eq!(tool.invocation_count(), 2);
+    let transcript = state["transcript"]
+        .as_array()
+        .ok_or_else(|| Error::other("handoff long task omitted transcript"))?;
+    assert_eq!(
+        transcript.len(),
+        14,
+        "handoff rewrote public transcript history"
+    );
+    assert_eq!(transcript[0]["role"], "user");
+    assert_eq!(
+        transcript
+            .last()
+            .and_then(|message| message["content"].as_str()),
+        Some("HANDOFF_LONG_TASK_COMPLETE")
+    );
+    assert_eq!(
+        transcript
+            .iter()
+            .filter(|message| message["content"] == "HANDOFF_LONG_TASK_COMPLETE")
+            .count(),
+        1,
+        "long task produced more than one durable final"
+    );
+    assert!(state["context_handoff"]["handoff_id"].as_str().is_some());
+    assert_eq!(state["context_handoff"]["generation"], 3);
+    assert!(state["context_handoff"]["previous_handoff_id"]
+        .as_str()
+        .is_some());
+
+    let requests = (0..model.request_count())
+        .filter_map(|index| model.request(index))
+        .collect::<Vec<_>>();
+    let handoff_indices = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| {
+            provider_request_is_context_handoff(request).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(handoff_indices.len(), 2);
+    for (generation, handoff_index) in (2..=3).zip(handoff_indices) {
+        let fresh_boot = requests[handoff_index + 1].to_string();
+        assert!(fresh_boot.contains(&format!("Fresh context generation {generation}")));
+        assert!(!fresh_boot.contains(USER_MARKER));
+        assert!(!fresh_boot.contains(HANDOFF_DOCUMENT));
+        assert!(requests[handoff_index + 2]
+            .to_string()
+            .contains(HANDOFF_DOCUMENT));
+        assert!(requests[handoff_index + 3]
+            .to_string()
+            .contains(USER_MARKER));
+    }
+    for index in 0..model.request_count() {
+        let request = model
+            .request(index)
+            .ok_or_else(|| Error::other("model fixture lost an observed request"))?;
+        let observed = observed_provider_context_upper_bound(&request)?;
+        assert!(
+            observed <= INPUT_TOKENS,
+            "provider context exceeded its configured input budget: {observed} > {INPUT_TOKENS}"
+        );
+    }
+
+    server.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_context_handoff_restart_reuses_committed_document() -> TestResult<()> {
+    const HANDOFF_DOCUMENT: &str = "RESTART_HANDOFF_DOCUMENT_MARKER: the original stage completed exactly once; resume the same durable task and read history before finalizing.";
+    const USER_MARKER: &str = "RESTART_ORIGINAL_HISTORY_MARKER";
+    let database = TempDatabase::new("runtime-context-handoff-restart")?;
+    let hold = ModelHold::new();
+    let scripts = vec![
+        ModelScript::tool_call("restart-context-call-0", "fixture_tool", r#"{"stage":0}"#),
+        ModelScript::tool_call("restart-read-handoff", "read_context_handoff", r#"{}"#),
+        ModelScript::tool_call(
+            "restart-read-history",
+            "read_session_history",
+            r#"{"limit":16}"#,
+        ),
+        ModelScript::final_text("RESTARTED_HANDOFF_TASK_COMPLETE"),
+    ];
+    let mut model =
+        ModelFixture::start_with_handoff_hold(scripts, HANDOFF_DOCUMENT, hold.clone()).await?;
+    let mut tool = ToolFixture::start(vec![ToolScript::Response(json!({
+        "status": "completed",
+        "result": {
+            "content": format!(
+                "restart stage zero complete; {}",
+                "restart-handoff-source ".repeat(600)
+            )
+        }
+    }))])
+    .await?;
+    let config = config_file_with_context_handoff(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        2,
+        24_000,
+        14_000,
+        1_024,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-context-handoff-restart",
+    )
+    .await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "context-handoff-restart-message",
+        &format!("{USER_MARKER}: finish the task without another user command after restart"),
+    )
+    .await?;
+
+    hold.wait_entered().await?;
+    assert_eq!(model.handoff_request_count(), 1);
+    let before_restart = get_session(&client, &server, &session_id).await?;
+    let handoff_id = before_restart["context_handoff"]["handoff_id"]
+        .as_str()
+        .ok_or_else(|| Error::other("handoff was not durable before restart"))?
+        .to_owned();
+    let transcript_before_restart = before_restart["transcript"]
+        .as_array()
+        .ok_or_else(|| Error::other("restart handoff omitted public transcript"))?
+        .clone();
+    assert_eq!(tool.invocation_count(), 1);
+
+    server.stop().await?;
+    hold.release();
+    let mut restarted = ConfiguredServer::start(&database, &config).await?;
+    let final_state = timeout(Duration::from_secs(30), async {
+        loop {
+            let state = get_session(&client, &restarted, &session_id).await?;
+            if state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| Error::new(ErrorKind::TimedOut, "handoff restart did not finish"))??;
+
+    assert_eq!(
+        final_state["context_handoff"]["handoff_id"], handoff_id,
+        "restart replaced rather than reused the committed handoff"
+    );
+    assert_eq!(model.handoff_request_count(), 1);
+    assert_eq!(
+        tool.invocation_count(),
+        1,
+        "restart duplicated a tool effect"
+    );
+    let final_transcript = final_state["transcript"]
+        .as_array()
+        .ok_or_else(|| Error::other("handoff restart omitted final transcript"))?;
+    assert_eq!(
+        &final_transcript[..transcript_before_restart.len()],
+        transcript_before_restart.as_slice(),
+        "restart or context handoff rewrote public history"
+    );
+    assert_eq!(
+        final_transcript
+            .iter()
+            .filter(|message| message["content"] == "RESTARTED_HANDOFF_TASK_COMPLETE")
+            .count(),
+        1,
+        "handoff restart did not converge to one durable final"
+    );
+    assert_eq!(
+        final_transcript
+            .last()
+            .and_then(|message| message["content"].as_str()),
+        Some("RESTARTED_HANDOFF_TASK_COMPLETE")
+    );
+
+    let conversation_requests = (0..model.request_count())
+        .filter_map(|index| model.request(index))
+        .filter(|request| !provider_request_is_context_handoff(request))
+        .collect::<Vec<_>>();
+    let retry_pair = &conversation_requests[1..3];
+    assert_eq!(retry_pair.len(), 2);
+    assert_eq!(retry_pair[0]["messages"], retry_pair[1]["messages"]);
+    assert_eq!(retry_pair[0]["tools"], retry_pair[1]["tools"]);
+    assert!(!retry_pair[1].to_string().contains(USER_MARKER));
+    assert!(!retry_pair[1].to_string().contains(HANDOFF_DOCUMENT));
+    assert!(conversation_requests[3]
+        .to_string()
+        .contains(HANDOFF_DOCUMENT));
+    assert!(conversation_requests[4].to_string().contains(USER_MARKER));
+
+    restarted.stop().await?;
     assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
     model.stop().await?;
     tool.stop().await?;

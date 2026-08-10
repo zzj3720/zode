@@ -363,7 +363,6 @@ function writeEndpointConfig(root: string, authorityId: string, secretFile: stri
       runtime: {
         tool_foreground_ms: 3_000,
         snapshot_every_events: 1_000,
-        max_rounds_per_activation: 8,
         model_step_max_attempts: 1,
         model_retry_base_ms: 1,
         model_retry_max_ms: 10,

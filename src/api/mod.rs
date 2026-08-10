@@ -2085,7 +2085,6 @@ fn session_view(state: SessionState) -> Value {
             "selection_version": activation.selection_version,
             "minimum_auth_revision": activation.minimum_auth_revision,
             "started_at_ms": activation.started_at_ms,
-            "rounds_started": activation.rounds_started,
             "model": activation.selection.model.map(public_model),
             "tools": activation.selection.tools,
         })
@@ -2094,6 +2093,7 @@ fn session_view(state: SessionState) -> Value {
         json!({
             "activation_id": round.activation_id,
             "round_id": round.round_id,
+            "purpose": round.purpose,
             "delivery_through_queue_id": round.delivery_through_queue_id,
             "request": round.request.map(|request| json!({
                 "request_id": request.request_id,
@@ -2123,6 +2123,17 @@ fn session_view(state: SessionState) -> Value {
             "maximum_attempts": fact.maximum_attempts,
             "finished_at_ms": fact.finished_at_ms,
             "reason": "model_attempts_exhausted",
+        })
+    });
+    let context_handoff = state.latest_context_handoff.map(|handoff| {
+        json!({
+            "handoff_id": handoff.handoff_id,
+            "previous_handoff_id": handoff.previous_handoff_id,
+            "generation": handoff.next_generation,
+            "covered_through_message_id": handoff.covered_through_message_id,
+            "source_tokens": handoff.source_tokens,
+            "document_tokens": handoff.document_tokens,
+            "token_accounting_version": handoff.token_accounting_version,
         })
     });
     let pending = state
@@ -2157,6 +2168,7 @@ fn session_view(state: SessionState) -> Value {
         "active_activation": active_activation,
         "active_model_round": active_model_round,
         "last_model_attempts_exhausted": last_model_attempts_exhausted,
+        "context_handoff": context_handoff,
     })
 }
 
@@ -2291,6 +2303,7 @@ fn public_event(record: &EventRecord) -> Option<PublicEvent> {
     // stream for replay but never become public SSE frames.
     let kind = match &record.event {
         SessionEvent::ModelRequestPrepared { .. }
+        | SessionEvent::ContextHandoffPlanned { .. }
         | SessionEvent::ModelAttemptStarted { .. }
         | SessionEvent::ModelRequestCompleted { .. }
         | SessionEvent::WaitTimerScheduled { .. }
@@ -2304,6 +2317,8 @@ fn public_event(record: &EventRecord) -> Option<PublicEvent> {
         }
         SessionEvent::ModelAttemptsExhausted { .. } => "model_attempts_exhausted",
         SessionEvent::ModelStepRetryScheduled { .. } => "model_step_retrying",
+        SessionEvent::ContextHandoffCreated { .. } => "context_handoff_created",
+        SessionEvent::ContextHandoffFailed { .. } => "context_handoff_failed",
         SessionEvent::AsyncToolCallCallbackCompleted { .. } => "async_tool_call_completed",
         SessionEvent::AsyncToolCallCallbackFailed { .. } => "async_tool_call_failed",
         SessionEvent::SessionCreated { .. }
@@ -2397,13 +2412,33 @@ fn public_event_data(event: &SessionEvent) -> Value {
         SessionEvent::ModelRoundStarted {
             activation_id,
             round_id,
+            purpose,
             delivery_through_queue_id,
             started_at_ms,
         } => json!({
             "activation_id": activation_id,
             "round_id": round_id,
+            "purpose": purpose,
             "delivery_through_queue_id": delivery_through_queue_id,
             "started_at_ms": started_at_ms,
+        }),
+        SessionEvent::ContextHandoffCreated { handoff } => json!({
+            "handoff_id": handoff.handoff_id,
+            "previous_handoff_id": handoff.previous_handoff_id,
+            "generation": handoff.next_generation,
+            "covered_through_message_id": handoff.covered_through_message_id,
+            "source_tokens": handoff.source_tokens,
+            "document_tokens": handoff.document_tokens,
+            "token_accounting_version": handoff.token_accounting_version,
+        }),
+        SessionEvent::ContextHandoffFailed {
+            plan_id,
+            error,
+            finished_at_ms,
+        } => json!({
+            "plan_id": plan_id,
+            "error": serializable(error),
+            "finished_at_ms": finished_at_ms,
         }),
         SessionEvent::ModelAttemptFailedFact {
             activation_id,

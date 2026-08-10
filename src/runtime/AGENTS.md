@@ -89,9 +89,23 @@ SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
   activation; it does not resume an old model HTTP stream.
 - Preserve a configurable consecutive-timeout activation budget so repeated
   waits cannot create an unbounded self-wake loop without external input.
-- Stop an activation after its configured model-round budget; a retry of the
-  already prepared round remains eligible, while a queued user delivery may
-  wake a fresh activation under a new budget.
+- Do not impose a numeric model-round ceiling on an activation or user task.
+  Continue legitimate model/tool rounds until model final, durable wait,
+  explicit supported cancellation, or typed execution failure. Bound provider
+  attempts, idle time, tools, waits, context, storage, and other concrete
+  resources independently; never turn an unfinished tool loop into `Finished`
+  because a counter reached an arbitrary value.
+- Keep complete public transcript history append-only while bounding each
+  provider context generation by tokens. Before a normal request exceeds its
+  configured threshold, ask the current agent through the same selected
+  aimux/provider path to write a bounded durable handoff document, atomically
+  advance the context generation, and continue the same activation/task. The
+  fresh generation receives no implicit old transcript or handoff body; it uses
+  runtime-owned read-only tools to open the handoff and page or chunk original
+  history as needed. Restart reuses the committed handoff. Never delete history,
+  inject a hidden summary, use a storage snapshot as model context, count
+  messages/bytes as a substitute for tokens, or let Server/UI own a handoff or
+  history mirror.
 - `planned` is strictly pre-dispatch: a durable transition to `running` must
   commit before side effects start, so recovery may dispatch an unclaimed plan
   once. On restart, process-bound running tools become terminal
@@ -127,6 +141,11 @@ auto wait for a mixed batch, explicit-wait precedence, duplicate terminal
 commands, partial-stream retry without partial tool effects, interrupted-model
 recovery, two-session isolation, restart reconciliation, and SSE reconnect
 without duplicated wake effects.
+Long-task acceptance additionally requires one session to perform repeated
+model/tool work, create a durable agent-authored handoff, enter a fresh context
+that actively reads the handoff and required paginated history, restart Endpoint
+after the handoff, preserve its complete public transcript, avoid duplicate
+external effects, and reach one durable final without another user command.
 
 Stable executable anchors are:
 
@@ -139,7 +158,11 @@ Stable executable anchors are:
   order when B arrives during A's model request, and
   `e2e_restart_recovers_queued_input_without_another_command` requiring the
   same order after A is interrupted, B is queued, and Endpoint restarts with
-  no new client command;
+  no new client command, plus
+  `e2e_long_task_continues_until_final`,
+  `e2e_long_task_writes_handoff_and_continues_in_fresh_context`, and
+  `e2e_context_handoff_restart_reuses_committed_document` for autonomous
+  continuation and bounded provider context;
 - model retry/recovery:
   `e2e_model_pre_stream_rate_limit_is_one_logical_request`,
   `e2e_model_partial_stream_retry_has_no_partial_tool_effect`,

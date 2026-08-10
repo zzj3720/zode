@@ -3267,7 +3267,6 @@ fn write_catalog_endpoint_config(root: &Path) -> TestResult<PathBuf> {
         "runtime": {
             "tool_foreground_ms": 100,
             "snapshot_every_events": 8,
-            "max_rounds_per_activation": 4,
             "model_step_max_attempts": 1,
             "model_retry_base_ms": 1,
             "model_retry_max_ms": 1

@@ -106,7 +106,9 @@ The v0 configuration shape is conceptually:
   "runtime": {
     "tool_foreground_ms": 3000,
     "snapshot_every_events": 100,
-    "max_rounds_per_activation": 32,
+    "model_context_input_tokens": 32768,
+    "model_context_handoff_at_tokens": 24576,
+    "model_context_handoff_document_tokens": 4096,
     "model_step_max_attempts": 3,
     "model_retry_base_ms": 500,
     "model_retry_max_ms": 5000,
@@ -150,6 +152,22 @@ separately bounds how many times Endpoint may call aimux for one prepared model
 step after aimux surfaces a retryable failure; it includes the first call and
 must be at least one. Retry delay uses bounded jitter between the configured
 base and maximum and honors a shorter valid provider hint.
+
+There is no model-round-count setting: an activation is not stopped after an
+arbitrary number of model/tool rounds. `model_context_input_tokens` is the
+maximum provider input budget after the deployment has reserved output
+capacity for its enabled models.
+`model_context_handoff_at_tokens` triggers an agent-authored durable handoff
+before that ceiling, and `model_context_handoff_document_tokens` bounds the
+handoff response. All counts include message framing and selected tool schemas
+through the runtime's versioned token accountant. V0 conservatively treats
+every serialized UTF-8 byte as at most one token and adds explicit
+message/tool framing reserves, so it can trigger early but cannot undercount
+the configured provider input budget. Invalid relationships fail startup. The
+next context generation starts without implicit old transcript or handoff-body
+injection and uses the built-in read-only handoff/history tools.
+These limits affect only provider context: public transcript history remains
+complete.
 
 Each controller credential maps to one immutable `authority_id`; a caller
 cannot select another authority in a header. Secret file contents are outside
@@ -313,9 +331,18 @@ rather than silently restarting pagination.
   "delivery": { "acknowledged_through": 0, "pending": [] },
   "wait": null,
   "tool_calls": [],
-  "active_activation": null
+  "active_activation": null,
+  "active_model_round": null,
+  "context_handoff": null
 }
 ```
+
+After a handoff, `context_handoff` exposes only its stable ID, parent ID,
+generation, covered transcript message ID, and token-accounting metadata. The
+handoff body is not injected as projection metadata; the successor agent reads
+it through the session-bound `read_context_handoff` runtime tool. That bounded
+tool result then becomes part of the ordinary append-only transcript like any
+other tool result.
 
 List, read, mutation, and tool routes return the same safe not-found result for
 a missing session and a session owned by another authority/subject. The
@@ -417,6 +444,10 @@ emitted after a retry, terminal, or committed-assistant boundary already
 covered by catch-up. Catch-up therefore cannot turn old provisional text into
 apparently new progress or delay all current progress until an unbounded
 history finishes loading.
+
+`context_handoff_created` and `context_handoff_failed` are durable public
+metadata events. The created event carries the same bounded metadata as the
+session projection, never the handoff document body or a provider request.
 
 The cursor and connection belong to the Endpoint stream, not to a session.
 Creating, opening, closing, or navigating among sessions does not create or
