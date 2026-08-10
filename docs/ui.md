@@ -168,7 +168,11 @@ Before session create, the UI resolves the visible provider default to one
 explicit auth profile, full immutable non-secret provider-execution descriptor,
 and minimum installed auth revision. It freezes that request body with the
 idempotency key for all retries; a changed default or descriptor never mutates
-an in-flight create.
+an in-flight create. If Server rejects that frozen create because a provider
+descriptor advanced, the logic refreshes the authoritative provider catalog,
+keeps the draft and form open on the latest valid selection, and requires a
+new explicit submission. That rejected command is not presented as an unknown
+admission and is never retried with silently changed bytes.
 
 An existing session's execution recovery form starts from that session's
 current provider, model, and auth profile whenever each remains available. A
@@ -380,6 +384,9 @@ Required browser scenarios:
 - one Endpoint SSE multiplexes at least two sessions across navigation, and
   disconnect/reconnect does not miss or duplicate either session's durable
   final message;
+- switching from one session to another clears the previous unsent draft
+  without submitting it
+  (`e2e_browser_switching_sessions_clears_the_previous_unsent_draft`);
 - same-session execution recovery in a multi-provider catalog, including
   current-selection defaults, no-op submission, refresh, and legal
   Server/Endpoint restart without changing session identity or history;

@@ -354,6 +354,9 @@ Endpoint aimux.
 
 - configure one API-key profile on Server, share it to two Endpoints, and prove
   both Endpoints call the provider directly without per-Endpoint setup;
+- `e2e_browser_profile_create_remains_accepted_while_replica_distribution_is_pending`
+  proves an accepted Server profile create is independent from a slow Endpoint
+  install and that the original pending projection later converges to ready;
 - `e2e_browser_provider_profile_default_action_updates_server_pointer` creates
   two profiles through the real management UI, changes the provider-scoped
   default, and verifies the Server-owned pointer and non-secret projection;

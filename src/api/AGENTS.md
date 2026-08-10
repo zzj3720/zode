@@ -73,8 +73,14 @@ contract.
   skip private facts or sessions owned by another subject.
 - Commit order, not handler completion order, controls publication. Recover a
   lagged receiver from storage without leaking debug errors into the stream.
-- Subscribe before replay, deduplicate by durable cursor, and support
-  `Last-Event-ID`. A disconnect never cancels runtime work.
+- Subscribe before replay, establish one Endpoint-wide handoff fence, stream
+  catch-up in bounded batches through that fence, and merge later durable frames
+  into the same ordered catch-up. No-ID transient progress may overtake an older
+  durable replay tail, but a durable retry boundary must be delivered before
+  transient text from its next attempt. Deduplicate by durable cursor and
+  support `Last-Event-ID`; never emit a pre-fence transient after a retry,
+  terminal, or committed-assistant boundary already delivered by catch-up. A
+  disconnect never cancels runtime work.
 - Token deltas may eventually be transient; lifecycle transitions and final
   messages remain durable and reconnectable.
 - Public model retry/interruption events expose only zode attempt counters,

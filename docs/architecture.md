@@ -86,6 +86,15 @@ Provider authentication authority remains on Server:
 - policy deciding which Endpoint may receive which profile;
 - distribution state and acknowledgements.
 
+Server deployment configuration also owns the provider-auth adapter catalog.
+Each configured OAuth adapter binds one provider identity to bounded non-secret
+authorization/token endpoints, public client identity, scopes, and one declared
+refresh-recovery capability; an optional client secret is referenced only by a
+protected file. These management credentials and endpoints never enter the
+provider execution descriptor sent to Endpoint. A provider without a configured
+OAuth adapter remains API-key-only, and browser code never infers OAuth support
+from a provider name or test fixture.
+
 Endpoint also has a credential store because it must call providers directly
 and survive restart. For a Server-managed profile, Endpoint stores a
 versioned, read-only replica. It is not a second management authority.
@@ -480,6 +489,14 @@ databases.
 - **Server crashes during distribution**: retry uses the same operation and
   revision. Endpoint either replays the acknowledgement or completes the
   staged install.
+- **Server crashes after a committed SQLite write**: the next exclusive owner
+  may recover a private, single-link WAL even when SQLite's disposable SHM file
+  is absent. It recreates only that disposable SHM, validates the recovered
+  authority metadata and the existing database/lock/owner identities before
+  readiness, and removes the recreated SHM again if validation fails. Existing
+  symlinked, multiply linked, non-private, or identity-mismatched database,
+  WAL, SHM, lock, or owner files still fail closed without changing durable
+  bytes.
 - **Server crashes after forwarding a session command**: the client retries the
   same Endpoint-scoped route and idempotency key; Endpoint replays the result.
 - **SSE interruption or Access expiry**: Server closes no later than assertion

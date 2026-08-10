@@ -142,6 +142,12 @@ replication is `docs/auth-replication.md`; ingress identity is
 - Keep profile/OAuth non-secret control facts append-only and secrets in a
   replaceable protected store. Default pointer, refresh, delete, sharing, and
   recovery serialize under the owning profile/provider locks and transactions.
+- Load OAuth capability only from the validated Server
+  `provider_auth_adapters` catalog. Bind one adapter to one provider identity;
+  keep authorization/token endpoints, client configuration, PKCE/state and
+  refresh recovery out of Endpoint execution descriptors, browser input and
+  test-only environment overrides. Public provider projections expose only the
+  sorted supported auth methods.
 - Distribute only to explicitly authorized Endpoint IDs. `all_current` expands
   to a durable explicit plan; it does not auto-authorize future Endpoints.
 - Allocate stable operation/profile/revision identity before secret staging.
@@ -181,14 +187,20 @@ replication is `docs/auth-replication.md`; ingress identity is
   missing markers, symlink, inode/path replacement, or multiply-linked
   sidecars fail before READY rather than changing the owned store.
   Existing-store integrity is preflighted before a failed startup can create
-  new ownership sidecars.
+  new ownership sidecars. A missing SQLite SHM after a crash is recoverable
+  only when the canonical database, stable lock/anchor, both owner markers, and
+  a private single-link WAL remain valid. The next exclusive owner may rebuild
+  only that disposable SHM, must validate authority metadata through the WAL
+  before readiness, and must remove the rebuilt SHM again if validation fails.
+  Existing unsafe sidecars or any durable identity mismatch still fail closed.
   The readiness matrix covers database/lock/pair swaps, both-marker removal,
   URI-delimiter restart, corrupt-store cleanup, and WAL/SHM link rejection.
   Its anchors include
   `e2e_server_control_database_path_swap_cannot_cross_catalog_ownership`,
   `e2e_server_control_owner_markers_removal_and_lock_pair_replacement_cannot_allow_second_owner`,
-  `e2e_server_corrupt_existing_control_store_failure_removes_new_ownership_sidecars`,
-  and `e2e_initialized_server_wal_shm_hardlink_is_rejected_before_ready`.
+    `e2e_server_corrupt_existing_control_store_failure_removes_new_ownership_sidecars`,
+    `e2e_initialized_server_wal_shm_hardlink_is_rejected_before_ready`, and
+    `e2e_server_crash_with_committed_wal_and_missing_shm_recovers_same_control_facts`.
 - The combined Server starts one built-in local Endpoint on a private loopback
   listener as a supervised standalone `zode` child and treats it as a normal
   Endpoint record/client. Do not link or instantiate Endpoint runtime state in

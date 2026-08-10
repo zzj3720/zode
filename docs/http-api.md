@@ -405,6 +405,19 @@ exactly once and in increasing Endpoint-global order. Subscribe/replay handoff
 and live publication cannot lose an event. Keepalive comments have no `id` and
 carry no state.
 
+Durable catch-up is streamed in bounded batches rather than accumulated in
+memory before the first frame. Opening a stream and recovering from receiver
+lag each establish one Endpoint-wide handoff fence: durable events through the
+fence are replayed in global order, and later durable frames join that same
+ordered catch-up. No-ID transient progress is outside the durable cursor order:
+it may overtake an older durable replay tail so current work remains visible.
+A durable retry boundary still fences transient text from the next attempt
+until that boundary has been delivered, and a pre-fence transient is never
+emitted after a retry, terminal, or committed-assistant boundary already
+covered by catch-up. Catch-up therefore cannot turn old provisional text into
+apparently new progress or delay all current progress until an unbounded
+history finishes loading.
+
 The cursor and connection belong to the Endpoint stream, not to a session.
 Creating, opening, closing, or navigating among sessions does not create or
 reset an SSE stream. A client uses the frame's `session_id` to dispatch the

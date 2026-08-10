@@ -281,6 +281,7 @@ The response shape is exact and versioned:
         "models": ["model-a"],
         "options": {}
       },
+      "auth_methods": ["api_key", "oauth"],
       "default_profile_id": "01JPROFILEEXAMPLE0000000000",
       "auth_status": "ready",
       "auth_profile_count": 2
@@ -298,6 +299,44 @@ filtered by Access actor. The response cannot contain secret bytes, raw account
 subjects, OAuth attempt/ticket state, replica credentials, or provider headers.
 An authority with no configured providers returns the same schema with an empty
 `providers` array; it does not return 404 or invent a built-in provider.
+
+Each provider projection additionally contains a sorted `auth_methods` array.
+`api_key` is always present. `oauth` is present only when Server startup loaded
+one valid OAuth adapter for that exact provider identity. The projection never
+contains authorization/token URLs, client identity, client-secret references,
+scopes, PKCE material, refresh tokens, or adapter-internal state. UI uses this
+field as the only authority for offering OAuth enrollment.
+
+Server's optional `provider_auth_adapters` deployment configuration is a list
+with at most one entry per provider:
+
+```json
+{
+  "provider": "models-example",
+  "kind": "oauth2_authorization_code_pkce",
+  "authorization_endpoint": "https://login.example.test/oauth/authorize",
+  "token_endpoint": "https://login.example.test/oauth/token",
+  "client_id": "zode-public-client",
+  "client_secret_file": null,
+  "scopes": ["models.execute"],
+  "refresh_recovery": "same_operation_id_idempotent"
+}
+```
+
+Endpoints are exact HTTPS URLs, except loopback HTTP is allowed for local test
+or development fixtures; credentials, fragments, and pre-existing query values
+are rejected. `client_secret_file`, when present, is resolved relative to the
+Server config and must be a private regular file outside SQLite. Scopes are
+bounded, sorted, and unique. `refresh_recovery` is exactly
+`same_operation_id_idempotent`, `exact_result_reconcile`, or `none` and is
+frozen into each admitted refresh operation. Duplicate provider entries or an
+unsupported adapter fail startup. Environment variables and browser input
+cannot install or override an adapter.
+
+This catalog is Server management configuration, not Endpoint execution
+configuration. It is never copied into `provider_execution.options` or an auth
+replica. Updating the catalog requires a normal Server config/restart and does
+not mutate an already admitted attempt or refresh operation.
 
 `PUT /v1/providers/{provider}` creates or updates that provider type's
 non-secret execution descriptor:
@@ -330,6 +369,21 @@ routes are:
 - `POST /v1/auth-profiles/{profile_id}/refresh-operations`
 - `GET /v1/auth-refresh-operations/{operation_id}`
 - `GET /v1/auth-refresh-operations/{operation_id}/events`
+
+`POST /v1/providers/{provider}/auth-profiles` durably creates the Server-owned
+profile, its sharing plan, and the original non-secret response before it
+returns. Endpoint replica installation is asynchronous: an unavailable or
+slow Endpoint leaves the profile visibly `pending` or `unreachable` and does
+not turn an accepted profile create into a `5xx` response. Server rebuilds and
+retries unfinished distribution after restart with the original operation
+identity.
+
+The API-key profile-create response is an immutable receipt scoped to the
+Access actor, provider, idempotency key, and request body. A matching retry
+returns that original safe response even after distribution state changes. If
+an upgraded database contains a historical create operation without a receipt,
+Server fails closed with `409 idempotency_receipt_unavailable`; it never
+synthesizes an old response from the current projection.
 
 `PUT /v1/providers/{provider}/default-auth-profile` accepts
 `{"profile_id":"..."}` and returns the selected non-secret auth-profile
@@ -698,6 +752,10 @@ provider/tool/OAuth fixtures.
   reroutes or serves invented stale session state;
 - OAuth/profile/default/distribution lifecycle with multiple profiles for one
   provider;
+- `e2e_browser_profile_create_remains_accepted_while_replica_distribution_is_pending`
+  holds the real Endpoint replica install, proves profile create returns its
+  durable `pending` receipt instead of `5xx`, then releases the Endpoint and
+  observes the same browser projection automatically converge to `ready`;
 - redeem one OAuth authorize ticket twice and concurrently; exactly one request
   produces one redirect/provider state, every replay is consumed, and an
   explicit new ticket is required for another redirect; the provider observes
@@ -707,6 +765,11 @@ provider/tool/OAuth fixtures.
   distribution; non-idempotent unknown refresh fences new-key explicit and
   scheduled refresh with no second provider call until successful relogin, and
   never blindly retries or reuses a revision;
+- `e2e_server_crash_with_committed_wal_and_missing_shm_recovers_same_control_facts`
+  kills the real Server after a committed provider descriptor, proves a
+  non-empty private WAL remains while SHM is absent, then restarts through the
+  same config and observes the exact durable descriptor without weakening the
+  database/lock/owner integrity checks;
 - Endpoint-scoped callback relay completes exactly once when reachable and
   returns retryable unavailability without a Server queue when offline; its
   bearer never appears in a URL, log, event, or database; the same callback URL
