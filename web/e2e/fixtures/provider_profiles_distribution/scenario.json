@@ -67,7 +67,7 @@
     }
   ],
   "uiSemantics": {
-    "deploymentSharedText": "deployment[ -]shared|shared deployment",
+    "deploymentSharedText": "share ready profiles with Endpoints",
     "forbiddenOwnershipTerms": ["personal", "owner", "workspace", "role", "grant"]
   },
   "distributionStatuses": [

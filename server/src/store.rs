@@ -117,6 +117,19 @@ CREATE TABLE IF NOT EXISTS auth_profile_create_operations (
     UNIQUE (profile_id)
 ) WITHOUT ROWID, STRICT;
 
+CREATE TABLE IF NOT EXISTS auth_profile_rotation_operations (
+    actor_key BLOB NOT NULL CHECK (length(actor_key) = 32),
+    provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 128),
+    profile_id TEXT NOT NULL CHECK (length(profile_id) BETWEEN 1 AND 128),
+    command_key BLOB NOT NULL CHECK (length(command_key) = 32),
+    request_fingerprint BLOB NOT NULL CHECK (length(request_fingerprint) = 32),
+    revision INTEGER NOT NULL CHECK (revision > 1),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    response_json TEXT NOT NULL CHECK (length(response_json) BETWEEN 2 AND 1048576),
+    PRIMARY KEY (actor_key, provider, command_key),
+    FOREIGN KEY (profile_id) REFERENCES auth_profiles(profile_id)
+) WITHOUT ROWID, STRICT;
+
 CREATE TABLE IF NOT EXISTS auth_profiles (
     profile_id TEXT PRIMARY KEY CHECK (length(profile_id) BETWEEN 1 AND 128),
     provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 128),
@@ -465,6 +478,16 @@ pub(crate) struct ProfileCreateWrite {
     pub(crate) secret_ref: String,
     pub(crate) sharing_json: String,
     pub(crate) make_default: bool,
+    pub(crate) created_at_ms: i64,
+}
+
+pub(crate) struct ProfileRotationWrite {
+    pub(crate) actor_key: [u8; DIGEST_BYTES],
+    pub(crate) provider: String,
+    pub(crate) profile_id: String,
+    pub(crate) command_key: [u8; DIGEST_BYTES],
+    pub(crate) request_fingerprint: [u8; DIGEST_BYTES],
+    pub(crate) secret_ref: String,
     pub(crate) created_at_ms: i64,
 }
 
@@ -2509,6 +2532,126 @@ impl ControlStore {
         Ok(response_json)
     }
 
+    pub(crate) fn rotate_api_key_profile<F>(
+        &self,
+        write: ProfileRotationWrite,
+        response_for: F,
+    ) -> Result<(String, Option<String>), StoreError>
+    where
+        F: FnOnce(&AuthProfileRecord, &[AuthReplicaRecord]) -> Result<String, StoreError>,
+    {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_fingerprint, profile_id, response_json
+                 FROM auth_profile_rotation_operations
+                 WHERE actor_key = ?1 AND provider = ?2 AND command_key = ?3",
+                params![
+                    &write.actor_key[..],
+                    &write.provider,
+                    &write.command_key[..],
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| StoreError::Internal)?;
+        if let Some((fingerprint, profile_id, response_json)) = existing {
+            if !equal_digest(&fingerprint, &write.request_fingerprint)
+                || profile_id != write.profile_id
+            {
+                return Err(StoreError::Conflict);
+            }
+            read_auth_profile(&transaction, &profile_id)?;
+            transaction.commit().map_err(|_| StoreError::Internal)?;
+            return Ok((response_json, None));
+        }
+
+        let profile = read_auth_profile_optional(&transaction, &write.profile_id)?
+            .ok_or(StoreError::NotFound)?;
+        if profile.provider != write.provider
+            || profile.kind != "api_key"
+            || profile.deleted_at_ms.is_some()
+        {
+            return Err(StoreError::Conflict);
+        }
+        let current_revision =
+            i64::try_from(profile.revision).map_err(|_| StoreError::Integrity)?;
+        let highest_reserved = transaction
+            .query_row(
+                "SELECT MAX(revision) FROM (
+                    SELECT revision FROM auth_replica_operations WHERE profile_id = ?1
+                    UNION ALL
+                    SELECT reserved_revision AS revision
+                    FROM auth_refresh_operations WHERE profile_id = ?1
+                 )",
+                [&write.profile_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|_| StoreError::Internal)?
+            .unwrap_or(current_revision);
+        let revision = highest_reserved
+            .max(current_revision)
+            .checked_add(1)
+            .ok_or(StoreError::Integrity)?;
+        let changed = transaction
+            .execute(
+                "UPDATE auth_profiles
+                 SET revision = ?2, secret_ref = ?3
+                 WHERE profile_id = ?1 AND kind = 'api_key' AND deleted_at_ms IS NULL",
+                params![&write.profile_id, revision, &write.secret_ref],
+            )
+            .map_err(|error| {
+                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                    StoreError::Conflict
+                } else {
+                    StoreError::Internal
+                }
+            })?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        let endpoint_ids = parse_endpoint_ids(&profile.endpoint_ids_json)?;
+        append_replica_installs(
+            &transaction,
+            &write.profile_id,
+            revision,
+            &endpoint_ids,
+            &format!("api-key-rotation:{}", hex(&write.request_fingerprint)),
+        )?;
+        let record = read_auth_profile(&transaction, &write.profile_id)?;
+        let replicas = read_auth_replicas(&transaction, &write.profile_id)?;
+        let response_json = response_for(&record, &replicas)?;
+        transaction
+            .execute(
+                "INSERT INTO auth_profile_rotation_operations (
+                    actor_key, provider, profile_id, command_key, request_fingerprint,
+                    revision, created_at_ms, response_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    &write.actor_key[..],
+                    &write.provider,
+                    &write.profile_id,
+                    &write.command_key[..],
+                    &write.request_fingerprint[..],
+                    revision,
+                    write.created_at_ms,
+                    &response_json,
+                ],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok((response_json, Some(profile.secret_ref)))
+    }
+
     pub(crate) fn mark_replica_ready(
         &self,
         profile_id: &str,
@@ -2529,6 +2672,30 @@ impl ControlStore {
         if changed != 1 {
             return Err(StoreError::Integrity);
         }
+        Ok(())
+    }
+
+    pub(crate) fn mark_endpoint_replicas_unreachable(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "UPDATE auth_replica_operations AS replica
+                 SET status = 'unreachable'
+                 WHERE replica.endpoint_id = ?1
+                   AND replica.status != 'unreachable'
+                   AND NOT (replica.kind = 'tombstone' AND replica.status = 'ready')
+                   AND NOT EXISTS (
+                        SELECT 1 FROM auth_replica_operations AS newer
+                        WHERE newer.profile_id = replica.profile_id
+                          AND newer.endpoint_id = replica.endpoint_id
+                          AND newer.revision > replica.revision
+                   )",
+                [endpoint_id],
+            )
+            .map_err(|_| StoreError::Internal)?;
         Ok(())
     }
 
@@ -3499,7 +3666,14 @@ fn append_replica_installs(
                 "INSERT INTO auth_replica_operations (
                     profile_id, endpoint_id, revision, operation_id,
                     kind, status, observed_revision
-                 ) VALUES (?1, ?2, ?3, ?4, 'install', 'pending', NULL)",
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, 'install', 'pending',
+                    (
+                        SELECT MAX(observed_revision)
+                        FROM auth_replica_operations
+                        WHERE profile_id = ?1 AND endpoint_id = ?2
+                    )
+                 )",
                 params![profile_id, endpoint_id, revision, operation_id],
             )
             .map_err(|_| StoreError::Internal)?;
@@ -3650,6 +3824,16 @@ fn auth_replica_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthReplic
     let observed_revision = optional_u64(row, 6)?;
     let kind = row.get::<_, String>(7)?;
     let status = row.get::<_, String>(5)?;
+    let public_status = if kind == "tombstone" && status == "ready" {
+        "removed".to_owned()
+    } else if kind == "install"
+        && status == "pending"
+        && observed_revision.is_some_and(|observed| observed < revision)
+    {
+        "stale".to_owned()
+    } else {
+        status
+    };
     Ok(AuthReplicaRecord {
         profile_id: row.get(0)?,
         endpoint_id: row.get(1)?,
@@ -3657,11 +3841,7 @@ fn auth_replica_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthReplic
         revision,
         operation_id: row.get(4)?,
         kind: kind.clone(),
-        status: if kind == "tombstone" && status == "ready" {
-            "removed".to_owned()
-        } else {
-            status
-        },
+        status: public_status,
         observed_revision,
     })
 }

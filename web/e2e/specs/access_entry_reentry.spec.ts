@@ -44,7 +44,7 @@ const SSE_ACCESS_REENTRY_E2E_NAME =
 const SSE_ACCESS_REENTRY_CLASSIFICATION =
   "ACCESS_REENTRY_SSE_401_RECONNECT_LOOP";
 const SSE_ACCESS_REENTRY_FIRST_OBSERVED =
-  "the real Access edge returned HTTP 401 for a session event stream, but the browser kept retrying instead of re-entering Access";
+  "the real Access edge returned HTTP 401 for the Endpoint event stream, but the browser kept retrying instead of re-entering Access";
 const INCIDENT_DIRECTORY = resolve(REPO_ROOT, "web/e2e/fixtures/incidents");
 const execFileAsync = promisify(execFile);
 
@@ -508,7 +508,9 @@ function forwardHeaders(
 }
 
 function isMutation(request: IncomingMessage): boolean {
-  return ["POST", "PUT", "PATCH", "DELETE"].includes((request.method ?? "GET").toUpperCase());
+  const method = (request.method ?? "GET").toUpperCase();
+  const path = new URL(request.url ?? "/", "http://fixture.invalid").pathname;
+  return ["POST", "PUT", "PATCH", "DELETE"].includes(method) && path.split("/").at(-1) !== "probe";
 }
 
 function isDocumentRequest(request: IncomingMessage): boolean {
@@ -683,6 +685,7 @@ class AccessEdgeFixture {
   private sseClosed: Promise<void> | undefined;
   private sseOpenedCountValue = 0;
   private expireNextMutation = false;
+  private invalidNextSse = false;
   private autoCompleteReentry = false;
   private reentryCountValue = 0;
   origin = "";
@@ -717,6 +720,10 @@ class AccessEdgeFixture {
   async setMode(mode: AccessMode): Promise<void> {
     this.mode = mode;
     this.expireNextMutation = false;
+  }
+
+  invalidateNextSse(): void {
+    this.invalidNextSse = true;
   }
 
   enableAutoCompleteReentry(): void {
@@ -811,6 +818,7 @@ class AccessEdgeFixture {
     this.sseClosed = undefined;
     this.sseOpenedCountValue = 0;
     this.expireNextMutation = false;
+    this.invalidNextSse = false;
     this.autoCompleteReentry = false;
     this.reentryCountValue = 0;
     this.exchanges.length = 0;
@@ -1006,9 +1014,17 @@ class AccessEdgeFixture {
       return;
     }
 
-    const signingMode: AccessMode = isMutation(request) && this.expireNextMutation
-      ? "expired"
-      : this.mode;
+    const isSse = request.headers.accept?.includes("text/event-stream") ?? false;
+    const invalidateThisSse = isSse && this.invalidNextSse;
+    const signingMode: AccessMode = invalidateThisSse
+      ? "invalid"
+      : isMutation(request) && this.expireNextMutation
+        ? "expired"
+        : this.mode;
+    if (invalidateThisSse) {
+      this.invalidNextSse = false;
+      this.mode = "invalid";
+    }
     const signingKeys = signingMode === "invalid" ? this.forgedKeys : this.initialKeys;
     const signedAssertion = signAccessJwt(signingKeys, signingMode);
     const assertion = signedAssertion.token;
@@ -1020,7 +1036,7 @@ class AccessEdgeFixture {
     exchange.requestSemanticHeaders = canonicalRequestSemanticHeaders(
       forwardHeaders(request, { "cf-access-jwt-assertion": assertion }, body),
     );
-    if (request.headers.accept?.includes("text/event-stream")) {
+    if (isSse) {
       const lastEventId = typeof request.headers["last-event-id"] === "string" ? request.headers["last-event-id"] : "";
       const sseExchange: SseExchange = Object.assign(exchange, {
         lastEventId,
@@ -1190,6 +1206,11 @@ async function writeProcessConfigs(root: string, edge: AccessEdgeFixture): Promi
       kind: "bearer_secret_file",
       secret_file: controllerSecretPath,
     }],
+    provider_execution: {
+      adapter_kinds: ["openai_compatible"],
+      allowed_base_url_origins: ["http://127.0.0.1"],
+    },
+    callback: { allowed_public_origins: [callbackOrigin] },
   };
   await writeJson(endpointConfigPath, endpointConfig);
 
@@ -1244,6 +1265,27 @@ async function seedAccessSession(
   endpointOrigin: string,
   controllerSecret: string,
 ): Promise<string> {
+  const providerName = "access-entry-provider";
+  const modelName = "access-entry-model";
+  const managementJson = async (
+    method: string,
+    path: string,
+    body?: Record<string, unknown>,
+  ): Promise<{ status: number; body: Record<string, any> }> => {
+    const response = await fetch(`${accessEdge.origin}${path}`, {
+      method,
+      headers: {
+        accept: "application/json",
+        ...(body ? { "content-type": "application/json" } : {}),
+        ...(method === "POST" || method === "PUT"
+          ? { "idempotency-key": `access-entry-seed-${randomUUID()}` }
+          : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const responseBody = await response.json().catch(() => ({})) as Record<string, any>;
+    return { status: response.status, body: responseBody };
+  };
   const endpointResponse = await fetch(`${accessEdge.origin}/v1/endpoints`, {
     method: "POST",
     headers: {
@@ -1262,22 +1304,72 @@ async function seedAccessSession(
   }
   const endpoint = (await endpointResponse.json()) as { endpoint_id?: string };
   if (!endpoint.endpoint_id) throw new ReadinessNonEvidence();
-  const sessionResponse = await fetch(
-    `${accessEdge.origin}/v1/endpoints/${encodeURIComponent(endpoint.endpoint_id)}/sessions`,
+  const provider = await managementJson("PUT", `/v1/providers/${providerName}`, {
+    kind: "openai_compatible",
+    base_url: "http://127.0.0.1/v1",
+    models: [modelName],
+    options: {},
+  });
+  if (provider.status !== 200) throw new ReadinessNonEvidence();
+  const profile = await managementJson(
+    "POST",
+    `/v1/providers/${providerName}/auth-profiles`,
     {
-      method: "POST",
-      headers: {
-        accept: "application/json",
-        "content-type": "application/json",
-        "idempotency-key": `access-expiry-session-${randomUUID()}`,
-      },
-      body: JSON.stringify({ tools: [] }),
+      kind: "api_key",
+      label: "Access entry profile",
+      api_key: controllerSecret,
+      make_default: true,
+      sharing: { mode: "selected", endpoint_ids: [endpoint.endpoint_id] },
     },
   );
-  if (!sessionResponse.ok) throw new ReadinessNonEvidence();
-  const session = (await sessionResponse.json()) as { session_id?: string };
-  if (!session.session_id) throw new ReadinessNonEvidence();
-  return `/endpoints/${encodeURIComponent(endpoint.endpoint_id)}/sessions/${encodeURIComponent(session.session_id)}`;
+  if (profile.status !== 201 || typeof profile.body.auth_profile_id !== "string") {
+    throw new ReadinessNonEvidence();
+  }
+  const replicaDeadline = Date.now() + 20_000;
+  let replicaReady = false;
+  while (Date.now() < replicaDeadline) {
+    const profiles = await managementJson(
+      "GET",
+      `/v1/providers/${providerName}/auth-profiles`,
+    );
+    const current = Array.isArray(profiles.body.items)
+      ? profiles.body.items.find(
+        (candidate: Record<string, any>) =>
+          candidate.auth_profile_id === profile.body.auth_profile_id,
+      )
+      : undefined;
+    replicaReady = current?.distribution?.some(
+      (replica: Record<string, any>) =>
+        replica.endpoint_id === endpoint.endpoint_id && replica.status === "ready",
+    ) ?? false;
+    if (replicaReady) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  }
+  if (!replicaReady) throw new ReadinessNonEvidence();
+  const session = await managementJson(
+    "POST",
+    `/v1/endpoints/${encodeURIComponent(endpoint.endpoint_id)}/sessions`,
+    {
+      model: {
+        provider: providerName,
+        model: modelName,
+        provider_execution: {
+          schema: "zode.provider-execution.v1",
+          revision: provider.body.revision,
+          kind: provider.body.kind,
+          base_url: provider.body.base_url,
+          options: provider.body.options,
+        },
+        auth_profile_id: profile.body.auth_profile_id,
+        minimum_auth_revision: profile.body.revision,
+      },
+      tools: [],
+    },
+  );
+  if (session.status !== 201 || typeof session.body.session_id !== "string") {
+    throw new ReadinessNonEvidence();
+  }
+  return `/endpoints/${encodeURIComponent(endpoint.endpoint_id)}/sessions/${encodeURIComponent(session.body.session_id)}`;
 }
 
 class TestStack {
@@ -1546,12 +1638,11 @@ function assertSseCursorRecovery(stack: TestStack): void {
   const recovered = stack.access.sseExchanges[1];
   if (!first || !recovered) throw new Error("SSE cursor recovery did not retain two exchanges");
   expect(first.lastEventId).toBe("");
-  const firstPair = first.path.match(/^\/v1\/endpoints\/([^/]+)\/sessions\/([^/]+)\/events(?:\?.*)?$/);
-  const recoveredPair = recovered.path.match(/^\/v1\/endpoints\/([^/]+)\/sessions\/([^/]+)\/events(?:\?.*)?$/);
-  expect(firstPair).not.toBeNull();
-  expect(recoveredPair).not.toBeNull();
-  expect(recoveredPair?.[1]).toBe(firstPair?.[1]);
-  expect(recoveredPair?.[2]).toBe(firstPair?.[2]);
+  const firstEndpoint = first.path.match(/^\/v1\/endpoints\/([^/]+)\/events(?:\?.*)?$/);
+  const recoveredEndpoint = recovered.path.match(/^\/v1\/endpoints\/([^/]+)\/events(?:\?.*)?$/);
+  expect(firstEndpoint).not.toBeNull();
+  expect(recoveredEndpoint).not.toBeNull();
+  expect(recoveredEndpoint?.[1]).toBe(firstEndpoint?.[1]);
 
   const cursor = first.eventIds.at(-1) ?? first.lastEventId;
   expect(cursor).toBeTruthy();
@@ -1562,7 +1653,7 @@ function assertSseCursorRecovery(stack: TestStack): void {
   expect(recoveredIds.size).toBe(recovered.eventIds.length);
   // The reconnect pair is the stream continuity contract.  A later full
   // document re-entry intentionally opens a fresh stream without a cursor
-  // and may replay the initial session frame; it is not a Last-Event-ID
+  // and may replay initial Endpoint events; it is not a Last-Event-ID
   // reconnect and must not be mistaken for a duplicate in that pair.
   expect([...firstIds].some((id) => recoveredIds.has(id))).toBe(false);
 }
@@ -1704,7 +1795,7 @@ test.describe("Access entry and re-entry", () => {
 
   for (const mode of ["expired", "invalid"] as const) {
     test(`e2e_access_${mode}_assertion_reenters_management_origin_and_stops_mutation_retries`, async ({ page, context }, testInfo) => {
-      const viewUrl = stack.managementUrl(VIEW_STATE_PATH);
+      const viewUrl = stack.managementUrl(stack.sessionPath);
       const response = await page.goto(viewUrl, { waitUntil: "domcontentloaded" });
       assertManagementUiResponse(response, new URL(viewUrl).pathname + new URL(viewUrl).search, testInfo);
       await assertManagementUi(page);
@@ -1714,7 +1805,7 @@ test.describe("Access entry and re-entry", () => {
       });
 
       const composer = page.getByRole("textbox", { name: /message|prompt|composer/i }).first();
-      const send = page.getByRole("button", { name: /send|submit/i }).first();
+      const send = page.getByRole("button", { name: /send|submit|start session/i }).first();
       await expect(composer).toBeVisible();
       await expect(send).toBeVisible();
       await composer.fill(MUTATION_TEXT);
@@ -1745,15 +1836,14 @@ test.describe("Access entry and re-entry", () => {
 
     await page.goto(stack.managementUrl(stack.sessionPath), { waitUntil: "domcontentloaded" });
     await assertManagementUi(page);
-    await expect(page.getByRole("heading", { name: "Session", exact: true })).toBeVisible();
+    await expect(page.getByRole("form", { name: "Message composer", exact: true })).toBeVisible();
 
     const captureSetId = stack.beginCaptureSet(SESSION_ACCESS_REENTRY_E2E_NAME);
     let primaryError: unknown;
     try {
       await stack.access.setMode("expired");
-      await page.getByRole("link", { name: "Endpoints", exact: true }).click();
-      await expect(page).toHaveURL(/\/endpoints$/u);
-      await page.getByRole("link", { name: "Sessions", exact: true }).click();
+      await page.getByRole("navigation", { name: "Primary", exact: true })
+        .getByRole("link", { name: "New session", exact: true }).click();
       try {
         await expect(page.locator("[data-access-reentry]")).toBeVisible({ timeout: 10_000 });
       } catch (error) {
@@ -1771,6 +1861,7 @@ test.describe("Access entry and re-entry", () => {
         const firstFailure = stack.journal.first({
           boundary: "management-access-edge",
           responseStatus: 401,
+          captureSetId,
         });
         if (!firstFailure) throw new Error("Access re-entry capture contained no HTTP 401 exchange");
         const capture = stack.journal.flushCaptureSet(captureSetId, {
@@ -1896,7 +1987,7 @@ test.describe("Access entry and re-entry", () => {
       // real HTTP 401 from the management Server.  A browser must stop the SSE
       // retry loop and re-enter through the management origin, rather than
       // treating an admission failure as an Endpoint/network outage.
-      await stack.access.setMode("invalid");
+      stack.access.invalidateNextSse();
       const navigationCountBefore401 = navigationUrls.length;
       try {
         await expect
@@ -1971,8 +2062,12 @@ test.describe("Access entry and re-entry", () => {
             `${error instanceof Error ? error.message : String(error)} active_recordings=${active.join(",")}`,
           );
         }
+        const unauthorizedPath = stack.access.sseExchanges.find(
+          (exchange) => exchange.responseStatus === 401,
+        )?.path;
         const firstFailure = stack.journal.first({
           boundary: "management-access-edge",
+          requestPath: unauthorizedPath,
           responseStatus: 401,
           captureSetId,
         });

@@ -911,11 +911,18 @@ function restoreHeaders(headers, ledger) {
   return restored;
 }
 
-async function requestRaw(target, { method, headers, body, timeoutMs = HTTP_TIMEOUT_MS }) {
+async function requestRaw(target, {
+  method,
+  headers,
+  body,
+  timeoutMs = HTTP_TIMEOUT_MS,
+  disconnectAfterResponseBytes,
+}) {
   return withTimeout(new Promise((resolve, reject) => {
     const started = process.hrtime.bigint();
     const request = http.request(target, { method, headers }, (response) => {
       const chunks = [];
+      let responseBytes = 0;
       let settled = false;
       const finish = (value) => {
         if (settled) return;
@@ -927,10 +934,21 @@ async function requestRaw(target, { method, headers, body, timeoutMs = HTTP_TIME
           outcome: value,
         });
       };
-      response.on('data', (chunk) => chunks.push({
-        offsetUs: Number(process.hrtime.bigint() - started) / 1_000,
-        data: Buffer.from(chunk),
-      }));
+      const disconnect = () => {
+        finish('client_disconnected');
+        response.destroy();
+        request.destroy();
+      };
+      response.on('data', (chunk) => {
+        const bytes = Buffer.from(chunk);
+        responseBytes += bytes.length;
+        chunks.push({
+          offsetUs: Number(process.hrtime.bigint() - started) / 1_000,
+          data: bytes,
+        });
+        if (disconnectAfterResponseBytes !== undefined
+          && responseBytes >= disconnectAfterResponseBytes) disconnect();
+      });
       response.once('end', () => finish('completed'));
       // Terminal outcome is an observation of this replay target, never a
       // hint from the captured cassette.  Otherwise a target that disconnects
@@ -940,6 +958,7 @@ async function requestRaw(target, { method, headers, body, timeoutMs = HTTP_TIME
       response.once('close', () => {
         if (!settled && !response.complete) finish('disconnected');
       });
+      if (disconnectAfterResponseBytes === 0) disconnect();
     });
     request.once('error', reject);
     request.end(body || undefined);
@@ -947,7 +966,7 @@ async function requestRaw(target, { method, headers, body, timeoutMs = HTTP_TIME
 }
 
 class RecordingJournal {
-  constructor({ rootDir, ledger, recoveryOnly = false }) {
+  constructor({ rootDir, ledger, recoveryOnly = false, defaultMaxMembers = 64 }) {
     this.ledger = ledger;
     this.records = [];
     this.active = new Map();
@@ -975,7 +994,10 @@ class RecordingJournal {
     }
     this.rootDir = ensureDirectory(rootDir);
     this.promotedDir = ensureDirectory(path.join(rootDir, 'promoted'));
-    this.defaultCaptureSetId = this.beginCaptureSet({ e2eName: 'web-e2e-harness-run', maxMembers: 64 });
+    this.defaultCaptureSetId = this.beginCaptureSet({
+      e2eName: 'web-e2e-harness-run',
+      maxMembers: defaultMaxMembers,
+    });
   }
 
   /**
@@ -2321,11 +2343,15 @@ class RecordingJournal {
         throw new HarnessFailure('REPLAY_REQUEST_HEADER_MISMATCH', 'replay request headers differed from the captured exchange', { name });
       }
     }
+    const expectedChunks = exchange.response.chunks.map((chunk) => decodeBase64Strict(chunk.data_base64, 'replay response chunk', MAX_RECORDING_RESPONSE_BYTES));
+    const expectedBody = Buffer.concat(expectedChunks);
     const response = await requestRaw(target, {
       method: exchange.method,
       headers: requestHeaders,
       body: requestBody,
       timeoutMs: HTTP_TIMEOUT_MS,
+      disconnectAfterResponseBytes:
+        exchange.response.outcome === 'client_disconnected' ? expectedBody.length : undefined,
     });
     const expectedResponseHeaders = normalizeHeaders(restoreHeaders(exchange.response.headers, this.ledger));
     const actualResponseHeaders = normalizeHeaders(publicHeaders(response.headers));
@@ -2335,14 +2361,12 @@ class RecordingJournal {
         throw new HarnessFailure('REPLAY_RESPONSE_HEADER_MISMATCH', 'replay response headers differed from the captured exchange', { name });
       }
     }
-    const expectedChunks = exchange.response.chunks.map((chunk) => decodeBase64Strict(chunk.data_base64, 'replay response chunk', MAX_RECORDING_RESPONSE_BYTES));
     // A live HTTP hop is allowed to coalesce or split transport reads.  The
     // replay server below re-emits the captured chunk boundaries, but a
     // same-entry replay through a real product/edge can only compare the
     // ordered response bytes and terminal outcome.  Treating Node's read
     // segmentation as product semantics makes a captured CSS/font response
     // fail even when its status, headers, bytes, and termination all match.
-    const expectedBody = Buffer.concat(expectedChunks);
     const actualBody = redactBuffer(Buffer.concat(response.chunks.map((chunk) => chunk.data)), this.ledger);
     if (response.status !== exchange.response.status || !actualBody.equals(expectedBody)) {
       throw new HarnessFailure('REPLAY_MISMATCH', 'secret-safe cassette replay did not reproduce the public exchange', {
@@ -2383,6 +2407,21 @@ class RecordingJournal {
       while (this.active.size) await new Promise((resolve) => setImmediate(resolve));
     })(), timeoutMs, 'recording capture did not reach an idle boundary');
     this.assertFlushed();
+  }
+
+  async waitForQuiescent(timeoutMs = PROCESS_STOP_TIMEOUT_MS) {
+    await withTimeout((async () => {
+      while ([...this.active.values()].some((context) => {
+        const contentType = String(context.responseHeaders?.['content-type'] || '')
+          .toLowerCase()
+          .split(';', 1)[0]
+          .trim();
+        return contentType !== 'text/event-stream';
+      })) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    })(), timeoutMs, 'recording capture did not reach a non-streaming idle boundary');
+    this._healthy();
   }
 
   async waitForFatal(timeoutMs = HTTP_TIMEOUT_MS) {
@@ -2719,6 +2758,7 @@ async function proxyHttp({
   let settled = false;
   let responseStatus;
   let responseHeaders;
+  let streamingResponse = false;
   const bufferedChunks = [];
   const sendUnavailable = () => {
     if (response.destroyed || response.writableEnded) return;
@@ -2756,6 +2796,15 @@ async function proxyHttp({
       responseStartedAt = process.hrtime.bigint();
       responseStatus = upstreamResponse.statusCode || 502;
       responseHeaders = upstreamResponse.headers;
+      streamingResponse = String(responseHeaders['content-type'] || '')
+        .toLowerCase()
+        .split(';', 1)[0]
+        .trim() === 'text/event-stream';
+      if (settled) {
+        upstreamResponse.destroy();
+        resolve();
+        return;
+      }
       try {
         journal.responseStarted(recording, { status: responseStatus, headers: responseHeaders });
       } catch (error) {
@@ -2765,43 +2814,90 @@ async function proxyHttp({
         resolve();
         return;
       }
+      if (streamingResponse) {
+        response.writeHead(responseStatus, responseHeaders);
+        try {
+          response.flushHeaders();
+        } catch (error) {
+          upstreamResponse.destroy();
+          finish('transport_error');
+          resolve();
+          return;
+        }
+      }
       upstreamResponse.on('data', (chunk) => {
+        if (settled) return;
         try {
           const bytes = Buffer.from(chunk);
           journal.chunk(recording, bytes, Number(process.hrtime.bigint() - responseStartedAt) / 1_000);
-          bufferedChunks.push(bytes);
+          if (streamingResponse) response.write(bytes);
+          else bufferedChunks.push(bytes);
         } catch (error) {
           journal._fail(error);
           upstreamResponse.destroy();
-          sendUnavailable();
+          if (streamingResponse) response.destroy();
+          else sendUnavailable();
           resolve();
         }
       });
       upstreamResponse.on('end', () => {
-        finishAndRespond('completed');
+        if (streamingResponse) {
+          try {
+            finish('completed');
+            if (!response.writableEnded) response.end();
+          } catch (error) {
+            journal._fail(error);
+            if (!response.destroyed) response.destroy();
+          }
+        } else {
+          finishAndRespond('completed');
+        }
         resolve();
       });
       upstreamResponse.on('aborted', () => {
-        finishAndRespond('disconnected');
+        if (streamingResponse) {
+          try {
+            finish('disconnected');
+          } catch (error) {
+            journal._fail(error);
+          }
+          if (!response.destroyed && !response.writableEnded) response.end();
+        } else {
+          finishAndRespond('disconnected');
+        }
         resolve();
       });
       upstreamResponse.on('error', () => {
-        finishAndRespond('transport_error');
+        if (streamingResponse) {
+          try {
+            finish('transport_error');
+          } catch (error) {
+            journal._fail(error);
+          }
+          if (!response.destroyed) response.destroy();
+        } else {
+          finishAndRespond('transport_error');
+        }
         resolve();
       });
       upstreamResponse.once('close', () => {
         if (!settled && !upstreamResponse.complete) {
-          finishAndRespond('disconnected');
+          if (streamingResponse) {
+            try {
+              finish('disconnected');
+            } catch (error) {
+              journal._fail(error);
+            }
+            if (!response.destroyed && !response.writableEnded) response.end();
+          } else {
+            finishAndRespond('disconnected');
+          }
           resolve();
         }
       });
     });
     upstream.on('error', (error) => {
-      // The client may close immediately after the bounded disconnect
-      // observation has been durably finished.  In that case the upstream
-      // socket error is a late transport notification, not a second response
-      // start; never turn it into a recording-state failure.
-      if (recording.finished) {
+      if (settled) {
         resolve();
         return;
       }
@@ -2835,9 +2931,16 @@ async function proxyHttp({
   return recording.record;
 }
 
-async function startFakeProvider({ ledger }) {
+async function startFakeProvider({ ledger, mode = 'default' }) {
   const requests = [];
   const requestBarrier = new Barrier('fake provider request');
+  const toolRequests = [];
+  const toolRequestBarrier = new Barrier('fake provider tool request');
+  let releaseVisualStream;
+  let releaseVisualTool;
+  const visualStreamGate = new Promise((resolve) => { releaseVisualStream = resolve; });
+  const visualToolGate = new Promise((resolve) => { releaseVisualTool = resolve; });
+  let visualProviderRound = 0;
   const fixture = await startHttpServer(async (request, response) => {
     if (request.method === 'GET' && request.url === '/healthz') {
       response.writeHead(200, { 'content-type': 'application/json' });
@@ -2847,9 +2950,34 @@ async function startFakeProvider({ ledger }) {
     const body = await readRequestBody(request);
     const authorization = String(request.headers.authorization || '');
     const requestRecord = { method: request.method, path: request.url, body, authorization };
+    if (mode === 'visual-session-states' && request.url === '/fixture_async') {
+      toolRequests.push(requestRecord);
+      toolRequestBarrier.notify(requestRecord);
+      await visualToolGate;
+      response.writeHead(500, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ error: { code: 'visual_fixture_failure' } }));
+      return;
+    }
     requests.push(requestRecord);
     requestBarrier.notify(requestRecord);
     response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+    if (mode === 'visual-session-states') {
+      visualProviderRound += 1;
+      if (visualProviderRound === 1) {
+        response.write('data: {"choices":[{"delta":{"content":"VISUAL_STREAM"},"finish_reason":null}]}\n\n');
+        await visualStreamGate;
+        response.write('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"visual-wait-tool-call","type":"function","function":{"name":"wait_for","arguments":"{\\"reason\\":\\"Visual state wait\\",\\"timeout_seconds\\":60}"}}]},"finish_reason":null}]}\n\n');
+        response.write('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n');
+        response.end('data: [DONE]\n\n');
+        return;
+      }
+      if (visualProviderRound === 2) {
+        response.write('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"visual-async-tool-call","type":"function","function":{"name":"fixture_async","arguments":"{\\"mode\\":\\"visual-error\\"}"}}]},"finish_reason":null}]}\n\n');
+        response.write('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n');
+        response.end('data: [DONE]\n\n');
+        return;
+      }
+    }
     response.write('data: {"choices":[{"delta":{"content":"E2E_OK"},"finish_reason":null}]}\n\n');
     response.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
     response.end('data: [DONE]\n\n');
@@ -2861,6 +2989,21 @@ async function startFakeProvider({ ledger }) {
     async waitForRequest(count = 1) {
       while (requests.length < count) await requestBarrier.wait();
       return requests[count - 1];
+    },
+    async waitForToolRequest(count = 1) {
+      while (toolRequests.length < count) await toolRequestBarrier.wait();
+      return toolRequests[count - 1];
+    },
+    releaseVisualStream() {
+      releaseVisualStream();
+    },
+    releaseVisualToolFailure() {
+      releaseVisualTool();
+    },
+    async close() {
+      releaseVisualStream();
+      releaseVisualTool();
+      await fixture.close();
     },
     ledger,
   };
@@ -3055,7 +3198,14 @@ function resolveAuthorityId(value, fallback) {
   return authorityId;
 }
 
-function endpointConfig({ root, database, providerOrigin, controllerSecret, authorityId }) {
+function endpointConfig({
+  root,
+  database,
+  providerOrigin,
+  controllerSecret,
+  authorityId,
+  tools = [],
+}) {
   const credentials = ensureDirectory(path.join(root, 'credentials'));
   const blobs = ensureDirectory(path.join(root, 'blobs'));
   const secretFile = writePrivateFile(path.join(root, 'controller.secret'), controllerSecret);
@@ -3085,7 +3235,7 @@ function endpointConfig({ root, database, providerOrigin, controllerSecret, auth
       allowed_base_url_origins: [providerOrigin],
     },
     callback: { allowed_public_origins: [providerOrigin] },
-    tools: [],
+    tools,
   });
 }
 
@@ -3150,7 +3300,7 @@ async function buildUiAssets(directory, { ledger, sourceDirectory } = {}) {
   return directory;
 }
 
-function serverConfig({ root, issuer, jwksUrl, managementOrigin, callbackOrigin, uiMode = 'api_only', uiAssetsDirectory, includeServerOrigins = false, authorityId }) {
+function serverConfig({ root, issuer, jwksUrl, managementOrigin, callbackOrigin, uiMode = 'api_only', uiAssetsDirectory, authorityId }) {
   const management = loopbackOrigin(managementOrigin, 'management_origin');
   const callback = loopbackOrigin(callbackOrigin, 'callback_origin');
   const serverAuthorityId = resolveAuthorityId(authorityId, 'web-e2e-server');
@@ -3173,6 +3323,8 @@ function serverConfig({ root, issuer, jwksUrl, managementOrigin, callbackOrigin,
   const config = {
     schema: 'zode.server-config.v1',
     listen: '127.0.0.1:0',
+    management_origin: management,
+    callback_origin: callback,
     server_authority_id: serverAuthorityId,
     deployment: 'server_only',
     ui_mode: uiMode,
@@ -3187,14 +3339,6 @@ function serverConfig({ root, issuer, jwksUrl, managementOrigin, callbackOrigin,
       subject_key_version: 1,
     },
   };
-  // The current Server config schema does not yet own the top-level origin
-  // fields. Keep the real Access edges canonical while allowing a consumer
-  // running a Server that has adopted that schema extension to opt in
-  // explicitly; never probe by spawning a second child after a config error.
-  if (includeServerOrigins) {
-    config.management_origin = management;
-    config.callback_origin = callback;
-  }
   return writeJsonPrivate(path.join(root, 'server-config.json'), config);
 }
 
@@ -3434,7 +3578,11 @@ async function createWebE2EHarness(options = {}) {
   ledger.add('access_subject', 'web-e2e-human-subject');
   ledger.add('access_email', 'web-e2e-human@example.invalid');
   ledger.add('service_client', 'web-e2e-service-client');
-  const journal = new RecordingJournal({ rootDir: quarantineRoot, ledger });
+  const journal = new RecordingJournal({
+    rootDir: quarantineRoot,
+    ledger,
+    defaultMaxMembers: options.captureMaxMembers || 64,
+  });
   let fakeProvider;
   let providerProxy;
   let access;
@@ -3443,7 +3591,8 @@ async function createWebE2EHarness(options = {}) {
   let edge;
   let callbackEdge;
   try {
-    fakeProvider = await startFakeProvider({ ledger });
+    const fakeProviderMode = options.fakeProviderMode || 'default';
+    fakeProvider = await startFakeProvider({ ledger, mode: fakeProviderMode });
     providerProxy = await startRecordingProxy({ targetBaseUrl: fakeProvider.baseUrl, journal, ledger });
     access = await startAccessFixture({ ledger, journal, managementOrigin, callbackOrigin });
     const endpointRoot = ensureDirectory(path.join(runRoot, 'endpoint'));
@@ -3454,6 +3603,9 @@ async function createWebE2EHarness(options = {}) {
       providerOrigin: providerProxy.baseUrl,
       controllerSecret,
       authorityId,
+      tools: typeof options.endpointTools === 'function'
+        ? options.endpointTools({ fakeProvider })
+        : (options.endpointTools || []),
     });
     const uiMode = options.uiMode || process.env.ZODE_WEB_E2E_UI_MODE
       || (process.env.ZODE_UI_ASSETS_DIRECTORY ? 'assets' : 'api_only');
@@ -3471,7 +3623,6 @@ async function createWebE2EHarness(options = {}) {
       callbackOrigin,
       uiMode,
       uiAssetsDirectory,
-      includeServerOrigins: options.includeServerOrigins === true,
       authorityId,
     });
     const startupCaptureRoot = path.join(quarantineRoot, 'startup');

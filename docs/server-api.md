@@ -258,6 +258,12 @@ deleted. It cannot be added as ordinary row deletion.
 health/capability observation. It does not cause Endpoint to register or open a
 reverse connection.
 
+A failed authenticated probe also marks that Endpoint's latest non-terminal
+auth-replica projections `unreachable`. A later successful probe wakes normal
+replica reconciliation; Server does not guess that a credential is ready.
+Already acknowledged tombstones remain `removed` and cannot regress merely
+because a later probe fails.
+
 ## 4. Provider types and auth profiles
 
 `GET /v1/providers` lists Server-managed provider types, their versioned
@@ -409,6 +415,28 @@ An API-key create body is:
   }
 }
 ```
+
+The same route replaces the secret of an existing API-key profile when the
+body contains `replace_auth_profile_id` instead of create-only `label`,
+`make_default`, and `sharing` fields:
+
+```json
+{
+  "kind": "api_key",
+  "api_key": "new secret input",
+  "replace_auth_profile_id": "profile-opaque"
+}
+```
+
+A replacement preserves the profile ID, provider, label, default pointer, and
+sharing policy. It atomically advances the profile above every credential,
+reserved refresh, install, and tombstone revision, then creates install work
+for every currently authorized Endpoint. The accepted response may therefore
+show distribution as `pending`, `stale`, or `unreachable`; it never claims the
+new credential is ready before the exact revision is acknowledged. The
+replacement is idempotent for the Access actor, provider, key, and complete
+request body. It rejects a missing, deleted, non-API-key, or cross-provider
+profile and never returns either the old or new secret.
 
 The response contains profile ID, provider, kind, label, safe account hint,
 status, revision, expiry when known, default flag, sharing policy, and

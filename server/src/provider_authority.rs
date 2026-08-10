@@ -24,8 +24,9 @@ use crate::{
         hex, AuthProfileRecord, AuthRefreshRecord, AuthRefreshSuccess, AuthRefreshWrite,
         AuthReplicaRecord, ControlStore, OAuthAttemptRecord, OAuthAttemptSuccess,
         OAuthAttemptWrite, OAuthTicketRedemption, OAuthTicketWrite, ProfileCreatePhase,
-        ProfileCreateWrite, ProfileDeleteWrite, ProfileSharingWrite, ProviderControlEvent,
-        ProviderDefaultProfileWrite, ProviderDescriptorRecord, ProviderDescriptorWrite, StoreError,
+        ProfileCreateWrite, ProfileDeleteWrite, ProfileRotationWrite, ProfileSharingWrite,
+        ProviderControlEvent, ProviderDefaultProfileWrite, ProviderDescriptorRecord,
+        ProviderDescriptorWrite, StoreError,
     },
 };
 
@@ -76,11 +77,21 @@ pub(crate) struct PutProviderDescriptorRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateAuthProfileRequest {
     kind: String,
-    label: String,
+    #[serde(default)]
+    label: Option<String>,
     api_key: String,
     #[serde(default)]
     make_default: bool,
-    sharing: SharingRequest,
+    #[serde(default)]
+    sharing: Option<SharingRequest>,
+    #[serde(default)]
+    replace_auth_profile_id: Option<String>,
+}
+
+impl CreateAuthProfileRequest {
+    pub(crate) fn is_replacement(&self) -> bool {
+        self.replace_auth_profile_id.is_some()
+    }
 }
 
 #[derive(Deserialize)]
@@ -217,6 +228,26 @@ impl ProviderAuthority {
                 }
             }
         });
+    }
+
+    pub(crate) async fn observe_endpoint_unreachable(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<(), ProviderError> {
+        let store = Arc::clone(&self.store);
+        let endpoint_id = endpoint_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store.mark_endpoint_replicas_unreachable(&endpoint_id)
+        })
+        .await
+        .map_err(|_| ProviderError::Internal)?
+        .map_err(map_store_error)?;
+        self.reconcile_signal.notify_one();
+        Ok(())
+    }
+
+    pub(crate) fn request_reconciliation(&self) {
+        self.reconcile_signal.notify_one();
     }
 
     async fn reconcile_profile_tombstones(&self) -> Result<bool, ProviderError> {
@@ -1245,7 +1276,6 @@ impl ProviderAuthority {
         if !valid_identifier(provider, MAX_PROVIDER_BYTES)
             || !valid_text(idempotency_key, MAX_IDEMPOTENCY_KEY_BYTES)
             || request.kind != "api_key"
-            || !valid_text(&request.label, MAX_PROFILE_LABEL_BYTES)
             || request.api_key.is_empty()
             || request.api_key.len() > MAX_API_KEY_BYTES
             || request.api_key.contains('\0')
@@ -1256,10 +1286,33 @@ impl ProviderAuthority {
                 ProviderError::Invalid
             });
         }
-        normalize_sharing(&mut request.sharing)?;
+        if let Some(profile_id) = request.replace_auth_profile_id.take() {
+            if !valid_identifier(&profile_id, 128)
+                || request.label.is_some()
+                || request.sharing.is_some()
+                || request.make_default
+            {
+                return Err(ProviderError::Invalid);
+            }
+            return self
+                .rotate_api_key_profile(
+                    actor,
+                    idempotency_key,
+                    provider,
+                    profile_id,
+                    request.api_key,
+                )
+                .await;
+        }
+        let label = request.label.take().ok_or(ProviderError::Invalid)?;
+        if !valid_text(&label, MAX_PROFILE_LABEL_BYTES) {
+            return Err(ProviderError::Invalid);
+        }
+        let mut sharing = request.sharing.take().ok_or(ProviderError::Invalid)?;
+        normalize_sharing(&mut sharing)?;
         let sharing_json = serde_json::to_string(&json!({
-            "mode": request.sharing.mode,
-            "endpoint_ids": request.sharing.endpoint_ids,
+            "mode": sharing.mode,
+            "endpoint_ids": sharing.endpoint_ids,
         }))
         .map_err(|_| ProviderError::Invalid)?;
         let keys = self.store.keys();
@@ -1272,7 +1325,7 @@ impl ProviderAuthority {
             &[
                 provider.as_bytes(),
                 request.kind.as_bytes(),
-                request.label.as_bytes(),
+                label.as_bytes(),
                 request.api_key.as_bytes(),
                 if request.make_default {
                     b"default"
@@ -1293,7 +1346,7 @@ impl ProviderAuthority {
             command_key,
             request_fingerprint,
             profile_id,
-            label: request.label,
+            label,
             secret_ref,
             sharing_json,
             make_default: request.make_default,
@@ -1327,6 +1380,98 @@ impl ProviderAuthority {
         .map_err(|_| ProviderError::Internal)?
         .map_err(map_store_error)?;
         if operation.phase != ProfileCreatePhase::Complete {
+            self.reconcile_signal.notify_one();
+        }
+        serde_json::from_str(&response_json).map_err(|_| ProviderError::Internal)
+    }
+
+    async fn rotate_api_key_profile(
+        &self,
+        actor: &ActorContext,
+        idempotency_key: &str,
+        provider: &str,
+        profile_id: String,
+        api_key: String,
+    ) -> Result<Value, ProviderError> {
+        let store = Arc::clone(&self.store);
+        let profile_for_read = profile_id.clone();
+        let existing = tokio::task::spawn_blocking(move || store.get_auth_profile(&profile_for_read))
+            .await
+            .map_err(|_| ProviderError::Internal)?
+            .map_err(map_store_error)?
+            .ok_or(ProviderError::NotFound)?;
+        if existing.provider != provider
+            || existing.kind != "api_key"
+            || existing.deleted_at_ms.is_some()
+        {
+            return Err(ProviderError::Conflict);
+        }
+
+        let keys = self.store.keys();
+        let command_key = keys.digest(
+            b"auth-profile-rotation-command-v1",
+            &[provider.as_bytes(), idempotency_key.as_bytes()],
+        );
+        let request_fingerprint = keys.digest(
+            b"auth-profile-rotation-request-v1",
+            &[provider.as_bytes(), profile_id.as_bytes(), api_key.as_bytes()],
+        );
+        let secret_ref = hex(&keys.digest(
+            b"auth-profile-rotation-secret-reference-v1",
+            &[
+                provider.as_bytes(),
+                profile_id.as_bytes(),
+                &command_key,
+                &request_fingerprint,
+            ],
+        ));
+        let staged_secret_ref = secret_ref.clone();
+        let store = Arc::clone(&self.store);
+        let reference = secret_ref.clone();
+        let secret = Secret(api_key.into_bytes());
+        tokio::task::spawn_blocking(move || store.stage_provider_secret(&reference, &secret.0))
+            .await
+            .map_err(|_| ProviderError::Internal)?
+            .map_err(map_store_error)?;
+
+        let write = ProfileRotationWrite {
+            actor_key: *actor.actor_key(),
+            provider: provider.to_owned(),
+            profile_id,
+            command_key,
+            request_fingerprint,
+            secret_ref,
+            created_at_ms: unix_millis()?,
+        };
+        let store = Arc::clone(&self.store);
+        let authority_id = self.store.authority_id().to_owned();
+        let rotation = tokio::task::spawn_blocking(move || {
+            store.rotate_api_key_profile(write, |profile, replicas| {
+                let response = profile_response_value(profile, replicas, &authority_id)
+                    .map_err(|_| StoreError::Integrity)?;
+                serde_json::to_string(&response).map_err(|_| StoreError::Integrity)
+            })
+        })
+        .await
+        .map_err(|_| ProviderError::Internal)?;
+        let (response_json, old_secret_ref) = match rotation {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let store = Arc::clone(&self.store);
+                let reference = staged_secret_ref.clone();
+                tokio::task::spawn_blocking(move || store.remove_provider_secret(&reference))
+                    .await
+                    .map_err(|_| ProviderError::Internal)?
+                    .map_err(map_store_error)?;
+                return Err(map_store_error(error));
+            }
+        };
+        if let Some(old_secret_ref) = old_secret_ref.filter(|old| old != &staged_secret_ref) {
+            let store = Arc::clone(&self.store);
+            tokio::task::spawn_blocking(move || store.remove_provider_secret(&old_secret_ref))
+                .await
+                .map_err(|_| ProviderError::Internal)?
+                .map_err(map_store_error)?;
             self.reconcile_signal.notify_one();
         }
         serde_json::from_str(&response_json).map_err(|_| ProviderError::Internal)
@@ -1768,6 +1913,8 @@ fn profile_response_value(
         .any(|replica| replica.status == "unreachable")
     {
         "unreachable"
+    } else if replicas.iter().any(|replica| replica.status == "stale") {
+        "stale"
     } else if replicas.iter().all(|replica| replica.status == "ready") {
         "ready"
     } else {

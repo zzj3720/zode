@@ -77,8 +77,8 @@ export const globalStyles = css`
 
   input:focus-visible,
   textarea:focus-visible {
-    outline: none;
-    outline-offset: 0;
+    outline: 2px solid var(--zode-focus);
+    outline-offset: 1px;
   }
 
   .app-shell {
@@ -2623,11 +2623,6 @@ export const globalStyles = css`
     outline: 0;
     background: transparent;
     line-height: 28px;
-  }
-
-  .composer-input:focus-visible,
-  .home-composer-input:focus-visible {
-    outline: 0;
   }
 
   .composer-footer {

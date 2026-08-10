@@ -167,6 +167,11 @@ replication is `docs/auth-replication.md`; ingress identity is
   revision clears it. Failed/cancelled relogin leaves it fenced.
 - Tombstones are monotonically versioned. UI must represent pending,
   unreachable, stale, ready, removing, and removed accurately.
+- Static API-key replacement preserves the same profile identity, default
+  pointer, label, and sharing policy. It allocates above every credential,
+  reserved, install, and tombstone revision and redistributes only to the
+  currently authorized Endpoints; neither request nor response may expose the
+  previous or replacement secret.
 - Profile deletion and sharing removal atomically allocate a revision above
   every credential/tombstone revision and append durable per-Endpoint tombstone
   operations. Retain and rebuild them across restart until acknowledged;

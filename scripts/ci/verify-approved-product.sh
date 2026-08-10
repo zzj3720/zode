@@ -21,6 +21,7 @@ command -v node >/dev/null 2>&1 || die 'node is required'
 test -x "$PLAYWRIGHT" || die 'Playwright binary was not installed'
 node --check "$ROOT/scripts/ci/assert-product-playwright-list.cjs"
 node --check "$ROOT/scripts/ci/assert-playwright-results.cjs"
+"$ROOT/scripts/ci/assert-web-logic-boundary.sh"
 
 PRODUCT_FILES=()
 while IFS= read -r file; do

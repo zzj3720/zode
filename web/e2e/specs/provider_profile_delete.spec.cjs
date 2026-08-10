@@ -9,6 +9,7 @@ const {
   proxyHttp,
   startHttpServer,
 } = require("../support/harness.cjs");
+const { openManagement } = require("../support/radix.cjs");
 
 const E2E_NAME = "e2e_browser_provider_profile_delete_tombstones_endpoint_replica";
 const CLASSIFICATION = "PROVIDER_PROFILE_DELETE_ACTION_MISSING";
@@ -73,11 +74,11 @@ function firstPublicRecord(records) {
 }
 
 async function configureProvider(page, harness) {
-  await page.getByRole("link", { name: "Providers", exact: true }).click();
+  await openManagement(page, "Providers");
   await page.getByRole("button", { name: "Configure provider", exact: true }).click();
   const form = page.locator("form.editor-panel").filter({ hasText: "Configure provider" });
   await form.getByLabel("Provider ID").fill(PROVIDER);
-  await form.getByLabel("Provider kind").selectOption("openai_compatible");
+  await expect(form.getByText("OpenAI compatible", { exact: true })).toBeVisible();
   await form.getByLabel("Base URL").fill(`${harness.providerProxy.baseUrl}/v1`);
   await form.getByLabel("Models").fill(MODEL);
   await Promise.all([
@@ -91,7 +92,7 @@ async function configureProvider(page, harness) {
 }
 
 async function addRemoteEndpoint(page, harness) {
-  await page.getByRole("link", { name: "Endpoints", exact: true }).click();
+  await openManagement(page, "Endpoints");
   await page.getByRole("button", { name: "Add remote Endpoint", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Add remote Endpoint" });
   await dialog.getByLabel("Endpoint label").fill(ENDPOINT_LABEL);
@@ -107,7 +108,7 @@ async function addRemoteEndpoint(page, harness) {
 }
 
 async function createSharedProfile(page, harness) {
-  await page.getByRole("link", { name: "Providers", exact: true }).click();
+  await openManagement(page, "Providers");
   const card = page.locator("article.resource-card").filter({ hasText: PROVIDER }).first();
   await card.getByRole("button", { name: "Add API key profile", exact: true }).click();
   const form = card.locator("form.nested-editor");
@@ -222,7 +223,9 @@ test(E2E_NAME, async ({ page }) => {
   let primaryError;
   try {
     await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "What do you want to work on?", exact: true }),
+    ).toBeVisible();
     await addRemoteEndpoint(page, harness);
     await configureProvider(page, harness);
     await createSharedProfile(page, harness);
@@ -312,6 +315,7 @@ test(E2E_NAME, async ({ page }) => {
     primaryError = error;
   } finally {
     try {
+      if (!page.isClosed()) await page.close();
       await harness.journal.waitForIdle();
       const records = recordsFor(harness, captureSetId);
       const firstFailure = firstPublicRecord(records);
@@ -369,7 +373,9 @@ test(RESPONSE_LOSS_E2E_NAME, async ({ page }) => {
   let primaryError;
   try {
     await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "What do you want to work on?", exact: true }),
+    ).toBeVisible();
     await addRemoteEndpoint(page, harness);
     await configureProvider(page, harness);
     await createSharedProfile(page, harness);
@@ -444,6 +450,7 @@ test(RESPONSE_LOSS_E2E_NAME, async ({ page }) => {
     primaryError = error;
   } finally {
     try {
+      if (!page.isClosed()) await page.close();
       await harness.journal.waitForIdle();
       const records = harness.journal.records
         .filter((record) => record.captureSetId === captureSetId)

@@ -50,12 +50,11 @@ function firstPublicRecord(records) {
 }
 
 async function configureProvider(page, harness) {
-  await page.getByRole("link", { name: "Providers", exact: true }).click();
+  await openManagement(page, "Providers");
   await expect(page).toHaveURL(/\/providers$/u);
   await page.getByRole("button", { name: "Configure provider", exact: true }).click();
   const form = page.locator("form.editor-panel").filter({ hasText: "Configure provider" });
   await form.getByLabel("Provider ID").fill(PROVIDER);
-  await form.getByLabel("Provider kind").selectOption("openai_compatible");
   await form.getByLabel("Base URL").fill(`${harness.providerProxy.baseUrl}/v1`);
   await form.getByLabel("Models").fill(MODEL);
   await Promise.all([
@@ -66,7 +65,7 @@ async function configureProvider(page, harness) {
 }
 
 async function addRemoteEndpoint(page, harness, label) {
-  await page.getByRole("link", { name: "Endpoints", exact: true }).click();
+  await openManagement(page, "Endpoints");
   await expect(page).toHaveURL(/\/endpoints$/u);
   await page.getByRole("button", { name: "Add remote Endpoint", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Add remote Endpoint" });
@@ -83,7 +82,7 @@ async function addRemoteEndpoint(page, harness, label) {
 }
 
 async function createProfile(page, harness, label, makeDefault, shareEndpoint) {
-  await page.getByRole("link", { name: "Providers", exact: true }).click();
+  await openManagement(page, "Providers");
   const card = page.locator("article.resource-card").filter({ hasText: PROVIDER }).first();
   await card.getByRole("button", { name: "Add API key profile", exact: true }).click();
   const form = card.locator("form.nested-editor");
@@ -111,6 +110,20 @@ async function createProfile(page, harness, label, makeDefault, shareEndpoint) {
   await expect(form).toBeHidden();
 }
 
+async function openManagement(page, name) {
+  const settingsLink = page.getByRole("link", { name, exact: true });
+  if (await settingsLink.isVisible()) {
+    await settingsLink.click();
+    return;
+  }
+  let link = page.getByRole("menuitem", { name, exact: true });
+  if (!(await link.isVisible())) {
+    await page.getByRole("button", { name: "Zode", exact: true }).click();
+    link = page.getByRole("menuitem", { name, exact: true });
+  }
+  await link.click();
+}
+
 async function armProviderRead(page) {
   await page.evaluate(async () => {
     const response = await fetch("/v1/providers", { headers: { accept: "application/json" } });
@@ -132,7 +145,7 @@ test(E2E_NAME, async ({ page }) => {
   let primaryError;
   try {
     await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "What do you want to work on?", exact: true })).toBeVisible();
     await addRemoteEndpoint(page, harness, ENDPOINT_LABEL);
     await configureProvider(page, harness);
     await createProfile(page, harness, "Primary profile", true, true);
@@ -157,7 +170,12 @@ test(E2E_NAME, async ({ page }) => {
     primaryError = error;
   } finally {
     try {
+      if (!page.isClosed()) await page.close();
       await harness.journal.waitForIdle();
+      if (!captureSetId) {
+        if (!primaryError) throw new Error("profile default capture was never opened");
+        throw primaryError;
+      }
       const records = recordsFor(harness, captureSetId);
       const firstFailure = firstPublicRecord(records);
       if (!firstFailure) throw new Error("profile default capture contained no public exchange");

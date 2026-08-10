@@ -46,31 +46,58 @@ async function managementJson(page, harness, path, options = {}) {
   }, { targetPath: path, requestOptions: { ...options, headers } });
 }
 
-async function installProviderReplica(page, harness) {
-  const result = await managementJson(page, harness, '/v1/auth-replicas/profile-e2e', {
+async function configureProviderSession(page, harness) {
+  const endpoint = await managementJson(page, harness, '/v1/endpoints', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'idempotency-key': 'harness-regression-register-endpoint',
+    },
+    body: JSON.stringify({
+      label: 'Harness regression Endpoint',
+      base_url: harness.endpoint.baseUrl,
+      control_auth: { kind: 'bearer', secret: harness.controllerSecret },
+    }),
+  });
+  assert.equal(endpoint.status, 201, `Endpoint registration failed: ${endpoint.status}`);
+  const endpointId = endpoint.body?.endpoint_id;
+  assert.ok(endpointId, 'Endpoint registration omitted endpoint_id');
+
+  const provider = await managementJson(page, harness, '/v1/providers/fixture-provider', {
     method: 'PUT',
     headers: {
       'content-type': 'application/json',
-      'idempotency-key': 'harness-regression-install-provider-replica',
+      'idempotency-key': 'harness-regression-configure-provider',
     },
     body: JSON.stringify({
-      schema: 'zode.auth-replica.install.v1',
-      authority_id: ENDPOINT_AUTHORITY,
-      provider: 'fixture-provider',
-      kind: 'api_key',
-      revision: 1,
-      credential_schema: 'openai-compatible.api-key.v1',
-      secret: {
-        encoding: 'application/zode-secret-envelope',
-        payload: harness.providerSecret,
-      },
+      kind: 'openai_compatible',
+      base_url: harness.providerProxy.baseUrl,
+      models: ['fixture-model'],
+      options: {},
     }),
   });
-  assert.ok(result.status === 200 || result.status === 201, `provider replica install failed: ${result.status}`);
+  assert.equal(provider.status, 200, `provider configuration failed: ${provider.status}`);
+
+  const profile = await managementJson(page, harness, '/v1/providers/fixture-provider/auth-profiles', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'idempotency-key': 'harness-regression-create-provider-profile',
+    },
+    body: JSON.stringify({
+      kind: 'api_key',
+      label: 'Harness regression profile',
+      api_key: harness.providerSecret,
+      make_default: true,
+      sharing: { mode: 'selected', endpoint_ids: [endpointId] },
+    }),
+  });
+  assert.equal(profile.status, 201, `provider profile creation failed: ${profile.status}`);
+  return { endpointId, profile: profile.body, provider: provider.body };
 }
 
-async function createProviderSession(page, harness) {
-  const result = await managementJson(page, harness, '/v1/sessions', {
+async function createProviderSession(page, harness, configured) {
+  const result = await managementJson(page, harness, `/v1/endpoints/${configured.endpointId}/sessions`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -81,14 +108,14 @@ async function createProviderSession(page, harness) {
         provider: 'fixture-provider',
         provider_execution: {
           schema: 'zode.provider-execution.v1',
-          revision: 1,
-          kind: 'openai_compatible',
-          base_url: harness.providerProxy.baseUrl,
+          revision: configured.provider.revision,
+          kind: configured.provider.kind,
+          base_url: configured.provider.base_url,
+          options: configured.provider.options,
         },
         model: 'fixture-model',
-        auth_authority_id: ENDPOINT_AUTHORITY,
-        auth_profile_id: 'profile-e2e',
-        auth_revision: 1,
+        auth_profile_id: configured.profile.auth_profile_id,
+        minimum_auth_revision: configured.profile.revision,
       },
       tools: [],
     }),
@@ -98,8 +125,8 @@ async function createProviderSession(page, harness) {
   return result.body.session_id;
 }
 
-async function appendProviderMessage(page, harness, sessionId) {
-  const result = await managementJson(page, harness, `/v1/sessions/${sessionId}/messages`, {
+async function appendProviderMessage(page, harness, endpointId, sessionId) {
+  const result = await managementJson(page, harness, `/v1/endpoints/${endpointId}/sessions/${sessionId}/messages`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -107,7 +134,7 @@ async function appendProviderMessage(page, harness, sessionId) {
     },
     body: JSON.stringify({ content: 'recording gap regression' }),
   });
-  assert.equal(result.status, 202, `provider message admission failed: ${result.status}`);
+  assert.equal(result.status, 503, `unrecordable browser command did not fail closed: ${result.status}`);
 }
 
 function requestLocalEdge(url, headers) {
@@ -379,7 +406,10 @@ test.describe('Zode web E2E harness regressions', () => {
     let restoreQuarantine;
     let closeError;
     try {
-      harness = await createWebE2EHarness();
+      harness = await createWebE2EHarness({
+        e2eName: testInfo.title,
+        authorityId: ENDPOINT_AUTHORITY,
+      });
 
       const systemResponse = await page.goto(`${harness.managementUrl}/v1/system`, {
         waitUntil: 'domcontentloaded',
@@ -387,11 +417,11 @@ test.describe('Zode web E2E harness regressions', () => {
       assert.equal(systemResponse?.status(), 200, 'the real browser management barrier did not open');
       await harness.access.waitForJwksRequest();
 
-      await installProviderReplica(page, harness);
-      const sessionId = await createProviderSession(page, harness);
+      const configured = await configureProviderSession(page, harness);
+      const sessionId = await createProviderSession(page, harness, configured);
 
       restoreQuarantine = makeDirectoryReadOnly(harness.journal.rootDir);
-      await appendProviderMessage(page, harness, sessionId);
+      await appendProviderMessage(page, harness, configured.endpointId, sessionId);
       const fatal = await harness.journal.waitForFatal();
       assert.equal(fatal.classification, 'RECORDING_FLUSH_FAILURE', 'recorder flush failure was not typed');
       const wireAttempts = harness.fakeProvider.requests.length;
@@ -1429,6 +1459,65 @@ test.describe('Zode web E2E harness regressions', () => {
       try { await replayTarget?.close(); } catch {}
       try { await edge?.close(); } catch {}
       try { await unavailable?.close(); } catch {}
+    }
+  });
+
+  test('e2e_browser_replay_reissues_a_captured_client_disconnect', async ({ page }, testInfo) => {
+    test.setTimeout(120_000);
+    const quarantineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-replay-client-disconnect-'));
+    const destinationDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'zode-replay-client-disconnect-destination-'));
+    const ledger = new SecretLedger();
+    const journal = new RecordingJournal({ rootDir: quarantineRoot, ledger });
+    let upstream;
+    let edge;
+    let replayServer;
+    try {
+      upstream = await startHttpServer((_request, response) => {
+        response.writeHead(200, { 'content-type': 'text/event-stream' });
+        response.flushHeaders();
+      });
+      const captureSetId = journal.beginCaptureSet({ e2eName: testInfo.title, maxMembers: 1 });
+      edge = await startHttpServer((request, response) => proxyHttp({
+        targetBaseUrl: upstream.baseUrl,
+        request,
+        response,
+        boundary: 'replay-client-disconnect-edge',
+        journal,
+        ledger,
+        captureSetId,
+        canonicalOrigin: upstream.baseUrl,
+      }));
+
+      const response = await page.goto(`${edge.baseUrl}/events`, { waitUntil: 'commit' });
+      assert.equal(response?.status(), 200, 'the browser did not open the recorded event stream');
+      await page.goto('about:blank');
+      await journal.waitForIdle();
+      const first = journal.first({ boundary: 'replay-client-disconnect-edge', responseStatus: 200 });
+      assert.ok(first?.rawPath, 'the browser disconnect was not retained');
+      assert.equal(first.response.outcome, 'client_disconnected');
+
+      const promoted = await journal.promoteCaptureSet(captureSetId, {
+        e2eName: testInfo.title,
+        classification: 'HARNESS_CLIENT_DISCONNECT_REPLAY',
+        firstObserved: 'a real browser closed an open SSE response after receiving its public headers',
+        firstFailureRecordingId: first.recordingId,
+        destinationDirectory,
+        replay: async (envelope) => {
+          replayServer = await journal.startReplayServer(envelope);
+          return {
+            ok: true,
+            results: await journal.replay(envelope, { baseUrl: replayServer.baseUrl }),
+          };
+        },
+      });
+      await replayServer.finish();
+      replayServer = undefined;
+      assert.ok(promoted.cassettePath, 'the client-disconnect cassette was not promoted');
+      assert.equal(promoted.replay?.results?.[0]?.outcome, 'client_disconnected');
+    } finally {
+      try { await replayServer?.finish(); } catch {}
+      try { await edge?.close(); } catch {}
+      try { await upstream?.close(); } catch {}
     }
   });
 });

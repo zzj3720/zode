@@ -85,28 +85,38 @@ async function openShell(page, harness) {
     waitUntil: "domcontentloaded",
   });
   expect(response?.status()).toBe(200);
-  await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "What do you want to work on?", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "New session message", exact: true })).toBeVisible();
 }
 
 async function exerciseNavigation(page) {
-  const expected = new Map([
-    ["Sessions", "/"],
+  const recent = page.getByText("Recent", { exact: true });
+  await expect(recent).toBeVisible();
+  const primary = page.getByRole("navigation", { name: "Primary", exact: true });
+  const newSession = primary.getByRole("link", { name: "New session", exact: true });
+  await expect(newSession).toHaveAttribute("href", "/");
+
+  await page.getByRole("button", { name: "Zode", exact: true }).click();
+  const management = page.getByRole("menu", { name: "Zode", exact: true });
+  await expect(management.getByRole("menuitem")).toHaveCount(3);
+  for (const [name, href] of [
     ["Endpoints", "/endpoints"],
     ["Providers", "/providers"],
     ["Settings", "/settings"],
-  ]);
-  for (const [name, href] of expected) {
-    const link = page.getByRole("link", { name, exact: true });
-    await expect(link).toBeVisible();
-    await expect(link).toHaveAttribute("href", href);
+  ]) {
+    const item = management.getByRole("menuitem", { name, exact: true });
+    await expect(item).toBeVisible();
+    await expect(item).toHaveAttribute("href", href);
   }
-  await page.getByRole("link", { name: "Providers", exact: true }).click();
+  await management.getByRole("menuitem", { name: "Providers", exact: true }).click();
   await expect(page).toHaveURL(/\/providers$/u);
   await expect(page.getByRole("heading", { name: "Providers", exact: true })).toBeVisible();
 }
 
 async function exerciseRemoteEndpoint(page, harness) {
-  await page.getByText("Endpoints", { exact: true }).first().click();
+  await openManagement(page, "Endpoints");
   await expect(page.getByRole("heading", { name: "Endpoints", exact: true })).toBeVisible();
   const trigger = page.getByRole("button", { name: "Add remote Endpoint", exact: true });
   await expect(trigger).toBeVisible();
@@ -125,7 +135,7 @@ async function exerciseRemoteEndpoint(page, harness) {
 
 async function exerciseEndpointProbe(page, harness) {
   const identity = await harness.endpointIdentity();
-  await page.getByRole("link", { name: "Endpoints", exact: true }).click();
+  await openManagement(page, "Endpoints");
   await expect(page).toHaveURL(/\/endpoints$/u);
   await expect(page.getByRole("heading", { name: "Endpoints", exact: true })).toBeVisible();
   const card = page.getByRole("article").filter({ hasText: REMOTE_LABEL });
@@ -152,6 +162,15 @@ async function exerciseEndpointProbe(page, harness) {
   expect((await response.json()).error.code).toBe("endpoint_unavailable");
   await expect(card).toContainText(/unreachable/iu);
   await expect(page.getByText(/non-authoritative/iu)).toBeVisible();
+}
+
+async function openManagement(page, name) {
+  const switcher = page.getByRole("menu", { name: "Zode", exact: true });
+  if (!(await switcher.isVisible())) {
+    await page.getByRole("button", { name: "Zode", exact: true }).click();
+  }
+  await page.getByRole("menu", { name: "Zode", exact: true })
+    .getByRole("menuitem", { name, exact: true }).click();
 }
 
 async function preseedRemoteEndpoint(harness) {
@@ -201,6 +220,7 @@ async function runCase(page, testCase) {
     primaryError = error;
   } finally {
     try {
+      if (!page.isClosed()) await page.close();
       await harness.journal.waitForIdle();
       const records = recordsFor(harness, captureSetId);
       const firstFailure = firstPageRecord(records);

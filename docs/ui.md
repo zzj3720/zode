@@ -47,15 +47,15 @@ with that private source.
 
 At the 1920 by 1080 desktop reference viewport, the required shell is:
 
-- a fixed 274 px left navigation pane separated from the main surface by a
+- a fixed 275 px left navigation pane separated from the main surface by a
   single-pixel boundary;
-- navigation background `#27363b`, selected-row background `#38464b`, main
-  background `#181818`, secondary surface `#242424`, and composer surface
-  `#2a2a2a`;
-- primary text near `#f5f6f6`, secondary text near `#dfe1e1`, subdued text with
-  at least AA contrast, and amber `#f39c12` only for the same narrow status or
+- navigation background `#000000`, selected-row background
+  `rgba(255, 255, 255, 0.12)`, main background `#181818`, and both secondary
+  and composer surfaces `#212121`;
+- primary text `#ffffff`, secondary text `rgba(255, 255, 255, 0.7)`, subdued
+  text with at least AA contrast, and orange `#ff8549` only for the same narrow status or
   attention role visible in the reference;
-- a 56 px main header and a 736 px maximum-width thread column centered in the
+- a 46 px main header and a 736 px maximum-width thread column centered in the
   space to the right of the navigation pane;
 - a 736 px composer aligned to that column, 16 px from the viewport bottom,
   with a 24 px outer radius and content-driven height;
@@ -106,14 +106,17 @@ delivery works.
 The private source may be read only in an explicit local calibration run whose
 path is supplied outside tracked files. That run writes comparison artifacts to
 the ignored 0600 quarantine and never records the source path, bytes, or digest
-in a tracked fixture. After independent acceptance, promote only the zode-
-rendered screenshot as the immutable regression golden. Default and CI browser
-runs compare against that zode golden and must work without access to the
-private source.
+in a tracked fixture. After independent acceptance, or after the user approves
+an already merged zode-owned visual implementation as the baseline, an
+explicit local acceptance run may create the missing zode-rendered golden once;
+it may never overwrite an existing golden. Default and CI browser runs compare
+against that zode golden and must work without access to the private source.
 
 ## 3. Navigation
 
-The v0 information architecture has four primary destinations:
+The v0 information architecture has four destinations. Sessions remain in the
+always-visible navigation; the compact Manage entry exposes the three
+management destinations without adding another visual hierarchy:
 
 1. **Sessions**: Endpoint-grouped live session lists, create action,
    active/offline/waiting status, Endpoint and model summary.
@@ -232,11 +235,18 @@ One provider type can contain many OAuth or API-key profiles. Cards/rows show:
 - kind, readiness, expiry, and explicit default;
 - profile revision;
 - sharing scope and per-Endpoint distribution summary;
-- actions to set default, edit sharing, refresh/relogin, or delete.
+- actions to set default, replace an API key, edit sharing, refresh/relogin, or
+  delete.
 
 Adding an API key uses a write-only secret field. OAuth opens the protected
 Server redirect and follows attempt events for redirect, device code, prompt,
 progress, success, failure, or cancellation.
+
+Replacing an API key uses another write-only field and preserves the logical
+profile identity, label, default selection, and sharing policy. The UI follows
+the resulting higher revision through the same per-Endpoint pending, stale,
+unreachable, and ready distribution states; it never stores or redisplays the
+secret.
 
 An OAuth redirect ticket stays in memory only. An explicit button navigates
 with `location.replace`; it is not rendered as a prefetchable anchor, copied to

@@ -433,12 +433,17 @@ async fn create_auth_profile(
         .map_err(|_| ApiError::payload_too_large())?;
     let request: CreateAuthProfileRequest =
         serde_json::from_slice(&body).map_err(|_| ApiError::invalid())?;
+    let status = if request.is_replacement() {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
     let profile = state
         .providers
         .create_profile(&actor, &idempotency_key, &provider, request)
         .await
         .map_err(ApiError::from_provider)?;
-    Ok((StatusCode::CREATED, Json(profile)).into_response())
+    Ok((status, Json(profile)).into_response())
 }
 
 async fn start_oauth_attempt(
@@ -1089,12 +1094,21 @@ async fn probe_endpoint(
     State(state): State<AppState>,
     Path(endpoint_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    state
-        .catalog
-        .probe_endpoint_by_id(&endpoint_id)
-        .await
-        .map(Json)
-        .map_err(ApiError::from_catalog)
+    match state.catalog.probe_endpoint_by_id(&endpoint_id).await {
+        Ok(observation) => {
+            state.providers.request_reconciliation();
+            Ok(Json(observation))
+        }
+        Err(CatalogError::EndpointUnavailable) => {
+            state
+                .providers
+                .observe_endpoint_unreachable(&endpoint_id)
+                .await
+                .map_err(ApiError::from_provider)?;
+            Err(ApiError::from_catalog(CatalogError::EndpointUnavailable))
+        }
+        Err(error) => Err(ApiError::from_catalog(error)),
+    }
 }
 
 fn one_header(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {

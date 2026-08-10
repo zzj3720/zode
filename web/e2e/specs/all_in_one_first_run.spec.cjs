@@ -21,6 +21,10 @@ const {
   RecordingJournal,
   SecretLedger,
 } = require("../support/harness.cjs");
+const {
+  expectSelectedExecutionProfile,
+  selectRadixValue,
+} = require("../support/radix.cjs");
 
 const E2E = "e2e_all_in_one_first_run_uses_normal_server_api_and_local_endpoint";
 const HISTORICAL_INCIDENT_OWNER = "e2e_ui_all_in_one_first_run_creates_profile_and_chats";
@@ -1529,6 +1533,7 @@ class EndpointProbeWire {
     this.origin = null;
     this.server = null;
     this.pending = 0;
+    this.pendingFinite = 0;
     this.idleWaiters = [];
     this.errors = [];
     this.exchanges = new Map();
@@ -1590,7 +1595,7 @@ class EndpointProbeWire {
   }
 
   async waitForIdle() {
-    if (this.pending === 0) {
+    if (this.pendingFinite === 0) {
       return;
     }
     await withTimeout(
@@ -1954,6 +1959,7 @@ class AccessEdge {
     this.issuer = null;
     this.server = null;
     this.pending = 0;
+    this.pendingFinite = 0;
     this.idleWaiters = [];
     this.errors = [];
     this.lastAssertion = null;
@@ -2057,7 +2063,7 @@ class AccessEdge {
   }
 
   async waitForIdle() {
-    if (this.pending === 0) {
+    if (this.pendingFinite === 0) {
       return;
     }
     await withTimeout(
@@ -2067,9 +2073,12 @@ class AccessEdge {
     );
   }
 
-  settleRequest() {
+  settleRequest(isEventStream) {
     this.pending -= 1;
-    if (this.pending === 0) {
+    if (!isEventStream) {
+      this.pendingFinite -= 1;
+    }
+    if (this.pendingFinite === 0) {
       for (const resolve of this.idleWaiters.splice(0)) {
         resolve();
       }
@@ -2090,11 +2099,17 @@ class AccessEdge {
       return;
     }
 
+    const isEventStream = new URL(request.url, "http://access-edge.invalid").pathname.endsWith(
+      "/events",
+    );
     this.pending += 1;
+    if (!isEventStream) {
+      this.pendingFinite += 1;
+    }
     try {
       const reconnect =
         this.sseDropped &&
-        request.url.includes("/events") &&
+        isEventStream &&
         typeof request.headers["last-event-id"] === "string" &&
         request.headers["last-event-id"].length > 0;
       const recording = this.laterGapCapture?.begin(request, { reconnect }) ?? null;
@@ -2133,13 +2148,21 @@ class AccessEdge {
         }
         this.resolveSseReconnect?.();
       }
-      await this.proxy({ request, response, body, target, headers, recording });
+      await this.proxy({
+        request,
+        response,
+        body,
+        target,
+        headers,
+        recording,
+        isEventStream,
+      });
     } finally {
-      this.settleRequest();
+      this.settleRequest(isEventStream);
     }
   }
 
-  async proxy({ request, response, body, target, headers, recording }) {
+  async proxy({ request, response, body, target, headers, recording, isEventStream }) {
     await new Promise((resolve, reject) => {
       const upstream = http.request(target, { method: request.method, headers });
       upstream.once("error", (error) => {
@@ -2164,7 +2187,6 @@ class AccessEdge {
         const started = process.hrtime.bigint();
         let finished = false;
         let finishPromise = null;
-        const isSse = request.url.includes("/events");
         let streamState = null;
         const finish = (outcome) => {
           if (finishPromise) {
@@ -2194,7 +2216,7 @@ class AccessEdge {
           finishPromise.then(resolve, reject);
           return finishPromise;
         };
-        if (isSse) {
+        if (isEventStream) {
           streamState = {
             response,
             upstream: upstreamResponse,
@@ -3418,7 +3440,7 @@ async function selectVisible(page, names, value, label) {
   for (const name of names) {
     const locator = page.getByLabel(name, { exact: true });
     if ((await locator.count()) > 0 && (await locator.first().isVisible())) {
-      await locator.first().selectOption(value);
+      await selectRadixValue(page, locator.first(), value);
       return;
     }
   }
@@ -3665,11 +3687,11 @@ test(E2E, async ({ playwright }) => {
       expect(harness.provider.requests).toHaveLength(0);
     }
 
+    await page.getByRole("button", { name: "Zode", exact: true }).click();
     await clickVisible(
       page,
       [
-        { role: "link", name: "Providers" },
-        { role: "button", name: "Providers" },
+        { role: "menuitem", name: "Providers" },
       ],
       "Providers navigation",
     );
@@ -3683,7 +3705,7 @@ test(E2E, async ({ playwright }) => {
       "provider configuration",
     );
     await fillVisible(page, ["Provider ID", "Provider"], PROVIDER_ID, "provider ID");
-    await selectVisible(page, ["Provider kind", "Adapter"], "openai_compatible", "provider kind");
+    await expect(page.getByText("OpenAI compatible", { exact: true })).toBeVisible();
     await fillVisible(page, ["Base URL", "Provider base URL"], harness.provider.baseUrl, "base URL");
     await fillVisible(page, ["Models", "Model"], MODEL_ID, "model catalog");
     await clickVisible(
@@ -3730,24 +3752,22 @@ test(E2E, async ({ playwright }) => {
     await clickVisible(
       page,
       [
-        { role: "link", name: "Sessions" },
-        { role: "button", name: "Sessions" },
+        { role: "link", name: "New session" },
       ],
-      "Sessions navigation",
+      "New session navigation",
     );
-    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
-    await clickVisible(
+    await expect(
+      page.getByRole("heading", { name: "What do you want to work on?", exact: true }),
+    ).toBeVisible();
+    await expect(page.getByRole("combobox", { name: "Environment", exact: true })).toContainText(
+      "This machine",
+    );
+    await expectSelectedExecutionProfile(
       page,
-      [
-        { role: "button", name: "New session" },
-        { role: "button", name: "Create session" },
-      ],
-      "session create",
+      page.getByRole("button", { name: "Choose model and reasoning", exact: true }),
+      MODEL_ID,
+      "UI E2E profile",
     );
-    await selectVisible(page, ["Endpoint"], localEndpoint.endpoint_id, "Endpoint placement");
-    await selectVisible(page, ["Provider"], PROVIDER_ID, "provider selection");
-    await selectVisible(page, ["Model"], MODEL_ID, "model selection");
-    await selectVisible(page, ["Auth profile", "Profile"], profile.profile_id, "profile selection");
     await clickVisible(
       page,
       [
@@ -3777,7 +3797,7 @@ test(E2E, async ({ playwright }) => {
     await harness.edge.waitForSseReconnect();
     await expect(durableFinal).toHaveCount(1);
     try {
-      await expect(page.getByText("Live", { exact: true })).toHaveCount(1);
+      await expect(page.getByText("Connected to Endpoint", { exact: true })).toHaveCount(1);
     } catch (error) {
       process.stderr.write(
         `ZODE_E2E_UI_RECONNECT_OBSERVATION classification=${RECONNECT_FAILURE} relation=${LATER_GAP_RELATION} observed=Reconnecting expected=Live durable_assistant_reply_count=1\n`,
@@ -3812,9 +3832,7 @@ test(E2E, async ({ playwright }) => {
     for (const request of observedEventRequests) {
       const url = new URL(request.url);
       expect(url.origin).toBe(harness.edge.baseUrl);
-      expect(url.pathname).toBe(
-        `/v1/endpoints/${created.endpointId}/sessions/${created.sessionId}/events`,
-      );
+      expect(url.pathname).toBe(`/v1/endpoints/${created.endpointId}/events`);
     }
     expect(
       observedEventRequests

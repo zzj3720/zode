@@ -6,6 +6,7 @@ const {
   ProductBehaviorFailure,
   createWebE2EHarness,
 } = require("../support/harness.cjs");
+const { openManagement } = require("../support/radix.cjs");
 
 const E2E_NAME = "e2e_browser_provider_profile_list_keeps_active_after_many_tombstones";
 const CLASSIFICATION = "PROVIDER_PROFILE_LIST_ACTIVE_HIDDEN_AFTER_TOMBSTONES";
@@ -78,11 +79,11 @@ function firstFailureRecord(records) {
 }
 
 async function configureProvider(page, harness) {
-  await page.getByRole("link", { name: "Providers", exact: true }).click();
+  await openManagement(page, "Providers");
   await page.getByRole("button", { name: "Configure provider", exact: true }).click();
   const form = page.locator("form.editor-panel").filter({ hasText: "Configure provider" });
   await form.getByLabel("Provider ID").fill(PROVIDER);
-  await form.getByLabel("Provider kind").selectOption("openai_compatible");
+  await expect(form.getByText("OpenAI compatible", { exact: true })).toBeVisible();
   await form.getByLabel("Base URL").fill(`${harness.providerProxy.baseUrl}/v1`);
   await form.getByLabel("Models").fill(MODEL);
   const response = page.waitForResponse((candidate) =>
@@ -201,7 +202,9 @@ test(E2E_NAME, async ({ page }) => {
   try {
     preseedCaptureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 256 });
     await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "What do you want to work on?", exact: true }),
+    ).toBeVisible();
     await configureProvider(page, harness);
     const profileIds = await seedProfiles(page, harness);
     await deleteProfiles(page, PROVIDER, profileIds);

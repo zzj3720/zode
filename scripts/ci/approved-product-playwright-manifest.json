@@ -313,6 +313,10 @@
     },
     {
       "file": "specs/ui_logic_models.spec.cjs",
+      "title": "e2e_browser_confirmed_management_mutation_is_not_downgraded_by_projection_failure"
+    },
+    {
+      "file": "specs/ui_logic_models.spec.cjs",
       "title": "e2e_browser_initial_home_reconciles_preexisting_endpoint_sessions"
     }
   ]

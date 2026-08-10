@@ -46,6 +46,7 @@ export type ProviderDescriptor = {
 export type Provider = {
   provider: string;
   descriptor: ProviderDescriptor;
+  auth_methods: Array<"api_key" | "oauth">;
   default_profile_id: string | null;
   auth_status: string;
   auth_profile_count: number;
@@ -59,6 +60,8 @@ export type Replica = {
   status: string;
 };
 
+export type ProfileSharingMode = "none" | "selected" | "all_current";
+
 export type AuthProfile = {
   auth_profile_id: string;
   profile_id: string;
@@ -70,11 +73,46 @@ export type AuthProfile = {
   descriptor_revision: number;
   is_default: boolean;
   sharing: {
-    mode: string;
+    mode: ProfileSharingMode;
     endpoint_ids: string[];
   };
   expires_at_ms?: number | null;
+  refresh_state: "ready" | "reauth_required";
+  allowed_actions: Array<"refresh" | "relogin">;
   distribution: Replica[];
+};
+
+export type OAuthAttempt = {
+  schema: "zode.oauth-attempt.v1";
+  attempt_id: string;
+  provider: string;
+  auth_profile_id: string;
+  profile_id: string;
+  replace_auth_profile_id: string | null;
+  label: string;
+  status: "active" | "succeeded" | "failed" | "cancelled";
+  safe_code: string | null;
+  sharing: { mode: string; endpoint_ids: string[] };
+  make_default: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+  expires_at_ms: number;
+  allowed_actions: Array<"authorize" | "cancel">;
+};
+
+export type AuthRefreshOperation = {
+  schema: "zode.auth-refresh-operation.v1";
+  operation_id: string;
+  auth_profile_id: string;
+  provider: string;
+  status: "prepared" | "dispatching" | "succeeded" | "refresh_unknown" | "failed";
+  safe_code: string | null;
+  source_revision: number;
+  reserved_revision: number;
+  recovery: "same_operation_id_idempotent" | "none";
+  created_at_ms: number;
+  updated_at_ms: number;
+  allowed_actions: Array<"relogin">;
 };
 
 export type TranscriptMessage = {
@@ -83,6 +121,22 @@ export type TranscriptMessage = {
   content: string;
   tool_call_id?: string | null;
   tool_calls?: Array<{ tool_call_id: string; tool_name: string }>;
+};
+
+export type ToolCallProjection = {
+  schema?: "zode.tool-call.v1";
+  session_id?: string;
+  tool_call_id: string;
+  tool_name?: string;
+  name?: string;
+  status: string;
+  completion_mode?: string;
+  allowed_actions: Array<"cancel" | "retry_dispatch">;
+  result?: unknown;
+  reconciliation?: {
+    reason?: string;
+  } | null;
+  error?: { class?: string; message?: string } | null;
 };
 
 export type Session = {
@@ -104,14 +158,7 @@ export type Session = {
   } | null;
   transcript: TranscriptMessage[];
   wait: { reason?: string; deadline_ms?: number } | null;
-  tool_calls: Array<{
-    tool_call_id: string;
-    tool_name?: string;
-    name?: string;
-    status: string;
-    reconciliation?: { reason?: string } | null;
-    error?: { class?: string; message?: string } | null;
-  }>;
+  tool_calls: ToolCallProjection[];
   active_activation: { activation_id?: string } | null;
   active_model_round?: {
     attempt?: { attempt_number?: number; outcome?: string } | null;
@@ -185,284 +232,440 @@ function isPublicError(value: unknown): value is PublicError {
   );
 }
 
-async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
-  let response: Response;
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    const headers = new Headers(init.headers);
-    headers.set("Accept", "application/json");
-    if (init.body !== undefined) headers.set("Content-Type", "application/json");
-    response = await fetch(path, {
-      ...init,
-      headers,
-      credentials: "same-origin",
-      signal: controller.signal,
-    });
+export type EndpointCreateRequest = {
+  label: string;
+  baseUrl: string;
+  controllerCredential: string;
+};
 
-    let body: unknown = null;
+export type ApiKeyProfileCreateRequest = {
+  label: string;
+  apiKey: string;
+  endpointIds: string[];
+  makeDefault: boolean;
+};
+
+export type OAuthAttemptCreateRequest = {
+  label: string;
+  endpointIds: string[];
+  makeDefault: boolean;
+  replaceAuthProfileId?: string;
+};
+
+export type SessionExecutionRequest = {
+  provider: Provider;
+  model: string;
+  profile: AuthProfile;
+};
+
+export class ServerClient {
+  constructor(
+    private readonly request: typeof fetch = globalThis.fetch.bind(globalThis),
+    private readonly timeoutMs = REQUEST_TIMEOUT_MS,
+  ) {}
+
+  private async requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
+    const controller = new AbortController();
+    const timeout = globalThis.setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      body = await response.json();
-    } catch {
-      // A typed public error is returned below for a non-JSON response.
-    }
-    if (!response.ok) {
-      if (isPublicError(body)) {
+      const headers = new Headers(init.headers);
+      headers.set("Accept", "application/json");
+      if (init.body !== undefined) headers.set("Content-Type", "application/json");
+      const response = await this.request(path, {
+        ...init,
+        headers,
+        credentials: "same-origin",
+        signal: controller.signal,
+      });
+      let body: unknown = null;
+      try {
+        body = await response.json();
+      } catch {
+        // Non-JSON failures map to the bounded status code below.
+      }
+      if (!response.ok) {
+        if (isPublicError(body)) {
+          throw new ServerClientError(
+            body.error.code,
+            response.status,
+            body.error.retryable,
+            body.error.message,
+          );
+        }
         throw new ServerClientError(
-          body.error.code,
+          `http_${response.status}`,
           response.status,
-          body.error.retryable,
-          body.error.message,
+          response.status === 408 || response.status === 429 || response.status >= 500,
         );
       }
+      return body as T;
+    } catch (error) {
+      if (error instanceof ServerClientError) throw error;
       throw new ServerClientError(
-        `http_${response.status}`,
-        response.status,
-        response.status === 408 || response.status === 429 || response.status >= 500,
+        controller.signal.aborted ? "request_timeout" : "network_error",
+        0,
+        true,
       );
+    } finally {
+      globalThis.clearTimeout(timeout);
     }
-    return body as T;
-  } catch (error) {
-    if (error instanceof ServerClientError) throw error;
-    if (controller.signal.aborted) {
-      throw new ServerClientError("request_timeout", 0, true);
-    }
-    throw new ServerClientError("network_error", 0, true);
-  } finally {
-    window.clearTimeout(timeout);
+  }
+
+  private command(method: string, body: unknown, idempotencyKey: string): RequestInit {
+    return {
+      method,
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify(body),
+    };
+  }
+
+  getSystem(): Promise<SystemResponse> {
+    return this.requestJson<SystemResponse>("/v1/system");
+  }
+
+  async listEndpoints(): Promise<Endpoint[]> {
+    const response = await this.requestJson<{ items: Endpoint[] }>("/v1/endpoints");
+    return response.items;
+  }
+
+  getEndpoint(endpointId: string): Promise<Endpoint> {
+    return this.requestJson<Endpoint>(`/v1/endpoints/${encodeURIComponent(endpointId)}`);
+  }
+
+  probeEndpoint(endpointId: string): Promise<Endpoint> {
+    return this.requestJson<Endpoint>(`/v1/endpoints/${encodeURIComponent(endpointId)}/probe`, {
+      method: "POST",
+    });
+  }
+
+  createEndpoint(body: EndpointCreateRequest, idempotencyKey: string): Promise<Endpoint> {
+    return this.requestJson<Endpoint>(
+      "/v1/endpoints",
+      this.command(
+        "POST",
+        {
+          label: body.label,
+          base_url: body.baseUrl,
+          control_auth: { kind: "bearer", secret: body.controllerCredential },
+        },
+        idempotencyKey,
+      ),
+    );
+  }
+
+  async listProviders(): Promise<Provider[]> {
+    const response = await this.requestJson<{ providers: Provider[] }>("/v1/providers");
+    return response.providers;
+  }
+
+  putProvider(
+    provider: string,
+    descriptor: Omit<ProviderDescriptor, "revision">,
+    idempotencyKey: string,
+  ): Promise<unknown> {
+    return this.requestJson(
+      `/v1/providers/${encodeURIComponent(provider)}`,
+      this.command("PUT", descriptor, idempotencyKey),
+    );
+  }
+
+  async listProfiles(provider: string): Promise<AuthProfile[]> {
+    const response = await this.requestJson<{ items: AuthProfile[] }>(
+      `/v1/providers/${encodeURIComponent(provider)}/auth-profiles`,
+    );
+    return response.items;
+  }
+
+  setDefaultProfile(
+    provider: string,
+    profileId: string,
+    idempotencyKey: string,
+  ): Promise<AuthProfile> {
+    return this.requestJson<AuthProfile>(
+      `/v1/providers/${encodeURIComponent(provider)}/default-auth-profile`,
+      this.command("PUT", { profile_id: profileId }, idempotencyKey),
+    );
+  }
+
+  updateProfileSharing(
+    profileId: string,
+    sharing: { mode: ProfileSharingMode; endpoint_ids: string[] },
+    idempotencyKey: string,
+  ): Promise<AuthProfile> {
+    return this.requestJson<AuthProfile>(
+      `/v1/auth-profiles/${encodeURIComponent(profileId)}/sharing`,
+      this.command("PUT", sharing, idempotencyKey),
+    );
+  }
+
+  deleteProfile(
+    provider: string,
+    profileId: string,
+    idempotencyKey: string,
+  ): Promise<{
+    auth_profile_id: string;
+    provider: string;
+    status: string;
+    distribution: Replica[];
+  }> {
+    return this.requestJson(
+      `/v1/providers/${encodeURIComponent(provider)}/auth-profiles/${encodeURIComponent(profileId)}`,
+      { method: "DELETE", headers: { "Idempotency-Key": idempotencyKey } },
+    );
+  }
+
+  createApiKeyProfile(
+    provider: string,
+    body: ApiKeyProfileCreateRequest,
+    idempotencyKey: string,
+  ): Promise<AuthProfile> {
+    return this.requestJson<AuthProfile>(
+      `/v1/providers/${encodeURIComponent(provider)}/auth-profiles`,
+      this.command(
+        "POST",
+        {
+          kind: "api_key",
+          label: body.label,
+          api_key: body.apiKey,
+          make_default: body.makeDefault,
+          sharing:
+            body.endpointIds.length > 0
+              ? { mode: "selected", endpoint_ids: body.endpointIds }
+              : { mode: "none", endpoint_ids: [] },
+        },
+        idempotencyKey,
+      ),
+    );
+  }
+
+  replaceApiKeyProfile(
+    provider: string,
+    profileId: string,
+    apiKey: string,
+    idempotencyKey: string,
+  ): Promise<AuthProfile> {
+    return this.requestJson<AuthProfile>(
+      `/v1/providers/${encodeURIComponent(provider)}/auth-profiles`,
+      this.command(
+        "POST",
+        {
+          kind: "api_key",
+          api_key: apiKey,
+          replace_auth_profile_id: profileId,
+        },
+        idempotencyKey,
+      ),
+    );
+  }
+
+  startOAuthAttempt(
+    provider: string,
+    body: OAuthAttemptCreateRequest,
+    idempotencyKey: string,
+  ): Promise<OAuthAttempt> {
+    return this.requestJson<OAuthAttempt>(
+      `/v1/providers/${encodeURIComponent(provider)}/auth-attempts`,
+      this.command(
+        "POST",
+        {
+          label: body.label,
+          make_default: body.makeDefault,
+          sharing:
+            body.endpointIds.length > 0
+              ? { mode: "selected", endpoint_ids: body.endpointIds }
+              : { mode: "none", endpoint_ids: [] },
+          ...(body.replaceAuthProfileId
+            ? { replace_auth_profile_id: body.replaceAuthProfileId }
+            : {}),
+        },
+        idempotencyKey,
+      ),
+    );
+  }
+
+  getOAuthAttempt(attemptId: string): Promise<OAuthAttempt> {
+    return this.requestJson<OAuthAttempt>(`/v1/auth-attempts/${encodeURIComponent(attemptId)}`);
+  }
+
+  mintOAuthAuthorizeTicket(
+    attemptId: string,
+    idempotencyKey: string,
+  ): Promise<{ schema: "zode.oauth-authorize-ticket.v1"; attempt_id: string; ticket: string }> {
+    return this.requestJson(
+      `/v1/auth-attempts/${encodeURIComponent(attemptId)}/authorize-tickets`,
+      { method: "POST", headers: { "Idempotency-Key": idempotencyKey } },
+    );
+  }
+
+  cancelOAuthAttempt(attemptId: string, idempotencyKey: string): Promise<OAuthAttempt> {
+    return this.requestJson<OAuthAttempt>(
+      `/v1/auth-attempts/${encodeURIComponent(attemptId)}/cancel`,
+      { method: "POST", headers: { "Idempotency-Key": idempotencyKey } },
+    );
+  }
+
+  oauthAttemptEvents(
+    attemptId: string,
+    lastEventId: string,
+    signal: AbortSignal,
+  ): Promise<Response> {
+    return this.controlEvents(
+      `/v1/auth-attempts/${encodeURIComponent(attemptId)}/events`,
+      lastEventId,
+      signal,
+    );
+  }
+
+  startAuthRefresh(profileId: string, idempotencyKey: string): Promise<AuthRefreshOperation> {
+    return this.requestJson<AuthRefreshOperation>(
+      `/v1/auth-profiles/${encodeURIComponent(profileId)}/refresh-operations`,
+      { method: "POST", headers: { "Idempotency-Key": idempotencyKey } },
+    );
+  }
+
+  getAuthRefresh(operationId: string): Promise<AuthRefreshOperation> {
+    return this.requestJson<AuthRefreshOperation>(
+      `/v1/auth-refresh-operations/${encodeURIComponent(operationId)}`,
+    );
+  }
+
+  authRefreshEvents(
+    operationId: string,
+    lastEventId: string,
+    signal: AbortSignal,
+  ): Promise<Response> {
+    return this.controlEvents(
+      `/v1/auth-refresh-operations/${encodeURIComponent(operationId)}/events`,
+      lastEventId,
+      signal,
+    );
+  }
+
+  async listReplicas(profileId: string): Promise<Replica[]> {
+    const response = await this.requestJson<{ items: Replica[] }>(
+      `/v1/auth-profiles/${encodeURIComponent(profileId)}/replicas`,
+    );
+    return response.items;
+  }
+
+  listSessions(endpointId: string, cursor?: string): Promise<SessionListPage> {
+    const query = new URLSearchParams({ limit: "50" });
+    if (cursor) query.set("cursor", cursor);
+    return this.requestJson<SessionListPage>(
+      `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions?${query.toString()}`,
+    );
+  }
+
+  createSession(
+    endpointId: string,
+    body: SessionExecutionRequest,
+    idempotencyKey: string,
+  ): Promise<{ session_id: string }> {
+    return this.requestJson(
+      `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions`,
+      this.command("POST", { model: executionBody(body), tools: [] }, idempotencyKey),
+    );
+  }
+
+  getSession(endpointId: string, sessionId: string): Promise<Session> {
+    return this.requestJson(
+      `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}`,
+    );
+  }
+
+  selectSessionModel(
+    endpointId: string,
+    sessionId: string,
+    body: SessionExecutionRequest,
+    idempotencyKey: string,
+  ): Promise<unknown> {
+    return this.requestJson(
+      `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}/model`,
+      this.command("PUT", executionBody(body), idempotencyKey),
+    );
+  }
+
+  sendMessage(
+    endpointId: string,
+    sessionId: string,
+    content: string,
+    idempotencyKey: string,
+  ): Promise<unknown> {
+    return this.requestJson(
+      `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}/messages`,
+      this.command("POST", { content }, idempotencyKey),
+    );
+  }
+
+  getToolCall(
+    endpointId: string,
+    sessionId: string,
+    toolCallId: string,
+  ): Promise<ToolCallProjection> {
+    return this.requestJson(
+      `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}/tool-calls/${encodeURIComponent(toolCallId)}`,
+    );
+  }
+
+  cancelToolCall(
+    endpointId: string,
+    sessionId: string,
+    toolCallId: string,
+    idempotencyKey: string,
+  ): Promise<ToolCallProjection> {
+    return this.requestJson(
+      `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}/tool-calls/${encodeURIComponent(toolCallId)}/cancel`,
+      this.command("POST", { reason: "user requested cancellation" }, idempotencyKey),
+    );
+  }
+
+  reconcileToolCall(
+    endpointId: string,
+    sessionId: string,
+    toolCallId: string,
+    idempotencyKey: string,
+  ): Promise<ToolCallProjection> {
+    return this.requestJson(
+      `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}/tool-calls/${encodeURIComponent(toolCallId)}/reconcile`,
+      this.command("POST", { action: "retry_dispatch" }, idempotencyKey),
+    );
+  }
+
+  endpointEvents(endpointId: string, lastEventId: string, signal: AbortSignal): Promise<Response> {
+    const headers: Record<string, string> = { Accept: "text/event-stream" };
+    if (lastEventId) headers["Last-Event-ID"] = lastEventId;
+    return this.request(`/v1/endpoints/${encodeURIComponent(endpointId)}/events`, {
+      headers,
+      credentials: "same-origin",
+      cache: "no-store",
+      signal,
+    });
+  }
+
+  private controlEvents(path: string, lastEventId: string, signal: AbortSignal): Promise<Response> {
+    const headers: Record<string, string> = { Accept: "text/event-stream" };
+    if (lastEventId) headers["Last-Event-ID"] = lastEventId;
+    return this.request(path, {
+      headers,
+      credentials: "same-origin",
+      cache: "no-store",
+      signal,
+    });
   }
 }
 
-function idempotent(method: string, body: unknown, idempotencyKey?: string): RequestInit {
+function executionBody(body: SessionExecutionRequest) {
   return {
-    method,
-    headers: { "Idempotency-Key": idempotencyKey ?? crypto.randomUUID() },
-    body: JSON.stringify(body),
+    provider: body.provider.provider,
+    model: body.model,
+    provider_execution: {
+      schema: "zode.provider-execution.v1",
+      revision: body.provider.descriptor.revision,
+      kind: body.provider.descriptor.kind,
+      base_url: body.provider.descriptor.base_url,
+      options: body.provider.descriptor.options,
+    },
+    auth_profile_id: body.profile.auth_profile_id,
+    minimum_auth_revision: body.profile.revision,
   };
-}
-
-export function getSystem(): Promise<SystemResponse> {
-  return requestJson<SystemResponse>("/v1/system");
-}
-
-export async function listEndpoints(): Promise<Endpoint[]> {
-  const response = await requestJson<{ items: Endpoint[] }>("/v1/endpoints");
-  return response.items;
-}
-
-export function getEndpoint(endpointId: string): Promise<Endpoint> {
-  return requestJson<Endpoint>(`/v1/endpoints/${encodeURIComponent(endpointId)}`);
-}
-
-export function probeEndpoint(endpointId: string): Promise<Endpoint> {
-  return requestJson<Endpoint>(`/v1/endpoints/${encodeURIComponent(endpointId)}/probe`, {
-    method: "POST",
-  });
-}
-
-export function createEndpoint(
-  body: {
-    label: string;
-    baseUrl: string;
-    controllerCredential: string;
-  },
-  idempotencyKey?: string,
-): Promise<Endpoint> {
-  return requestJson<Endpoint>(
-    "/v1/endpoints",
-    idempotent(
-      "POST",
-      {
-        label: body.label,
-        base_url: body.baseUrl,
-        control_auth: {
-          kind: "bearer",
-          secret: body.controllerCredential,
-        },
-      },
-      idempotencyKey,
-    ),
-  );
-}
-
-export async function listProviders(): Promise<Provider[]> {
-  const response = await requestJson<{ providers: Provider[] }>("/v1/providers");
-  return response.providers;
-}
-
-export function putProvider(
-  provider: string,
-  descriptor: Omit<ProviderDescriptor, "revision">,
-  idempotencyKey?: string,
-): Promise<unknown> {
-  return requestJson(
-    `/v1/providers/${encodeURIComponent(provider)}`,
-    idempotent("PUT", descriptor, idempotencyKey),
-  );
-}
-
-export async function listProfiles(provider: string): Promise<AuthProfile[]> {
-  const response = await requestJson<{ items: AuthProfile[] }>(
-    `/v1/providers/${encodeURIComponent(provider)}/auth-profiles`,
-  );
-  return response.items;
-}
-
-export function setDefaultProfile(
-  provider: string,
-  profileId: string,
-  idempotencyKey?: string,
-): Promise<AuthProfile> {
-  return requestJson<AuthProfile>(
-    `/v1/providers/${encodeURIComponent(provider)}/default-auth-profile`,
-    idempotent("PUT", { profile_id: profileId }, idempotencyKey),
-  );
-}
-
-export function deleteProfile(
-  provider: string,
-  profileId: string,
-  idempotencyKey?: string,
-): Promise<{
-  auth_profile_id: string;
-  provider: string;
-  status: string;
-  distribution: Replica[];
-}> {
-  return requestJson(
-    `/v1/providers/${encodeURIComponent(provider)}/auth-profiles/${encodeURIComponent(profileId)}`,
-    { method: "DELETE", headers: { "Idempotency-Key": idempotencyKey ?? crypto.randomUUID() } },
-  );
-}
-
-export function createApiKeyProfile(
-  provider: string,
-  body: {
-    label: string;
-    apiKey: string;
-    endpointIds: string[];
-    makeDefault: boolean;
-  },
-  idempotencyKey?: string,
-): Promise<AuthProfile> {
-  return requestJson<AuthProfile>(
-    `/v1/providers/${encodeURIComponent(provider)}/auth-profiles`,
-    idempotent(
-      "POST",
-      {
-        kind: "api_key",
-        label: body.label,
-        api_key: body.apiKey,
-        make_default: body.makeDefault,
-        sharing:
-          body.endpointIds.length > 0
-            ? { mode: "selected", endpoint_ids: body.endpointIds }
-            : { mode: "none", endpoint_ids: [] },
-      },
-      idempotencyKey,
-    ),
-  );
-}
-
-export async function listReplicas(profileId: string): Promise<Replica[]> {
-  const response = await requestJson<{ items: Replica[] }>(
-    `/v1/auth-profiles/${encodeURIComponent(profileId)}/replicas`,
-  );
-  return response.items;
-}
-
-export async function listSessions(endpointId: string, cursor?: string): Promise<SessionListPage> {
-  const query = new URLSearchParams({ limit: "50" });
-  if (cursor) query.set("cursor", cursor);
-  return requestJson<SessionListPage>(
-    `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions?${query.toString()}`,
-  );
-}
-
-export async function createSession(
-  endpointId: string,
-  body: {
-    provider: Provider;
-    model: string;
-    profile: AuthProfile;
-  },
-  idempotencyKey?: string,
-): Promise<{ session_id: string }> {
-  return requestJson(
-    `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions`,
-    idempotent(
-      "POST",
-      {
-        model: {
-          provider: body.provider.provider,
-          model: body.model,
-          provider_execution: {
-            schema: "zode.provider-execution.v1",
-            revision: body.provider.descriptor.revision,
-            kind: body.provider.descriptor.kind,
-            base_url: body.provider.descriptor.base_url,
-            options: body.provider.descriptor.options,
-          },
-          auth_profile_id: body.profile.auth_profile_id,
-          minimum_auth_revision: body.profile.revision,
-        },
-        tools: [],
-      },
-      idempotencyKey,
-    ),
-  );
-}
-
-export function getSession(endpointId: string, sessionId: string): Promise<Session> {
-  return requestJson(
-    `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}`,
-  );
-}
-
-export function selectSessionModel(
-  endpointId: string,
-  sessionId: string,
-  body: {
-    provider: Provider;
-    model: string;
-    profile: AuthProfile;
-  },
-  idempotencyKey?: string,
-): Promise<unknown> {
-  return requestJson(
-    `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}/model`,
-    idempotent(
-      "PUT",
-      {
-        provider: body.provider.provider,
-        model: body.model,
-        provider_execution: {
-          schema: "zode.provider-execution.v1",
-          revision: body.provider.descriptor.revision,
-          kind: body.provider.descriptor.kind,
-          base_url: body.provider.descriptor.base_url,
-          options: body.provider.descriptor.options,
-        },
-        auth_profile_id: body.profile.auth_profile_id,
-        minimum_auth_revision: body.profile.revision,
-      },
-      idempotencyKey,
-    ),
-  );
-}
-
-export function sendMessage(
-  endpointId: string,
-  sessionId: string,
-  content: string,
-  idempotencyKey?: string,
-): Promise<unknown> {
-  return requestJson(
-    `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}/messages`,
-    idempotent("POST", { content }, idempotencyKey),
-  );
-}
-
-export function eventStreamUrl(endpointId: string, sessionId: string): string {
-  return `/v1/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}/events`;
 }
