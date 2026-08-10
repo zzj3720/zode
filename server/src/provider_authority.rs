@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use url::{Host, Url};
 use zeroize::Zeroize;
 
@@ -166,6 +166,7 @@ pub(crate) struct ProviderAuthority {
     auth_adapters: BTreeMap<String, ProviderAuthAdapterConfig>,
     management_origin: String,
     provider_client: Client,
+    secret_store_lock: Mutex<()>,
     reconcile_signal: Arc<Notify>,
     control_signal: Arc<Notify>,
 }
@@ -203,6 +204,7 @@ impl ProviderAuthority {
                 .collect(),
             management_origin,
             provider_client,
+            secret_store_lock: Mutex::new(()),
             reconcile_signal: Arc::new(Notify::new()),
             control_signal: Arc::new(Notify::new()),
         })
@@ -221,7 +223,15 @@ impl ProviderAuthority {
                     .await
                     .unwrap_or(true);
                 let refreshes_pending = authority.reconcile_auth_refreshes().await.unwrap_or(true);
-                if tombstones_pending || profiles_pending || refreshes_pending {
+                let secret_cleanup_pending = authority
+                    .reconcile_provider_secret_cleanup()
+                    .await
+                    .unwrap_or(true);
+                if tombstones_pending
+                    || profiles_pending
+                    || refreshes_pending
+                    || secret_cleanup_pending
+                {
                     tokio::time::sleep(TOMBSTONE_RECONCILIATION_INTERVAL).await;
                 } else {
                     authority.reconcile_signal.notified().await;
@@ -230,18 +240,26 @@ impl ProviderAuthority {
         });
     }
 
+    async fn reconcile_provider_secret_cleanup(&self) -> Result<bool, ProviderError> {
+        let _guard = self.secret_store_lock.lock().await;
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || store.cleanup_unreferenced_provider_secrets())
+            .await
+            .map_err(|_| ProviderError::Internal)?
+            .map_err(map_store_error)?;
+        Ok(false)
+    }
+
     pub(crate) async fn observe_endpoint_unreachable(
         &self,
         endpoint_id: &str,
     ) -> Result<(), ProviderError> {
         let store = Arc::clone(&self.store);
         let endpoint_id = endpoint_id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            store.mark_endpoint_replicas_unreachable(&endpoint_id)
-        })
-        .await
-        .map_err(|_| ProviderError::Internal)?
-        .map_err(map_store_error)?;
+        tokio::task::spawn_blocking(move || store.mark_endpoint_replicas_unreachable(&endpoint_id))
+            .await
+            .map_err(|_| ProviderError::Internal)?
+            .map_err(map_store_error)?;
         self.reconcile_signal.notify_one();
         Ok(())
     }
@@ -689,6 +707,7 @@ impl ProviderAuthority {
             b"oauth-pkce-secret-reference-v1",
             &[attempt_id.as_bytes(), &state_digest],
         ));
+        let _secret_guard = self.secret_store_lock.lock().await;
         let store = Arc::clone(&self.store);
         let reference = pkce_secret_ref.clone();
         let verifier_secret = Secret(verifier.as_bytes().to_vec());
@@ -698,6 +717,7 @@ impl ProviderAuthority {
         .await
         .map_err(|_| ProviderError::Internal)?
         .map_err(map_store_error)?;
+        self.reconcile_signal.notify_one();
         let redeemed_at_ms = unix_millis()?;
         let event_json = serde_json::to_string(&json!({
             "schema": "zode.oauth-attempt-event.v1",
@@ -719,6 +739,7 @@ impl ProviderAuthority {
             .await
             .map_err(|_| ProviderError::Internal)?
             .map_err(map_store_error)?;
+        drop(_secret_guard);
         self.control_signal.notify_waiters();
 
         let mut authorization_url =
@@ -773,7 +794,7 @@ impl ProviderAuthority {
         .await
         .map_err(|_| ProviderError::Internal)?
         .map_err(map_store_error)?;
-        self.remove_oauth_pkce(&attempt).await?;
+        self.reconcile_signal.notify_one();
         self.control_signal.notify_waiters();
         oauth_attempt_value(&finished)
     }
@@ -864,6 +885,7 @@ impl ProviderAuthority {
             b"oauth-credential-secret-reference-v1",
             &[attempt.attempt_id.as_bytes(), attempt.profile_id.as_bytes()],
         ));
+        let _secret_guard = self.secret_store_lock.lock().await;
         let store = Arc::clone(&self.store);
         let credential_reference = credential_secret_ref.clone();
         tokio::task::spawn_blocking(move || {
@@ -872,6 +894,7 @@ impl ProviderAuthority {
         .await
         .map_err(|_| ProviderError::Internal)?
         .map_err(map_store_error)?;
+        self.reconcile_signal.notify_one();
         let event_json = terminal_oauth_event(&attempt.attempt_id, "succeeded", "succeeded")?;
         let success = OAuthAttemptSuccess {
             actor_key: *actor.actor_key(),
@@ -881,19 +904,12 @@ impl ProviderAuthority {
             completed_at_ms: unix_millis()?,
         };
         let store = Arc::clone(&self.store);
-        let (_profile, _replicas, old_secret_ref) =
+        let (_profile, _replicas, _old_secret_ref) =
             tokio::task::spawn_blocking(move || store.complete_oauth_attempt(success, &event_json))
                 .await
                 .map_err(|_| ProviderError::Internal)?
                 .map_err(map_store_error)?;
-        if let Some(old_secret_ref) = old_secret_ref {
-            let store = Arc::clone(&self.store);
-            tokio::task::spawn_blocking(move || store.remove_provider_secret(&old_secret_ref))
-                .await
-                .map_err(|_| ProviderError::Internal)?
-                .map_err(map_store_error)?;
-        }
-        self.remove_oauth_pkce(&attempt).await?;
+        drop(_secret_guard);
         self.reconcile_signal.notify_one();
         self.control_signal.notify_waiters();
         let completed = OAuthAttemptRecord {
@@ -1195,16 +1211,11 @@ impl ProviderAuthority {
             completed_at_ms,
         };
         let store = Arc::clone(&self.store);
-        let (completed, _profile, source_secret_ref) =
+        let (completed, _profile, _source_secret_ref) =
             tokio::task::spawn_blocking(move || store.complete_auth_refresh(success, &event_json))
                 .await
                 .map_err(|_| ProviderError::Internal)?
                 .map_err(map_store_error)?;
-        let store = Arc::clone(&self.store);
-        tokio::task::spawn_blocking(move || store.remove_provider_secret(&source_secret_ref))
-            .await
-            .map_err(|_| ProviderError::Internal)?
-            .map_err(map_store_error)?;
         self.reconcile_signal.notify_one();
         self.control_signal.notify_waiters();
         Ok(completed)
@@ -1395,11 +1406,12 @@ impl ProviderAuthority {
     ) -> Result<Value, ProviderError> {
         let store = Arc::clone(&self.store);
         let profile_for_read = profile_id.clone();
-        let existing = tokio::task::spawn_blocking(move || store.get_auth_profile(&profile_for_read))
-            .await
-            .map_err(|_| ProviderError::Internal)?
-            .map_err(map_store_error)?
-            .ok_or(ProviderError::NotFound)?;
+        let existing =
+            tokio::task::spawn_blocking(move || store.get_auth_profile(&profile_for_read))
+                .await
+                .map_err(|_| ProviderError::Internal)?
+                .map_err(map_store_error)?
+                .ok_or(ProviderError::NotFound)?;
         if existing.provider != provider
             || existing.kind != "api_key"
             || existing.deleted_at_ms.is_some()
@@ -1414,7 +1426,11 @@ impl ProviderAuthority {
         );
         let request_fingerprint = keys.digest(
             b"auth-profile-rotation-request-v1",
-            &[provider.as_bytes(), profile_id.as_bytes(), api_key.as_bytes()],
+            &[
+                provider.as_bytes(),
+                profile_id.as_bytes(),
+                api_key.as_bytes(),
+            ],
         );
         let secret_ref = hex(&keys.digest(
             b"auth-profile-rotation-secret-reference-v1",
@@ -1425,7 +1441,7 @@ impl ProviderAuthority {
                 &request_fingerprint,
             ],
         ));
-        let staged_secret_ref = secret_ref.clone();
+        let _secret_guard = self.secret_store_lock.lock().await;
         let store = Arc::clone(&self.store);
         let reference = secret_ref.clone();
         let secret = Secret(api_key.into_bytes());
@@ -1433,6 +1449,7 @@ impl ProviderAuthority {
             .await
             .map_err(|_| ProviderError::Internal)?
             .map_err(map_store_error)?;
+        self.reconcile_signal.notify_one();
 
         let write = ProfileRotationWrite {
             actor_key: *actor.actor_key(),
@@ -1454,26 +1471,16 @@ impl ProviderAuthority {
         })
         .await
         .map_err(|_| ProviderError::Internal)?;
-        let (response_json, old_secret_ref) = match rotation {
+        let (response_json, _old_secret_ref) = match rotation {
             Ok(outcome) => outcome,
             Err(error) => {
-                let store = Arc::clone(&self.store);
-                let reference = staged_secret_ref.clone();
-                tokio::task::spawn_blocking(move || store.remove_provider_secret(&reference))
-                    .await
-                    .map_err(|_| ProviderError::Internal)?
-                    .map_err(map_store_error)?;
+                drop(_secret_guard);
+                self.reconcile_signal.notify_one();
                 return Err(map_store_error(error));
             }
         };
-        if let Some(old_secret_ref) = old_secret_ref.filter(|old| old != &staged_secret_ref) {
-            let store = Arc::clone(&self.store);
-            tokio::task::spawn_blocking(move || store.remove_provider_secret(&old_secret_ref))
-                .await
-                .map_err(|_| ProviderError::Internal)?
-                .map_err(map_store_error)?;
-            self.reconcile_signal.notify_one();
-        }
+        drop(_secret_guard);
+        self.reconcile_signal.notify_one();
         serde_json::from_str(&response_json).map_err(|_| ProviderError::Internal)
     }
 
@@ -1830,20 +1837,9 @@ impl ProviderAuthority {
         .await
         .map_err(|_| ProviderError::Internal)?
         .map_err(map_store_error)?;
-        self.remove_oauth_pkce(attempt).await?;
+        self.reconcile_signal.notify_one();
         self.control_signal.notify_waiters();
         Ok(finished)
-    }
-
-    async fn remove_oauth_pkce(&self, attempt: &OAuthAttemptRecord) -> Result<(), ProviderError> {
-        let Some(reference) = attempt.pkce_secret_ref.clone() else {
-            return Ok(());
-        };
-        let store = Arc::clone(&self.store);
-        tokio::task::spawn_blocking(move || store.remove_provider_secret(&reference))
-            .await
-            .map_err(|_| ProviderError::Internal)?
-            .map_err(map_store_error)
     }
 
     async fn exchange_authorization_code(

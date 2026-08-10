@@ -1259,6 +1259,9 @@ test.describe(
           setSafeStage("session-message-entry");
           await page.keyboard.type(`Reply with exactly ${EXPECTED_ASSISTANT_TEXT}`);
           setSafeStage("session-submit-focus");
+          await expect(
+            sessionComposer.getByRole("button", { name: /start session/i }),
+          ).toBeEnabled({ timeout: 30_000 });
           await tabTo(
             page,
             { role: "button", name: /start session/i },

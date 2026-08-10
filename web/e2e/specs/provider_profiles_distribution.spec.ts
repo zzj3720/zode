@@ -9,7 +9,7 @@ import {
   type ServerResponse,
 } from 'node:http';
 import { readFileSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -2060,8 +2060,21 @@ test.describe('provider profile distribution', () => {
         'profile B replica install',
       );
 
+      const orphanSecretPath = join(
+        environment.root,
+        'server-secrets',
+        'providers',
+        createHash('sha256').update(`unreferenced-${randomUUID()}`).digest('hex'),
+      );
+      await writeFile(orphanSecretPath, 'test-owned-unreferenced-provider-secret', {
+        flag: 'wx',
+        mode: 0o600,
+      });
       environment.endpointProxies[0].holdReplicaWrites = true;
       await rotateApiKey(page, profileA, rotatedApiKeyA, environment.endpointProxies[0]);
+      await expect
+        .poll(async () => (await stat(orphanSecretPath).catch(() => undefined)) === undefined)
+        .toBe(true);
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'stale');
       await expect(profileA.card.getByRole('button', { name: 'Rotate API key' })).toBeDisabled();
       await guard.assertClean();

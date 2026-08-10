@@ -203,31 +203,41 @@ function parseVersionedAssetHref(html: string, label: string): string {
 }
 
 async function buildTestOwnedUiDist(): Promise<BuiltUi> {
-  try {
-    await execFileAsync(
-      "vp",
-      ["build", "--outDir", UI_DIST_DIR],
-      { cwd: WEB_ROOT, env: { ...process.env }, timeout: 120_000 },
-    );
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new HarnessFailure(
-      "STATIC_UI_BUILD_BLOCKED",
-      `real vp build did not produce the test-owned UI dist: ${detail}`,
-      { directory: UI_DIST_DIR, nonEvidence: true },
-    );
+  const configuredDirectory = process.env.ZODE_UI_ASSETS_DIRECTORY;
+  const directory = configuredDirectory ? resolve(configuredDirectory) : UI_DIST_DIR;
+  if (!configuredDirectory) {
+    try {
+      await execFileAsync(
+        "vp",
+        ["build", "--outDir", directory],
+        { cwd: WEB_ROOT, env: { ...process.env }, timeout: 120_000 },
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new HarnessFailure(
+        "STATIC_UI_BUILD_BLOCKED",
+        `real vp build did not produce the test-owned UI dist: ${detail}`,
+        { directory, nonEvidence: true },
+      );
+    }
   }
-  const indexPath = join(UI_DIST_DIR, "index.html");
+  const indexPath = join(directory, "index.html");
   const indexMetadata = await stat(indexPath).catch(() => undefined);
   if (!indexMetadata?.isFile()) {
     throw new HarnessFailure(
       "STATIC_UI_BUILD_BLOCKED",
-      "real vp build did not produce test-owned dist/index.html",
-      { directory: UI_DIST_DIR, nonEvidence: true },
+      "the selected UI artifact did not contain index.html",
+      { directory, nonEvidence: true },
     );
   }
   const index = await readFile(indexPath, "utf8");
-  return { directory: UI_DIST_DIR, assetHref: parseVersionedAssetHref(index, "test-owned dist/index.html") };
+  return {
+    directory,
+    assetHref: parseVersionedAssetHref(
+      index,
+      configuredDirectory ? "CI-provided UI artifact/index.html" : "test-owned dist/index.html",
+    ),
+  };
 }
 
 async function installUiAssetsServerWrapper(builtUi: BuiltUi): Promise<RestoredServerEnvironment> {

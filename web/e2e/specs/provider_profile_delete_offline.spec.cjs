@@ -184,8 +184,10 @@ async function concurrentTombstoneProxy(harness) {
   let armed = false;
   let requests = 0;
   let resolveSecond;
+  let resolveSecondStarted;
   let resolveFirst;
   const firstFinished = new Promise((resolve) => { resolveFirst = resolve; });
+  const secondStarted = new Promise((resolve) => { resolveSecondStarted = resolve; });
   const twoDispatches = new Promise((resolve) => { resolveSecond = resolve; });
   const failure = await startHttpServer((_request, response) => {
     response.writeHead(502, { "content-type": "application/json" });
@@ -212,6 +214,13 @@ async function concurrentTombstoneProxy(harness) {
     requests += 1;
     if (requests === 1) {
       try {
+        await Promise.race([
+          secondStarted,
+          new Promise((_, reject) => setTimeout(
+            () => reject(new Error("second tombstone dispatch did not enter the held race")),
+            15_000,
+          )),
+        ]);
         return await proxyHttp({
           targetBaseUrl: target.baseUrl,
           request,
@@ -227,6 +236,7 @@ async function concurrentTombstoneProxy(harness) {
         resolveFirst();
       }
     }
+    resolveSecondStarted();
     await firstFinished;
     await new Promise((resolve) => setTimeout(resolve, 250));
     try {

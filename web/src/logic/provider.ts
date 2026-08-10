@@ -135,8 +135,8 @@ class ControlResourceStream {
     }
     if (eventName !== this.eventName || !/^\d+$/.test(eventId)) return;
     if (this.cursor && BigInt(eventId) <= BigInt(this.cursor)) return;
-    this.cursor = eventId;
     await this.reconcile();
+    this.cursor = eventId;
   }
 
   private isCurrent(generation: number, controller: AbortController): boolean {

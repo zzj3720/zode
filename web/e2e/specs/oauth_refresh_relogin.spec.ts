@@ -280,6 +280,9 @@ class AccessFixture {
   private readonly jwksServer: ReturnType<typeof createServer>;
   private edgeServer: ReturnType<typeof createServer> | undefined;
   private targetOrigin = "";
+  private failGetPathPrefix = "";
+  private failGetRemaining = 0;
+  private failedGetCount = 0;
   private tokenSequence = 0;
   private readonly ledger: SecretLedgerContract | undefined;
   private readonly journal: RecordingJournalContract | undefined;
@@ -394,10 +397,32 @@ class AccessFixture {
     this.targetOrigin = normalizeOrigin(targetOrigin);
   }
 
+  failNextGets(pathPrefix: string, count: number): void {
+    this.failGetPathPrefix = pathPrefix;
+    this.failGetRemaining = count;
+    this.failedGetCount = 0;
+  }
+
+  get projectionFailures(): number {
+    return this.failedGetCount;
+  }
+
   private async forward(request: IncomingMessage, response: ServerResponse): Promise<void> {
     if (!this.targetOrigin) {
       response.writeHead(503);
       response.end();
+      return;
+    }
+    const requestPath = new URL(request.url ?? "/", this.managementOrigin).pathname;
+    if (
+      request.method === "GET" &&
+      this.failGetRemaining > 0 &&
+      requestPath.startsWith(this.failGetPathPrefix)
+    ) {
+      this.failGetRemaining -= 1;
+      this.failedGetCount += 1;
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { code: "management_unavailable", retryable: true } }));
       return;
     }
     const assertion = this.token();
@@ -940,6 +965,14 @@ class ZodeBrowserHarness {
       throw new Error("registered OAuth Endpoint omitted its identity");
     }
     return endpointId;
+  }
+
+  failNextAuthRefreshProjections(count: number): void {
+    this.access.failNextGets("/v1/auth-refresh-operations/", count);
+  }
+
+  get authRefreshProjectionFailures(): number {
+    return this.access.projectionFailures;
   }
 
   async retainProviderDescriptorFailure(
@@ -3029,10 +3062,21 @@ test.describe("OAuth and refresh browser boundary", () => {
       let refreshAdmissionsAfterUnknown: number | undefined;
 
       await test.step("refresh success advances one profile revision", async () => {
-        await provider.setMode("refresh_success");
+        await provider.setMode("refresh_held");
         const previousRevision = profile.revision;
         await clickProfileAction(page, /refresh/i);
-        await waitForSafeUiState(page, /succeeded|refreshed|ready/i);
+        await provider.waitFor(
+          (state) => state.refresh_count === 1 && state.held_refresh_count === 1,
+          "held refresh before terminal projection failure",
+        );
+        harness.failNextAuthRefreshProjections(3);
+        await provider.releaseRefresh();
+        await expect
+          .poll(() => harness.authRefreshProjectionFailures, { timeout: HTTP_TIMEOUT })
+          .toBe(3);
+        await expect(page.getByRole("status").filter({ hasText: "Credentials refreshed" })).toBeVisible({
+          timeout: HTTP_TIMEOUT,
+        });
         profile = await reloadProvidersAndReadProfile(page, harness.managementOrigin, PROFILE_LABEL);
         expect(profile.id).toBe(fencedProfileId);
         expect(profile.revision).toBeGreaterThan(previousRevision);

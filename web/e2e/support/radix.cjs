@@ -1,3 +1,5 @@
+const { expect } = require("@playwright/test");
+
 function escapeAttributeValue(value) {
   return String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"');
 }
@@ -23,13 +25,21 @@ async function openManagement(page, name) {
 
 async function openExecutionChoices(page, trigger, model) {
   await closeExecutionChoices(page);
+  await expect(trigger).toBeVisible();
+  await expect(trigger).toBeEnabled({ timeout: 20_000 });
   await trigger.click();
   const advanced = page.getByRole("menuitem", { name: "Show advanced options", exact: true });
+  const modelMenu = page.getByRole("menuitem", { name: /^Model\b/u });
+  await expect.poll(async () =>
+    (await advanced.isVisible()) || (await modelMenu.isVisible()),
+  ).toBe(true);
   if (await advanced.isVisible()) await advanced.click();
-  await page.getByRole("menuitem", { name: /^Model\b/u }).hover();
+  await modelMenu.waitFor({ state: "visible" });
+  await modelMenu.hover();
   const modelItem = page.locator(
     `[role="menuitem"][data-zode-model="${escapeAttributeValue(model)}"]`,
   );
+  await modelItem.waitFor({ state: "visible" });
   await modelItem.hover();
   return modelItem;
 }
@@ -43,21 +53,22 @@ async function closeExecutionChoices(page) {
 
 async function selectExecutionProfile(page, trigger, model, profileLabel) {
   const modelItem = await openExecutionChoices(page, trigger, model);
+  const hasProfileSubmenu = (await modelItem.getAttribute("aria-haspopup")) === "menu";
   const profileItem = page.getByRole("menuitem", { name: profileLabel, exact: true });
-  const profileVisible = await profileItem
-    .waitFor({ state: "visible", timeout: 3_000 })
-    .then(() => true, () => false);
-  if (profileVisible) await profileItem.click();
-  else await modelItem.click();
+  if (hasProfileSubmenu) {
+    await profileItem.waitFor({ state: "visible" });
+    await profileItem.click();
+  } else {
+    await modelItem.click();
+  }
 }
 
 async function expectSelectedExecutionProfile(page, trigger, model, profileLabel) {
   const modelItem = await openExecutionChoices(page, trigger, model);
+  const hasProfileSubmenu = (await modelItem.getAttribute("aria-haspopup")) === "menu";
   const profileItem = page.getByRole("menuitem", { name: profileLabel, exact: true });
-  const profileVisible = await profileItem
-    .waitFor({ state: "visible", timeout: 3_000 })
-    .then(() => true, () => false);
-  if (profileVisible) {
+  if (hasProfileSubmenu) {
+    await profileItem.waitFor({ state: "visible" });
     if ((await profileItem.getAttribute("data-zode-selected")) !== "true") {
       throw new Error(`execution profile ${profileLabel} was not selected`);
     }

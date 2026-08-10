@@ -536,9 +536,14 @@ test(CASES.session.name, async ({ page }) => {
     await expect(composer).toHaveValue(draft);
 
     const keys = [];
+    const bodies = [];
     let firstRequestResolved;
+    let releaseFirstResponse;
     const firstRequest = new Promise((resolve) => {
       firstRequestResolved = resolve;
+    });
+    const firstResponseRelease = new Promise((resolve) => {
+      releaseFirstResponse = resolve;
     });
     await page.route(`**${product.messagePath}`, async (route) => {
       if (route.request().method() !== "POST") {
@@ -546,10 +551,12 @@ test(CASES.session.name, async ({ page }) => {
         return;
       }
       keys.push(route.request().headers()["idempotency-key"]);
+      bodies.push(route.request().postData());
       if (keys.length === 1) {
         const response = await route.fetch();
         expect(response.status()).toBe(202);
         firstRequestResolved();
+        await firstResponseRelease;
         await route.abort("failed");
         return;
       }
@@ -557,7 +564,12 @@ test(CASES.session.name, async ({ page }) => {
     });
     await page.getByRole("button", { name: "Send", exact: true }).click();
     await firstRequest;
+    const nextDraft = "next draft after the admitted message";
+    await composer.fill(nextDraft);
+    releaseFirstResponse();
     await expect(page.getByText("The Server could not be reached.", { exact: true })).toBeVisible();
+    await expect(composer).toHaveAttribute("readonly", "");
+    await expect(composer).toHaveValue(draft);
     await openManagement(page, "Providers");
     await page.goBack({ waitUntil: "domcontentloaded" });
     await expect(composer).toHaveValue(draft);
@@ -575,6 +587,8 @@ test(CASES.session.name, async ({ page }) => {
     expect((await secondResponse).status()).toBe(202);
     expect(keys[0]).toBeTruthy();
     expect(keys[1]).toBe(keys[0]);
+    expect(bodies[1]).toBe(bodies[0]);
+    await expect(composer).toHaveValue(nextDraft);
     await expect(page.getByLabel("You").filter({ hasText: draft })).toHaveCount(1, {
       timeout: 30_000,
     });

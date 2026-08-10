@@ -449,6 +449,7 @@ export class Session {
   private projectionRefresh: Promise<void> | null = null;
   private projectionRefreshDirty = false;
   private sendCommand: Command<{ content: string }> | null = null;
+  private deferredDraft: string | null = null;
 
   readonly data: ReadonlySignal<SessionSnapshot | null> = this.dataSignal;
   readonly summary: ReadonlySignal<SessionSummarySnapshot>;
@@ -572,6 +573,7 @@ export class Session {
   }
 
   setDraft(text: string): void {
+    if (this.sendCommand?.state === "unknown") return;
     this.draftSignal.value = text;
   }
 
@@ -611,7 +613,9 @@ export class Session {
     const content = this.draftSignal.value.trim();
     if (!content || this.sendMutationSignal.value === "submitting") return;
     if (this.executionUnavailableForSending.value || this.connection.value !== "Live") return;
-    if (this.sendCommand && this.sendCommand.body.content !== content) this.sendCommand = null;
+    if (this.sendCommand?.state === "accepted" && this.sendCommand.body.content !== content) {
+      this.sendCommand = null;
+    }
     const command = this.sendCommand ?? {
       key: this.services.nextId(),
       body: { content },
@@ -629,15 +633,23 @@ export class Session {
       );
     } catch (error) {
       command.state = "unknown";
-      this.sendMutationSignal.value = "unknown";
+      if (this.draftSignal.value.trim() !== command.body.content) {
+        this.deferredDraft = this.draftSignal.value;
+      }
+      batch(() => {
+        this.draftSignal.value = command.body.content;
+        this.sendMutationSignal.value = "unknown";
+      });
       this.services.notices.error(error);
       throw error;
     }
     command.state = "accepted";
     batch(() => {
-      if (this.draftSignal.value.trim() === command.body.content) this.draftSignal.value = "";
+      if (this.deferredDraft !== null) this.draftSignal.value = this.deferredDraft;
+      else if (this.draftSignal.value.trim() === command.body.content) this.draftSignal.value = "";
       this.sendMutationSignal.value = "accepted";
     });
+    this.deferredDraft = null;
     await Promise.allSettled([
       this.refresh(true),
       this.services.refreshSessionList(this.endpoint.id, true),

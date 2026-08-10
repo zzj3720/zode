@@ -1975,6 +1975,7 @@ class AccessEdge {
     this.sseReconnectPromise = null;
     this.resolveSseDrop = null;
     this.resolveSseReconnect = null;
+    this.sseChunkWaiters = [];
   }
 
   setTarget(baseUrl) {
@@ -1994,14 +1995,9 @@ class AccessEdge {
     });
   }
 
-  dropSseAfterBrowserBarrier() {
-    if (!this.sseDropPromise || !this.activeSse) {
-      throw new Error("no active proxied SSE stream was available for the disconnect barrier");
-    }
-    if (this.sseDropped) {
-      throw new Error("proxied SSE stream was already disconnected");
-    }
-    const frames = Buffer.concat(this.activeSse.chunks.map((chunk) => chunk.body))
+  finalSseFrames() {
+    if (!this.activeSse) return [];
+    return Buffer.concat(this.activeSse.chunks.map((chunk) => chunk.body))
       .toString("utf8")
       .split(/\r?\n\r?\n/)
       .filter(
@@ -2010,6 +2006,36 @@ class AccessEdge {
           (/^event:\s*assistant_message_committed\s*$/m.test(frame) ||
             /"kind"\s*:\s*"assistant_message_committed"/.test(frame)),
       );
+  }
+
+  async dropSseAfterBrowserBarrier() {
+    if (!this.sseDropPromise || !this.activeSse) {
+      throw new Error("no active proxied SSE stream was available for the disconnect barrier");
+    }
+    if (this.sseDropped) {
+      throw new Error("proxied SSE stream was already disconnected");
+    }
+    const frames = await withTimeout(
+      new Promise((resolve, reject) => {
+        const inspect = () => {
+          const observed = this.finalSseFrames();
+          if (observed.length === 1) {
+            resolve(observed);
+            return;
+          }
+          if (observed.length > 1) {
+            reject(new Error(
+              `proxied SSE contained ${observed.length} frames for the durable final, expected one`,
+            ));
+            return;
+          }
+          this.sseChunkWaiters.push(inspect);
+        };
+        inspect();
+      }),
+      20_000,
+      "proxied SSE durable-final observation barrier",
+    );
     if (frames.length !== 1) {
       throw new Error(
         `proxied SSE contained ${frames.length} frames for the durable final, expected one`,
@@ -2244,6 +2270,9 @@ class AccessEdge {
             offset_us: offsetUs,
             body: bytes,
           });
+          for (const resolveChunk of this.sseChunkWaiters.splice(0)) {
+            resolveChunk();
+          }
           if (!response.destroyed) {
             response.write(bytes);
           }
@@ -3794,7 +3823,7 @@ test(E2E, async ({ playwright }) => {
     );
     const durableFinal = page.getByText(FINAL_ASSISTANT, { exact: true });
     await expect(durableFinal).toHaveCount(1);
-    harness.edge.dropSseAfterBrowserBarrier();
+    await harness.edge.dropSseAfterBrowserBarrier();
     await harness.edge.waitForSseDrop();
     await harness.edge.waitForSseReconnect();
     await expect(durableFinal).toHaveCount(1);

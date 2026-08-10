@@ -3070,6 +3070,7 @@ function SessionComposer({ session }: { session: Session }) {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [session.draft.value]);
+  const retryingUnknownAdmission = session.sendMutation.value === "unknown";
   async function submit() {
     await session.send().catch(() => undefined);
   }
@@ -3090,6 +3091,7 @@ function SessionComposer({ session }: { session: Session }) {
         placeholder="Message"
         aria-label="Message"
         value={session.draft.value}
+        readOnly={retryingUnknownAdmission}
         onChange={(event) => session.setDraft(event.target.value)}
         onKeyDown={(event) => {
           if (!event.nativeEvent.isComposing && event.key === "Enter" && !event.shiftKey) {
@@ -3128,7 +3130,9 @@ function SessionComposer({ session }: { session: Session }) {
                 ? "Choose an available execution before sending"
                 : busy
                   ? "Sending"
-                  : "Send"
+                  : retryingUnknownAdmission
+                    ? "Retry message"
+                    : "Send"
             }
             disabled={!session.canSend.value}
           >
