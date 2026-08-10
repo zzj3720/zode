@@ -312,6 +312,10 @@ Named real-browser/real-process acceptance includes:
 - `e2e_browser_provider_endpoint_and_settings_models_follow_server_authority_without_shadow_state`:
   provider, Endpoint, profile, and settings changes reconcile without stale
   client defaults or a local shadow database.
+- `e2e_browser_confirmed_management_mutation_is_not_downgraded_by_projection_failure`:
+  after a management mutation is publicly confirmed, a later projection
+  failure marks cached data stale but does not change admission to unknown,
+  repeat the mutation, or allocate another idempotency key.
 - `e2e_browser_write_only_secrets_and_oauth_ticket_non_disclosure`: OAuth
   attempt, prompt, explicit authorize navigation, cancel, success, refresh,
   response loss, refresh fence, and same-profile relogin remain Server-owned

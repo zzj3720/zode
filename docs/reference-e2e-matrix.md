@@ -1,8 +1,10 @@
 # Approved common-user E2E matrix
 
 Status: approved Zode behavior map, current protected main
-`999e6aea9150609c6912317ec944c059c6ca8ea0`; current non-visual candidate
-`6f06ab84ab9d82cfaa84ee5934471f0464b7cdc3`.
+`999e6aea9150609c6912317ec944c059c6ca8ea0`; the current non-visual candidate
+is the unmerged `codex/zode-ui-logic` branch. Its current non-visual Chromium
+matrix is 86/86 green; the six remaining cases require the separately delivered
+visual UI, after which the complete 92-case matrix must run without filtering.
 
 This document turns the approved outside-repository adoption baseline into
 Zode-owned black-box anchors. It is a traceability document, not a claim that
