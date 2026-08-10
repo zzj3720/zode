@@ -270,11 +270,14 @@ Startup has one order:
 5. require the Endpoint's own lock, startup recovery, and `ZODE_READY`, then make
    authenticated identity and capability probes using the normal Endpoint API;
 6. append or verify the same local Endpoint catalog record; and
-7. only then bind the public Server listener and emit `ZODE_SERVER_READY`.
+7. arm the Server's process shutdown signal handling, then bind the public
+   listener and emit `ZODE_SERVER_READY`.
 
-Stdout readiness is a process barrier, not identity evidence. The catalog uses
-the Endpoint-probed ID and stable private origin. A restart must match both; it
-never allocates a replacement ID. Graceful shutdown of a child spawned by the
+Stdout readiness is a process barrier, not identity evidence. Once it is
+observable, an immediate termination signal must enter the same graceful
+shutdown path rather than racing an unarmed default signal action. The catalog
+uses the Endpoint-probed ID and stable private origin. A restart must match both;
+it never allocates a replacement ID. Graceful shutdown of a child spawned by the
 current Server is supervisor process lifecycle: stop public admission, drain
 Server work, signal the owned child through its process handle, wait/reap it, and
 release the Server lock last. It is not a private handler call or a new Endpoint

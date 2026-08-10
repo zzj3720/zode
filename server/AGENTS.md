@@ -234,8 +234,10 @@ replication is `docs/auth-replication.md`; ingress identity is
   the control-store owner, a normal shutdown checkpoints and truncates its WAL so
   a later startup does not mistake the Server's own missing SQLite SHM sidecar for
   external store damage; external sidecar/link mutations still fail closed during
-  preflight. Crash-surviving adoption/handoff remains an explicit later lifecycle
-  state, never an accidental orphan.
+  preflight. Arm process shutdown signal handling before publishing
+  `ZODE_SERVER_READY`, so an immediate signal after the readiness barrier cannot
+  bypass that checkpoint and cleanup path. Crash-surviving adoption/handoff
+  remains an explicit later lifecycle state, never an accidental orphan.
 - Endpoint holds an exclusive process-lifetime lock for its runtime/secret
   identity. On startup, all-in-one first probes the stable loopback address and
   adopts a healthy matching installation. An unresponsive/mismatched probe
