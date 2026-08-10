@@ -490,6 +490,7 @@ If durable catch-up fails after headers were sent, emit one neutral
   "tool_name": "fixture_tool",
   "status": "running",
   "completion_mode": "response",
+  "allowed_actions": ["cancel"],
   "result": null,
   "error": null,
   "reconciliation": null
@@ -501,9 +502,14 @@ Terminal `result` is either a bounded public value or
 classified and redacted.
 
 Public status is `planned`, `running`, `unknown_outcome`, `completed`, `failed`,
-or `cancelled`. `unknown_outcome` is nonterminal: automatic dispatch is paused,
-an authenticated callback may still resolve it, and public reconciliation
-metadata explains only the safe reason and allowed actions.
+or `cancelled`. `allowed_actions` is the complete current public action set:
+`planned`/`running` may expose `cancel`; `unknown_outcome` may expose
+`retry_dispatch` only for a tool whose contract guarantees the original
+invocation identity is deduplicated or fenced; terminal and unsupported states
+expose an empty array. Clients never infer actions from status.
+`unknown_outcome` is nonterminal: automatic dispatch is paused, an
+authenticated callback may still resolve it, and `reconciliation` explains the
+safe reason without creating a second action authority.
 
 ### Cancel
 

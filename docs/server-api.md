@@ -618,6 +618,10 @@ segment and does not persist or index it. It derives the same opaque subject for
 every request by that Access actor; Endpoint returns not-found for another
 subject's session.
 
+Tool projections preserve Endpoint's complete `allowed_actions` array. Server
+does not infer Cancel or retry eligibility from status and Web does not add an
+action that the proxied projection omitted.
+
 The common replay-aware ordering is applied before mutable provider, profile,
 model, or action gates. Thus a lost admitted message/model/tool-command
 response remains replayable after a policy change, while a new key is judged by
