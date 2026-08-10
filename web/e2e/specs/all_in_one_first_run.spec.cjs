@@ -91,6 +91,8 @@ function productEnvironment(source) {
 }
 
 const repositoryRoot = path.resolve(__dirname, "..", "..", "..");
+const uiAssetsDirectory =
+  process.env.ZODE_UI_ASSETS_DIRECTORY || path.join(repositoryRoot, "web", "dist");
 const trackedIncidentPath = path.join(
   repositoryRoot,
   "web",
@@ -2587,7 +2589,7 @@ class Harness {
     this.serverListen = serverListen;
     const installedUiDirectory = path.join(serverRoot, "ui");
     if (!scaffoldCapture) {
-      await fs.cp(path.join(repositoryRoot, "web", "dist"), installedUiDirectory, {
+      await fs.cp(uiAssetsDirectory, installedUiDirectory, {
         recursive: true,
         force: false,
         errorOnExist: true,

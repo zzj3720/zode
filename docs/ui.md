@@ -93,12 +93,15 @@ The visual contract is executable through these named browser E2Es:
   the visible streaming, waiting, tool, error, reconnect, and focus states on
   the same shell.
 
-The pixel E2E pins browser version, device scale, fonts, viewport, and product
-state. It may mask only dynamic user text, IDs, timestamps, token content, and
-carets; it may not mask layout, surfaces, icons, status labels, controls, or
-focus state. Measured geometry and palette have a one-CSS-pixel/one-channel
-maximum deviation, and the masked full-page screenshot has a maximum changed-
-pixel ratio of 0.2%. The source capture itself is never the committed golden.
+The pixel E2E pins browser version, operating-system rendering platform, device
+scale, fonts, viewport, and product state. Each supported verification platform
+uses its own accepted zode-rendered golden so native system-font rasterization
+does not weaken the common geometry, palette, or pixel thresholds. It may mask
+only dynamic user text, IDs, timestamps, token content, and carets; it may not
+mask layout, surfaces, icons, status labels, controls, or focus state. Measured
+geometry and palette have a one-CSS-pixel/one-channel maximum deviation, and
+the masked full-page screenshot has a maximum changed-pixel ratio of 0.2%. The
+source capture itself is never the committed golden.
 A missing route or empty Router is classified as blocked shallow evidence; the
 first retained visual red is the first real rendered mismatch after static UI
 delivery works.

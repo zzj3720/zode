@@ -1842,10 +1842,15 @@ test.describe("Access entry and re-entry", () => {
     let primaryError: unknown;
     try {
       await stack.access.setMode("expired");
-      await page.getByRole("navigation", { name: "Primary", exact: true })
-        .getByRole("link", { name: "New session", exact: true }).click();
+      const reentry = page.locator("[data-access-reentry]");
+      const navigation = page
+        .getByRole("navigation", { name: "Primary", exact: true })
+        .getByRole("link", { name: "New session", exact: true })
+        .click()
+        .catch(() => undefined);
       try {
-        await expect(page.locator("[data-access-reentry]")).toBeVisible({ timeout: 10_000 });
+        await expect(reentry).toBeVisible({ timeout: 10_000 });
+        await navigation;
       } catch (error) {
         throw new ProductBehaviorFailure(
           SESSION_ACCESS_REENTRY_CLASSIFICATION,

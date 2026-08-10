@@ -3478,8 +3478,7 @@ test.describe("session reconnect and runtime states", () => {
       await page.setViewportSize({ width, height: 800 });
       const toggle = page.getByRole("button", { name: "Activity" });
       if (await toggle.getAttribute("aria-expanded") === "true") {
-        await toggle.focus();
-        await page.keyboard.press("Enter");
+        await toggle.press("Enter");
       }
       await expect(toggle).toHaveAttribute("aria-expanded", "false");
       await expect(unknownOutcomeRow).toBeVisible();
@@ -3487,12 +3486,11 @@ test.describe("session reconnect and runtime states", () => {
       await expect(unknownOutcomeRow.getByRole("button", { name: "Reconcile tool outcome" })).toHaveCount(0);
       await expect(unknownOutcomeRow.getByRole("button", { name: "Cancel tool" })).toHaveCount(0);
       await expect(unknownOutcomeRow.getByRole("button", { name: "Mark failed" })).toHaveCount(0);
-      await toggle.focus();
-      await page.keyboard.press("Enter");
+      await toggle.press("Enter");
+      await expect(toggle).toHaveAttribute("aria-expanded", "true");
       const rail = page.getByRole("complementary", { name: "Activity" });
       await expect(rail).toBeVisible();
-      await toggle.focus();
-      await page.keyboard.press("Enter");
+      await toggle.press("Enter");
       await expect(toggle).toHaveAttribute("aria-expanded", "false");
     }
     await recordSseResponseMarkers(topology, sseRequests, sessionId, "mobile runtime state");

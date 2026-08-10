@@ -20,6 +20,7 @@ const READY_TIMEOUT_MS = 20_000;
 const HTTP_TIMEOUT_MS = 10_000;
 const ULID = /^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{26}$/;
 const REPO_ROOT = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
+const UI_ASSETS_DIRECTORY = process.env.ZODE_UI_ASSETS_DIRECTORY ?? resolve(REPO_ROOT, "web", "dist");
 const CASSETTE_PATH = fileURLToPath(
   new URL("../fixtures/remote_endpoint_placement/remote-endpoint-add.first-failure.json", import.meta.url),
 );
@@ -476,7 +477,7 @@ async function startHarness(): Promise<Harness> {
     localBootstrapSecret,
       },
     );
-    cpSync(resolve(REPO_ROOT, "web", "dist"), join(root, "ui"), { recursive: true });
+    cpSync(UI_ASSETS_DIRECTORY, join(root, "ui"), { recursive: true });
     remote = await startChildProcess(endpointBinary, ["--config", remoteConfig, "--listen", remoteListen], "ZODE_READY ");
     const identityResponse = await fetch(`${remote.baseUrl}/v1/identity`, {
       headers: {
@@ -525,7 +526,7 @@ async function startServerOnlyHarness(): Promise<ServerOnlyHarness> {
   let edge: AccessEdge | undefined;
   try {
     access = await startAccessFixture();
-    cpSync(resolve(REPO_ROOT, "web", "dist"), join(root, "ui"), { recursive: true });
+    cpSync(UI_ASSETS_DIRECTORY, join(root, "ui"), { recursive: true });
     const serverConfig = writeServerConfig(root, access.issuer, access.jwksUrl, {
       deployment: "server_only",
     });

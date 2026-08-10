@@ -33,7 +33,9 @@ const FIXTURE_ROOT = resolve(
 const CONTRACT_PATH = resolve(FIXTURE_ROOT, "contract.v1.json");
 const GOLDEN_PATH = resolve(
   FIXTURE_ROOT,
-  "codex-desktop-shell.golden.png",
+  process.platform === "linux"
+    ? "codex-desktop-shell.linux.golden.png"
+    : "codex-desktop-shell.golden.png",
 );
 const CALIBRATION_SOURCE_ENV = "ZODE_CODEX_DESKTOP_REFERENCE";
 const CALIBRATION_ENABLE_ENV = "ZODE_CODEX_DESKTOP_CALIBRATION";
