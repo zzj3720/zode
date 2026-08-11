@@ -2154,6 +2154,7 @@ async function seedDurableReplayHistory(
   count: number,
 ): Promise<void> {
   for (let index = 0; index < count; index += 1) {
+    const expectedModel = index % 2 === 0 ? REPLAY_HISTORY_MODEL : MODEL;
     const selected = requireBody(
       await apiJson(
         topology.server.baseUrl,
@@ -2165,9 +2166,7 @@ async function seedDurableReplayHistory(
             "content-type": "application/json",
             "Idempotency-Key": `browser-replay-history-${index}-${randomUUID()}`,
           },
-          body: JSON.stringify(
-            fixtureModelSelection(topology, index % 2 === 0 ? REPLAY_HISTORY_MODEL : MODEL),
-          ),
+          body: JSON.stringify(fixtureModelSelection(topology, expectedModel)),
         },
       ),
       202,
@@ -2185,7 +2184,8 @@ async function seedDurableReplayHistory(
           if (
             current.status === 200 &&
             current.body !== null &&
-            Number(current.body.version) > selectedVersion &&
+            Number(current.body.version) >= selectedVersion &&
+            current.body.model?.model === expectedModel &&
             current.body.active_activation === null &&
             current.body.active_model_round === null
           ) {
@@ -2195,7 +2195,7 @@ async function seedDurableReplayHistory(
         }
       })(),
       15_000,
-      `browser durable replay history selection ${index} did not reach an idle public projection`,
+      `browser durable replay history selection ${index} did not expose the selected idle public projection`,
     );
   }
 }

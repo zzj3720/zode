@@ -2215,6 +2215,7 @@ function assertProviderDescriptor(
     kind: "openai_compatible",
     base_url: providerBaseUrl,
     models: ["descriptor-model-a", "descriptor-model-b"],
+    model_limits: {},
     options: { organization: "descriptor-org" },
   });
   const serialized = JSON.stringify(value);
@@ -2359,6 +2360,7 @@ test.describe("Server provider-list foundation", () => {
                 kind: "openai_compatible",
                 base_url: providerBaseUrl,
                 models: ["descriptor-model-a", "descriptor-model-b"],
+                model_limits: {},
                 options: { organization: "descriptor-org" },
               },
               auth_methods: ["api_key"],
