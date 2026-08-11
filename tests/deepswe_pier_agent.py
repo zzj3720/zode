@@ -73,7 +73,11 @@ class _ShellBridge(ThreadingHTTPServer):
                 raise ValueError("tracked DeepSWE event trace digest is invalid")
             trace = json.loads(replay_bytes)
             if (
-                trace.get("schema") != "zode.deepswe-event-trace.v1"
+                trace.get("schema")
+                not in {
+                    "zode.deepswe-event-trace.v1",
+                    "zode.deepswe-event-trace.v2",
+                }
                 or not isinstance(trace.get("integrity_sha256"), str)
                 or not isinstance(trace.get("source"), dict)
                 or not isinstance(trace.get("events"), list)
@@ -84,6 +88,8 @@ class _ShellBridge(ThreadingHTTPServer):
                 "source": trace["source"],
                 "events": trace["events"],
             }
+            if trace["schema"] == "zode.deepswe-event-trace.v2":
+                digest_preimage["blobs"] = trace.get("blobs", [])
             digest = hashlib.sha256(
                 json.dumps(
                     digest_preimage,
@@ -97,6 +103,22 @@ class _ShellBridge(ThreadingHTTPServer):
                 "provider_fixture_sha256"
             ) != hashlib.sha256(provider_replay_path.read_bytes()).hexdigest():
                 raise ValueError("DeepSWE event trace does not match provider replay")
+            blobs: dict[str, str] = {}
+            for blob in trace.get("blobs", []):
+                content = blob.get("content")
+                blob_id = blob.get("blob_id")
+                if not isinstance(content, str) or not isinstance(blob_id, str):
+                    raise ValueError("DeepSWE event trace blob is invalid")
+                encoded = content.encode("utf-8")
+                digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+                if (
+                    blob_id != digest
+                    or blob.get("sha256") != digest
+                    or blob.get("byte_len") != len(encoded)
+                    or blob_id in blobs
+                ):
+                    raise ValueError("DeepSWE event trace blob integrity is invalid")
+                blobs[blob_id] = content
             started: dict[str, dict[str, Any]] = {}
             for index, event in enumerate(trace["events"], start=1):
                 if (
@@ -128,6 +150,11 @@ class _ShellBridge(ThreadingHTTPServer):
                 elif event["event_type"] == "async_tool_call_completed":
                     tool_call_id = payload.get("tool_call_id")
                     content = payload.get("result", {}).get("Inline", {}).get("content")
+                    if not isinstance(content, str):
+                        blob_id = payload.get("result", {}).get("BlobRef", {}).get(
+                            "blob_id"
+                        )
+                        content = blobs.get(blob_id)
                     exchange = started.get(tool_call_id)
                     if exchange is None or not isinstance(content, str):
                         raise ValueError("DeepSWE event trace tool result is invalid")

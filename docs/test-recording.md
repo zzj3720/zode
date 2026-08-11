@@ -251,6 +251,15 @@ test-owned tool fixture. Endpoint must independently commit both lifecycle
 events in the same causal position. Even when an event represents an admitted
 input, the harness never appends that event directly.
 
+The causal manifest is closed over immutable blobs referenced by those events.
+When a tool result exceeds the inline event bound, the trace carries the exact
+UTF-8 object addressed by that event's `BlobRef` and verifies its ID, byte
+length, media type, and SHA-256 before replay. This is not a second shell
+transcript or an environment snapshot: unreferenced files are excluded, and
+the referenced object is usable only through its originating event. Replay
+returns those bytes through the real external-tool adapter and requires the new
+Endpoint run to commit the same `BlobRef`.
+
 The provider HTTP cassette is the only supplemental long-run recording. It
 retains exact provider request/response bytes because those payloads are
 intentionally excluded from session events. Replay still starts the real
