@@ -1765,13 +1765,20 @@ async function addOAuthProfile(
   expect(callbackResponse.status()).toBeLessThan(400);
   await expect(page.getByRole('heading', { name: 'Providers', exact: true })).toBeVisible({ timeout: ACTION_TIMEOUT_MS });
 
-  const profileListResponse = await expectResponseAfter(
+  const profileListRoute = resolveRoute(seamMatrix.profileList, { provider: scenario.provider });
+  await expectResponseAfter(
     page,
-    resolveRoute(seamMatrix.profileList, { provider: scenario.provider }),
+    profileListRoute,
     () => page.reload({ waitUntil: 'domcontentloaded' }).then(() => undefined),
     `OAuth profile list for ${label}`,
   );
-  const profileListBody: unknown = await profileListResponse.json();
+  expect(profileListRoute.method, `OAuth profile list for ${label} method`).toBe('GET');
+  const profileListResult = await page.evaluate(async (path) => {
+    const response = await fetch(path, { headers: { accept: 'application/json' } });
+    return { status: response.status, body: await response.json() as unknown };
+  }, profileListRoute.path);
+  expect(profileListResult.status, `OAuth profile list for ${label} status`).toBe(profileListRoute.status);
+  const profileListBody: unknown = profileListResult.body;
   const found = findProfileInJson(profileListBody, label);
   if (!found) throw new Error(`OAuth profile ${label} was absent from the profile list response`);
   expect(found.kind, `OAuth profile ${label} kind`).toBe('oauth');
