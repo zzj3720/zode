@@ -492,6 +492,17 @@ async fn wait_for_terminal_activation(
                         )
                         .into());
                     }
+                    let outcome = data["data"]["outcome"].as_str().ok_or_else(|| {
+                        Error::other("benchmark activation finish omitted its durable outcome")
+                    })?;
+                    if outcome == "wait" {
+                        // An async tool may outlive the activation that
+                        // dispatched it. Its terminal delivery starts a fresh
+                        // activation, so a wait boundary is not the benchmark
+                        // completion boundary.
+                        saw_activation = false;
+                        continue;
+                    }
                     return Ok(());
                 }
             }
