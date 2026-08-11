@@ -1658,6 +1658,29 @@ async fn e2e_recorded_provider_replay_rejects_unbounded_captured_timing() -> Tes
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_recorded_provider_replay_accepts_long_total_stream_with_bounded_inter_chunk_delays(
+) -> TestResult<()> {
+    let (recording, _run_directory) = capture_complete_recording_for(
+        "e2e_recorded_provider_replay_accepts_long_total_stream_with_bounded_inter_chunk_delays",
+    )
+    .await?;
+    let mut long_stream = recording;
+    let chunks = &mut long_stream.requests[0].response.chunks;
+    if chunks.len() < 2 {
+        return Err(Error::other("long-stream timing fixture needs at least two chunks").into());
+    }
+    let bounded_gap = MAX_LLM_CHUNK_DELAY_US / 2 + 1;
+    for (index, chunk) in chunks.iter_mut().enumerate() {
+        chunk.at_us = bounded_gap.saturating_mul(index as u64 + 1);
+    }
+    if chunks.last().map_or(0, |chunk| chunk.at_us) <= MAX_LLM_CHUNK_DELAY_US {
+        return Err(Error::other("long-stream timing fixture did not exceed one idle gap").into());
+    }
+    let long_stream = digest_without_validation(long_stream)?;
+    replay_synthetic_failure(long_stream, "replay-long-total-stream-bounded-gaps").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_llm_recorder_rejects_ambiguous_attempt_identity() -> TestResult<()> {
     let mut provider = ModelFixture::start(vec![
         ModelScript::final_text("ambiguous first"),
@@ -2043,6 +2066,66 @@ async fn e2e_llm_recorder_stream_capture_bound_fails_closed() -> TestResult<()> 
         return Err(
             Error::other("oversized provider response produced a promotable recording").into(),
         );
+    }
+    scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_llm_recorder_accepts_bounded_reasoning_stream_needed_by_handoff_generation(
+) -> TestResult<()> {
+    const REASONING_STREAM_BYTES: usize = 5 * 1024 * 1024;
+    let mut provider =
+        ModelFixture::start(vec![ModelScript::large_stream(REASONING_STREAM_BYTES)]).await?;
+    let (mut recorder, run_directory) = start_synthetic_recorder(
+        provider.origin(),
+        "synthetic_bounded_reasoning_stream",
+        "e2e_llm_recorder_accepts_bounded_reasoning_stream_needed_by_handoff_generation",
+    )
+    .await?;
+    let database = TempDatabase::new("recording-bounded-reasoning-stream")?;
+    let config = config_for_replay(database.path(), &recorder.base_url("/v1"))?;
+    let cancel = Arc::new(Notify::new());
+    let attempt = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database,
+            config,
+            recorder.base_url("/v1"),
+            "recording-bounded-reasoning-stream",
+        ),
+        cancel.clone(),
+    ));
+    recorder.wait_for_completed_exchanges(1).await?;
+    cancel.notify_one();
+    attempt
+        .await
+        .map_err(|error| Error::other(format!("bounded reasoning task failed: {error}")))??;
+    recorder.stop().await?;
+    provider.stop().await?;
+    if let Some(error) = recorder.flush_error() {
+        return Err(Error::other(format!(
+            "bounded reasoning response failed recorder flush: {error}"
+        ))
+        .into());
+    }
+    let recording = recorder.recording()?;
+    let captured_bytes = recording.requests[0]
+        .response
+        .chunks
+        .iter()
+        .map(|chunk| chunk.bytes_hex.len() / 2)
+        .sum::<usize>();
+    if captured_bytes != REASONING_STREAM_BYTES {
+        return Err(Error::other(format!(
+            "bounded reasoning response captured {captured_bytes} of {REASONING_STREAM_BYTES} bytes"
+        ))
+        .into());
+    }
+    let path = run_directory.join("recording.json");
+    recording.write_atomic(&path, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    let persisted = LlmHttpRecording::load(&path)?;
+    if persisted.requests[0].response.chunks.len() != recording.requests[0].response.chunks.len() {
+        return Err(Error::other("persisted reasoning recording changed frame count").into());
     }
     scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
     Ok(())

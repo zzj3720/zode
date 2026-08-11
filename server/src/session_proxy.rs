@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     access::ActorContext,
+    provider_authority::{parse_provider_model_catalog, ProviderModelLimits},
     store::{
         AuthProfileRecord, AuthReplicaRecord, ControlStore, EndpointRecord,
         ProviderDescriptorRecord, StoreError,
@@ -55,6 +56,8 @@ pub(crate) struct CreateSessionRequest {
 pub(crate) struct ModelSelectionRequest {
     provider: String,
     model: String,
+    #[serde(default)]
+    limits: Option<ProviderModelLimits>,
     provider_execution: ProviderExecution,
     #[serde(default, rename = "auth_authority_id")]
     _auth_authority_id: Option<String>,
@@ -559,7 +562,7 @@ impl SessionProxy {
     }
 
     fn model_body(&self, model: &ModelSelectionRequest) -> Value {
-        json!({
+        let mut body = json!({
             "provider": model.provider,
             "provider_execution": {
                 "schema": model.provider_execution.schema,
@@ -572,7 +575,11 @@ impl SessionProxy {
             "auth_authority_id": self.store.authority_id(),
             "auth_profile_id": model.auth_profile_id,
             "minimum_auth_revision": model.minimum_auth_revision,
-        })
+        });
+        if let Some(limits) = &model.limits {
+            body["limits"] = json!(limits);
+        }
+        body
     }
 
     async fn forward_tool_command(
@@ -776,8 +783,8 @@ fn validate_descriptor(
     model: &CreateModelSelection,
     descriptor: &ProviderDescriptorRecord,
 ) -> Result<(), SessionProxyError> {
-    let models: Vec<String> =
-        serde_json::from_str(&descriptor.models_json).map_err(|_| SessionProxyError::Internal)?;
+    let (models, model_limits) = parse_provider_model_catalog(&descriptor.models_json)
+        .map_err(|_| SessionProxyError::Internal)?;
     let options: BTreeMap<String, Value> =
         serde_json::from_str(&descriptor.options_json).map_err(|_| SessionProxyError::Internal)?;
     if descriptor.provider != model.provider
@@ -786,6 +793,7 @@ fn validate_descriptor(
         || descriptor.base_url != model.provider_execution.base_url
         || options != model.provider_execution.options
         || !models.contains(&model.model)
+        || model.limits != model_limits.get(&model.model).cloned()
     {
         return Err(SessionProxyError::Invalid);
     }

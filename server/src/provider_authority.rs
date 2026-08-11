@@ -70,7 +70,40 @@ pub(crate) struct PutProviderDescriptorRequest {
     kind: String,
     base_url: String,
     models: Vec<String>,
+    #[serde(default)]
+    model_limits: BTreeMap<String, ProviderModelLimits>,
     options: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderModelLimits {
+    pub(crate) context_window_tokens: u64,
+    pub(crate) max_output_tokens: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderModelCatalog {
+    models: Vec<String>,
+    #[serde(default)]
+    model_limits: BTreeMap<String, ProviderModelLimits>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StoredProviderModelCatalog {
+    Catalog(ProviderModelCatalog),
+    Legacy(Vec<String>),
+}
+
+pub(crate) fn parse_provider_model_catalog(
+    encoded: &str,
+) -> Result<(Vec<String>, BTreeMap<String, ProviderModelLimits>), serde_json::Error> {
+    match serde_json::from_str::<StoredProviderModelCatalog>(encoded)? {
+        StoredProviderModelCatalog::Catalog(catalog) => Ok((catalog.models, catalog.model_limits)),
+        StoredProviderModelCatalog::Legacy(models) => Ok((models, BTreeMap::new())),
+    }
 }
 
 #[derive(Deserialize)]
@@ -429,14 +462,23 @@ impl ProviderAuthority {
                 .models
                 .iter()
                 .any(|model| !valid_text(model, MAX_MODEL_BYTES))
+            || request.model_limits.iter().any(|(model, limits)| {
+                !request.models.contains(model)
+                    || limits.context_window_tokens == 0
+                    || limits.max_output_tokens == 0
+                    || u64::from(limits.max_output_tokens) >= limits.context_window_tokens
+            })
             || request.options.keys().any(|key| sensitive_option_key(key))
             || contains_sensitive_option(&request.options)
         {
             return Err(ProviderError::Invalid);
         }
         request.base_url = normalize_base_url(&request.base_url)?;
-        let models_json =
-            serde_json::to_string(&request.models).map_err(|_| ProviderError::Invalid)?;
+        let models_json = serde_json::to_string(&ProviderModelCatalog {
+            models: request.models,
+            model_limits: request.model_limits,
+        })
+        .map_err(|_| ProviderError::Invalid)?;
         let options_json =
             serde_json::to_string(&request.options).map_err(|_| ProviderError::Invalid)?;
         if models_json.len() > MAX_OPTIONS_BYTES || options_json.len() > MAX_OPTIONS_BYTES {
@@ -2126,13 +2168,14 @@ fn descriptor_response(record: &ProviderDescriptorRecord) -> Result<Value, Provi
         "kind": descriptor["kind"],
         "base_url": descriptor["base_url"],
         "models": descriptor["models"],
+        "model_limits": descriptor["model_limits"],
         "options": descriptor["options"],
     }))
 }
 
 fn descriptor_value(record: &ProviderDescriptorRecord) -> Result<Value, ProviderError> {
-    let models: Value =
-        serde_json::from_str(&record.models_json).map_err(|_| ProviderError::Internal)?;
+    let (models, model_limits) =
+        parse_provider_model_catalog(&record.models_json).map_err(|_| ProviderError::Internal)?;
     let options: Value =
         serde_json::from_str(&record.options_json).map_err(|_| ProviderError::Internal)?;
     Ok(json!({
@@ -2140,6 +2183,7 @@ fn descriptor_value(record: &ProviderDescriptorRecord) -> Result<Value, Provider
         "kind": record.kind,
         "base_url": record.base_url,
         "models": models,
+        "model_limits": model_limits,
         "options": options,
     }))
 }

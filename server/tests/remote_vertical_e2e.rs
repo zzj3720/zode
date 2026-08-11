@@ -1340,6 +1340,12 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         "kind": "openai_compatible",
         "base_url": provider_base_url,
         "models": [MODEL_NAME],
+        "model_limits": {
+            (MODEL_NAME): {
+                "context_window_tokens": 1_000_000,
+                "max_output_tokens": 384_000
+            }
+        },
         "options": {}
     }));
     let (status, _body, descriptor_value) = public_json(
@@ -1353,6 +1359,8 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         || descriptor_value["kind"] != "openai_compatible"
         || descriptor_value["base_url"] != provider_base_url
         || descriptor_value["models"] != json!([MODEL_NAME])
+        || descriptor_value["model_limits"][MODEL_NAME]["context_window_tokens"] != 1_000_000
+        || descriptor_value["model_limits"][MODEL_NAME]["max_output_tokens"] != 384_000
     {
         return Err(Error::other("provider descriptor was not persisted exactly").into());
     }
@@ -1416,6 +1424,10 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
             "kind": "openai_compatible",
             "base_url": provider_base_url,
             "options": {}
+        },
+        "limits": {
+            "context_window_tokens": 1_000_000,
+            "max_output_tokens": 384_000
         },
         "auth_profile_id": profile_id,
         "minimum_auth_revision": profile_revision
@@ -1516,6 +1528,8 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         || selected_session["model"]["model"] != MODEL_NAME
         || selected_session["model"]["provider_execution_revision"] != descriptor_revision
         || selected_session["model"]["auth_profile_id"] != profile_id
+        || selected_session["model"]["limits"]["context_window_tokens"] != 1_000_000
+        || selected_session["model"]["limits"]["max_output_tokens"] != 384_000
     {
         return Err(Error::other("remote session model selection was not durable").into());
     }

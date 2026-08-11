@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+mod reducer;
+pub use reducer::DomainError;
+
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -73,7 +76,7 @@ pub struct ActiveModelRound {
     pub delivery_through_queue_id: u64,
     pub started_at_ms: i64,
     #[serde(default)]
-    pub request: Option<ModelRequestRecord>,
+    pub request: Option<ModelRequestFact>,
     #[serde(default)]
     pub attempt: Option<ModelAttemptRecord>,
     #[serde(default)]
@@ -81,7 +84,7 @@ pub struct ActiveModelRound {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ModelRequestRecord {
+pub struct ModelRequestFact {
     pub activation_id: String,
     pub round_id: String,
     pub request_id: String,
@@ -89,9 +92,37 @@ pub struct ModelRequestRecord {
     pub provider_execution_fingerprint: String,
     pub prompt_fingerprint: String,
     pub tool_schema_fingerprint: String,
-    pub envelope: DurablePayload,
+    /// Historical request-content field retained only so existing snapshots
+    /// and event streams keep their exact state digest. New request
+    /// declarations always leave it absent, and runtime recovery never reads
+    /// it.
+    #[serde(default, rename = "envelope", skip_serializing_if = "Option::is_none")]
+    pub legacy_envelope: Option<DurablePayload>,
     pub maximum_attempts: u32,
     pub minimum_auth_revision: u64,
+}
+
+/// Safe numeric context accounting returned by the provider for one completed
+/// conversation request. It anchors the next preflight calculation without
+/// persisting any request, prompt, transcript, or provider payload.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelUsageAnchor {
+    pub context_generation: u64,
+    pub selection_fingerprint: String,
+    pub tool_schema_fingerprint: String,
+    pub result_message_id: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Provider-independent estimate of the exact request whose provider usage
+    /// is recorded above. This is numeric calibration metadata only; it never
+    /// contains request, prompt, transcript, tool, or provider payload data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_input_estimate_tokens: Option<u64>,
+    /// Highest provider/local input-token ratio observed in this context
+    /// generation, expressed in millionths. The next preflight applies it only
+    /// to context appended after this anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_estimate_scale_millionths: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -169,7 +200,9 @@ pub struct ContextHandoffDocument {
     pub next_generation: u64,
     pub covered_through_message_id: String,
     pub source_digest: String,
-    pub document: DurablePayload,
+    /// Agent-authored plain text for the next context generation. This is a
+    /// first-class session fact, not a generic provider/tool payload envelope.
+    pub document: String,
     pub document_digest: String,
     pub source_tokens: u64,
     pub document_tokens: u64,
@@ -227,9 +260,17 @@ pub struct SessionModelSelection {
     pub provider: String,
     pub provider_execution: ProviderExecutionSelection,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ModelLimits>,
     pub auth_authority_id: String,
     pub auth_profile_id: String,
     pub auth_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelLimits {
+    pub context_window_tokens: u64,
+    pub max_output_tokens: u32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -273,6 +314,16 @@ impl SessionSelection {
                 });
             }
             validate_identifier("model", &model.model)?;
+            if let Some(limits) = &model.limits {
+                if limits.context_window_tokens == 0
+                    || limits.max_output_tokens == 0
+                    || u64::from(limits.max_output_tokens) >= limits.context_window_tokens
+                {
+                    return Err(DomainError::InvalidState(
+                        "model limits must leave a positive input window".into(),
+                    ));
+                }
+            }
             validate_identifier("auth_authority_id", &model.auth_authority_id)?;
             validate_identifier("auth_profile_id", &model.auth_profile_id)?;
             if model.auth_revision == 0 {
@@ -755,6 +806,10 @@ pub enum SessionEvent {
         error: ModelAttemptError,
         finished_at_ms: i64,
     },
+    /// Historical request-content event retained only to replay immutable
+    /// streams written before request snapshots were removed. New runtime
+    /// code never emits this variant and never treats its envelope as
+    /// recovery authority.
     ModelRequestPrepared {
         activation_id: String,
         round_id: String,
@@ -764,6 +819,17 @@ pub enum SessionEvent {
         prompt_fingerprint: String,
         tool_schema_fingerprint: String,
         envelope: DurablePayload,
+        maximum_attempts: u32,
+        minimum_auth_revision: u64,
+    },
+    ModelRequestDeclared {
+        activation_id: String,
+        round_id: String,
+        request_id: String,
+        request_fingerprint: String,
+        provider_execution_fingerprint: String,
+        prompt_fingerprint: String,
+        tool_schema_fingerprint: String,
         maximum_attempts: u32,
         minimum_auth_revision: u64,
     },
@@ -795,6 +861,14 @@ pub enum SessionEvent {
         attempt_number: u32,
         reason: String,
     },
+    ModelRequestAbandoned {
+        activation_id: String,
+        round_id: String,
+        request_id: String,
+        attempt_id: String,
+        reason: String,
+        abandoned_at_ms: i64,
+    },
     ModelAttemptsExhausted {
         fact: ModelAttemptsExhaustedFact,
     },
@@ -806,6 +880,8 @@ pub enum SessionEvent {
         round_id: String,
         request_id: String,
         attempt_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<ModelUsageAnchor>,
     },
     ActivationFinished {
         activation_id: String,
@@ -899,9 +975,11 @@ impl SessionEvent {
             Self::ContextHandoffCreated { .. } => "context_handoff_created",
             Self::ContextHandoffFailed { .. } => "context_handoff_failed",
             Self::ModelRequestPrepared { .. } => "model_request_prepared",
+            Self::ModelRequestDeclared { .. } => "model_request_declared",
             Self::ModelAttemptStarted { .. } => "model_attempt_started",
             Self::ModelAttemptFailedFact { .. } => "model_attempt_failed",
             Self::ModelAttemptInterrupted { .. } => "model_attempt_interrupted",
+            Self::ModelRequestAbandoned { .. } => "model_request_abandoned",
             Self::ModelAttemptsExhausted { .. } => "model_attempts_exhausted",
             Self::ModelStepRetryScheduled { .. } => "model_step_retry_scheduled",
             Self::ModelRequestCompleted { .. } => "model_request_completed",
@@ -1007,7 +1085,7 @@ impl SessionEvent {
                 validate_model_error(error)?;
                 validate_non_negative_timestamp("context handoff finished_at_ms", *finished_at_ms)?;
             }
-            Self::ModelRequestPrepared {
+            Self::ModelRequestDeclared {
                 activation_id,
                 round_id,
                 request_id,
@@ -1015,10 +1093,24 @@ impl SessionEvent {
                 provider_execution_fingerprint,
                 prompt_fingerprint,
                 tool_schema_fingerprint,
-                envelope,
                 maximum_attempts,
                 minimum_auth_revision,
+            }
+            | Self::ModelRequestPrepared {
+                activation_id,
+                round_id,
+                request_id,
+                request_fingerprint,
+                provider_execution_fingerprint,
+                prompt_fingerprint,
+                tool_schema_fingerprint,
+                maximum_attempts,
+                minimum_auth_revision,
+                ..
             } => {
+                if let Self::ModelRequestPrepared { envelope, .. } = self {
+                    envelope.validate()?;
+                }
                 validate_identifier("activation_id", activation_id)?;
                 validate_identifier("round_id", round_id)?;
                 validate_identifier("request_id", request_id)?;
@@ -1029,7 +1121,6 @@ impl SessionEvent {
                 )?;
                 validate_model_fingerprint("prompt_fingerprint", prompt_fingerprint)?;
                 validate_model_fingerprint("tool_schema_fingerprint", tool_schema_fingerprint)?;
-                envelope.validate()?;
                 if *maximum_attempts == 0 || *maximum_attempts > MAX_MODEL_ATTEMPTS_PER_STEP {
                     return Err(DomainError::InvalidState(
                         "model request maximum attempts are outside the bounded range".into(),
@@ -1105,6 +1196,21 @@ impl SessionEvent {
                     ));
                 }
             }
+            Self::ModelRequestAbandoned {
+                activation_id,
+                round_id,
+                request_id,
+                attempt_id,
+                reason,
+                abandoned_at_ms,
+            } => {
+                validate_identifier("activation_id", activation_id)?;
+                validate_identifier("round_id", round_id)?;
+                validate_identifier("request_id", request_id)?;
+                validate_identifier("attempt_id", attempt_id)?;
+                validate_bounded_text("model request abandonment reason", reason)?;
+                validate_non_negative_timestamp("model request abandoned_at_ms", *abandoned_at_ms)?;
+            }
             Self::ModelAttemptsExhausted { fact } => {
                 validate_model_attempts_exhausted(fact)?;
             }
@@ -1114,11 +1220,15 @@ impl SessionEvent {
                 round_id,
                 request_id,
                 attempt_id,
+                usage,
             } => {
                 validate_identifier("activation_id", activation_id)?;
                 validate_identifier("round_id", round_id)?;
                 validate_identifier("request_id", request_id)?;
                 validate_identifier("attempt_id", attempt_id)?;
+                if let Some(usage) = usage {
+                    validate_model_usage_anchor(usage)?;
+                }
             }
             Self::ActivationFinished {
                 activation_id,
@@ -1296,6 +1406,8 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_context_handoff: Option<ContextHandoffDocument>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_model_usage: Option<ModelUsageAnchor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_context_handoff_failure: Option<ModelAttemptError>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub callback_bindings: BTreeMap<String, AsyncCallbackBinding>,
@@ -1309,1632 +1421,6 @@ pub struct SessionState {
 pub struct DomainDecision {
     pub effective_events: Vec<SessionEvent>,
     pub state: SessionState,
-}
-
-impl SessionState {
-    pub fn new(session_id: impl Into<String>) -> Self {
-        Self {
-            session_id: session_id.into(),
-            owner: None,
-            created_at_ms: None,
-            selection: SessionSelection::default(),
-            selection_version: 0,
-            status: SessionStatus::Idle,
-            transcript: Vec::new(),
-            last_model_attempt_failure: None,
-            delivery_queue: Vec::new(),
-            delivery_ack: 0,
-            active_wait: None,
-            active_timer: None,
-            wake_pending_wait_id: None,
-            async_tool_calls: BTreeMap::new(),
-            active_activation: None,
-            active_model_round: None,
-            pending_context_handoff: None,
-            latest_context_handoff: None,
-            last_context_handoff_failure: None,
-            callback_bindings: BTreeMap::new(),
-            last_model_attempts_exhausted: None,
-            stream_version: 0,
-            dedupe_facts: DedupeFacts::default(),
-        }
-    }
-
-    pub fn apply_event(&self, event: &SessionEvent) -> Result<Self, DomainError> {
-        self.validate()?;
-        self.validate_event_position(event)?;
-        event.validate()?;
-        let mut next = self.clone();
-        next.apply_payload(event)?;
-        if next == *self {
-            return Ok(next);
-        }
-        // Validate the projected state at the version that the event will
-        // occupy. Creation installs owner/timestamp/selection while the
-        // input projection still has stream_version zero; validating before
-        // advancing would classify that legitimate transition as an
-        // uncreated state. No-op transitions return above and retain the
-        // caller's version for reducer-level idempotency filtering.
-        next.stream_version = next
-            .stream_version
-            .checked_add(1)
-            .ok_or(DomainError::VersionOverflow)?;
-        next.validate()?;
-        Ok(next)
-    }
-
-    pub fn decide_batch(&self, events: &[SessionEvent]) -> Result<DomainDecision, DomainError> {
-        if events.is_empty() {
-            return Err(DomainError::EmptyEventBatch);
-        }
-        self.validate()?;
-        let mut state = self.clone();
-        let mut effective_events = Vec::with_capacity(events.len());
-        for event in events {
-            let next = state.apply_event(event)?;
-            if next.stream_version != state.stream_version {
-                effective_events.push(event.clone());
-            }
-            state = next;
-        }
-        Ok(DomainDecision {
-            effective_events,
-            state,
-        })
-    }
-
-    pub fn apply_events<I>(&self, events: I) -> Result<Self, DomainError>
-    where
-        I: IntoIterator<Item = SessionEvent>,
-    {
-        let next = events
-            .into_iter()
-            .try_fold(self.clone(), |state, event| state.apply_event(&event))?;
-        next.validate()?;
-        Ok(next)
-    }
-
-    pub fn apply_record(&self, record: &EventRecord) -> Result<Self, DomainError> {
-        self.validate()?;
-        if record.event_schema_version != EVENT_SCHEMA_VERSION {
-            return Err(DomainError::UnsupportedEventSchema(
-                record.event_schema_version,
-            ));
-        }
-        if record.stream_id != self.session_id {
-            return Err(DomainError::SessionMismatch {
-                expected: self.session_id.clone(),
-                actual: record.stream_id.clone(),
-            });
-        }
-        let expected_version = self
-            .stream_version
-            .checked_add(1)
-            .ok_or(DomainError::VersionOverflow)?;
-        if record.stream_version != expected_version {
-            return Err(DomainError::StreamVersionGap {
-                expected: expected_version,
-                actual: record.stream_version,
-            });
-        }
-        let event_key = format!("event:{}", record.event_id);
-        if self.dedupe_facts.contains(&event_key) {
-            return Err(DomainError::DuplicateEventId(record.event_id.clone()));
-        }
-        self.validate_event_position(&record.event)?;
-        record.event.validate()?;
-        let mut next = self.clone();
-        next.apply_payload(&record.event)?;
-        next.stream_version = record.stream_version;
-        next.dedupe_facts.remember(event_key);
-        next.validate()?;
-        Ok(next)
-    }
-
-    /// Rebuild a projection from the immutable event records in stream order.
-    ///
-    /// This is intentionally the only replay path exposed by the domain.  It
-    /// does not inspect storage metadata or allocate repair facts; callers
-    /// provide the records and receive either a complete projection or the
-    /// first invalid transition.
-    pub fn replay<I>(session_id: impl Into<String>, records: I) -> Result<Self, DomainError>
-    where
-        I: IntoIterator<Item = EventRecord>,
-    {
-        records
-            .into_iter()
-            .try_fold(Self::new(session_id), |state, record| {
-                state.apply_record(&record)
-            })
-    }
-
-    pub fn terminal_model_failure_for_last_user(&self) -> Option<&ModelAttemptFailure> {
-        let message = self.transcript.last()?;
-        let failure = self.last_model_attempt_failure.as_ref()?;
-        (message.role == TranscriptRole::User && message.message_id == failure.trigger_message_id)
-            .then_some(failure)
-    }
-
-    pub fn validate(&self) -> Result<(), DomainError> {
-        require_text("session_id", &self.session_id)?;
-        validate_text("session_id", &self.session_id)?;
-        match (self.stream_version, self.owner.as_ref(), self.created_at_ms) {
-            (0, None, None) => {
-                if self.selection != SessionSelection::default() {
-                    return Err(DomainError::InvalidState(
-                        "uncreated session contains an initial selection".into(),
-                    ));
-                }
-                if self.selection_version != 0 {
-                    return Err(DomainError::InvalidState(
-                        "uncreated session has a selection version".into(),
-                    ));
-                }
-            }
-            (0, _, _) => {
-                return Err(DomainError::InvalidState(
-                    "uncreated session contains creation facts".into(),
-                ));
-            }
-            (_, Some(owner), Some(created_at_ms)) => {
-                owner.validate()?;
-                if created_at_ms < 0 {
-                    return Err(DomainError::InvalidCreatedAt);
-                }
-                self.selection.validate()?;
-                if self.selection_version == 0 {
-                    return Err(DomainError::InvalidState(
-                        "created session selection version must be positive".into(),
-                    ));
-                }
-            }
-            _ => return Err(DomainError::SessionNotCreated),
-        }
-        self.dedupe_facts.validate()?;
-        let mut message_ids = BTreeSet::new();
-        let mut declared_tool_calls = BTreeMap::new();
-        for message in &self.transcript {
-            validate_message(message)?;
-            if !message_ids.insert(message.message_id.as_str()) {
-                return Err(DomainError::ConflictingTranscriptMessage(
-                    message.message_id.clone(),
-                ));
-            }
-            if !message.tool_calls.is_empty() && message.role != TranscriptRole::Assistant {
-                return Err(DomainError::InvalidState(
-                    "only assistant messages may declare tool calls".into(),
-                ));
-            }
-            for call in &message.tool_calls {
-                if declared_tool_calls
-                    .insert(call.tool_call_id.as_str(), call)
-                    .is_some()
-                {
-                    return Err(DomainError::DuplicateTranscriptToolCallId(
-                        call.tool_call_id.clone(),
-                    ));
-                }
-            }
-            if let Some(tool_call_id) = &message.tool_call_id {
-                if message.role != TranscriptRole::Tool {
-                    return Err(DomainError::InvalidState(
-                        "tool_call_id may only be attached to tool messages".into(),
-                    ));
-                }
-                if !declared_tool_calls.contains_key(tool_call_id.as_str()) {
-                    return Err(DomainError::UnknownToolCall(tool_call_id.clone()));
-                }
-            }
-        }
-        if let Some(failure) = &self.last_model_attempt_failure {
-            validate_model_attempt_failure(failure)?;
-            if !self.transcript.iter().any(|message| {
-                message.role == TranscriptRole::User
-                    && message.message_id == failure.trigger_message_id
-            }) {
-                return Err(DomainError::InvalidState(
-                    "model attempt failure has no causal user message".into(),
-                ));
-            }
-        }
-        let mut expected_queue_id = self
-            .delivery_ack
-            .checked_add(1)
-            .ok_or(DomainError::VersionOverflow)?;
-        for delivery in &self.delivery_queue {
-            validate_delivery(delivery, true)?;
-            if delivery.queue_id != expected_queue_id {
-                return Err(DomainError::DeliveryQueueOrder {
-                    expected: expected_queue_id,
-                    actual: delivery.queue_id,
-                });
-            }
-            expected_queue_id = expected_queue_id
-                .checked_add(1)
-                .ok_or(DomainError::VersionOverflow)?;
-        }
-        if self.delivery_queue.len() > MAX_DELIVERY_QUEUE_ITEMS {
-            return Err(DomainError::CollectionTooLarge {
-                field: "delivery queue",
-                items: self.delivery_queue.len(),
-                max: MAX_DELIVERY_QUEUE_ITEMS,
-            });
-        }
-        if let Some(wait) = &self.active_wait {
-            validate_wait(wait)?;
-            if let Some(pending_wait_id) = &self.wake_pending_wait_id {
-                if pending_wait_id != &wait.wait_id {
-                    return Err(DomainError::InvalidState(
-                        "pending wake belongs to a different active wait".into(),
-                    ));
-                }
-            }
-        } else if self.wake_pending_wait_id.is_some() {
-            return Err(DomainError::InvalidState(
-                "pending wake requires an active wait".into(),
-            ));
-        }
-        if let Some(timer) = &self.active_timer {
-            if self
-                .active_wait
-                .as_ref()
-                .is_none_or(|wait| wait.wait_id != timer.wait_id)
-            {
-                return Err(DomainError::InvalidState(
-                    "wait timer must belong to the active wait".into(),
-                ));
-            }
-            if timer.deadline_ms
-                != self
-                    .active_wait
-                    .as_ref()
-                    .map(|wait| wait.deadline_ms)
-                    .unwrap_or_default()
-            {
-                return Err(DomainError::InvalidState(
-                    "wait timer deadline does not match active wait".into(),
-                ));
-            }
-        }
-        if let Some(activation) = &self.active_activation {
-            validate_active_activation(activation)?;
-        }
-        if let Some(round) = &self.active_model_round {
-            validate_active_model_round(round)?;
-            let Some(activation) = &self.active_activation else {
-                return Err(DomainError::InvalidState(
-                    "active model round requires an active activation".into(),
-                ));
-            };
-            if round.activation_id != activation.activation_id {
-                return Err(DomainError::InvalidState(
-                    "active model round belongs to another activation".into(),
-                ));
-            }
-        }
-        if let Some(plan) = &self.pending_context_handoff {
-            validate_context_handoff_plan(plan)?;
-            let Some(activation) = &self.active_activation else {
-                return Err(DomainError::InvalidState(
-                    "pending context handoff requires an active activation".into(),
-                ));
-            };
-            if plan.activation_id != activation.activation_id
-                || activation.selection.model.as_ref() != Some(&plan.selection)
-            {
-                return Err(DomainError::InvalidState(
-                    "pending context handoff belongs to another activation".into(),
-                ));
-            }
-            if plan.previous_handoff_id.as_deref()
-                != self
-                    .latest_context_handoff
-                    .as_ref()
-                    .map(|handoff| handoff.handoff_id.as_str())
-            {
-                return Err(DomainError::InvalidState(
-                    "pending context handoff has a stale parent".into(),
-                ));
-            }
-            let expected_generation = self
-                .latest_context_handoff
-                .as_ref()
-                .map_or(2, |handoff| handoff.next_generation.saturating_add(1));
-            if plan.next_generation != expected_generation {
-                return Err(DomainError::InvalidState(
-                    "pending context handoff has an invalid generation".into(),
-                ));
-            }
-            if !self
-                .transcript
-                .iter()
-                .any(|message| message.message_id == plan.covered_through_message_id)
-            {
-                return Err(DomainError::InvalidState(
-                    "pending context handoff boundary is absent from history".into(),
-                ));
-            }
-        }
-        if let Some(handoff) = &self.latest_context_handoff {
-            validate_context_handoff_document(handoff)?;
-            if !self
-                .transcript
-                .iter()
-                .any(|message| message.message_id == handoff.covered_through_message_id)
-            {
-                return Err(DomainError::InvalidState(
-                    "context handoff boundary is absent from history".into(),
-                ));
-            }
-        }
-        if let Some(error) = &self.last_context_handoff_failure {
-            validate_model_error(error)?;
-        }
-        if let Some(round) = &self.active_model_round {
-            match round.purpose {
-                ModelRequestPurpose::Conversation => {
-                    let completed = round
-                        .attempt
-                        .as_ref()
-                        .is_some_and(|attempt| attempt.outcome == ModelAttemptOutcome::Completed);
-                    if self.pending_context_handoff.is_some() && !completed {
-                        return Err(DomainError::InvalidState(
-                            "pending context handoff requires a handoff round".into(),
-                        ));
-                    }
-                }
-                ModelRequestPurpose::ContextHandoff => {
-                    let completed = round
-                        .attempt
-                        .as_ref()
-                        .is_some_and(|attempt| attempt.outcome == ModelAttemptOutcome::Completed);
-                    if self.pending_context_handoff.is_none()
-                        && !completed
-                        && self.last_context_handoff_failure.is_none()
-                    {
-                        return Err(DomainError::InvalidState(
-                            "active context handoff round has no durable plan".into(),
-                        ));
-                    }
-                }
-            }
-        }
-        if self.async_tool_calls.len() > MAX_ASYNC_TOOL_CALLS {
-            return Err(DomainError::CollectionTooLarge {
-                field: "async tool calls",
-                items: self.async_tool_calls.len(),
-                max: MAX_ASYNC_TOOL_CALLS,
-            });
-        }
-        for (tool_call_id, record) in &self.async_tool_calls {
-            validate_async_record(record)?;
-            if tool_call_id != &record.tool_call_id {
-                return Err(DomainError::InvalidState(
-                    "async tool call map key does not match tool_call_id".into(),
-                ));
-            }
-            let Some(declared) = declared_tool_calls.get(tool_call_id.as_str()) else {
-                return Err(DomainError::UnknownToolCall(tool_call_id.clone()));
-            };
-            if declared.tool_name != record.tool_name || declared.input != record.input {
-                return Err(DomainError::ConflictingToolCallIdentity(
-                    tool_call_id.clone(),
-                ));
-            }
-        }
-        if self.callback_bindings.len() > MAX_ASYNC_TOOL_CALLS {
-            return Err(DomainError::CollectionTooLarge {
-                field: "callback bindings",
-                items: self.callback_bindings.len(),
-                max: MAX_ASYNC_TOOL_CALLS,
-            });
-        }
-        let mut callback_tool_ids = BTreeSet::new();
-        for (callback_id, binding) in &self.callback_bindings {
-            validate_callback_binding(binding)?;
-            if callback_id != &binding.callback_id {
-                return Err(DomainError::InvalidState(
-                    "callback binding map key does not match callback_id".into(),
-                ));
-            }
-            let Some(record) = self.async_tool_calls.get(&binding.tool_call_id) else {
-                return Err(DomainError::UnknownAsyncToolCall(
-                    binding.tool_call_id.clone(),
-                ));
-            };
-            if record.completion_mode != CompletionMode::ExternalCallback {
-                return Err(DomainError::InvalidState(
-                    "callback binding requires external-callback tool mode".into(),
-                ));
-            }
-            if binding.payload_fingerprint.is_some() && !record.status.is_terminal() {
-                return Err(DomainError::InvalidState(
-                    "callback payload fingerprint requires a terminal tool call".into(),
-                ));
-            }
-            if !callback_tool_ids.insert(binding.tool_call_id.as_str()) {
-                return Err(DomainError::InvalidState(
-                    "tool call already has a callback binding".into(),
-                ));
-            }
-        }
-        if let Some(fact) = &self.last_model_attempts_exhausted {
-            validate_model_attempts_exhausted(fact)?;
-        }
-        Ok(())
-    }
-
-    fn apply_payload(&mut self, event: &SessionEvent) -> Result<(), DomainError> {
-        match event {
-            SessionEvent::SessionCreated {
-                session_id,
-                owner,
-                created_at_ms,
-                selection,
-                ..
-            } => {
-                if session_id != &self.session_id {
-                    return Err(DomainError::SessionMismatch {
-                        expected: self.session_id.clone(),
-                        actual: session_id.clone(),
-                    });
-                }
-                self.owner = Some(owner.clone());
-                self.created_at_ms = Some(*created_at_ms);
-                self.selection = selection.clone();
-                self.selection_version = 1;
-            }
-            SessionEvent::ModelSelectionChanged { selection } => {
-                self.selection = selection.clone();
-                self.selection_version = self
-                    .selection_version
-                    .checked_add(1)
-                    .ok_or(DomainError::VersionOverflow)?;
-            }
-            SessionEvent::StatusChanged { status } => self.status = status.clone(),
-            SessionEvent::DeliveryQueued { delivery } => {
-                if delivery.queue_id <= self.delivery_ack {
-                    return Ok(());
-                }
-                if let Some(existing) = self
-                    .delivery_queue
-                    .iter()
-                    .find(|queued| queued.queue_id == delivery.queue_id)
-                {
-                    if existing == delivery {
-                        return Ok(());
-                    }
-                    return Err(DomainError::ConflictingDelivery(
-                        delivery.delivery_id.clone(),
-                    ));
-                }
-                if self
-                    .dedupe_facts
-                    .contains(&format!("delivery:{}", delivery.delivery_id))
-                    || self.dedupe_facts.contains(&delivery.dedupe_key)
-                {
-                    return Ok(());
-                }
-                if self.delivery_queue.len() >= MAX_DELIVERY_QUEUE_ITEMS {
-                    return Err(DomainError::CollectionTooLarge {
-                        field: "delivery queue",
-                        items: self.delivery_queue.len() + 1,
-                        max: MAX_DELIVERY_QUEUE_ITEMS,
-                    });
-                }
-                let expected_queue_id = self
-                    .delivery_ack
-                    .checked_add(self.delivery_queue.len() as u64 + 1)
-                    .ok_or(DomainError::VersionOverflow)?;
-                if delivery.queue_id != expected_queue_id {
-                    return Err(DomainError::DeliveryQueueOrder {
-                        expected: expected_queue_id,
-                        actual: delivery.queue_id,
-                    });
-                }
-                self.delivery_queue.push(delivery.clone());
-                self.dedupe_facts
-                    .remember(format!("delivery:{}", delivery.delivery_id));
-                self.dedupe_facts.remember(delivery.dedupe_key.clone());
-                if delivery.wake {
-                    if let Some(wait) = &self.active_wait {
-                        self.wake_pending_wait_id = Some(wait.wait_id.clone());
-                    }
-                }
-            }
-            SessionEvent::DeliveryAcknowledged { through_queue_id } => {
-                if *through_queue_id <= self.delivery_ack {
-                    return Ok(());
-                }
-                let max_queued = self
-                    .delivery_ack
-                    .checked_add(self.delivery_queue.len() as u64)
-                    .ok_or(DomainError::VersionOverflow)?;
-                if *through_queue_id > max_queued {
-                    return Err(DomainError::AckBeyondEnqueued {
-                        requested: *through_queue_id,
-                        max_queued,
-                    });
-                }
-                if self
-                    .delivery_queue
-                    .iter()
-                    .take_while(|delivery| delivery.queue_id <= *through_queue_id)
-                    .any(|delivery| delivery.materialized_message_id.is_none())
-                {
-                    return Err(DomainError::DeliveryNotMaterialized(*through_queue_id));
-                }
-                self.delivery_ack = *through_queue_id;
-                self.delivery_queue
-                    .retain(|delivery| delivery.queue_id > self.delivery_ack);
-            }
-            SessionEvent::DeliveryMaterialized { queue_id, message } => {
-                let index = self
-                    .delivery_queue
-                    .iter()
-                    .position(|delivery| delivery.queue_id == *queue_id)
-                    .ok_or(DomainError::UnknownDelivery(*queue_id))?;
-                if message.source_queue_id != Some(*queue_id) {
-                    return Err(DomainError::MaterializationIdentity(*queue_id));
-                }
-                if self
-                    .delivery_queue
-                    .iter()
-                    .take(index)
-                    .any(|delivery| delivery.materialized_message_id.is_none())
-                {
-                    return Err(DomainError::InvalidState(
-                        "deliveries must materialize in queue order".into(),
-                    ));
-                }
-                if let Some(existing_message_id) = self.delivery_queue[index]
-                    .materialized_message_id
-                    .as_deref()
-                {
-                    if existing_message_id == message.message_id
-                        && self.transcript.iter().any(|existing| existing == message)
-                    {
-                        return Ok(());
-                    }
-                    return Err(DomainError::ConflictingDelivery(
-                        self.delivery_queue[index].delivery_id.clone(),
-                    ));
-                }
-                if let Some(existing) = self
-                    .transcript
-                    .iter()
-                    .find(|existing| existing.message_id == message.message_id)
-                {
-                    if existing != message {
-                        return Err(DomainError::ConflictingTranscriptMessage(
-                            message.message_id.clone(),
-                        ));
-                    }
-                } else {
-                    self.transcript.push(message.clone());
-                }
-                self.delivery_queue[index].materialized_message_id =
-                    Some(message.message_id.clone());
-                self.dedupe_facts
-                    .remember(format!("message:{}", message.message_id));
-                if self.delivery_queue[index].wake {
-                    self.active_wait = None;
-                    self.active_timer = None;
-                    self.wake_pending_wait_id = None;
-                }
-            }
-            SessionEvent::MessageAppended { message, wake_wait } => {
-                if let Some(existing) = self
-                    .transcript
-                    .iter()
-                    .find(|existing| existing.message_id == message.message_id)
-                {
-                    if existing == message {
-                        return Ok(());
-                    }
-                    return Err(DomainError::ConflictingTranscriptMessage(
-                        message.message_id.clone(),
-                    ));
-                }
-                if message
-                    .dedupe_key
-                    .as_ref()
-                    .is_some_and(|key| self.dedupe_facts.contains(key))
-                {
-                    return Ok(());
-                }
-                if self.transcript.len() >= MAX_TRANSCRIPT_MESSAGES {
-                    return Err(DomainError::CollectionTooLarge {
-                        field: "transcript",
-                        items: self.transcript.len() + 1,
-                        max: MAX_TRANSCRIPT_MESSAGES,
-                    });
-                }
-                if !message.tool_calls.is_empty() {
-                    if message.role != TranscriptRole::Assistant {
-                        return Err(DomainError::InvalidState(
-                            "only assistant messages may declare tool calls".into(),
-                        ));
-                    }
-                    for call in &message.tool_calls {
-                        if self.transcript.iter().any(|existing| {
-                            existing.tool_calls.iter().any(|existing_call| {
-                                existing_call.tool_call_id == call.tool_call_id
-                            })
-                        }) {
-                            return Err(DomainError::DuplicateTranscriptToolCallId(
-                                call.tool_call_id.clone(),
-                            ));
-                        }
-                    }
-                }
-                if let Some(tool_call_id) = &message.tool_call_id {
-                    if message.role != TranscriptRole::Tool {
-                        return Err(DomainError::InvalidState(
-                            "tool_call_id may only be attached to tool messages".into(),
-                        ));
-                    }
-                    if !self.transcript.iter().any(|existing| {
-                        existing
-                            .tool_calls
-                            .iter()
-                            .any(|call| call.tool_call_id == *tool_call_id)
-                    }) {
-                        return Err(DomainError::UnknownToolCall(tool_call_id.clone()));
-                    }
-                }
-                self.transcript.push(message.clone());
-                self.dedupe_facts
-                    .remember(format!("message:{}", message.message_id));
-                if let Some(key) = &message.dedupe_key {
-                    self.dedupe_facts.remember(key.clone());
-                }
-                if *wake_wait {
-                    self.active_wait = None;
-                    self.active_timer = None;
-                    self.wake_pending_wait_id = None;
-                }
-            }
-            SessionEvent::ActivationStarted {
-                activation_id,
-                selection,
-                selection_version,
-                minimum_auth_revision,
-                started_at_ms,
-            } => {
-                if self.active_activation.is_some() {
-                    return Err(DomainError::InvalidState(
-                        "session already has an active activation".into(),
-                    ));
-                }
-                if *selection_version != self.selection_version {
-                    return Err(DomainError::InvalidState(
-                        "activation selection version does not match session selection".into(),
-                    ));
-                }
-                self.active_activation = Some(ActiveActivation {
-                    activation_id: activation_id.clone(),
-                    selection: selection.clone(),
-                    selection_version: *selection_version,
-                    minimum_auth_revision: *minimum_auth_revision,
-                    started_at_ms: *started_at_ms,
-                    legacy_rounds_started: 0,
-                });
-                self.active_model_round = None;
-            }
-            SessionEvent::ModelRoundStarted {
-                activation_id,
-                round_id,
-                purpose,
-                delivery_through_queue_id,
-                started_at_ms,
-            } => {
-                let activation = self.active_activation.as_mut().ok_or_else(|| {
-                    DomainError::InvalidState("model round has no activation".into())
-                })?;
-                if activation.activation_id != *activation_id {
-                    return Err(DomainError::InvalidState(
-                        "model round belongs to another activation".into(),
-                    ));
-                }
-                if let Some(existing) = &self.active_model_round {
-                    let completed = existing
-                        .attempt
-                        .as_ref()
-                        .is_some_and(|attempt| attempt.outcome == ModelAttemptOutcome::Completed);
-                    if !completed {
-                        return Err(DomainError::InvalidState(
-                            "session already has an active model round".into(),
-                        ));
-                    }
-                    // A completed request is a round boundary. The next
-                    // round replaces that completed projection while keeping
-                    // its immutable facts in the event stream.
-                    self.active_model_round = None;
-                }
-                activation.legacy_rounds_started =
-                    activation.legacy_rounds_started.saturating_add(1);
-                self.active_model_round = Some(ActiveModelRound {
-                    activation_id: activation_id.clone(),
-                    round_id: round_id.clone(),
-                    purpose: purpose.clone(),
-                    delivery_through_queue_id: *delivery_through_queue_id,
-                    started_at_ms: *started_at_ms,
-                    request: None,
-                    attempt: None,
-                    retry: None,
-                });
-            }
-            SessionEvent::ContextHandoffPlanned { plan } => {
-                let activation = self.active_activation.as_ref().ok_or_else(|| {
-                    DomainError::InvalidState(
-                        "context handoff plan has no active activation".into(),
-                    )
-                })?;
-                if plan.activation_id != activation.activation_id
-                    || activation.selection.model.as_ref() != Some(&plan.selection)
-                {
-                    return Err(DomainError::InvalidState(
-                        "context handoff plan belongs to another activation".into(),
-                    ));
-                }
-                if plan.previous_handoff_id.as_deref()
-                    != self
-                        .latest_context_handoff
-                        .as_ref()
-                        .map(|handoff| handoff.handoff_id.as_str())
-                {
-                    return Err(DomainError::InvalidState(
-                        "context handoff plan has a stale parent".into(),
-                    ));
-                }
-                let expected_generation = self
-                    .latest_context_handoff
-                    .as_ref()
-                    .map_or(2, |handoff| handoff.next_generation.saturating_add(1));
-                if plan.next_generation != expected_generation {
-                    return Err(DomainError::InvalidState(
-                        "context handoff plan has an invalid generation".into(),
-                    ));
-                }
-                if !self
-                    .transcript
-                    .iter()
-                    .any(|message| message.message_id == plan.covered_through_message_id)
-                {
-                    return Err(DomainError::InvalidState(
-                        "context handoff plan boundary is absent from history".into(),
-                    ));
-                }
-                if let Some(existing) = &self.pending_context_handoff {
-                    if existing == plan {
-                        return Ok(());
-                    }
-                    return Err(DomainError::InvalidState(
-                        "context handoff already has a pending plan".into(),
-                    ));
-                }
-                self.pending_context_handoff = Some(plan.clone());
-                self.last_context_handoff_failure = None;
-            }
-            SessionEvent::ContextHandoffCreated { handoff } => {
-                let plan = self.pending_context_handoff.as_ref().ok_or_else(|| {
-                    DomainError::InvalidState("context handoff document has no pending plan".into())
-                })?;
-                if handoff.plan_id != plan.plan_id
-                    || handoff.previous_handoff_id != plan.previous_handoff_id
-                    || handoff.next_generation != plan.next_generation
-                    || handoff.covered_through_message_id != plan.covered_through_message_id
-                    || handoff.source_digest != plan.source_digest
-                    || handoff.source_tokens != plan.source_tokens
-                    || handoff.token_accounting_version != plan.token_accounting_version
-                    || handoff.selection != plan.selection
-                {
-                    return Err(DomainError::InvalidState(
-                        "context handoff document conflicts with its durable plan".into(),
-                    ));
-                }
-                if let Some(existing) = &self.latest_context_handoff {
-                    if existing.handoff_id == handoff.handoff_id && existing == handoff {
-                        self.pending_context_handoff = None;
-                        return Ok(());
-                    }
-                    if Some(existing.handoff_id.as_str()) != handoff.previous_handoff_id.as_deref()
-                    {
-                        return Err(DomainError::InvalidState(
-                            "context handoff document has a stale parent".into(),
-                        ));
-                    }
-                }
-                self.latest_context_handoff = Some(handoff.clone());
-                self.pending_context_handoff = None;
-                self.last_context_handoff_failure = None;
-            }
-            SessionEvent::ContextHandoffFailed { plan_id, error, .. } => {
-                let plan = self.pending_context_handoff.as_ref().ok_or_else(|| {
-                    DomainError::InvalidState("context handoff failure has no pending plan".into())
-                })?;
-                if plan.plan_id != *plan_id {
-                    return Err(DomainError::InvalidState(
-                        "context handoff failure belongs to another plan".into(),
-                    ));
-                }
-                self.pending_context_handoff = None;
-                self.last_context_handoff_failure = Some(error.clone());
-            }
-            SessionEvent::ModelRequestPrepared {
-                activation_id,
-                round_id,
-                request_id,
-                request_fingerprint,
-                provider_execution_fingerprint,
-                prompt_fingerprint,
-                tool_schema_fingerprint,
-                envelope,
-                maximum_attempts,
-                minimum_auth_revision,
-            } => {
-                let round = self.active_model_round.as_mut().ok_or_else(|| {
-                    DomainError::InvalidState("model request has no active round".into())
-                })?;
-                if round.activation_id != *activation_id || round.round_id != *round_id {
-                    return Err(DomainError::InvalidState(
-                        "model request belongs to another round".into(),
-                    ));
-                }
-                if round.request.is_some() {
-                    return Err(DomainError::InvalidState(
-                        "model request was prepared more than once".into(),
-                    ));
-                }
-                if self.active_activation.as_ref().is_none_or(|activation| {
-                    activation.minimum_auth_revision > *minimum_auth_revision
-                }) {
-                    return Err(DomainError::InvalidState(
-                        "model request minimum auth revision is below activation requirement"
-                            .into(),
-                    ));
-                }
-                round.request = Some(ModelRequestRecord {
-                    activation_id: activation_id.clone(),
-                    round_id: round_id.clone(),
-                    request_id: request_id.clone(),
-                    request_fingerprint: request_fingerprint.clone(),
-                    provider_execution_fingerprint: provider_execution_fingerprint.clone(),
-                    prompt_fingerprint: prompt_fingerprint.clone(),
-                    tool_schema_fingerprint: tool_schema_fingerprint.clone(),
-                    envelope: envelope.clone(),
-                    maximum_attempts: *maximum_attempts,
-                    minimum_auth_revision: *minimum_auth_revision,
-                });
-            }
-            SessionEvent::ModelAttemptStarted {
-                activation_id,
-                round_id,
-                request_id,
-                attempt_id,
-                attempt_number,
-                auth_revision,
-                started_at_ms,
-            } => {
-                let round = self.active_model_round.as_mut().ok_or_else(|| {
-                    DomainError::InvalidState("model attempt has no active round".into())
-                })?;
-                let request = round.request.as_ref().ok_or_else(|| {
-                    DomainError::InvalidState("model attempt has no prepared request".into())
-                })?;
-                if request.activation_id != *activation_id
-                    || request.round_id != *round_id
-                    || request.request_id != *request_id
-                {
-                    return Err(DomainError::InvalidState(
-                        "model attempt belongs to another request".into(),
-                    ));
-                }
-                if *attempt_number > request.maximum_attempts {
-                    return Err(DomainError::InvalidState(
-                        "model attempt exceeds prepared request budget".into(),
-                    ));
-                }
-                if let Some(existing) = &round.attempt {
-                    if existing.attempt_id == *attempt_id
-                        && existing.attempt_number == *attempt_number
-                    {
-                        return Ok(());
-                    }
-                    return Err(DomainError::InvalidState(
-                        "model request already has an attempt".into(),
-                    ));
-                }
-                if let Some(schedule) = &round.retry {
-                    if schedule.next_attempt_id != *attempt_id
-                        || schedule.next_attempt_number != *attempt_number
-                    {
-                        return Err(DomainError::InvalidState(
-                            "model attempt does not claim the scheduled retry".into(),
-                        ));
-                    }
-                } else if *attempt_number != 1 {
-                    return Err(DomainError::InvalidState(
-                        "first model attempt must have number one".into(),
-                    ));
-                }
-                round.attempt = Some(ModelAttemptRecord {
-                    activation_id: activation_id.clone(),
-                    round_id: round_id.clone(),
-                    request_id: request_id.clone(),
-                    attempt_id: attempt_id.clone(),
-                    attempt_number: *attempt_number,
-                    auth_revision: *auth_revision,
-                    started_at_ms: *started_at_ms,
-                    outcome: ModelAttemptOutcome::Running,
-                });
-                round.retry = None;
-            }
-            SessionEvent::ModelAttemptFailedFact {
-                activation_id,
-                round_id,
-                request_id,
-                attempt_id,
-                attempt_number,
-                ..
-            } => {
-                let attempt = current_model_attempt_mut(
-                    self,
-                    activation_id,
-                    round_id,
-                    request_id,
-                    attempt_id,
-                    *attempt_number,
-                )?;
-                match attempt.outcome {
-                    ModelAttemptOutcome::Running => attempt.outcome = ModelAttemptOutcome::Failed,
-                    ModelAttemptOutcome::Failed => return Ok(()),
-                    _ => {
-                        return Err(DomainError::InvalidState(
-                            "model attempt failure is not first-wins".into(),
-                        ))
-                    }
-                }
-            }
-            SessionEvent::ModelAttemptInterrupted {
-                activation_id,
-                round_id,
-                request_id,
-                attempt_id,
-                attempt_number,
-                ..
-            } => {
-                let attempt = current_model_attempt_mut(
-                    self,
-                    activation_id,
-                    round_id,
-                    request_id,
-                    attempt_id,
-                    *attempt_number,
-                )?;
-                match attempt.outcome {
-                    ModelAttemptOutcome::Running => {
-                        attempt.outcome = ModelAttemptOutcome::Interrupted
-                    }
-                    ModelAttemptOutcome::Interrupted => return Ok(()),
-                    _ => {
-                        return Err(DomainError::InvalidState(
-                            "model attempt interruption is not first-wins".into(),
-                        ))
-                    }
-                }
-            }
-            SessionEvent::ModelAttemptsExhausted { fact } => {
-                if let Some(existing) = &self.last_model_attempts_exhausted {
-                    if existing == fact {
-                        return Ok(());
-                    }
-                    if existing.activation_id == fact.activation_id {
-                        return Err(DomainError::InvalidState(
-                            "model exhaustion has conflicting semantics".into(),
-                        ));
-                    }
-                }
-                let round = self.active_model_round.as_ref().ok_or_else(|| {
-                    DomainError::InvalidState("model exhaustion has no active round".into())
-                })?;
-                let request = round.request.as_ref().ok_or_else(|| {
-                    DomainError::InvalidState("model exhaustion has no prepared request".into())
-                })?;
-                let attempt = round.attempt.as_ref().ok_or_else(|| {
-                    DomainError::InvalidState("model exhaustion has no active attempt".into())
-                })?;
-                if round.activation_id != fact.activation_id
-                    || round.round_id != fact.round_id
-                    || request.request_id != fact.request_id
-                    || attempt.attempt_id != fact.attempt_id
-                    || attempt.attempt_number != fact.attempt_number
-                    || request.maximum_attempts != fact.maximum_attempts
-                {
-                    return Err(DomainError::InvalidState(
-                        "model exhaustion belongs to another attempt".into(),
-                    ));
-                }
-                if !matches!(
-                    attempt.outcome,
-                    ModelAttemptOutcome::Failed | ModelAttemptOutcome::Interrupted
-                ) {
-                    return Err(DomainError::InvalidState(
-                        "model exhaustion requires a failed or interrupted attempt".into(),
-                    ));
-                }
-                self.last_model_attempts_exhausted = Some(fact.clone());
-            }
-            SessionEvent::ModelStepRetryScheduled { schedule } => {
-                let round = self.active_model_round.as_mut().ok_or_else(|| {
-                    DomainError::InvalidState("retry has no active model round".into())
-                })?;
-                let attempt = round.attempt.as_ref().ok_or_else(|| {
-                    DomainError::InvalidState("retry has no model attempt".into())
-                })?;
-                if attempt.activation_id != schedule.activation_id
-                    || attempt.round_id != schedule.round_id
-                    || attempt.request_id != schedule.request_id
-                    || attempt.attempt_id != schedule.failed_attempt_id
-                    || attempt.attempt_number != schedule.failed_attempt_number
-                {
-                    return Err(DomainError::InvalidState(
-                        "retry schedule does not match failed attempt".into(),
-                    ));
-                }
-                if !matches!(
-                    attempt.outcome,
-                    ModelAttemptOutcome::Failed | ModelAttemptOutcome::Interrupted
-                ) {
-                    return Err(DomainError::InvalidState(
-                        "retry schedule requires a failed or interrupted attempt".into(),
-                    ));
-                }
-                if let Some(existing) = &round.retry {
-                    if existing == schedule {
-                        return Ok(());
-                    }
-                    return Err(DomainError::InvalidState(
-                        "model retry schedule has conflicting semantics".into(),
-                    ));
-                }
-                round.retry = Some(schedule.clone());
-                round.attempt = None;
-            }
-            SessionEvent::ModelRequestCompleted {
-                activation_id,
-                round_id,
-                request_id,
-                attempt_id,
-            } => {
-                let round = self.active_model_round.as_mut().ok_or_else(|| {
-                    DomainError::InvalidState("model completion has no active round".into())
-                })?;
-                let attempt = round.attempt.as_mut().ok_or_else(|| {
-                    DomainError::InvalidState("model completion has no attempt".into())
-                })?;
-                if attempt.activation_id != *activation_id
-                    || attempt.round_id != *round_id
-                    || attempt.request_id != *request_id
-                    || attempt.attempt_id != *attempt_id
-                {
-                    return Err(DomainError::InvalidState(
-                        "model completion belongs to another attempt".into(),
-                    ));
-                }
-                match attempt.outcome {
-                    ModelAttemptOutcome::Running => {
-                        attempt.outcome = ModelAttemptOutcome::Completed
-                    }
-                    ModelAttemptOutcome::Completed => return Ok(()),
-                    _ => {
-                        return Err(DomainError::InvalidState(
-                            "model completion requires a running attempt".into(),
-                        ))
-                    }
-                }
-            }
-            SessionEvent::ActivationFinished {
-                activation_id,
-                outcome: _,
-                finished_at_ms: _,
-            } => {
-                let active = self.active_activation.as_ref().ok_or_else(|| {
-                    DomainError::InvalidState("activation finish has no active activation".into())
-                })?;
-                if active.activation_id != *activation_id {
-                    return Err(DomainError::InvalidState(
-                        "activation finish belongs to another activation".into(),
-                    ));
-                }
-                self.active_activation = None;
-                self.active_model_round = None;
-            }
-            SessionEvent::ModelAttemptFailed { failure } => {
-                if !self.transcript.last().is_some_and(|message| {
-                    message.role == TranscriptRole::User
-                        && message.message_id == failure.trigger_message_id
-                }) {
-                    return Err(DomainError::InvalidState(
-                        "model attempt failure does not match the current user message".into(),
-                    ));
-                }
-                if let Some(existing) = &self.last_model_attempt_failure {
-                    if existing.trigger_message_id == failure.trigger_message_id {
-                        if existing == failure {
-                            return Ok(());
-                        }
-                        return Err(DomainError::InvalidState(
-                            "current user message has conflicting terminal model failures".into(),
-                        ));
-                    }
-                }
-                self.last_model_attempt_failure = Some(failure.clone());
-            }
-            SessionEvent::WaitSet { wait } => {
-                self.active_wait = Some(wait.clone());
-                self.active_timer = None;
-                self.wake_pending_wait_id = None;
-            }
-            SessionEvent::WaitTimerScheduled { timer } => {
-                let wait = self.active_wait.as_ref().ok_or_else(|| {
-                    DomainError::InvalidState("wait timer has no active wait".into())
-                })?;
-                if wait.wait_id != timer.wait_id || wait.deadline_ms != timer.deadline_ms {
-                    return Err(DomainError::InvalidState(
-                        "wait timer does not match active wait".into(),
-                    ));
-                }
-                self.active_timer = Some(timer.clone());
-            }
-            SessionEvent::WaitCleared { wait_id } | SessionEvent::WaitExpired { wait_id } => {
-                if self.wake_pending_wait_id.as_deref() == Some(wait_id.as_str()) {
-                    return Ok(());
-                }
-                if self
-                    .active_wait
-                    .as_ref()
-                    .is_some_and(|wait| wait.wait_id == *wait_id)
-                {
-                    self.active_wait = None;
-                    self.active_timer = None;
-                    self.wake_pending_wait_id = None;
-                }
-            }
-            SessionEvent::AsyncToolCallStarted { record } => {
-                if let Some(existing) = self.async_tool_calls.get(&record.tool_call_id) {
-                    if existing == record {
-                        return Ok(());
-                    }
-                    return Err(DomainError::ConflictingAsyncToolCallStart(
-                        record.tool_call_id.clone(),
-                    ));
-                }
-                let Some(declared) = self.transcript.iter().find_map(|message| {
-                    message
-                        .tool_calls
-                        .iter()
-                        .find(|call| call.tool_call_id == record.tool_call_id)
-                }) else {
-                    return Err(DomainError::UnknownToolCall(record.tool_call_id.clone()));
-                };
-                if declared.tool_name != record.tool_name || declared.input != record.input {
-                    return Err(DomainError::ConflictingToolCallIdentity(
-                        record.tool_call_id.clone(),
-                    ));
-                }
-                if self.async_tool_calls.len() >= MAX_ASYNC_TOOL_CALLS {
-                    return Err(DomainError::CollectionTooLarge {
-                        field: "async tool calls",
-                        items: self.async_tool_calls.len() + 1,
-                        max: MAX_ASYNC_TOOL_CALLS,
-                    });
-                }
-                self.async_tool_calls
-                    .insert(record.tool_call_id.clone(), record.clone());
-            }
-            SessionEvent::AsyncToolCallRunning { tool_call_id } => {
-                let record = self
-                    .async_tool_calls
-                    .get_mut(tool_call_id)
-                    .ok_or_else(|| DomainError::UnknownAsyncToolCall(tool_call_id.clone()))?;
-                if record.completion_mode == CompletionMode::ExternalCallback
-                    && !self
-                        .callback_bindings
-                        .values()
-                        .any(|binding| binding.tool_call_id == *tool_call_id)
-                {
-                    return Err(DomainError::InvalidState(
-                        "external callback tool must be bound before it becomes running".into(),
-                    ));
-                }
-                match record.status {
-                    AsyncToolStatus::Planned => record.status = AsyncToolStatus::Running,
-                    AsyncToolStatus::Running => return Ok(()),
-                    AsyncToolStatus::UnknownOutcome if record.retry_dispatch_deduplicated => {
-                        record.status = AsyncToolStatus::Running
-                    }
-                    _ => {
-                        return Err(DomainError::InvalidState(
-                            "only a planned or safely reconcilable tool call can become running"
-                                .into(),
-                        ))
-                    }
-                }
-            }
-            SessionEvent::AsyncToolCallUnknownOutcome {
-                tool_call_id,
-                reason: _,
-            } => {
-                let record = self
-                    .async_tool_calls
-                    .get_mut(tool_call_id)
-                    .ok_or_else(|| DomainError::UnknownAsyncToolCall(tool_call_id.clone()))?;
-                match record.status {
-                    AsyncToolStatus::Running => record.status = AsyncToolStatus::UnknownOutcome,
-                    AsyncToolStatus::UnknownOutcome => return Ok(()),
-                    _ => {
-                        return Err(DomainError::InvalidState(
-                            "only a running tool call can become unknown outcome".into(),
-                        ))
-                    }
-                }
-            }
-            SessionEvent::AsyncToolCallRuntimeRestarted {
-                tool_call_id,
-                reason,
-                completed_at_ms,
-            } => {
-                let record = self
-                    .async_tool_calls
-                    .get_mut(tool_call_id)
-                    .ok_or_else(|| DomainError::UnknownAsyncToolCall(tool_call_id.clone()))?;
-                if record.status == AsyncToolStatus::UnknownOutcome {
-                    return Ok(());
-                }
-                if record.status.is_terminal() {
-                    return Ok(());
-                }
-                if *completed_at_ms < record.started_at_ms {
-                    return Err(DomainError::InvalidTimestampOrder {
-                        start: record.started_at_ms,
-                        end: *completed_at_ms,
-                    });
-                }
-                record.status = AsyncToolStatus::RuntimeRestarted;
-                record.result = None;
-                record.error = Some(ToolError {
-                    class: "runtime_restarted".into(),
-                    message: reason.clone(),
-                });
-                record.cancel_reason = None;
-                record.completed_at_ms = Some(*completed_at_ms);
-            }
-            SessionEvent::AsyncToolCallCallbackPlanned { binding } => {
-                let record = self
-                    .async_tool_calls
-                    .get(&binding.tool_call_id)
-                    .ok_or_else(|| {
-                        DomainError::UnknownAsyncToolCall(binding.tool_call_id.clone())
-                    })?;
-                if record.completion_mode != CompletionMode::ExternalCallback {
-                    return Err(DomainError::InvalidState(
-                        "callback binding requires external-callback tool mode".into(),
-                    ));
-                }
-                if !matches!(
-                    record.status,
-                    AsyncToolStatus::Planned | AsyncToolStatus::Running
-                ) {
-                    return Err(DomainError::InvalidState(
-                        "callback binding requires a nonterminal tool call".into(),
-                    ));
-                }
-                if let Some(existing) = self.callback_bindings.get(&binding.callback_id) {
-                    if existing == binding {
-                        return Ok(());
-                    }
-                    return Err(DomainError::InvalidState(
-                        "callback id has conflicting binding".into(),
-                    ));
-                }
-                if self
-                    .callback_bindings
-                    .values()
-                    .any(|existing| existing.tool_call_id == binding.tool_call_id)
-                {
-                    return Err(DomainError::InvalidState(
-                        "tool call already has a callback binding".into(),
-                    ));
-                }
-                self.callback_bindings
-                    .insert(binding.callback_id.clone(), binding.clone());
-            }
-            SessionEvent::AsyncToolCallCallbackCompleted {
-                callback_id,
-                tool_call_id,
-                payload_fingerprint,
-                result,
-                completed_at_ms,
-            } => {
-                let binding = self
-                    .callback_bindings
-                    .get_mut(callback_id)
-                    .ok_or_else(|| DomainError::UnknownCallback(callback_id.clone()))?;
-                if binding.tool_call_id != *tool_call_id {
-                    return Err(DomainError::InvalidState(
-                        "callback completion belongs to another tool call".into(),
-                    ));
-                }
-                if let Some(existing) = &binding.payload_fingerprint {
-                    if existing == payload_fingerprint {
-                        return Ok(());
-                    }
-                    return Err(DomainError::CallbackPayloadConflict(callback_id.clone()));
-                }
-                let record = self
-                    .async_tool_calls
-                    .get_mut(tool_call_id)
-                    .ok_or_else(|| DomainError::UnknownAsyncToolCall(tool_call_id.clone()))?;
-                if record.status.is_terminal() {
-                    return Err(DomainError::CallbackTerminalConflict(tool_call_id.clone()));
-                }
-                if *completed_at_ms < record.started_at_ms {
-                    return Err(DomainError::InvalidTimestampOrder {
-                        start: record.started_at_ms,
-                        end: *completed_at_ms,
-                    });
-                }
-                record.status = AsyncToolStatus::Completed;
-                record.result = Some(result.clone());
-                record.error = None;
-                record.cancel_reason = None;
-                record.completed_at_ms = Some(*completed_at_ms);
-                binding.payload_fingerprint = Some(payload_fingerprint.clone());
-            }
-            SessionEvent::AsyncToolCallCallbackFailed {
-                callback_id,
-                tool_call_id,
-                payload_fingerprint,
-                error,
-                completed_at_ms,
-            } => {
-                let binding = self
-                    .callback_bindings
-                    .get_mut(callback_id)
-                    .ok_or_else(|| DomainError::UnknownCallback(callback_id.clone()))?;
-                if binding.tool_call_id != *tool_call_id {
-                    return Err(DomainError::InvalidState(
-                        "callback completion belongs to another tool call".into(),
-                    ));
-                }
-                if let Some(existing) = &binding.payload_fingerprint {
-                    if existing == payload_fingerprint {
-                        return Ok(());
-                    }
-                    return Err(DomainError::CallbackPayloadConflict(callback_id.clone()));
-                }
-                let record = self
-                    .async_tool_calls
-                    .get_mut(tool_call_id)
-                    .ok_or_else(|| DomainError::UnknownAsyncToolCall(tool_call_id.clone()))?;
-                if record.status.is_terminal() {
-                    return Err(DomainError::CallbackTerminalConflict(tool_call_id.clone()));
-                }
-                if *completed_at_ms < record.started_at_ms {
-                    return Err(DomainError::InvalidTimestampOrder {
-                        start: record.started_at_ms,
-                        end: *completed_at_ms,
-                    });
-                }
-                record.status = AsyncToolStatus::Failed;
-                record.result = None;
-                record.error = Some(error.clone());
-                record.cancel_reason = None;
-                record.completed_at_ms = Some(*completed_at_ms);
-                binding.payload_fingerprint = Some(payload_fingerprint.clone());
-            }
-            SessionEvent::AsyncToolCallProgress {
-                tool_call_id,
-                progress,
-            } => {
-                let record = self
-                    .async_tool_calls
-                    .get_mut(tool_call_id)
-                    .ok_or_else(|| DomainError::UnknownAsyncToolCall(tool_call_id.clone()))?;
-                if record.status.is_terminal() {
-                    return Ok(());
-                }
-                record.progress = Some(progress.clone());
-            }
-            SessionEvent::AsyncToolCallCompleted {
-                tool_call_id,
-                result,
-                completed_at_ms,
-            } => {
-                let record = self
-                    .async_tool_calls
-                    .get_mut(tool_call_id)
-                    .ok_or_else(|| DomainError::UnknownAsyncToolCall(tool_call_id.clone()))?;
-                if record.status == AsyncToolStatus::UnknownOutcome {
-                    return Err(DomainError::UnknownOutcomeTerminalConflict(
-                        tool_call_id.clone(),
-                    ));
-                }
-                if record.status.is_terminal() {
-                    return Ok(());
-                }
-                if *completed_at_ms < record.started_at_ms {
-                    return Err(DomainError::InvalidTimestampOrder {
-                        start: record.started_at_ms,
-                        end: *completed_at_ms,
-                    });
-                }
-                record.status = AsyncToolStatus::Completed;
-                record.result = Some(result.clone());
-                record.error = None;
-                record.cancel_reason = None;
-                record.completed_at_ms = Some(*completed_at_ms);
-            }
-            SessionEvent::AsyncToolCallFailed {
-                tool_call_id,
-                error,
-                completed_at_ms,
-            } => {
-                let record = self
-                    .async_tool_calls
-                    .get_mut(tool_call_id)
-                    .ok_or_else(|| DomainError::UnknownAsyncToolCall(tool_call_id.clone()))?;
-                if record.status == AsyncToolStatus::UnknownOutcome {
-                    return Err(DomainError::UnknownOutcomeTerminalConflict(
-                        tool_call_id.clone(),
-                    ));
-                }
-                if record.status.is_terminal() {
-                    return Ok(());
-                }
-                if *completed_at_ms < record.started_at_ms {
-                    return Err(DomainError::InvalidTimestampOrder {
-                        start: record.started_at_ms,
-                        end: *completed_at_ms,
-                    });
-                }
-                record.status = AsyncToolStatus::Failed;
-                record.result = None;
-                record.error = Some(error.clone());
-                record.cancel_reason = None;
-                record.completed_at_ms = Some(*completed_at_ms);
-            }
-            SessionEvent::AsyncToolCallCancelled {
-                tool_call_id,
-                reason,
-                completed_at_ms,
-            } => {
-                let record = self
-                    .async_tool_calls
-                    .get_mut(tool_call_id)
-                    .ok_or_else(|| DomainError::UnknownAsyncToolCall(tool_call_id.clone()))?;
-                if record.status == AsyncToolStatus::UnknownOutcome {
-                    return Err(DomainError::UnknownOutcomeTerminalConflict(
-                        tool_call_id.clone(),
-                    ));
-                }
-                if record.status.is_terminal() {
-                    return Ok(());
-                }
-                if *completed_at_ms < record.started_at_ms {
-                    return Err(DomainError::InvalidTimestampOrder {
-                        start: record.started_at_ms,
-                        end: *completed_at_ms,
-                    });
-                }
-                record.status = AsyncToolStatus::Cancelled;
-                record.result = None;
-                record.error = None;
-                record.cancel_reason = Some(reason.clone());
-                record.completed_at_ms = Some(*completed_at_ms);
-            }
-            SessionEvent::DedupeRecorded { key } => self.dedupe_facts.remember(key.clone()),
-        }
-        Ok(())
-    }
-
-    fn validate_event_position(&self, event: &SessionEvent) -> Result<(), DomainError> {
-        match (self.stream_version, event) {
-            (0, SessionEvent::SessionCreated { .. }) => Ok(()),
-            (0, _) => Err(DomainError::SessionNotCreated),
-            (_, SessionEvent::SessionCreated { .. }) => Err(DomainError::SessionAlreadyCreated),
-            _ => Ok(()),
-        }
-    }
-}
-
-#[derive(Debug, Error, PartialEq)]
-pub enum DomainError {
-    #[error("{field} must not be empty")]
-    EmptyField { field: &'static str },
-    #[error("{field} is too large: {bytes} bytes, maximum is {max}")]
-    TextTooLarge {
-        field: &'static str,
-        bytes: usize,
-        max: usize,
-    },
-    #[error("{field} collection is too large: {items} items, maximum is {max}")]
-    CollectionTooLarge {
-        field: &'static str,
-        items: usize,
-        max: usize,
-    },
-    #[error("durable payload is too large: {bytes} bytes, maximum is {max}")]
-    DurablePayloadTooLarge { bytes: usize, max: usize },
-    #[error("invalid durable payload: {0}")]
-    InvalidDurablePayload(String),
-    #[error("wait timeout must be between {WAIT_MIN_SECONDS} and {WAIT_MAX_SECONDS} seconds")]
-    InvalidWaitTimeout,
-    #[error("event batch must not be empty")]
-    EmptyEventBatch,
-    #[error("session mismatch: expected {expected}, got {actual}")]
-    SessionMismatch { expected: String, actual: String },
-    #[error("stream version gap: expected {expected}, got {actual}")]
-    StreamVersionGap {
-        expected: StreamVersion,
-        actual: StreamVersion,
-    },
-    #[error("event id was applied more than once: {0}")]
-    DuplicateEventId(String),
-    #[error("unsupported event schema version: {0}")]
-    UnsupportedEventSchema(u32),
-    #[error("unsupported SessionCreated schema version: {0}")]
-    UnsupportedSessionCreatedSchema(u32),
-    #[error("session stream does not begin with SessionCreated")]
-    SessionNotCreated,
-    #[error("SessionCreated can only be the first stream event")]
-    SessionAlreadyCreated,
-    #[error("session creation time must not be negative")]
-    InvalidCreatedAt,
-    #[error("{field} must not be negative")]
-    InvalidTimestamp { field: &'static str },
-    #[error("timestamp order is invalid: {start} is after {end}")]
-    InvalidTimestampOrder { start: i64, end: i64 },
-    #[error("invalid state: {0}")]
-    InvalidState(String),
-    #[error("async tool call {0} has an invalid start record")]
-    InvalidAsyncToolStart(String),
-    #[error("async tool call {0} was started with conflicting semantics")]
-    ConflictingAsyncToolCallStart(String),
-    #[error("async tool call {0} is unknown")]
-    UnknownAsyncToolCall(String),
-    #[error("async tool call {0} has an unknown outcome and cannot be rewritten")]
-    UnknownOutcomeTerminalConflict(String),
-    #[error("external callback {0} is unknown")]
-    UnknownCallback(String),
-    #[error("external callback {0} has a conflicting payload")]
-    CallbackPayloadConflict(String),
-    #[error("external callback terminal outcome conflicts for tool call {0}")]
-    CallbackTerminalConflict(String),
-    #[error("delivery {0} has conflicting semantics")]
-    ConflictingDelivery(String),
-    #[error("delivery {0} is unknown")]
-    UnknownDelivery(u64),
-    #[error("delivery {0} was not materialized")]
-    DeliveryNotMaterialized(u64),
-    #[error("delivery {0} materialization identity is invalid")]
-    MaterializationIdentity(u64),
-    #[error("delivery acknowledgement {requested} skips future queue ids; maximum enqueued is {max_queued}")]
-    AckBeyondEnqueued { requested: u64, max_queued: u64 },
-    #[error("delivery queue id expected {expected}, got {actual}")]
-    DeliveryQueueOrder { expected: u64, actual: u64 },
-    #[error("transcript message {0} has conflicting semantics")]
-    ConflictingTranscriptMessage(String),
-    #[error("transcript tool_call_id appears more than once: {0}")]
-    DuplicateTranscriptToolCallId(String),
-    #[error("tool call {0} is not declared by an assistant message")]
-    UnknownToolCall(String),
-    #[error("tool call {0} has conflicting durable identity")]
-    ConflictingToolCallIdentity(String),
-    #[error("stream version overflow")]
-    VersionOverflow,
 }
 
 fn validate_delivery(
@@ -3179,6 +1665,27 @@ fn validate_model_error(error: &ModelAttemptError) -> Result<(), DomainError> {
     validate_bounded_text("model error message", &error.message)
 }
 
+fn validate_model_usage_anchor(anchor: &ModelUsageAnchor) -> Result<(), DomainError> {
+    if anchor.context_generation == 0
+        || anchor.input_tokens == 0
+        || anchor.local_input_estimate_tokens == Some(0)
+        || anchor.input_estimate_scale_millionths == Some(0)
+    {
+        return Err(DomainError::InvalidState(
+            "model usage anchor has invalid token accounting".into(),
+        ));
+    }
+    validate_model_fingerprint(
+        "model usage selection fingerprint",
+        &anchor.selection_fingerprint,
+    )?;
+    validate_model_fingerprint(
+        "model usage tool schema fingerprint",
+        &anchor.tool_schema_fingerprint,
+    )?;
+    validate_identifier("model usage result_message_id", &anchor.result_message_id)
+}
+
 fn validate_context_handoff_plan(plan: &ContextHandoffPlan) -> Result<(), DomainError> {
     validate_identifier("context handoff plan_id", &plan.plan_id)?;
     validate_identifier("context handoff activation_id", &plan.activation_id)?;
@@ -3215,7 +1722,14 @@ fn validate_context_handoff_document(handoff: &ContextHandoffDocument) -> Result
     )?;
     validate_model_fingerprint("context handoff source digest", &handoff.source_digest)?;
     validate_model_fingerprint("context handoff document digest", &handoff.document_digest)?;
-    handoff.document.validate()?;
+    require_text("context handoff document", &handoff.document)?;
+    if handoff.document.len() > MAX_MESSAGE_CONTENT_BYTES {
+        return Err(DomainError::TextTooLarge {
+            field: "context handoff document",
+            bytes: handoff.document.len(),
+            max: MAX_MESSAGE_CONTENT_BYTES,
+        });
+    }
     if handoff.next_generation < 2
         || handoff.source_tokens == 0
         || handoff.document_tokens == 0
@@ -3319,7 +1833,7 @@ fn validate_active_model_round(round: &ActiveModelRound) -> Result<(), DomainErr
         validate_identifier("request_id", &request.request_id)?;
         if request.activation_id != round.activation_id || request.round_id != round.round_id {
             return Err(DomainError::InvalidState(
-                "prepared model request belongs to another round".into(),
+                "declared model request belongs to another round".into(),
             ));
         }
         validate_model_fingerprint("request_fingerprint", &request.request_fingerprint)?;
@@ -3329,13 +1843,15 @@ fn validate_active_model_round(round: &ActiveModelRound) -> Result<(), DomainErr
         )?;
         validate_model_fingerprint("prompt_fingerprint", &request.prompt_fingerprint)?;
         validate_model_fingerprint("tool_schema_fingerprint", &request.tool_schema_fingerprint)?;
-        request.envelope.validate()?;
+        if let Some(envelope) = &request.legacy_envelope {
+            envelope.validate()?;
+        }
         if request.maximum_attempts == 0
             || request.maximum_attempts > MAX_MODEL_ATTEMPTS_PER_STEP
             || request.minimum_auth_revision == 0
         {
             return Err(DomainError::InvalidState(
-                "prepared model request has invalid bounds".into(),
+                "declared model request has invalid bounds".into(),
             ));
         }
         if let Some(attempt) = &round.attempt {
@@ -3350,7 +1866,7 @@ fn validate_active_model_round(round: &ActiveModelRound) -> Result<(), DomainErr
             validate_identifier("attempt_id", &attempt.attempt_id)?;
             if attempt.attempt_number == 0 || attempt.attempt_number > request.maximum_attempts {
                 return Err(DomainError::InvalidState(
-                    "model attempt number is outside prepared request bounds".into(),
+                    "model attempt number is outside declared request bounds".into(),
                 ));
             }
             if attempt.auth_revision == 0 {
@@ -3362,7 +1878,7 @@ fn validate_active_model_round(round: &ActiveModelRound) -> Result<(), DomainErr
         }
     } else if round.attempt.is_some() || round.retry.is_some() {
         return Err(DomainError::InvalidState(
-            "model attempt/retry requires a prepared request".into(),
+            "model attempt/retry requires a declared request".into(),
         ));
     }
     if let Some(schedule) = &round.retry {
@@ -3395,7 +1911,7 @@ fn current_model_attempt_mut<'a>(
     let request = round
         .request
         .as_ref()
-        .ok_or_else(|| DomainError::InvalidState("model attempt has no prepared request".into()))?;
+        .ok_or_else(|| DomainError::InvalidState("model attempt has no declared request".into()))?;
     if request.activation_id != activation_id
         || request.round_id != round_id
         || request.request_id != request_id

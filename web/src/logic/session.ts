@@ -722,7 +722,9 @@ export class Session {
         model.provider_execution_kind !== descriptor.kind ||
         model.provider_execution_base_url !== descriptor.base_url ||
         JSON.stringify(model.provider_execution_options ?? {}) !==
-          JSON.stringify(descriptor.options))
+          JSON.stringify(descriptor.options) ||
+        JSON.stringify(model.limits ?? null) !==
+          JSON.stringify(descriptor.model_limits?.[model.model] ?? null))
     ) {
       return true;
     }

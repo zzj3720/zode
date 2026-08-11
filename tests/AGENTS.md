@@ -94,6 +94,13 @@ recording, fixture promotion, and replay.
   explicit fixture update with a human-readable request/response diff and the
   same secret scan; live-provider nondeterminism never rewrites it during an
   ordinary test run.
+- A long agent replay uses the stopped session's append-only event trace as its
+  single causal manifest. User deliveries and tool inputs/results are derived
+  from that trace and exercised through public HTTP or the real external
+  adapter; produced lifecycle events are compared back to the trace. Do not
+  maintain a parallel shell transcript or import recorded events into storage.
+  The provider cassette supplements only exact provider HTTP bytes that the
+  product intentionally does not persist in events.
 - Successful recordings may stay as ignored run artifacts. A recorded problem
   may not remain only in a live log: promote the sanitized cassette under
   `tests/fixtures/provider_recordings/`, bind it to a named real-process E2E,

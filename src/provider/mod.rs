@@ -589,6 +589,7 @@ impl AimuxProvider {
         let mut text = String::new();
         let mut tool_calls = Vec::<(String, String, String, Option<Value>)>::new();
         let mut finish = None;
+        let mut token_usage = None;
         while let Some(part) = stream.next().await {
             match part.map_err(|_| ModelError::ProviderFailed)? {
                 StreamPart::TextDelta { delta, .. } => {
@@ -638,7 +639,22 @@ impl AimuxProvider {
                         tool_calls.push((tool_call_id, tool_name, String::new(), Some(input)));
                     }
                 }
-                StreamPart::Finish { finish_reason, .. } => finish = Some(finish_reason),
+                StreamPart::Finish {
+                    finish_reason,
+                    usage,
+                    ..
+                } => {
+                    if finish_reason.raw.is_none() {
+                        return Err(ModelError::ProviderFailed);
+                    }
+                    token_usage = usage.input_tokens.total.map(|input_tokens| {
+                        crate::runtime::ModelTokenUsage {
+                            input_tokens: u64::from(input_tokens),
+                            output_tokens: u64::from(usage.output_tokens.total.unwrap_or(0)),
+                        }
+                    });
+                    finish = Some(finish_reason);
+                }
                 StreamPart::Error { .. } => return Err(ModelError::ProviderFailed),
                 _ => {}
             }
@@ -652,6 +668,7 @@ impl AimuxProvider {
                 Ok(ModelOutcome {
                     text,
                     tool_calls: Vec::new(),
+                    usage: token_usage,
                 })
             }
             FinishReasonUnified::ToolCalls => {
@@ -687,6 +704,7 @@ impl AimuxProvider {
                 Ok(ModelOutcome {
                     text,
                     tool_calls: calls,
+                    usage: token_usage,
                 })
             }
             FinishReasonUnified::Error

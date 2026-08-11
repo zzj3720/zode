@@ -25,6 +25,7 @@ const MAX_MODEL_RETRY_MS: u64 = 3_600_000;
 const MAX_MODEL_STREAM_IDLE_TIMEOUT_MS: u64 = 86_400_000;
 const MAX_MODEL_CONTEXT_TOKENS: u64 = 16 * 1024 * 1024;
 const MAX_CONTEXT_HANDOFF_DOCUMENT_TOKENS: u64 = 60 * 1024;
+const MAX_CONTEXT_HANDOFF_GENERATION_TOKENS: u64 = 256 * 1024;
 const MAX_AUTO_WAIT_TIMEOUT_SECONDS: u64 = 600;
 const MAX_NAME_BYTES: usize = 128;
 const MAX_AUTHORITY_ID_BYTES: usize = 64;
@@ -105,8 +106,9 @@ struct ControllerAuthConfig {
 struct RuntimeConfig {
     tool_foreground_ms: u64,
     snapshot_every_events: Option<u64>,
-    model_context_input_tokens: u64,
-    model_context_handoff_at_tokens: u64,
+    model_request_max_output_tokens: u64,
+    model_context_buffer_tokens: u64,
+    model_context_handoff_generation_tokens: u64,
     model_context_handoff_document_tokens: u64,
     model_step_max_attempts: u64,
     model_retry_base_ms: u64,
@@ -221,8 +223,12 @@ impl EndpointConfig {
         zode::runtime::RuntimeOptions {
             snapshot_every: self.runtime.snapshot_every_events,
             tool_foreground: Duration::from_millis(self.runtime.tool_foreground_ms),
-            model_context_input_tokens: self.runtime.model_context_input_tokens,
-            model_context_handoff_at_tokens: self.runtime.model_context_handoff_at_tokens,
+            model_request_max_output_tokens: self.runtime.model_request_max_output_tokens as u32,
+            model_context_buffer_tokens: self.runtime.model_context_buffer_tokens,
+            model_context_handoff_generation_tokens: self
+                .runtime
+                .model_context_handoff_generation_tokens
+                as u32,
             model_context_handoff_document_tokens: self
                 .runtime
                 .model_context_handoff_document_tokens
@@ -435,8 +441,9 @@ impl Default for RuntimeConfig {
         Self {
             tool_foreground_ms: 3_000,
             snapshot_every_events: None,
-            model_context_input_tokens: 32_768,
-            model_context_handoff_at_tokens: 24_576,
+            model_request_max_output_tokens: 128_000,
+            model_context_buffer_tokens: 32_000,
+            model_context_handoff_generation_tokens: 128_000,
             model_context_handoff_document_tokens: 4_096,
             model_step_max_attempts: 3,
             model_retry_base_ms: 500,
@@ -639,28 +646,30 @@ fn validate_runtime(runtime: &RuntimeConfig) -> Result<(), ConfigError> {
         "runtime.snapshot_every_events",
     )?;
     validate_positive(
-        runtime.model_context_input_tokens,
-        MAX_MODEL_CONTEXT_TOKENS,
-        "runtime.model_context_input_tokens",
+        runtime.model_request_max_output_tokens,
+        u64::from(u32::MAX),
+        "runtime.model_request_max_output_tokens",
     )?;
     validate_positive(
-        runtime.model_context_handoff_at_tokens,
+        runtime.model_context_buffer_tokens,
         MAX_MODEL_CONTEXT_TOKENS,
-        "runtime.model_context_handoff_at_tokens",
+        "runtime.model_context_buffer_tokens",
+    )?;
+    validate_positive(
+        runtime.model_context_handoff_generation_tokens,
+        MAX_CONTEXT_HANDOFF_GENERATION_TOKENS,
+        "runtime.model_context_handoff_generation_tokens",
     )?;
     validate_positive(
         runtime.model_context_handoff_document_tokens,
         MAX_CONTEXT_HANDOFF_DOCUMENT_TOKENS,
         "runtime.model_context_handoff_document_tokens",
     )?;
-    if runtime.model_context_handoff_at_tokens >= runtime.model_context_input_tokens {
+    if runtime.model_context_handoff_document_tokens
+        > runtime.model_context_handoff_generation_tokens
+    {
         return Err(ConfigError::Invalid(
-            "runtime.model_context_handoff_at_tokens must be below model_context_input_tokens",
-        ));
-    }
-    if runtime.model_context_handoff_document_tokens >= runtime.model_context_handoff_at_tokens {
-        return Err(ConfigError::Invalid(
-            "runtime.model_context_handoff_document_tokens must be below model_context_handoff_at_tokens",
+            "runtime.model_context_handoff_document_tokens must not exceed model_context_handoff_generation_tokens",
         ));
     }
     validate_positive(

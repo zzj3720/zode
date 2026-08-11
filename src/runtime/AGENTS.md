@@ -46,16 +46,25 @@ SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
 
 ## Round behavior and recovery
 
-- Before calling aimux, durably prepare the complete bounded credential-free,
-  model-neutral request envelope (or immutable blob reference), its
-  fingerprints, logical request/round IDs, selection, and maximum zode attempt
-  count once. The provider adapter converts that envelope to aimux types.
-  Before every dispatch, commit a fresh attempt ID and monotonic attempt number.
+- Assemble each provider request transiently in memory from the latest
+  committed session projection and current round boundary. Never serialize the
+  assembled provider request or a second request-owned copy of its transcript,
+  tool definitions, prompt, or controls into an event, storage snapshot, or
+  blob. A normal storage snapshot may represent the one authoritative
+  `SessionState` projection, but it is never provider-request authority. Before every dispatch,
+  commit only lifecycle facts: request/round identity, selected execution facts
+  or fingerprints, fresh attempt ID, concrete credential revision, and
+  monotonic attempt number.
+- Bytes already sent in one HTTP request cannot be changed, but that transport
+  fact is not a durable frozen-request abstraction. New deliveries remain
+  durable and enter the next model round.
 - Keep aimux's bounded pre-stream transport retries enabled. They are adapter
   tracing/metrics, not session events. If aimux returns a retryable terminal or
   mid-stream error, discard every partial candidate and optionally retry the
-  same prepared model step under the configured zode budget, committing the
-  classified retry decision and delay. Runtime publication preserves that
+  current in-memory model step under the configured zode budget, committing the
+  classified retry decision and delay. The request object may be reused only
+  while that process and model round remain alive; it is not recoverable after
+  a crash. Runtime publication preserves that
   durable retry boundary ahead of every transient delta from the next attempt;
   transport backpressure cannot concatenate failed-attempt and retry text.
   Retry attempts do not absorb newer deliveries because they are not a new
@@ -70,7 +79,7 @@ SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
   call. Commit the concrete revision in `ModelAttemptStarted`. Never use a
   management default, environment fallback, another profile, a stale secret,
   or a tombstoned revision. Replica bytes remain behind the credential port and
-  out of prepared envelopes/events.
+  out of session events.
 - Do not commit an assistant outcome or execute any tool until the complete
   stream ends normally with a valid finish and all completed tool calls pass
   validation for configured ordinary adapter tools. The runtime-owned
@@ -96,10 +105,30 @@ SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
   resources independently; never turn an unfinished tool loop into `Finished`
   because a counter reached an arbitrary value.
 - Keep complete public transcript history append-only while bounding each
-  provider context generation by tokens. Before a normal request exceeds its
-  configured threshold, ask the current agent through the same selected
-  aimux/provider path to write a bounded durable handoff document, atomically
-  advance the context generation, and continue the same activation/task. The
+  provider context generation by tokens. Keep the selected model's advertised
+  context/output capabilities separate from the actual request output limit
+  and the runtime safety reserve; subtract both actual request output and the
+  independent safety buffer from the context window, never the model's full
+  output capability by default. Ordinary rounds stop before that buffer; the
+  handoff request may consume the reserved headroom while still reserving its
+  own output allowance and staying inside the absolute context window. Anchor
+  accounting on provider-reported input
+  usage and estimate only the newly appended durable tail. Calibrate that tail
+  with the highest observed provider-input/local-estimate ratio. Do not add
+  private reasoning output wholesale to the next input; visible committed
+  output is already in the tail. Before a valid anchor, use exactly four
+  UTF-8 bytes/token as a coarse local baseline plus explicit framing, with no
+  second multiplier; the independent context buffer is the safety reserve.
+  Before a normal request exceeds that budget,
+  ask the current agent through the same selected
+  aimux/provider path to write a bounded durable handoff document from an inert
+  source input; prior operational prompts and tool roles are evidence, not
+  executable roles in the handoff request. Accept only a versioned plain
+  document in its first-class text field, never a generic inline JSON payload
+  or tool-call wire syntax. Keep provider-generation and durable-
+  document token limits separate so reasoning allowance cannot enlarge the
+  stored handoff. Atomically advance the context
+  generation and continue the same activation/task. The
   fresh generation receives no implicit old transcript or handoff body; it uses
   runtime-owned read-only tools to open the handoff and page or chunk original
   history as needed. Restart reuses the committed handoff. Never delete history,
@@ -123,13 +152,11 @@ SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
   activation, not a session-wide singleton. A later activation may append its
   own exhaustion fact after the prior activation has finished; conflicting
   facts within one activation remain fail-closed.
-- Recovery marks an unterminated model attempt interrupted and schedules the
-  same prepared request as a new zode attempt only while its bounded step
-  budget remains. `ModelStepRetryScheduled` preallocates the stable next
-  attempt ID/number; starting it is one expected-version claim, so restart
-  neither duplicates nor skips it. If budget is exhausted, commit interruption,
-  typed `model_attempts_exhausted`, activation terminal, and queued-delivery
-  runnable state atomically. Never rerun a committed assistant/tool batch.
+- Recovery marks an unterminated model attempt interrupted and discards its
+  uncommitted partial candidate. If durable work remains, materialize every
+  committed delivery and build a new model round from the latest facts. Never
+  reconstruct or replay the pre-crash provider request, reuse its content as
+  authority, or rerun a committed assistant/tool batch.
 
 ## Acceptance
 
@@ -146,7 +173,7 @@ model/tool work, create a durable agent-authored handoff, enter a fresh context
 that actively reads the handoff and required paginated history, restart Endpoint
 before and after a handoff request, preserve its complete public transcript,
 materialize input admitted during the handoff before the first fresh-context
-request, replay the exact prepared handoff envelope across restart, avoid
+request, reconstruct a new handoff request from the durable plan after restart, avoid
 duplicate external effects, and reach one durable final without another user
 command.
 
@@ -159,25 +186,37 @@ Stable executable anchors are:
   `e2e_concurrent_inputs_preserve_both_assistant_rounds` fixing the complete
   `input A -> assistant A -> input B -> assistant B` durable and provider-wire
   order when B arrives during A's model request, and
-  `e2e_restart_recovers_queued_input_without_another_command` requiring the
+  `e2e_restart_rebuilds_conversation_from_latest_durable_facts` requiring the
   same order after A is interrupted, B is queued, and Endpoint restarts with
   no new client command, plus
   `e2e_long_task_continues_until_final`,
+  `e2e_recorded_deepswe_long_run_replays_through_real_endpoint`,
+  `e2e_model_request_reserves_128k_output_and_independent_context_buffer`,
+  `e2e_unanchored_model_input_uses_four_byte_fallback_without_hidden_multiplier`,
+  `e2e_provider_usage_anchor_excludes_discarded_reasoning_output_from_next_input`,
   `e2e_long_task_writes_handoff_and_continues_in_fresh_context`, and
+  `e2e_context_handoff_source_is_inert_and_document_is_plain_text`,
+  `e2e_context_handoff_plain_document_pages_without_generic_payload_limit`,
   `e2e_delivery_admitted_during_handoff_reaches_first_fresh_context`,
-  `e2e_handoff_restart_replays_frozen_request_and_queued_input`, and
-  `e2e_context_handoff_restart_reuses_committed_document` for autonomous
-  continuation, bounded provider context, concurrent input, and restart;
+  `e2e_handoff_restart_rebuilds_from_durable_plan_and_queued_input`, and
+  `e2e_context_handoff_restart_reuses_committed_document`,
+  `e2e_large_history_result_crossing_handoff_threshold_continues_in_fresh_context`,
+  `e2e_context_handoff_request_never_exceeds_provider_input_budget`,
+  `e2e_context_handoff_plan_is_atomic_across_storage_failure`,
+  `e2e_model_request_lifecycle_does_not_persist_request_content`, and
+  `e2e_restart_rebuilds_conversation_from_latest_durable_facts`
+  for autonomous continuation, bounded provider context, atomic planning,
+  concurrent input, request non-duplication, and restart;
 - model retry/recovery:
   `e2e_model_pre_stream_rate_limit_is_one_logical_request`,
   `e2e_model_partial_stream_retry_has_no_partial_tool_effect`,
   `e2e_provider_process_exit_finishes_activation_without_stuck_working`,
-  `e2e_restart_reconciles_failed_model_attempt_before_retry_schedule`,
+  `e2e_restart_reconciles_failed_model_attempt_before_fresh_request`,
   `e2e_restart_reconciles_failed_model_attempt_before_terminal_finish`,
   `e2e_restart_reconciles_failed_attempt_after_prior_activation_exhaustion`,
   `e2e_tombstoned_replica_never_reaches_provider_before_or_after_restart`,
-  `e2e_hard_crash_recovery_exhausts_one_model_attempt_and_keeps_delivery_runnable`,
-  and `e2e_hard_crash_after_retry_fact_claims_one_scheduled_attempt`;
+  `e2e_hard_crash_rebuilds_fresh_request_without_consuming_attempt_budget`,
+  and `e2e_restart_after_retry_decision_builds_fresh_request`;
 - wait/concurrency/terminal behavior:
   `e2e_mixed_tool_batch_is_concurrent_ordered_and_waits_once`,
   `e2e_explicit_wait_last_wins_without_skipping_ordinary_tool`,

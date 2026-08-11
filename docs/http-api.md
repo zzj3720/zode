@@ -106,8 +106,9 @@ The v0 configuration shape is conceptually:
   "runtime": {
     "tool_foreground_ms": 3000,
     "snapshot_every_events": 100,
-    "model_context_input_tokens": 32768,
-    "model_context_handoff_at_tokens": 24576,
+    "model_request_max_output_tokens": 128000,
+    "model_context_buffer_tokens": 32000,
+    "model_context_handoff_generation_tokens": 128000,
     "model_context_handoff_document_tokens": 4096,
     "model_step_max_attempts": 3,
     "model_retry_base_ms": 500,
@@ -154,18 +155,26 @@ must be at least one. Retry delay uses bounded jitter between the configured
 base and maximum and honors a shorter valid provider hint.
 
 There is no model-round-count setting: an activation is not stopped after an
-arbitrary number of model/tool rounds. `model_context_input_tokens` is the
-maximum provider input budget after the deployment has reserved output
-capacity for its enabled models.
-`model_context_handoff_at_tokens` triggers an agent-authored durable handoff
-before that ceiling, and `model_context_handoff_document_tokens` bounds the
-handoff response. All counts include message framing and selected tool schemas
-through the runtime's versioned token accountant. V0 conservatively treats
-every serialized UTF-8 byte as at most one token and adds explicit
-message/tool framing reserves, so it can trigger early but cannot undercount
-the configured provider input budget. Invalid relationships fail startup. The
-next context generation starts without implicit old transcript or handoff-body
-injection and uses the built-in read-only handoff/history tools.
+arbitrary number of model/tool rounds. `model_request_max_output_tokens` is the
+actual ordinary-request output ceiling and is clamped by the selected model's
+advertised output capability. `model_context_buffer_tokens` is an independent
+safety reserve added after that output allowance. Usable input is the selected
+model context window minus both values; the model's full advertised output
+capability is not deducted unless an actual request asks for it. With the
+defaults, a 1,000,000-token model has an 840,000-token ordinary input budget,
+a 128,000-token requested output allowance, and a separate 32,000-token
+estimation and handoff-headroom reserve. Ordinary rounds cannot consume that
+reserve. A handoff request may consume it while still reserving its own output
+allowance and remaining inside the selected model's absolute context window.
+`model_context_handoff_generation_tokens` bounds the separate handoff request,
+while `model_context_handoff_document_tokens` bounds only its durable decoded
+document. The accountant anchors on provider-reported usage and estimates only
+the later tail; before a valid anchor it uses a four-UTF-8-bytes-per-token
+fallback plus explicit message/tool framing, without another hidden scale
+factor. The independent buffer above is the safety reserve. Raw serialized
+bytes are not counted as tokens. Invalid relationships fail startup. The next context
+generation starts without implicit old transcript or handoff-body injection
+and uses the built-in read-only handoff/history tools.
 These limits affect only provider context: public transcript history remains
 complete.
 
@@ -210,6 +219,10 @@ an HTTP tool.
       "options": {}
     },
     "model": "fixture-model",
+    "limits": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 384000
+    },
     "auth_authority_id": "authority-opaque",
     "auth_profile_id": "profile-opaque",
     "minimum_auth_revision": 3
@@ -234,6 +247,10 @@ installed revision at admission. A controller that distributed credentials
 should send the revision it verified. Omitting `model` creates a durable session
 that accepts and exposes messages but is not runnable until model selection is
 set; it does not silently choose an ambient provider or profile.
+`limits` records model capability, not the request output budget. A legacy
+selection may omit it and remains runnable, but Endpoint cannot safely trigger
+automatic context handoff for that selection because it will not invent a
+context window.
 `callback_base_url` is optional unless a selected external-callback tool needs
 it. It is concrete execution configuration supplied by the controller, must
 match Endpoint callback-origin policy, and does not cause Endpoint to connect
@@ -340,9 +357,11 @@ rather than silently restarting pagination.
 After a handoff, `context_handoff` exposes only its stable ID, parent ID,
 generation, covered transcript message ID, and token-accounting metadata. The
 handoff body is not injected as projection metadata; the successor agent reads
-it through the session-bound `read_context_handoff` runtime tool. That bounded
-tool result then becomes part of the ordinary append-only transcript like any
-other tool result.
+it through the session-bound `read_context_handoff` runtime tool. A long plain
+document is a first-class bounded text field rather than a generic inline JSON
+payload, and is returned in bounded UTF-8 chunks using `content_offset` and
+`next_content_offset`; each result then becomes part of the ordinary append-only
+transcript like any other tool result.
 
 List, read, mutation, and tool routes return the same safe not-found result for
 a missing session and a session owned by another authority/subject. The
@@ -385,6 +404,10 @@ duplicate the message.
     "options": {}
   },
   "model": "fixture-model",
+  "limits": {
+    "context_window_tokens": 1000000,
+    "max_output_tokens": 384000
+  },
   "auth_authority_id": "authority-opaque",
   "auth_profile_id": "profile-opaque",
   "minimum_auth_revision": 3
@@ -485,8 +508,8 @@ attempt text and retry text can never be presented as one candidate.
 Durable public kinds include session/message, activation final outcome,
 model-step retry/interruption, wait, and async tool lifecycle facts. A
 `model_step_retrying` payload exposes only round ID, failed/next/max zode
-attempt numbers, bounded delay, and a safe classified error code. Raw prepared
-model envelopes, credentials, raw tool result bodies, provider wire parts,
+attempt numbers, bounded delay, and a safe classified error code. Provider
+request content is never persisted or exposed. Credentials, raw tool result bodies, provider wire parts,
 aimux-internal HTTP attempts, internal ignored facts, snapshot operations, and
 mutable projection repair are not public event payloads. A transient text frame
 contains only bounded display text and the session/activation identity above;
@@ -494,15 +517,18 @@ provider metadata and raw wire parts remain private.
 
 The configured `model_step_max_attempts` includes the first zode call to aimux.
 Aimux may independently perform its bounded pre-stream transport retries inside
-one such call. A retry of the zode model step keeps the prepared request
-fingerprint and does not absorb deliveries that arrived after the round
-boundary. A stream that ends without a valid finish, contains invalid completed
+one such call. A retry of the zode model step may reuse the same in-memory
+request only while that process and round remain alive, and does not absorb
+deliveries that arrived after the round boundary. After a process restart the
+old request is abandoned and a new round is built from the latest durable
+facts. A stream that ends without a valid finish, contains invalid completed
 tool input, or emits an error has no assistant/tool side effect. If retry budget
 remains, the public retry event precedes the next attempt; otherwise the
 activation ends with safe typed `model_attempts_exhausted` and queued deliveries
 remain runnable. A retry event preallocates its stable next attempt ID/number.
-Starting that attempt is an expected-version claim; restart resumes an
-unclaimed schedule once and never appends a duplicate retry fact.
+Starting that attempt is an expected-version claim. A restart reconciles the
+failure boundary once, abandons the unavailable in-memory request, and never
+appends a duplicate retry fact.
 
 If durable catch-up fails after headers were sent, emit one neutral
 `event: error` with a stable public code, then close the stream.

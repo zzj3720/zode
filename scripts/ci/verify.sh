@@ -37,6 +37,10 @@ test -f "$UI_DIR/index.html" || die 'Vite+ build did not produce index.html'
 
 printf '%s\n' '== deterministic real-process/browser/replay E2E =='
 cargo test --locked --test process_capture_e2e -- --nocapture
+printf '%s\n' '== tracked DeepSWE event-log replay E2E =='
+cargo test --locked --test deepswe_e2e \
+  e2e_recorded_deepswe_long_run_replays_through_real_endpoint \
+  -- --exact --nocapture
 printf '%s\n' '== backend-neutral HTTP/SSE storage conformance =='
 "$ROOT/scripts/ci/storage-conformance.sh"
 printf '%s\n' '== Server--Endpoint protocol compatibility matrix E2E =='

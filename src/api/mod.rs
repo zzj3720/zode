@@ -34,7 +34,7 @@ use crate::{
     },
     domain::{
         ActiveWait, AsyncToolCallRecord, CompletionMode, DeliveryKind, DurablePayload, EventDraft,
-        EventRecord, ProviderExecutionSelection, QueuedDelivery, SessionEvent,
+        EventRecord, ModelLimits, ProviderExecutionSelection, QueuedDelivery, SessionEvent,
         SessionModelSelection, SessionOwner, SessionSelection, SessionState, ToolCall,
         TranscriptMessage, MAX_ERROR_MESSAGE_BYTES, MAX_IDENTIFIER_BYTES,
     },
@@ -200,10 +200,19 @@ struct CreateModelSelection {
     provider: String,
     provider_execution: CreateProviderExecutionSelection,
     model: String,
+    #[serde(default)]
+    limits: Option<CreateModelLimits>,
     auth_authority_id: String,
     auth_profile_id: String,
     #[serde(default = "default_auth_revision", alias = "minimum_auth_revision")]
     auth_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateModelLimits {
+    context_window_tokens: u64,
+    max_output_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1788,6 +1797,10 @@ fn model_selection_from_request(model: CreateModelSelection) -> SessionModelSele
             options: model.provider_execution.options,
         },
         model: model.model,
+        limits: model.limits.map(|limits| ModelLimits {
+            context_window_tokens: limits.context_window_tokens,
+            max_output_tokens: limits.max_output_tokens,
+        }),
         auth_authority_id: model.auth_authority_id,
         auth_profile_id: model.auth_profile_id,
         auth_revision: model.auth_revision,
@@ -2181,6 +2194,7 @@ fn public_model(model: SessionModelSelection) -> Value {
         "provider_execution_base_url": model.provider_execution.base_url,
         "provider_execution_options": model.provider_execution.options,
         "model": model.model,
+        "limits": model.limits,
         "auth_authority_id": model.auth_authority_id,
         "auth_profile_id": model.auth_profile_id,
         "auth_revision": model.auth_revision,
@@ -2298,13 +2312,15 @@ fn durable_fences_following_transient(record: &EventRecord) -> bool {
 }
 
 fn public_event(record: &EventRecord) -> Option<PublicEvent> {
-    // Durable storage contains private coordination facts (prepared request
-    // envelopes, attempt claims, dedupe/index details).  They remain in the
-    // stream for replay but never become public SSE frames.
+    // Durable storage contains private lifecycle claims and dedupe/index
+    // details. They remain in the stream for replay but never become public
+    // SSE frames. Provider request content is never persisted here.
     let kind = match &record.event {
         SessionEvent::ModelRequestPrepared { .. }
+        | SessionEvent::ModelRequestDeclared { .. }
         | SessionEvent::ContextHandoffPlanned { .. }
         | SessionEvent::ModelAttemptStarted { .. }
+        | SessionEvent::ModelRequestAbandoned { .. }
         | SessionEvent::ModelRequestCompleted { .. }
         | SessionEvent::WaitTimerScheduled { .. }
         | SessionEvent::AsyncToolCallCallbackPlanned { .. }

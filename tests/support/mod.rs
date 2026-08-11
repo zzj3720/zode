@@ -1450,9 +1450,21 @@ pub const HTTP_INCIDENT_RECORDING_SCHEMA: &str = "zode.http-incident-recording.v
 /// production code and is intentionally separate from the LLM cassette
 /// envelope.
 pub const PUBLIC_HTTP_GAP_RECORDING_SCHEMA: &str = "zode.public-http-gap-recording.v1";
-const MAX_LLM_RECORDING_BYTES: u64 = 16 * 1024 * 1024;
-pub const MAX_LLM_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_LLM_RESPONSE_CHUNKS: usize = 4_096;
+const MAX_LLM_RECORDING_BYTES: u64 = 64 * 1024 * 1024;
+// A long recorded agent run repeats its growing request context on every wire
+// exchange, so its private pre-promotion envelope can exceed the ordinary
+// cassette bound even when every individual request and response stays
+// bounded. Only the DeepSWE promotion/replay path uses this larger read bound;
+// tracked fixtures remain compressed and ordinary cassettes keep the smaller
+// limit above.
+const MAX_LLM_LONG_RUN_RECORDING_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_LLM_COMPRESSED_RECORDING_BYTES: u64 = 16 * 1024 * 1024;
+const LLM_COMPRESSED_RECORDING_LEVEL: i32 = 19;
+pub const MAX_LLM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+// Reasoning-capable providers can emit one SSE frame per short reasoning token.
+// Keep the byte ceiling authoritative while allowing a bounded long-task stream
+// to reach that ceiling instead of failing first on harmless frame granularity.
+const MAX_LLM_RESPONSE_CHUNKS: usize = 65_536;
 pub const MAX_LLM_CHUNK_DELAY_US: u64 = 60_000_000;
 const MAX_PUBLIC_HTTP_GAP_BODY_BYTES: usize = 4 * 1024 * 1024;
 
@@ -1565,11 +1577,37 @@ pub struct LlmHttpAttemptPlan {
 
 impl LlmHttpRecording {
     pub fn load(path: &Path) -> TestResult<Self> {
+        Self::load_with_bound(path, MAX_LLM_RECORDING_BYTES)
+    }
+
+    pub fn load_long_run(path: &Path) -> TestResult<Self> {
+        Self::load_with_bound(path, MAX_LLM_LONG_RUN_RECORDING_BYTES)
+    }
+
+    pub fn load_compressed(path: &Path) -> TestResult<Self> {
+        let file = fs::File::open(path)?;
+        if file.metadata()?.len() > MAX_LLM_COMPRESSED_RECORDING_BYTES {
+            return Err(IoError::other("compressed LLM recording exceeds its size bound").into());
+        }
+        let decoder = zstd::stream::read::Decoder::new(file)?;
+        let mut bytes = Vec::new();
+        decoder
+            .take(MAX_LLM_LONG_RUN_RECORDING_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_LLM_LONG_RUN_RECORDING_BYTES {
+            return Err(IoError::other("expanded LLM recording exceeds its size bound").into());
+        }
+        let recording: Self = serde_json::from_slice(&bytes)?;
+        recording.validate()?;
+        Ok(recording)
+    }
+
+    fn load_with_bound(path: &Path, max_bytes: u64) -> TestResult<Self> {
         let mut bytes = Vec::new();
         fs::File::open(path)?
-            .take(MAX_LLM_RECORDING_BYTES + 1)
+            .take(max_bytes + 1)
             .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_LLM_RECORDING_BYTES {
+        if bytes.len() as u64 > max_bytes {
             return Err(IoError::other("LLM recording exceeds its size bound").into());
         }
         let recording: Self = serde_json::from_slice(&bytes)?;
@@ -1599,6 +1637,80 @@ impl LlmHttpRecording {
     /// never overwritten.
     pub fn promote_immutable(&self, path: &Path, forbidden: &[&str]) -> TestResult<u64> {
         self.write_atomic_with_mode(path, forbidden, 0o444)
+    }
+
+    pub fn promote_immutable_compressed(&self, path: &Path, forbidden: &[&str]) -> TestResult<u64> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self)?;
+        for marker in forbidden.iter().filter(|marker| !marker.is_empty()) {
+            if bytes_contain(&bytes, marker.as_bytes()) {
+                return Err(IoError::other(
+                    "LLM recording contained forbidden credential material",
+                )
+                .into());
+            }
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| IoError::other("LLM recording path has no parent"))?;
+        fs::create_dir_all(parent)?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| IoError::other("LLM recording file name is invalid"))?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let temporary = parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let prepare = (|| -> TestResult<u64> {
+            let file = options.open(&temporary)?;
+            let mut encoder =
+                zstd::stream::write::Encoder::new(file, LLM_COMPRESSED_RECORDING_LEVEL)?;
+            encoder.include_checksum(true)?;
+            encoder.write_all(&bytes)?;
+            let file = encoder.finish()?;
+            file.sync_all()?;
+            drop(file);
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444))?;
+                fs::File::open(&temporary)?.sync_all()?;
+            }
+            Ok(fs::metadata(&temporary)?.len())
+        })();
+        let compressed_bytes = match prepare {
+            Ok(compressed_bytes) => compressed_bytes,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = fs::hard_link(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(if error.kind() == ErrorKind::AlreadyExists {
+                IoError::new(
+                    ErrorKind::AlreadyExists,
+                    "tracked compressed LLM recording is immutable",
+                )
+            } else {
+                error
+            }
+            .into());
+        }
+        fs::remove_file(&temporary)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(compressed_bytes)
     }
 
     fn write_atomic_with_mode(
@@ -1829,7 +1941,12 @@ fn validate_response(response: &LlmHttpRecordingResponse) -> TestResult<()> {
     }
     let mut response_bytes = 0usize;
     for (index, chunk) in response.chunks.iter().enumerate() {
-        if chunk.at_us > MAX_LLM_CHUNK_DELAY_US {
+        let previous_at_us = if index == 0 {
+            0
+        } else {
+            response.chunks[index - 1].at_us
+        };
+        if chunk.at_us < previous_at_us || chunk.at_us - previous_at_us > MAX_LLM_CHUNK_DELAY_US {
             return Err(IoError::other("LLM response captured timing bound exceeded").into());
         }
         let bytes = hex_decode(&chunk.bytes_hex)?;
@@ -1840,7 +1957,6 @@ fn validate_response(response: &LlmHttpRecordingResponse) -> TestResult<()> {
             return Err(IoError::other("LLM response capture byte bound exceeded").into());
         }
         if chunk.sequence != index as u64
-            || (index > 0 && chunk.at_us < response.chunks[index - 1].at_us)
             || (is_event_stream_content_type(response.content_type.as_deref())
                 && chunk.kind != LlmHttpChunkKind::Sse)
             || (!is_event_stream_content_type(response.content_type.as_deref())
@@ -2027,6 +2143,7 @@ enum LlmHttpProxyMode {
 struct RecordingSink {
     directory: PathBuf,
     requires_authorization: bool,
+    single_sequential_stream: bool,
     attempt_plan: Option<Vec<LlmHttpAttemptPlan>>,
     next_sequence: AtomicU64,
     chunk_count: AtomicU64,
@@ -2070,6 +2187,7 @@ impl RecordingSink {
         directory: PathBuf,
         attempt_plan: Option<Vec<LlmHttpAttemptPlan>>,
         requires_authorization: bool,
+        single_sequential_stream: bool,
     ) -> TestResult<Self> {
         fs::create_dir_all(&directory)?;
         #[cfg(unix)]
@@ -2080,6 +2198,7 @@ impl RecordingSink {
         Ok(Self {
             directory,
             requires_authorization,
+            single_sequential_stream,
             attempt_plan,
             next_sequence: AtomicU64::new(0),
             chunk_count: AtomicU64::new(0),
@@ -2245,13 +2364,13 @@ impl RecordingSink {
                     Some((previous, round, attempt, previous_retryable))
                         if previous == &logical_key =>
                     {
-                        if !*previous_retryable {
+                        if !*previous_retryable && !self.single_sequential_stream {
                             ambiguous_completion = true;
                             self.fail_flush(
                                 "ambiguous attempt identity; provide an explicit attempt plan",
                             );
                         }
-                        if *previous_retryable {
+                        if *previous_retryable || self.single_sequential_stream {
                             *attempt = attempt.saturating_add(1);
                         } else {
                             *attempt = 0;
@@ -2619,6 +2738,12 @@ pub struct LlmHttpProxy {
     state: std::sync::Arc<LlmHttpProxyState>,
 }
 
+struct LlmHttpRecordMode {
+    attempt_plan: Option<Vec<LlmHttpAttemptPlan>>,
+    requires_authorization: bool,
+    single_sequential_stream: bool,
+}
+
 impl LlmHttpProxy {
     pub async fn record(
         upstream_base_url: impl Into<String>,
@@ -2678,10 +2803,66 @@ impl LlmHttpProxy {
         attempt_plan: Option<Vec<LlmHttpAttemptPlan>>,
         requires_authorization: bool,
     ) -> TestResult<Self> {
+        Self::record_with_inference_mode(
+            upstream_base_url,
+            provider,
+            model,
+            quarantine_directory,
+            metadata,
+            LlmHttpRecordMode {
+                attempt_plan,
+                requires_authorization,
+                single_sequential_stream: false,
+            },
+        )
+        .await
+    }
+
+    /// Record one sequential model-request stream whose identical adjacent
+    /// requests are semantic retries of the same live in-memory request. This mode is
+    /// for a single live Endpoint session: concurrent requests still fail
+    /// closed, while an HTTP 200 response rejected by model-output validation
+    /// can be retained as the preceding wire attempt.
+    pub async fn record_single_sequential_stream(
+        upstream_base_url: impl Into<String>,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        quarantine_directory: impl Into<PathBuf>,
+        metadata: LlmHttpRecordingMetadata,
+    ) -> TestResult<Self> {
+        let requires_authorization = metadata.boundary.to_ascii_lowercase().contains("provider")
+            || metadata
+                .secret_slots
+                .iter()
+                .any(|slot| slot.to_ascii_uppercase().contains("AUTHORIZATION"));
+        Self::record_with_inference_mode(
+            upstream_base_url,
+            provider,
+            model,
+            quarantine_directory,
+            metadata,
+            LlmHttpRecordMode {
+                attempt_plan: None,
+                requires_authorization,
+                single_sequential_stream: true,
+            },
+        )
+        .await
+    }
+
+    async fn record_with_inference_mode(
+        upstream_base_url: impl Into<String>,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        quarantine_directory: impl Into<PathBuf>,
+        metadata: LlmHttpRecordingMetadata,
+        mode: LlmHttpRecordMode,
+    ) -> TestResult<Self> {
         let sink = std::sync::Arc::new(RecordingSink::new(
             quarantine_directory.into(),
-            attempt_plan,
-            requires_authorization,
+            mode.attempt_plan,
+            mode.requires_authorization,
+            mode.single_sequential_stream,
         )?);
         Self::start(LlmHttpProxyMode::Record {
             upstream_base_url: upstream_base_url.into(),
@@ -3657,13 +3838,28 @@ pub enum ModelScript {
     LargeStream {
         bytes: usize,
     },
+    CleanEof {
+        text: String,
+    },
     Final {
         text: String,
+    },
+    FinalWithUsage {
+        text: String,
+        input_tokens: u32,
+        output_tokens: u32,
     },
     ToolCall {
         tool_call_id: String,
         tool_name: String,
         arguments: String,
+    },
+    ToolCallWithUsage {
+        tool_call_id: String,
+        tool_name: String,
+        arguments: String,
+        input_tokens: u32,
+        output_tokens: u32,
     },
     ToolCalls(Vec<ToolCallScript>),
     Status(u16),
@@ -3766,8 +3962,24 @@ impl ModelScript {
         Self::LargeStream { bytes }
     }
 
+    pub fn clean_eof(text: impl Into<String>) -> Self {
+        Self::CleanEof { text: text.into() }
+    }
+
     pub fn final_text(text: impl Into<String>) -> Self {
         Self::Final { text: text.into() }
+    }
+
+    pub fn final_text_with_usage(
+        text: impl Into<String>,
+        input_tokens: u32,
+        output_tokens: u32,
+    ) -> Self {
+        Self::FinalWithUsage {
+            text: text.into(),
+            input_tokens,
+            output_tokens,
+        }
     }
 
     pub fn tool_call(
@@ -3779,6 +3991,22 @@ impl ModelScript {
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
             arguments: arguments.into(),
+        }
+    }
+
+    pub fn tool_call_with_usage(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        arguments: impl Into<String>,
+        input_tokens: u32,
+        output_tokens: u32,
+    ) -> Self {
+        Self::ToolCallWithUsage {
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            arguments: arguments.into(),
+            input_tokens,
+            output_tokens,
         }
     }
 
@@ -4049,11 +4277,16 @@ async fn model_request(
                     .expect("model fixture handoff hold mutex poisoned");
                 (!holds.is_empty()).then(|| holds.remove(0))
             };
+            let encoded_document = serde_json::to_string(&json!({
+                "schema": "zode.context-handoff-document.v1",
+                "document": document,
+            }))
+            .expect("fixture handoff document encodes");
             let script = match hold {
                 Some(hold) => {
-                    ModelScript::hold_entered(hold, ModelScript::final_text(document.clone()))
+                    ModelScript::hold_entered(hold, ModelScript::final_text(encoded_document))
                 }
-                None => ModelScript::final_text(document.clone()),
+                None => ModelScript::final_text(encoded_document),
             };
             return execute_model_script(script).await;
         }
@@ -4121,12 +4354,42 @@ async fn execute_model_script(mut script: ModelScript) -> AxumResponse {
             ModelScript::StreamDoneHold { hold } => return model_stream_done_hold(hold),
             ModelScript::StreamFailureHold { hold } => return model_stream_failure_hold(hold),
             ModelScript::LargeStream { bytes } => return model_large_stream(bytes),
+            ModelScript::CleanEof { text } => {
+                return model_stream(vec![sse_chunk(json!({
+                    "choices": [{
+                        "delta": {"reasoning_content": text},
+                        "finish_reason": null
+                    }]
+                }))]);
+            }
             ModelScript::Final { text } => return model_stream(final_chunks(&text)),
+            ModelScript::FinalWithUsage {
+                text,
+                input_tokens,
+                output_tokens,
+            } => {
+                return model_stream(final_chunks_with_usage(&text, input_tokens, output_tokens));
+            }
             ModelScript::ToolCall {
                 tool_call_id,
                 tool_name,
                 arguments,
             } => return model_stream(tool_chunks(&tool_call_id, &tool_name, &arguments)),
+            ModelScript::ToolCallWithUsage {
+                tool_call_id,
+                tool_name,
+                arguments,
+                input_tokens,
+                output_tokens,
+            } => {
+                return model_stream(tool_chunks_with_usage(
+                    &tool_call_id,
+                    &tool_name,
+                    &arguments,
+                    input_tokens,
+                    output_tokens,
+                ));
+            }
             ModelScript::ToolCalls(calls) => return model_stream(tool_batch_chunks(&calls)),
             ModelScript::Status(status) => {
                 let status =
@@ -4275,8 +4538,44 @@ fn final_chunks(text: &str) -> Vec<bytes::Bytes> {
     ]
 }
 
+fn final_chunks_with_usage(text: &str, input_tokens: u32, output_tokens: u32) -> Vec<bytes::Bytes> {
+    vec![
+        sse_chunk(json!({
+            "choices": [{"delta": {"content": text}, "finish_reason": null}]
+        })),
+        sse_chunk(json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": input_tokens.saturating_add(output_tokens)
+            }
+        })),
+        bytes::Bytes::from_static(b"data: [DONE]\n\n"),
+    ]
+}
+
 fn tool_chunks(tool_call_id: &str, tool_name: &str, arguments: &str) -> Vec<bytes::Bytes> {
     tool_batch_chunks(&[ToolCallScript::new(tool_call_id, tool_name, arguments)])
+}
+
+fn tool_chunks_with_usage(
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+) -> Vec<bytes::Bytes> {
+    let mut chunks = tool_chunks(tool_call_id, tool_name, arguments);
+    chunks[1] = sse_chunk(json!({
+        "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+        "usage": {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens.saturating_add(output_tokens)
+        }
+    }));
+    chunks
 }
 
 fn tool_batch_chunks(calls: &[ToolCallScript]) -> Vec<bytes::Bytes> {

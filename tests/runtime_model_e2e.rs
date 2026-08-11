@@ -3,6 +3,7 @@
 mod support;
 
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::{Error, ErrorKind},
     path::{Path, PathBuf},
@@ -104,6 +105,43 @@ async fn field_event_prefix(path: &Path) -> TestResult<Vec<FieldEventSnapshot>> 
             })
         })?;
         rows.collect()
+    })
+    .await
+}
+
+async fn field_snapshot_payloads(path: &Path) -> TestResult<Vec<(i64, Vec<u8>)>> {
+    let path = path.to_owned();
+    db_blocking(move || {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let mut statement = connection.prepare(
+            "SELECT stream_version, payload FROM snapshots
+             WHERE stream_id = ?1 ORDER BY stream_version ASC, snapshot_id ASC",
+        )?;
+        let rows = statement.query_map([FIELD_RECOVERY_SESSION_ID], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect()
+    })
+    .await
+}
+
+async fn context_handoff_prepare_event_counts(
+    path: &Path,
+    session_id: &str,
+) -> TestResult<(i64, i64, i64)> {
+    let path = path.to_owned();
+    let session_id = session_id.to_owned();
+    db_blocking(move || {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.query_row(
+            "SELECT
+                COALESCE(SUM(event_type = 'context_handoff_planned'), 0),
+                COALESCE(SUM(event_type = 'model_round_started'), 0),
+                COALESCE(SUM(event_type = 'model_request_declared'), 0)
+             FROM events WHERE stream_id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
     })
     .await
 }
@@ -955,19 +993,52 @@ fn config_file_with_context_handoff(
     handoff_at_tokens: u64,
     handoff_document_tokens: u64,
 ) -> TestResult<PathBuf> {
+    let output_tokens = handoff_document_tokens.max(1);
+    let buffer_tokens = input_tokens
+        .checked_sub(handoff_at_tokens)
+        .and_then(|reserve| reserve.checked_sub(output_tokens))
+        .filter(|tokens| *tokens > 0)
+        .ok_or_else(|| {
+            Error::other(
+                "context handoff test budget must reserve model output and handoff headroom",
+            )
+        })?;
     let path = config_file(database, model_url, tool_url, max_attempts)?;
     let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
-    config["runtime"]["model_context_input_tokens"] = json!(input_tokens);
-    config["runtime"]["model_context_handoff_at_tokens"] = json!(handoff_at_tokens);
+    config["runtime"]["model_request_max_output_tokens"] = json!(output_tokens);
+    config["runtime"]["model_context_buffer_tokens"] = json!(buffer_tokens);
+    config["runtime"]["model_context_handoff_generation_tokens"] = json!(output_tokens);
     config["runtime"]["model_context_handoff_document_tokens"] = json!(handoff_document_tokens);
     fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
     Ok(path)
 }
 
+fn json_value_contains_text(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(text) => text.contains(needle),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_value_contains_text(value, needle)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| json_value_contains_text(value, needle)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
 fn provider_request_is_context_handoff(request: &Value) -> bool {
-    request
-        .to_string()
-        .contains("Write a standalone handoff document for a fresh agent context")
+    json_value_contains_text(
+        request,
+        "Write a standalone handoff document for a fresh agent context",
+    )
+}
+
+fn measured_tool_call(
+    tool_call_id: impl Into<String>,
+    tool_name: impl Into<String>,
+    arguments: impl Into<String>,
+) -> ModelScript {
+    ModelScript::tool_call_with_usage(tool_call_id, tool_name, arguments, 1_024, 64)
 }
 
 fn observed_provider_context_upper_bound(request: &Value) -> TestResult<u64> {
@@ -979,9 +1050,10 @@ fn observed_provider_context_upper_bound(request: &Value) -> TestResult<u64> {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
+    let encoded_bytes = (serde_json::to_vec(messages)?.len() as u64)
+        .saturating_add(serde_json::to_vec(tools)?.len() as u64);
     Ok(256_u64
-        .saturating_add(serde_json::to_vec(messages)?.len() as u64)
-        .saturating_add(serde_json::to_vec(tools)?.len() as u64)
+        .saturating_add(encoded_bytes.div_ceil(4))
         .saturating_add(64_u64.saturating_mul(messages.len() as u64))
         .saturating_add(128_u64.saturating_mul(tools.len() as u64)))
 }
@@ -1060,6 +1132,25 @@ async fn create_session(
     provider_url: &str,
     idempotency_key: &str,
 ) -> TestResult<String> {
+    create_session_with_model_limits(
+        client,
+        server,
+        provider_url,
+        idempotency_key,
+        1_000_000,
+        384_000,
+    )
+    .await
+}
+
+async fn create_session_with_model_limits(
+    client: &Client,
+    server: &ConfiguredServer,
+    provider_url: &str,
+    idempotency_key: &str,
+    context_window_tokens: u64,
+    max_output_tokens: u64,
+) -> TestResult<String> {
     install_test_replica(
         client,
         &server.url(""),
@@ -1078,6 +1169,10 @@ async fn create_session(
                     "base_url": provider_url
                 },
                 "model": "fixture-model",
+                "limits": {
+                    "context_window_tokens": context_window_tokens,
+                    "max_output_tokens": max_output_tokens
+                },
                 "auth_authority_id": "controller-e2e",
                 "auth_profile_id": "profile-e2e",
                 "minimum_auth_revision": 1
@@ -1091,6 +1186,37 @@ async fn create_session(
     if status != StatusCode::CREATED {
         return Err(Error::other(format!(
             "session creation did not return 201: {status} {body}"
+        ))
+        .into());
+    }
+    require_ulid(&body)
+}
+
+async fn create_session_without_model_limits(
+    client: &Client,
+    server: &ConfiguredServer,
+    provider_url: &str,
+    idempotency_key: &str,
+) -> TestResult<String> {
+    install_test_replica(
+        client,
+        &server.url(""),
+        &format!("install-{idempotency_key}"),
+    )
+    .await?;
+    let response = authenticated(client.post(server.url("/v1/sessions")))
+        .header("Idempotency-Key", idempotency_key)
+        .json(&json!({
+            "model": model_selection(provider_url, "zode.provider-execution.v1", 1),
+            "tools": ["fixture_tool"]
+        }))
+        .send_with_timeout()
+        .await?;
+    let status = response.status();
+    let body = response_json(response).await?;
+    if status != StatusCode::CREATED {
+        return Err(Error::other(format!(
+            "legacy-limit session creation did not return 201: {status} {body}"
         ))
         .into());
     }
@@ -2353,6 +2479,19 @@ async fn e2e_restart_reconciles_failed_attempt_after_prior_activation_exhaustion
     assert_eq!(field_event_prefix(database.path()).await?, before);
 
     server.stop().await?;
+    let snapshots = field_snapshot_payloads(database.path()).await?;
+    assert!(
+        snapshots.iter().any(|(version, _)| *version == 45),
+        "field recovery did not persist the final safe snapshot"
+    );
+    for (version, payload) in &snapshots {
+        let payload = String::from_utf8(payload.clone())?;
+        assert!(
+            !payload.contains("\"envelope\""),
+            "field recovery reserialized a historical model request into snapshot version {version}"
+        );
+    }
+
     let mut restarted = ConfiguredServer::start(&database, &config).await?;
     assert_eq!(
         model.request_count(),
@@ -2378,13 +2517,12 @@ async fn e2e_restart_reconciles_failed_attempt_after_prior_activation_exhaustion
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e_restart_recovers_queued_input_without_another_command() -> TestResult<()> {
+async fn e2e_restart_rebuilds_conversation_from_latest_durable_facts() -> TestResult<()> {
     let database = TempDatabase::new("runtime-queued-input-recovery")?;
     let hold = ModelHold::new();
     let mut model = ModelFixture::start(vec![
         ModelScript::hold_entered(hold.clone(), ModelScript::final_text("unused A attempt")),
-        ModelScript::final_text("assistant A"),
-        ModelScript::final_text("assistant B"),
+        ModelScript::final_text("assistant rebuilt from A and B"),
     ])
     .await?;
     let config = config_file(&database, &model.provider_url(), None, 2)?;
@@ -2443,62 +2581,44 @@ async fn e2e_restart_recovers_queued_input_without_another_command() -> TestResu
 
     let mut restarted = ConfiguredServer::start(&database, &config).await?;
     let mut events = open_events(&client, &restarted, &session_id).await?;
-    if let Err(error) = model.wait_for_requests(3).await {
+    if let Err(error) = model.wait_for_requests(2).await {
         let _ = restarted.stop().await;
         let _ = model.stop().await;
         return Err(Error::other(format!(
-            "restart did not issue recovery provider requests for A and B: {error}"
+            "restart did not issue one fresh provider request from current facts: {error}"
         ))
         .into());
     }
     let recovery_request_count = model.seal_request_phase();
     assert_eq!(
-        recovery_request_count, 3,
-        "restart issued more than two recovery provider requests"
+        recovery_request_count, 2,
+        "restart issued more than one fresh provider request"
     );
-    let first_assistant = next_event_with_kind(&mut events, "assistant_message_committed")
-        .await
-        .map_err(|error| Error::other(format!("recovery assistant A was not durable: {error}")))?;
-    let second_assistant = next_event_with_kind(&mut events, "assistant_message_committed")
-        .await
-        .map_err(|error| Error::other(format!("recovery assistant B was not durable: {error}")))?;
+    let assistant =
+        next_assistant_with_content(&mut events, "assistant rebuilt from A and B").await?;
+    assert_eq!(assistant.data["session_id"], session_id);
+    let interrupted_wire = model
+        .request(0)
+        .ok_or_else(|| Error::other("interrupted provider request was missing"))?;
     assert_eq!(
-        first_assistant.data["data"]["message"]["content"],
-        "assistant A"
-    );
-    assert_eq!(
-        second_assistant.data["data"]["message"]["content"],
-        "assistant B"
-    );
-    let first_version = first_assistant.data["version"]
-        .as_u64()
-        .ok_or_else(|| Error::other("recovery assistant A omitted event version"))?;
-    let second_version = second_assistant.data["version"]
-        .as_u64()
-        .ok_or_else(|| Error::other("recovery assistant B omitted event version"))?;
-    assert!(
-        first_version < second_version,
-        "recovery assistant events were not ordered: {first_version} then {second_version}"
-    );
-    let replay_a_wire = model
-        .request(1)
-        .ok_or_else(|| Error::other("recovery provider request for A was missing"))?;
-    assert_eq!(
-        wire_dialogue(&replay_a_wire)?,
+        wire_dialogue(&interrupted_wire)?,
         vec![("user".to_owned(), "input A".to_owned())],
-        "first recovery provider request did not contain only input A"
+        "pre-crash request did not contain exactly the facts available at dispatch"
     );
-    let replay_b_wire = model
-        .request(2)
-        .ok_or_else(|| Error::other("recovery provider request for B was missing"))?;
+    let rebuilt_wire = model
+        .request(1)
+        .ok_or_else(|| Error::other("fresh recovery provider request was missing"))?;
     assert_eq!(
-        wire_dialogue(&replay_b_wire)?,
+        wire_dialogue(&rebuilt_wire)?,
         vec![
             ("user".to_owned(), "input A".to_owned()),
-            ("assistant".to_owned(), "assistant A".to_owned()),
             ("user".to_owned(), "input B".to_owned()),
         ],
-        "second recovery provider request did not preserve A, assistant A, B order"
+        "restart did not rebuild from all latest durable facts"
+    );
+    assert_ne!(
+        interrupted_wire["messages"], rebuilt_wire["messages"],
+        "restart replayed the interrupted request instead of rebuilding it"
     );
     let state = get_session(&client, &restarted, &session_id).await?;
     let transcript = state["transcript"]
@@ -2512,17 +2632,16 @@ async fn e2e_restart_recovers_queued_input_without_another_command() -> TestResu
         transcript_sequence,
         Some(vec![
             ("user", "input A"),
-            ("assistant", "assistant A"),
             ("user", "input B"),
-            ("assistant", "assistant B"),
+            ("assistant", "assistant rebuilt from A and B"),
         ]),
-        "recovery transcript did not materialize A and B exactly once in order"
+        "recovery transcript did not preserve A and B exactly once before one fresh final"
     );
     restarted.stop().await?;
     assert_eq!(
         model.request_count(),
-        3,
-        "restart recovery provider request count was not exactly two"
+        2,
+        "restart recovery provider request count was not exactly one"
     );
     assert_eq!(
         model.request_phase_violations(),
@@ -2582,6 +2701,59 @@ async fn e2e_model_partial_stream_retry_has_no_partial_tool_effect() -> TestResu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_model_clean_eof_without_finish_retries_in_memory_step() -> TestResult<()> {
+    let database = TempDatabase::new("runtime-clean-eof-retry")?;
+    let mut model = ModelFixture::start(vec![
+        ModelScript::clean_eof("incomplete reasoning must not finish the activation"),
+        ModelScript::final_text("clean EOF retry final"),
+    ])
+    .await?;
+    let mut tool = ToolFixture::start(Vec::new()).await?;
+    let config = config_file(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        2,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-clean-eof-retry",
+    )
+    .await?;
+    let mut events = open_events(&client, &server, &session_id).await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "clean-eof-retry-message",
+        "trigger a provider stream without a valid finish",
+    )
+    .await?;
+
+    let retry = next_event_with_kind(&mut events, "model_step_retrying").await?;
+    assert_eq!(retry.data["session_id"], session_id);
+    let assistant = next_assistant_with_content(&mut events, "clean EOF retry final").await?;
+    assert_eq!(assistant.data["session_id"], session_id);
+    let state = get_session(&client, &server, &session_id).await?;
+    assert_eq!(state["status"], "idle");
+    assert_eq!(state["active_activation"], Value::Null);
+    assert_eq!(state["active_model_round"], Value::Null);
+    assert!(!state
+        .to_string()
+        .contains("incomplete reasoning must not finish the activation"));
+    assert_eq!(model.request_count(), 2);
+
+    server.stop().await?;
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_provider_stream_disconnect_finishes_activation_for_next_message() -> TestResult<()> {
     let database = TempDatabase::new("runtime-provider-disconnect-recovery")?;
     let hold = ModelHold::new();
@@ -2629,11 +2801,15 @@ async fn e2e_provider_stream_disconnect_finishes_activation_for_next_message() -
     let failure = next_event_with_kind(&mut events, "model_attempt_failed").await?;
     assert_eq!(failure.data["session_id"], session_id);
 
+    let failed_activation_finished =
+        next_event_with_kind(&mut events, "activation_finished").await?;
+    assert_eq!(failed_activation_finished.data["session_id"], session_id);
+    let recovery_activation_finished =
+        next_event_with_kind(&mut events, "activation_finished").await?;
+    assert_eq!(recovery_activation_finished.data["session_id"], session_id);
     let assistant =
         next_assistant_with_content(&mut events, "message after provider disconnect").await?;
     assert_eq!(assistant.data["session_id"], session_id);
-    let finished = next_event_with_kind(&mut events, "activation_finished").await?;
-    assert_eq!(finished.data["session_id"], session_id);
     let recovered_state = get_session(&client, &server, &session_id).await?;
     assert_eq!(recovered_state["active_activation"], Value::Null);
     assert_eq!(recovered_state["active_model_round"], Value::Null);
@@ -2752,7 +2928,7 @@ async fn e2e_restart_reconciles_failed_model_attempt_before_terminal_finish() ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e_restart_reconciles_failed_model_attempt_before_retry_schedule() -> TestResult<()> {
+async fn e2e_restart_reconciles_failed_model_attempt_before_fresh_request() -> TestResult<()> {
     let database = TempDatabase::new("runtime-failed-attempt-retry-recovery")?;
     let hold = ModelHold::new();
     let mut model = ModelFixture::start(vec![
@@ -2790,15 +2966,14 @@ async fn e2e_restart_reconciles_failed_model_attempt_before_retry_schedule() -> 
 
     let failure = next_event_with_kind(&mut events, "model_attempt_failed").await?;
     assert_eq!(failure.data["session_id"], session_id);
-    // Stop immediately after the public failure fact.  The retry boundary is
-    // intentionally absent from this crash window; restart must schedule the
-    // same prepared request rather than leave the failed round active.
+    // Stop immediately after the public failure fact. The retry boundary is
+    // intentionally absent from this crash window; restart must abandon the
+    // dead in-memory request and continue from durable facts.
     server.stop().await?;
 
     let mut restarted = ConfiguredServer::start(&database, &config).await?;
     let mut recovery_events =
         open_events_with_cursor(&client, &restarted, &session_id, Some(&failure.id)).await?;
-    next_event_with_kind(&mut recovery_events, "model_step_retrying").await?;
     model.wait_for_requests(2).await?;
     let assistant =
         next_assistant_with_content(&mut recovery_events, "retry recovered after restart").await?;
@@ -2954,8 +3129,15 @@ async fn e2e_long_task_continues_until_final() -> TestResult<()> {
 
     let mut server = ConfiguredServer::start(&database, &config).await?;
     let client = support::http_client()?;
-    let session_id =
-        create_session(&client, &server, &model.provider_url(), "create-long-task").await?;
+    let session_id = create_session_with_model_limits(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-long-task",
+        1_000_000,
+        100_000,
+    )
+    .await?;
     post_message(
         &client,
         &server,
@@ -3014,19 +3196,613 @@ async fn e2e_long_task_continues_until_final() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_model_request_reserves_128k_output_and_independent_context_buffer() -> TestResult<()> {
+    let database = TempDatabase::new("runtime-model-128k-output")?;
+    let mut model = ModelFixture::start(vec![ModelScript::final_text_with_usage(
+        "128K_OUTPUT_REQUEST_COMPLETE",
+        512,
+        32,
+    )])
+    .await?;
+    let mut tool = ToolFixture::start(Vec::new()).await?;
+    let config = config_file(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-model-128k-output",
+    )
+    .await?;
+    let mut events = open_events(&client, &server, &session_id).await?;
+
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "model-128k-output-message",
+        "prove the configured output allowance reaches the provider request",
+    )
+    .await?;
+    next_assistant_with_content(&mut events, "128K_OUTPUT_REQUEST_COMPLETE").await?;
+    model.wait_for_requests(1).await?;
+
+    let request = model
+        .request(0)
+        .ok_or_else(|| Error::other("128k output E2E omitted the provider request"))?;
+    assert_eq!(
+        request["max_tokens"], 128_000,
+        "the DeepSeek-capable model request did not preserve the approved 128k output allowance"
+    );
+    assert_eq!(
+        request["stream_options"]["include_usage"], true,
+        "the provider request did not ask for the usage anchor required by context accounting"
+    );
+
+    server.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_unanchored_model_input_uses_four_byte_fallback_without_hidden_multiplier(
+) -> TestResult<()> {
+    const FINAL: &str = "FOUR_BYTE_FALLBACK_COMPLETE";
+    let database = TempDatabase::new("runtime-four-byte-context-fallback")?;
+    let mut model =
+        ModelFixture::start(vec![ModelScript::final_text_with_usage(FINAL, 12_500, 32)]).await?;
+    let mut tool = ToolFixture::start(Vec::new()).await?;
+    let config = config_file(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+    )?;
+    let mut config_value: Value = serde_json::from_slice(&fs::read(&config)?)?;
+    config_value["runtime"]["model_request_max_output_tokens"] = json!(1_000);
+    config_value["runtime"]["model_context_buffer_tokens"] = json!(1_000);
+    config_value["runtime"]["model_context_handoff_generation_tokens"] = json!(1_000);
+    config_value["runtime"]["model_context_handoff_document_tokens"] = json!(512);
+    fs::write(&config, serde_json::to_vec_pretty(&config_value)?)?;
+
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session_with_model_limits(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-four-byte-context-fallback",
+        20_000,
+        4_000,
+    )
+    .await?;
+    let mut events = open_events(&client, &server, &session_id).await?;
+    let input = format!(
+        "The first request has no provider usage anchor. {}",
+        "four-byte-token-fallback ".repeat(2_000)
+    );
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "four-byte-context-fallback-message",
+        &input,
+    )
+    .await?;
+    let final_state = async {
+        loop {
+            let state = get_session(&client, &server, &session_id).await?;
+            let final_visible = state["transcript"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .and_then(|message| message["content"].as_str())
+                == Some(FINAL);
+            if final_visible && state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    let state = timeout(Duration::from_secs(15), async {
+        tokio::select! {
+            state = final_state => state,
+            failure = next_event_with_kind(&mut events, "model_attempt_failed") => {
+                let failure = failure?;
+                Err(Error::other(format!(
+                    "the approved four-byte fallback was rejected before its first provider usage anchor: {}",
+                    failure.data["data"]["error"]
+                )).into())
+            }
+        }
+    })
+    .await
+    .map_err(|_| Error::new(ErrorKind::TimedOut, "four-byte fallback request did not finish"))??;
+    model.wait_for_requests(1).await?;
+
+    let request = model
+        .request(0)
+        .ok_or_else(|| Error::other("four-byte fallback E2E omitted the provider request"))?;
+    assert!(
+        !provider_request_is_context_handoff(&request),
+        "the unanchored four-byte estimate was multiplied into an early handoff"
+    );
+    assert_eq!(request["max_tokens"], 1_000);
+    assert_eq!(model.handoff_request_count(), 0);
+    assert_eq!(state["status"], "idle");
+    assert_eq!(
+        state["transcript"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .and_then(|message| message["content"].as_str()),
+        Some(FINAL)
+    );
+
+    server.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_provider_usage_anchor_excludes_discarded_reasoning_output_from_next_input(
+) -> TestResult<()> {
+    const FIRST_FINAL: &str = "FIRST_VISIBLE_FINAL";
+    const SECOND_FINAL: &str = "SECOND_VISIBLE_FINAL";
+    let database = TempDatabase::new("runtime-provider-usage-anchor")?;
+    let mut model = ModelFixture::start(vec![
+        ModelScript::final_text_with_usage(FIRST_FINAL, 3_000, 6_000),
+        ModelScript::final_text_with_usage(SECOND_FINAL, 3_400, 64),
+    ])
+    .await?;
+    let mut tool = ToolFixture::start(Vec::new()).await?;
+    let config = config_file(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+    )?;
+    let mut config_value: Value = serde_json::from_slice(&fs::read(&config)?)?;
+    config_value["runtime"]["model_request_max_output_tokens"] = json!(1_000);
+    config_value["runtime"]["model_context_buffer_tokens"] = json!(1_000);
+    config_value["runtime"]["model_context_handoff_generation_tokens"] = json!(1_000);
+    config_value["runtime"]["model_context_handoff_document_tokens"] = json!(512);
+    fs::write(&config, serde_json::to_vec_pretty(&config_value)?)?;
+
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session_with_model_limits(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-provider-usage-anchor",
+        10_000,
+        8_000,
+    )
+    .await?;
+    let mut events = open_events(&client, &server, &session_id).await?;
+    let first_input = format!(
+        "Establish a realistic input anchor before hidden reasoning. {}",
+        "provider context calibration ".repeat(120)
+    );
+
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "provider-usage-anchor-first",
+        &first_input,
+    )
+    .await?;
+    next_assistant_with_content(&mut events, FIRST_FINAL).await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "provider-usage-anchor-second",
+        "continue from the durable visible answer",
+    )
+    .await?;
+    next_assistant_with_content(&mut events, SECOND_FINAL).await?;
+    model.wait_for_requests(2).await?;
+
+    let requests = [
+        model
+            .request(0)
+            .ok_or_else(|| Error::other("usage anchor E2E omitted request zero"))?,
+        model
+            .request(1)
+            .ok_or_else(|| Error::other("usage anchor E2E omitted request one"))?,
+    ];
+    assert!(
+        requests
+            .iter()
+            .all(|request| !provider_request_is_context_handoff(request)),
+        "discarded hidden reasoning output incorrectly forced a context handoff: {requests:?}"
+    );
+    assert_eq!(
+        model.handoff_request_count(),
+        0,
+        "discarded hidden reasoning output was treated as replayable input context"
+    );
+    assert!(
+        json_value_contains_text(&requests[1], FIRST_FINAL)
+            && json_value_contains_text(&requests[1], "continue from the durable visible answer"),
+        "the next ordinary request did not rebuild from the durable visible transcript"
+    );
+
+    let state = get_session(&client, &server, &session_id).await?;
+    assert_eq!(state["status"], "idle");
+    assert!(state["active_activation"].is_null());
+    assert_eq!(
+        state["transcript"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .and_then(|message| message["content"].as_str()),
+        Some(SECOND_FINAL)
+    );
+
+    server.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_context_handoff_request_never_exceeds_provider_input_budget() -> TestResult<()> {
+    const INPUT_TOKENS: u64 = 8_192;
+    let database = TempDatabase::new("runtime-context-handoff-input-budget")?;
+    let mut model = ModelFixture::start_with_handoff(
+        vec![ModelScript::final_text("provider must not be reached")],
+        "an over-budget handoff must never reach the provider",
+    )
+    .await?;
+    let mut tool = ToolFixture::start(Vec::new()).await?;
+    let config = config_file_with_context_handoff(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+        INPUT_TOKENS,
+        6_144,
+        1_024,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session_with_model_limits(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-context-handoff-input-budget",
+        INPUT_TOKENS,
+        INPUT_TOKENS - 6_144,
+    )
+    .await?;
+    let mut events = open_events(&client, &server, &session_id).await?;
+    let oversized_input = format!(
+        "OVER_BUDGET_HANDOFF_SOURCE:{}",
+        "provider-input-budget ".repeat(2_400)
+    );
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "context-handoff-input-budget-message",
+        &oversized_input,
+    )
+    .await?;
+
+    let failure = next_event_with_kind(&mut events, "model_attempt_failed").await?;
+    assert_eq!(
+        failure.data["data"]["error"]["class"],
+        "context_handoff_failed"
+    );
+    let state = timeout(Duration::from_secs(10), async {
+        loop {
+            let state = get_session(&client, &server, &session_id).await?;
+            if state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "over-budget handoff did not fail bounded",
+        )
+    })??;
+    assert_eq!(
+        model.request_count(),
+        0,
+        "Endpoint dispatched a handoff request above its configured provider input budget"
+    );
+    assert!(state["context_handoff"].is_null());
+    let transcript = state["transcript"]
+        .as_array()
+        .ok_or_else(|| Error::other("over-budget handoff omitted public transcript"))?;
+    assert_eq!(transcript.len(), 1);
+    assert_eq!(transcript[0]["content"], oversized_input);
+
+    server.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_invalid_context_handoff_document_stops_without_automatic_replan() -> TestResult<()> {
+    const DOCUMENT_TOKENS: u64 = 1_024;
+    let database = TempDatabase::new("runtime-invalid-context-handoff-bounded")?;
+    let oversized_document = format!(
+        "INVALID_BOUNDED_HANDOFF:{}",
+        "x".repeat((DOCUMENT_TOKENS * 4) as usize)
+    );
+    let scripts = vec![measured_tool_call(
+        "invalid-handoff-stage",
+        "fixture_tool",
+        r#"{"stage":0}"#,
+    )];
+    let mut model = ModelFixture::start_with_handoff(scripts, oversized_document).await?;
+    let mut tool = ToolFixture::start(vec![ToolScript::Response(json!({
+        "status": "completed",
+        "result": {
+            "content": format!(
+                "invalid handoff stage completed; {}",
+                "bounded durable tool evidence ".repeat(1_600)
+            )
+        }
+    }))])
+    .await?;
+    let config = config_file_with_context_handoff(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+        24_000,
+        10_000,
+        DOCUMENT_TOKENS,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session_with_model_limits(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-invalid-context-handoff-bounded",
+        24_000,
+        10_000,
+    )
+    .await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "invalid-context-handoff-bounded-message",
+        "complete the external stage and preserve the task in a bounded handoff",
+    )
+    .await?;
+
+    timeout(Duration::from_secs(15), async {
+        while model.handoff_request_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            format!(
+                "invalid handoff was not dispatched: requests={}, handoffs={}, tools={}",
+                model.request_count(),
+                model.handoff_request_count(),
+                tool.invocation_count(),
+            ),
+        )
+    })?;
+
+    let failed = timeout(Duration::from_secs(15), async {
+        loop {
+            if model.handoff_request_count() > 1 {
+                return Err::<Value, Box<dyn std::error::Error + Send + Sync>>(
+                    Error::other("invalid handoff automatically dispatched another handoff").into(),
+                );
+            }
+            let state = get_session(&client, &server, &session_id).await?;
+            if state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "invalid handoff did not reach one bounded terminal failure",
+        )
+    })??;
+    assert!(failed["context_handoff"].is_null());
+    assert_eq!(model.handoff_request_count(), 1);
+
+    server.stop().await?;
+    let requests_before_restart = model.seal_request_phase();
+    let mut restarted = ConfiguredServer::start(&database, &config).await?;
+    let restarted_state = get_session(&client, &restarted, &session_id).await?;
+    assert_eq!(restarted_state["status"], "idle");
+    assert!(restarted_state["active_activation"].is_null());
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        model.request_count(),
+        requests_before_restart,
+        "restart retried a terminal invalid handoff without new user input"
+    );
+    assert_eq!(model.request_phase_violations(), 0);
+
+    restarted.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_restart_rebuilds_oversized_conversation_before_handoff() -> TestResult<()> {
+    const QUEUED_MARKER: &str = "QUEUED_INPUT_REQUIRING_HANDOFF";
+    const HANDOFF_DOCUMENT: &str = "RESTART_QUEUE_HANDOFF: both durable user inputs are available to the fresh context and remain part of the same task.";
+    const FINAL: &str = "RESTART_QUEUE_HANDOFF_COMPLETE";
+    let database = TempDatabase::new("runtime-conversation-restart-before-handoff")?;
+    let first_request_hold = ModelHold::new();
+    let scripts = vec![
+        ModelScript::stream_hold(first_request_hold.clone()),
+        measured_tool_call(
+            "restart-queue-read-handoff",
+            "read_context_handoff",
+            r#"{}"#,
+        ),
+        measured_tool_call(
+            "restart-queue-read-history",
+            "read_session_history",
+            r#"{"limit":16}"#,
+        ),
+        ModelScript::final_text(FINAL),
+    ];
+    let mut model = ModelFixture::start_with_handoff(scripts, HANDOFF_DOCUMENT).await?;
+    let mut tool = ToolFixture::start(Vec::new()).await?;
+    let config = config_file_with_context_handoff(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        2,
+        24_000,
+        10_000,
+        1_024,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session_with_model_limits(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-conversation-restart-before-handoff",
+        24_000,
+        14_000,
+    )
+    .await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "conversation-restart-initial",
+        "complete the first frozen model request before processing later input",
+    )
+    .await?;
+    first_request_hold.wait_entered().await?;
+    let queued_input = format!("{QUEUED_MARKER}:{}", "queued-context ".repeat(2_800));
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "conversation-restart-queued",
+        &queued_input,
+    )
+    .await?;
+    server.stop().await?;
+    first_request_hold.release();
+
+    let mut restarted = ConfiguredServer::start(&database, &config).await?;
+    let final_state = timeout(Duration::from_secs(45), async {
+        loop {
+            let state = get_session(&client, &restarted, &session_id).await?;
+            let final_visible = state["transcript"]
+                .as_array()
+                .is_some_and(|messages| messages.iter().any(|message| message["content"] == FINAL));
+            if final_visible && state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "restart did not rebuild the oversized conversation through a handoff",
+        )
+    })??;
+
+    let first_request = model
+        .request(0)
+        .ok_or_else(|| Error::other("initial provider request was not observed"))?;
+    assert!(
+        !first_request.to_string().contains(QUEUED_MARKER),
+        "queued input appeared before it was durably admitted"
+    );
+    let rebuilt_handoff_request = (0..model.request_count())
+        .filter_map(|index| model.request(index))
+        .find(provider_request_is_context_handoff)
+        .ok_or_else(|| Error::other("restart did not build a context handoff request"))?;
+    assert!(
+        rebuilt_handoff_request.to_string().contains(QUEUED_MARKER),
+        "restart handoff was built from stale pre-crash request content"
+    );
+    assert_eq!(model.handoff_request_count(), 1);
+    let transcript = final_state["transcript"]
+        .as_array()
+        .ok_or_else(|| Error::other("conversation restart omitted transcript"))?;
+    assert_eq!(
+        transcript
+            .iter()
+            .filter(|message| message["content"] == queued_input)
+            .count(),
+        1
+    );
+    assert_eq!(
+        transcript
+            .iter()
+            .filter(|message| message["content"] == FINAL)
+            .count(),
+        1
+    );
+    assert_eq!(
+        transcript
+            .last()
+            .and_then(|message| message["content"].as_str()),
+        Some(FINAL)
+    );
+
+    restarted.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_long_task_writes_handoff_and_continues_in_fresh_context() -> TestResult<()> {
     const INPUT_TOKENS: u64 = 24_000;
-    const HANDOFF_AT_TOKENS: u64 = 14_000;
+    const HANDOFF_AT_TOKENS: u64 = 10_000;
     const HANDOFF_DOCUMENT: &str = "HANDOFF_DOCUMENT_MARKER: stage zero completed durably; inspect the original user request, then finish the same task without asking the user to repeat it.";
     const USER_MARKER: &str = "ORIGINAL_USER_HISTORY_MARKER";
     let database = TempDatabase::new("runtime-long-task-context-handoff")?;
     let scripts = vec![
-        ModelScript::tool_call("call-context-task-0", "fixture_tool", r#"{"stage":0}"#),
-        ModelScript::tool_call("read-handoff-0", "read_context_handoff", r#"{}"#),
-        ModelScript::tool_call("read-history-0", "read_session_history", r#"{"limit":16}"#),
-        ModelScript::tool_call("call-context-task-1", "fixture_tool", r#"{"stage":1}"#),
-        ModelScript::tool_call("read-handoff-1", "read_context_handoff", r#"{}"#),
-        ModelScript::tool_call("read-history-1", "read_session_history", r#"{"limit":16}"#),
+        measured_tool_call("call-context-task-0", "fixture_tool", r#"{"stage":0}"#),
+        measured_tool_call("read-handoff-0", "read_context_handoff", r#"{}"#),
+        measured_tool_call("read-history-0", "read_session_history", r#"{"limit":16}"#),
+        measured_tool_call("call-context-task-1", "fixture_tool", r#"{"stage":1}"#),
+        measured_tool_call("read-handoff-1", "read_context_handoff", r#"{}"#),
+        measured_tool_call("read-history-1", "read_session_history", r#"{"limit":16}"#),
         ModelScript::final_text("HANDOFF_LONG_TASK_COMPLETE"),
     ];
     let mut model = ModelFixture::start_with_handoff(scripts, HANDOFF_DOCUMENT).await?;
@@ -3038,7 +3814,7 @@ async fn e2e_long_task_writes_handoff_and_continues_in_fresh_context() -> TestRe
                     "result": {
                         "content": format!(
                             "stage {stage} durable output; {}",
-                            "large-context-result ".repeat(600)
+                            "large-context-result ".repeat(2_400)
                         )
                     }
                 }))
@@ -3057,11 +3833,13 @@ async fn e2e_long_task_writes_handoff_and_continues_in_fresh_context() -> TestRe
     )?;
     let mut server = ConfiguredServer::start(&database, &config).await?;
     let client = support::http_client()?;
-    let session_id = create_session(
+    let session_id = create_session_with_model_limits(
         &client,
         &server,
         &model.provider_url(),
         "create-context-handoff-task",
+        INPUT_TOKENS,
+        INPUT_TOKENS - HANDOFF_AT_TOKENS,
     )
     .await?;
     post_message(
@@ -3073,7 +3851,7 @@ async fn e2e_long_task_writes_handoff_and_continues_in_fresh_context() -> TestRe
     )
     .await?;
 
-    let state = timeout(Duration::from_secs(45), async {
+    let state = match timeout(Duration::from_secs(45), async {
         loop {
             let state = get_session(&client, &server, &session_id).await?;
             let final_visible = state["transcript"]
@@ -3088,7 +3866,22 @@ async fn e2e_long_task_writes_handoff_and_continues_in_fresh_context() -> TestRe
         }
     })
     .await
-    .map_err(|_| Error::new(ErrorKind::TimedOut, "handoff long task did not finish"))??;
+    {
+        Ok(state) => state?,
+        Err(_) => {
+            let state = get_session(&client, &server, &session_id).await?;
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "handoff long task did not finish: requests={}, handoffs={}, tools={}, state={state}",
+                    model.request_count(),
+                    model.handoff_request_count(),
+                    tool.invocation_count(),
+                ),
+            )
+            .into());
+        }
+    };
 
     let observed_bounds = (0..model.request_count())
         .filter_map(|index| model.request(index))
@@ -3158,13 +3951,811 @@ async fn e2e_long_task_writes_handoff_and_continues_in_fresh_context() -> TestRe
             .request(index)
             .ok_or_else(|| Error::other("model fixture lost an observed request"))?;
         let observed = observed_provider_context_upper_bound(&request)?;
+        let requested_output = request["max_tokens"].as_u64().unwrap_or_default();
         assert!(
-            observed <= INPUT_TOKENS,
-            "provider context exceeded its configured input budget: {observed} > {INPUT_TOKENS}"
+            observed.saturating_add(requested_output) <= INPUT_TOKENS,
+            "provider request exceeded its configured context window: input={observed}, output={requested_output}, context={INPUT_TOKENS}"
         );
     }
 
     server.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_context_handoff_source_is_inert_and_document_is_plain_text() -> TestResult<()> {
+    const HANDOFF_DOCUMENT_PREFIX: &str = "ZODE_CONTEXT_HANDOFF_V1\nObjective: finish the same durable task.\nCompleted: the first external stage completed exactly once.\nNext: read this handoff and publish INERT_HANDOFF_COMPLETE.\nEvidence: ";
+    const USER_MARKER: &str = "INERT_HANDOFF_ORIGINAL_OBJECTIVE";
+    const FINAL: &str = "INERT_HANDOFF_COMPLETE";
+    let database = TempDatabase::new("runtime-context-handoff-inert-source")?;
+    let mut handoff_document = HANDOFF_DOCUMENT_PREFIX.to_owned();
+    handoff_document.push_str(&"x".repeat(3_840 - handoff_document.len()));
+    assert_eq!(handoff_document.len(), 3_840);
+    let scripts = vec![
+        measured_tool_call("inert-source-stage", "fixture_tool", r#"{"stage":0}"#),
+        measured_tool_call("inert-source-read", "read_context_handoff", r#"{}"#),
+        ModelScript::final_text(FINAL),
+    ];
+    let mut model = ModelFixture::start_with_handoff(scripts, &handoff_document).await?;
+    let mut tool = ToolFixture::start(vec![ToolScript::Response(json!({
+        "status": "completed",
+        "result": {
+            "content": format!(
+                "inert source stage completed; {}",
+                "bounded durable tool evidence ".repeat(1_600)
+            )
+        }
+    }))])
+    .await?;
+    let config = config_file_with_context_handoff(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+        24_000,
+        10_000,
+        1_024,
+    )?;
+    let mut config_value: Value = serde_json::from_slice(&fs::read(&config)?)?;
+    config_value["runtime"]["model_context_handoff_generation_tokens"] = json!(2_048);
+    fs::write(&config, serde_json::to_vec_pretty(&config_value)?)?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session_with_model_limits(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-context-handoff-inert-source",
+        24_000,
+        10_000,
+    )
+    .await?;
+    let mut events = open_events(&client, &server, &session_id).await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "context-handoff-inert-source-message",
+        &format!("{USER_MARKER}: complete the external stage and continue"),
+    )
+    .await?;
+
+    let final_state = async {
+        loop {
+            let state = get_session(&client, &server, &session_id).await?;
+            let final_visible = state["transcript"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .and_then(|message| message["content"].as_str())
+                == Some(FINAL);
+            if final_visible && state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    let state = timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            state = final_state => state,
+            failure = next_event_with_kind(&mut events, "context_handoff_failed") => {
+                let failure = failure?;
+                Err(Error::other(format!(
+                    "handoff document inside the advertised byte bound was rejected: {}",
+                    failure.data["data"]["error"]
+                )).into())
+            }
+        }
+    })
+    .await
+    .map_err(|_| Error::new(ErrorKind::TimedOut, "inert handoff task did not finish"))??;
+
+    assert_eq!(model.handoff_request_count(), 1);
+    assert_eq!(tool.invocation_count(), 1);
+    assert_eq!(
+        state["transcript"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .and_then(|message| message["content"].as_str()),
+        Some(FINAL)
+    );
+    let requests = (0..model.request_count())
+        .filter_map(|index| model.request(index))
+        .collect::<Vec<_>>();
+    let handoff_index = requests
+        .iter()
+        .position(provider_request_is_context_handoff)
+        .ok_or_else(|| Error::other("provider did not receive the handoff request"))?;
+    let handoff_request = &requests[handoff_index];
+    assert_eq!(
+        handoff_request["max_tokens"], 2_048,
+        "handoff generation reasoning budget was coupled to the 1024-token durable document bound"
+    );
+    let messages = handoff_request["messages"]
+        .as_array()
+        .ok_or_else(|| Error::other("handoff request omitted messages"))?;
+    assert_eq!(
+        messages.len(),
+        2,
+        "handoff replayed operational conversation roles instead of inert source data: {messages:?}"
+    );
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[1]["role"], "user");
+    let handoff_instruction = messages[0]["content"]
+        .as_str()
+        .ok_or_else(|| Error::other("handoff instruction was not text"))?;
+    assert!(
+        handoff_instruction.contains(
+            "After JSON decoding, the document string must be at most 3840 UTF-8 bytes"
+        ),
+        "handoff request did not disclose the durable response bound to the model: {handoff_instruction}"
+    );
+    let source = messages[1]["content"]
+        .as_str()
+        .ok_or_else(|| Error::other("handoff source was not inert text"))?;
+    assert!(source.contains("zode.context-handoff-source.v1"));
+    assert!(source.contains(USER_MARKER));
+    assert!(source.contains("fixture_tool"));
+    assert!(handoff_request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty));
+    let mut document_chunks = BTreeMap::new();
+    let fresh_request_summaries = requests
+        .iter()
+        .skip(handoff_index + 1)
+        .map(|request| {
+            let encoded = request.to_string();
+            for content in request["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|message| message["role"] == "tool")
+                .filter_map(|message| message["content"].as_str())
+                .filter_map(|content| serde_json::from_str::<Value>(content).ok())
+            {
+                let Some(offset) = content["document"]["content_offset"].as_u64() else {
+                    continue;
+                };
+                let Some(text) = content["document"]["text"].as_str() else {
+                    continue;
+                };
+                document_chunks.insert(offset, text.to_owned());
+            }
+            (
+                encoded.len(),
+                json_value_contains_text(request, HANDOFF_DOCUMENT_PREFIX),
+            )
+        })
+        .collect::<Vec<_>>();
+    let reconstructed_document = document_chunks.values().cloned().collect::<String>();
+    assert!(
+        reconstructed_document == handoff_document,
+        "fresh context did not page the complete durable handoff document: chunks={}, bytes={}, summaries={fresh_request_summaries:?}",
+        document_chunks.len(),
+        reconstructed_document.len(),
+    );
+
+    server.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_context_handoff_plain_document_pages_without_generic_payload_limit() -> TestResult<()>
+{
+    const DOCUMENT_PREFIX: &str = "PAGED_HANDOFF_DOCUMENT:";
+    const FINAL: &str = "PAGED_HANDOFF_COMPLETE";
+    let database = TempDatabase::new("runtime-context-handoff-paged-document")?;
+    let mut handoff_document = DOCUMENT_PREFIX.to_owned();
+    handoff_document.push_str(&"\"".repeat(40_000 - handoff_document.len()));
+    let large_history = format!("PAGED_HANDOFF_DURABLE_HISTORY:{}", "x".repeat(220_000));
+    let scripts = vec![
+        ModelScript::final_text(large_history.clone()),
+        measured_tool_call("paged-handoff-read-0", "read_context_handoff", r#"{}"#),
+        measured_tool_call(
+            "paged-handoff-read-1",
+            "read_context_handoff",
+            r#"{"content_offset":8192}"#,
+        ),
+        measured_tool_call(
+            "paged-handoff-read-2",
+            "read_context_handoff",
+            r#"{"content_offset":16384}"#,
+        ),
+        measured_tool_call(
+            "paged-handoff-read-3",
+            "read_context_handoff",
+            r#"{"content_offset":24576}"#,
+        ),
+        measured_tool_call(
+            "paged-handoff-read-4",
+            "read_context_handoff",
+            r#"{"content_offset":32768}"#,
+        ),
+        ModelScript::final_text(FINAL),
+    ];
+    let mut model = ModelFixture::start_with_handoff(scripts, &handoff_document).await?;
+    let mut tool = ToolFixture::start(Vec::new()).await?;
+    let config = config_file_with_context_handoff(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+        300_000,
+        50_000,
+        12_288,
+    )?;
+    let mut config_value: Value = serde_json::from_slice(&fs::read(&config)?)?;
+    config_value["runtime"]["model_context_handoff_generation_tokens"] = json!(128_000);
+    fs::write(&config, serde_json::to_vec_pretty(&config_value)?)?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session_with_model_limits(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-context-handoff-paged-document",
+        300_000,
+        200_000,
+    )
+    .await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "context-handoff-paged-document-history",
+        "Establish a large durable history before continuing the same task.",
+    )
+    .await?;
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let state = get_session(&client, &server, &session_id).await?;
+            if state["status"] == "idle"
+                && state["active_activation"].is_null()
+                && state["transcript"]
+                    .as_array()
+                    .and_then(|messages| messages.last())
+                    .and_then(|message| message["content"].as_str())
+                    == Some(large_history.as_str())
+            {
+                return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| Error::new(ErrorKind::TimedOut, "large durable history did not finish"))??;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "context-handoff-paged-document-message",
+        "Continue the original objective from the durable history.",
+    )
+    .await?;
+
+    let state = timeout(Duration::from_secs(30), async {
+        loop {
+            let state = get_session(&client, &server, &session_id).await?;
+            if state["status"] == "idle"
+                && state["active_activation"].is_null()
+                && state["transcript"]
+                    .as_array()
+                    .and_then(|messages| messages.last())
+                    .and_then(|message| message["content"].as_str())
+                    == Some(FINAL)
+            {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            format!(
+                "paged handoff did not finish after provider handoff requests={}",
+                model.handoff_request_count()
+            ),
+        )
+    })??;
+    assert_eq!(state["transcript"].as_array().map_or(0, Vec::len), 14);
+    assert_eq!(model.handoff_request_count(), 1);
+
+    let requests = (0..model.request_count())
+        .filter_map(|index| model.request(index))
+        .collect::<Vec<_>>();
+    let handoff_index = requests
+        .iter()
+        .position(provider_request_is_context_handoff)
+        .ok_or_else(|| Error::other("provider did not receive the paged handoff request"))?;
+    let handoff_instruction = requests[handoff_index]["messages"][0]["content"]
+        .as_str()
+        .ok_or_else(|| Error::other("paged handoff instruction was not text"))?;
+    assert!(handoff_instruction
+        .contains("After JSON decoding, the document string must be at most 48896 UTF-8 bytes"));
+
+    let mut chunks = BTreeMap::new();
+    for request in requests.iter().skip(handoff_index + 1) {
+        for content in request["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|message| message["role"] == "tool")
+            .filter_map(|message| message["content"].as_str())
+            .filter_map(|content| serde_json::from_str::<Value>(content).ok())
+        {
+            let Some(offset) = content["document"]["content_offset"].as_u64() else {
+                continue;
+            };
+            let Some(text) = content["document"]["text"].as_str() else {
+                continue;
+            };
+            chunks.insert(offset, text.to_owned());
+        }
+    }
+    assert_eq!(chunks.len(), 5);
+    assert_eq!(
+        chunks.values().cloned().collect::<String>(),
+        handoff_document
+    );
+
+    server.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_context_handoff_plan_is_atomic_across_storage_failure() -> TestResult<()> {
+    const HANDOFF_DOCUMENT: &str =
+        "ATOMIC_HANDOFF_DOCUMENT: resume the same durable task after storage recovery.";
+    const FINAL: &str = "ATOMIC_HANDOFF_RECOVERY_COMPLETE";
+    const FAULT_TRIGGER: &str = "e2e_context_handoff_prepare_storage_failure";
+    let database = TempDatabase::new("runtime-context-handoff-atomic-storage-failure")?;
+    let first_final = format!(
+        "FIRST_GENERATION_DURABLE_HISTORY {}",
+        "large durable history boundary ".repeat(2_400)
+    );
+    let mut model = ModelFixture::start_with_handoff(
+        vec![
+            ModelScript::final_text_with_usage(first_final.clone(), 1_024, 64),
+            ModelScript::final_text(FINAL),
+        ],
+        HANDOFF_DOCUMENT,
+    )
+    .await?;
+    let mut tool = ToolFixture::start(Vec::new()).await?;
+    let config = config_file_with_context_handoff(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+        32_000,
+        10_000,
+        512,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session_with_model_limits(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-atomic-context-handoff",
+        32_000,
+        10_000,
+    )
+    .await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "atomic-context-first-message",
+        "establish a durable first-generation history boundary",
+    )
+    .await?;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let state = get_session(&client, &server, &session_id).await?;
+            if state["status"] == "idle"
+                && state["active_activation"].is_null()
+                && state["transcript"]
+                    .as_array()
+                    .and_then(|messages| messages.last())
+                    .and_then(|message| message["content"].as_str())
+                    == Some(first_final.as_str())
+            {
+                return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "first handoff generation did not settle",
+        )
+    })??;
+
+    let before = context_handoff_prepare_event_counts(database.path(), &session_id).await?;
+    let database_path = database.path().to_owned();
+    db_blocking(move || {
+        let connection = Connection::open(database_path)?;
+        connection.execute_batch(&format!(
+            "CREATE TRIGGER {FAULT_TRIGGER}
+             BEFORE INSERT ON events
+             WHEN NEW.event_type = 'model_request_declared'
+              AND NEW.command_id LIKE 'context-handoff-prepare:%'
+             BEGIN
+               SELECT RAISE(ABORT, 'e2e forced context handoff storage failure');
+             END;"
+        ))
+    })
+    .await?;
+
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "atomic-context-second-message",
+        "continue the same task through a fresh context",
+    )
+    .await?;
+    let materialized = timeout(Duration::from_secs(5), async {
+        loop {
+            let state = get_session(&client, &server, &session_id).await?;
+            let second_visible = state["transcript"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["content"] == "continue the same task through a fresh context"
+                })
+            });
+            if second_visible && !state["active_activation"].is_null() {
+                return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if materialized.is_err() {
+        let state = get_session(&client, &server, &session_id).await?;
+        return Err(Error::new(
+            ErrorKind::TimedOut,
+            format!("storage-failure input was not materialized: {state}"),
+        )
+        .into());
+    }
+    materialized.map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "storage-failure input was not materialized",
+        )
+    })??;
+    // The faulted append runs immediately after the materialized input. There
+    // is deliberately no public failure event because the failing transaction
+    // cannot publish one; a bounded settling interval lets that local SQLite
+    // abort complete before the process is stopped for authoritative storage
+    // inspection.
+    sleep(Duration::from_millis(100)).await;
+    server.stop().await?;
+
+    let database_path = database.path().to_owned();
+    db_blocking(move || {
+        let connection = Connection::open(database_path)?;
+        connection.execute_batch(&format!("DROP TRIGGER IF EXISTS {FAULT_TRIGGER};"))
+    })
+    .await?;
+    let after_failure = context_handoff_prepare_event_counts(database.path(), &session_id).await?;
+    assert_eq!(
+        after_failure, before,
+        "the failed handoff transaction left a partial plan, round, or request declaration"
+    );
+    assert_eq!(
+        model.handoff_request_count(),
+        0,
+        "provider was reached despite the failed durable handoff plan"
+    );
+
+    let mut restarted = ConfiguredServer::start(&database, &config).await?;
+    let recovered = timeout(Duration::from_secs(15), async {
+        loop {
+            let state = get_session(&client, &restarted, &session_id).await?;
+            if state["status"] == "idle"
+                && state["active_activation"].is_null()
+                && state["transcript"]
+                    .as_array()
+                    .and_then(|messages| messages.last())
+                    .and_then(|message| message["content"].as_str())
+                    == Some(FINAL)
+            {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let state = match recovered {
+        Ok(state) => state?,
+        Err(_) => {
+            let state = get_session(&client, &restarted, &session_id).await?;
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "atomic handoff did not recover after restart: requests={}, handoffs={}, state={state}",
+                    model.request_count(),
+                    model.handoff_request_count(),
+                ),
+            )
+            .into());
+        }
+    };
+    assert_eq!(model.handoff_request_count(), 1);
+    assert_eq!(model.conversation_request_count(), 2);
+    assert_eq!(state["context_handoff"]["generation"], 2);
+    assert_eq!(
+        state["transcript"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|message| message["content"] == FINAL)
+            .count(),
+        1,
+        "storage recovery produced more than one durable final"
+    );
+    let after_recovery = context_handoff_prepare_event_counts(database.path(), &session_id).await?;
+    assert_eq!(after_recovery.0, before.0 + 1);
+    assert_eq!(after_recovery.1, before.1 + 2);
+    assert_eq!(after_recovery.2, before.2 + 2);
+
+    restarted.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_large_history_result_crossing_handoff_threshold_continues_in_fresh_context(
+) -> TestResult<()> {
+    const INPUT_TOKENS: u64 = 20_000;
+    const HANDOFF_AT_TOKENS: u64 = 6_000;
+    const FINAL: &str = "LARGE_HISTORY_HANDOFF_COMPLETE";
+    let database = TempDatabase::new("runtime-large-history-context-handoff")?;
+    let handoff_document = format!(
+        "LARGE_HISTORY_HANDOFF_DOCUMENT: continue the same task. {}",
+        "durable handoff detail ".repeat(260)
+    );
+    let scripts = vec![
+        measured_tool_call("large-history-stage", "fixture_tool", r#"{"stage":0}"#),
+        measured_tool_call(
+            "large-history-read-handoff",
+            "read_context_handoff",
+            r#"{}"#,
+        ),
+        measured_tool_call(
+            "large-history-read-page",
+            "read_session_history",
+            r#"{"limit":16}"#,
+        ),
+        ModelScript::final_text(FINAL),
+    ];
+    let mut model = ModelFixture::start_with_handoff(scripts, handoff_document).await?;
+    let mut tool = ToolFixture::start(vec![ToolScript::Response(json!({
+        "status": "completed",
+        "result": {
+            "content": format!(
+                "large durable stage output {}",
+                "original stage detail ".repeat(2_000)
+            )
+        }
+    }))])
+    .await?;
+    let config = config_file_with_context_handoff(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+        INPUT_TOKENS,
+        HANDOFF_AT_TOKENS,
+        7_000,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session_with_model_limits(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-large-history-context-handoff",
+        INPUT_TOKENS,
+        (INPUT_TOKENS - HANDOFF_AT_TOKENS).max(7_000),
+    )
+    .await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "large-history-context-handoff-message",
+        &format!(
+            "Complete the same long task after every handoff. {}",
+            "original user detail ".repeat(580)
+        ),
+    )
+    .await?;
+
+    let completed = timeout(Duration::from_secs(20), async {
+        loop {
+            let state = get_session(&client, &server, &session_id).await?;
+            let final_visible = state["transcript"].as_array().is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message["role"] == "assistant" && message["content"] == FINAL)
+            });
+            if final_visible && state["status"] == "idle" && state["active_activation"].is_null() {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let state = match completed {
+        Ok(state) => state?,
+        Err(_) => {
+            let state = get_session(&client, &server, &session_id).await?;
+            let observed_bounds = (0..model.request_count())
+                .filter_map(|index| model.request(index))
+                .map(|request| observed_provider_context_upper_bound(&request))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "large history handoff stopped after a completed tool result: model_requests={}, handoff_requests={}, observed_bounds={observed_bounds:?}, active_activation={}, active_model_round={}, last_role={}, context_generation={}",
+                    model.request_count(),
+                    model.handoff_request_count(),
+                    state["active_activation"],
+                    state["active_model_round"],
+                    state["transcript"]
+                        .as_array()
+                        .and_then(|messages| messages.last())
+                        .map_or(Value::Null, |message| message["role"].clone()),
+                    state["context_handoff"]["generation"],
+                ),
+            )
+            .into());
+        }
+    };
+
+    assert_eq!(tool.invocation_count(), 1);
+    assert!(
+        model.handoff_request_count() >= 2,
+        "large history result did not cross a second handoff boundary"
+    );
+    assert_eq!(
+        state["transcript"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|message| message["content"] == FINAL)
+            .count(),
+        1,
+        "large history continuation produced duplicate durable finals"
+    );
+    for index in 0..model.request_count() {
+        let request = model
+            .request(index)
+            .ok_or_else(|| Error::other("model fixture lost an observed request"))?;
+        let observed = observed_provider_context_upper_bound(&request)?;
+        let requested_output = request["max_tokens"].as_u64().unwrap_or_default();
+        assert!(
+            observed.saturating_add(requested_output) <= INPUT_TOKENS,
+            "provider request exceeded its configured context window: input={observed}, output={requested_output}, context={INPUT_TOKENS}"
+        );
+    }
+
+    server.stop().await?;
+    assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_model_request_lifecycle_does_not_persist_request_content() -> TestResult<()> {
+    const PROMPT: &str = "MODEL_REQUEST_CONTENT_MUST_STAY_IN_MEMORY";
+    const FINAL: &str = "NO_DURABLE_REQUEST_SNAPSHOT_COMPLETE";
+    let database = TempDatabase::new("runtime-model-request-no-snapshot")?;
+    let mut model = ModelFixture::start(vec![ModelScript::final_text(FINAL)]).await?;
+    let mut tool = ToolFixture::start(Vec::new()).await?;
+    let config = config_file(
+        &database,
+        &model.provider_url(),
+        Some(&tool.adapter_url()),
+        1,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-model-request-no-snapshot",
+    )
+    .await?;
+    let mut events = open_events(&client, &server, &session_id).await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "model-request-no-snapshot-message",
+        PROMPT,
+    )
+    .await?;
+    next_assistant_with_content(&mut events, FINAL).await?;
+    server.stop().await?;
+
+    let database_path = database.path().to_owned();
+    let inspected_session_id = session_id.clone();
+    let request_events = db_blocking(move || {
+        let connection =
+            Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let mut statement = connection.prepare(
+            "SELECT event_type, payload FROM events
+             WHERE stream_id = ?1 AND event_type LIKE 'model_request_%'
+             ORDER BY stream_version ASC",
+        )?;
+        let rows = statement.query_map([inspected_session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+    })
+    .await?;
+    assert!(
+        request_events
+            .iter()
+            .any(|(event_type, _)| event_type == "model_request_declared"),
+        "real Endpoint did not persist the bounded model request lifecycle fact"
+    );
+    assert!(
+        request_events
+            .iter()
+            .all(|(event_type, _)| event_type != "model_request_prepared"),
+        "new execution still persisted the historical request-content event"
+    );
+    for (event_type, payload) in &request_events {
+        let payload_text = String::from_utf8(payload.clone())?;
+        assert!(
+            !payload_text.contains(PROMPT)
+                && !payload_text.contains("controlled HTTP tool")
+                && !payload_text.contains("\"transcript\"")
+                && !payload_text.contains("\"tools\"")
+                && !payload_text.contains("\"envelope\""),
+            "{event_type} persisted provider request content: {payload_text}"
+        );
+    }
+    let blob_directory = database
+        .path()
+        .parent()
+        .ok_or_else(|| Error::other("temporary database has no root"))?
+        .join("blobs");
+    assert_eq!(
+        fs::read_dir(blob_directory)?.count(),
+        0,
+        "a model request created a durable blob"
+    );
+
+    let mut restarted = ConfiguredServer::start(&database, &config).await?;
+    let state = get_session(&client, &restarted, &session_id).await?;
+    assert_eq!(state["status"], "idle");
+    assert_eq!(state["transcript"][0]["content"], PROMPT);
+    assert_eq!(state["transcript"][1]["content"], FINAL);
+
+    restarted.stop().await?;
     assert!(!sqlite_contains_secret(database.path(), TEST_PROVIDER_SECRET).await?);
     model.stop().await?;
     tool.stop().await?;
@@ -3180,7 +4771,7 @@ async fn e2e_delivery_admitted_during_handoff_reaches_first_fresh_context() -> T
     let database = TempDatabase::new("runtime-context-handoff-concurrent-delivery")?;
     let handoff_hold = ModelHold::new();
     let scripts = vec![
-        ModelScript::tool_call("concurrent-handoff-tool", "fixture_tool", r#"{"stage":0}"#),
+        measured_tool_call("concurrent-handoff-tool", "fixture_tool", r#"{"stage":0}"#),
         ModelScript::final_text(FINAL),
     ];
     let mut model = ModelFixture::start_with_handoff_request_holds(
@@ -3194,7 +4785,7 @@ async fn e2e_delivery_admitted_during_handoff_reaches_first_fresh_context() -> T
         "result": {
             "content": format!(
                 "concurrent stage complete; {}",
-                "concurrent-handoff-source ".repeat(600)
+                "concurrent-handoff-source ".repeat(2_400)
             )
         }
     }))])
@@ -3210,11 +4801,13 @@ async fn e2e_delivery_admitted_during_handoff_reaches_first_fresh_context() -> T
     )?;
     let mut server = ConfiguredServer::start(&database, &config).await?;
     let client = support::http_client()?;
-    let session_id = create_session(
+    let session_id = create_session_with_model_limits(
         &client,
         &server,
         &model.provider_url(),
         "create-context-handoff-concurrent-delivery",
+        24_000,
+        10_000,
     )
     .await?;
     post_message(
@@ -3314,7 +4907,7 @@ async fn e2e_delivery_admitted_during_handoff_reaches_first_fresh_context() -> T
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e_handoff_restart_replays_frozen_request_and_queued_input() -> TestResult<()> {
+async fn e2e_handoff_restart_rebuilds_from_durable_plan_and_queued_input() -> TestResult<()> {
     const HANDOFF_DOCUMENT: &str =
         "INFLIGHT_RESTART_HANDOFF: resume the same task after restart and consume queued input.";
     const QUEUED_INPUT: &str = "QUEUED_DURING_INFLIGHT_HANDOFF";
@@ -3323,7 +4916,7 @@ async fn e2e_handoff_restart_replays_frozen_request_and_queued_input() -> TestRe
     let first_handoff_hold = ModelHold::new();
     let retry_handoff_hold = ModelHold::new();
     let scripts = vec![
-        ModelScript::tool_call("inflight-handoff-tool", "fixture_tool", r#"{"stage":0}"#),
+        measured_tool_call("inflight-handoff-tool", "fixture_tool", r#"{"stage":0}"#),
         ModelScript::final_text(FINAL),
     ];
     let mut model = ModelFixture::start_with_handoff_request_holds(
@@ -3337,7 +4930,7 @@ async fn e2e_handoff_restart_replays_frozen_request_and_queued_input() -> TestRe
         "result": {
             "content": format!(
                 "restart stage complete; {}",
-                "inflight-handoff-source ".repeat(600)
+                "inflight-handoff-source ".repeat(2_400)
             )
         }
     }))])
@@ -3356,11 +4949,13 @@ async fn e2e_handoff_restart_replays_frozen_request_and_queued_input() -> TestRe
     fs::write(&config, serde_json::to_vec_pretty(&original_config)?)?;
     let mut server = ConfiguredServer::start(&database, &config).await?;
     let client = support::http_client()?;
-    let session_id = create_session(
+    let session_id = create_session_with_model_limits(
         &client,
         &server,
         &model.provider_url(),
         "create-context-handoff-inflight-restart",
+        24_000,
+        10_000,
     )
     .await?;
     post_message(
@@ -3394,32 +4989,31 @@ async fn e2e_handoff_restart_replays_frozen_request_and_queued_input() -> TestRe
 
     let mut changed_config: Value = serde_json::from_slice(&fs::read(&config)?)?;
     changed_config["runtime"]["model_step_max_attempts"] = json!(1);
-    changed_config["runtime"]["model_context_handoff_document_tokens"] = json!(64);
-    changed_config["runtime"]["model_stream_idle_timeout_ms"] = json!(10);
+    changed_config["runtime"]["model_context_handoff_generation_tokens"] = json!(256);
+    changed_config["runtime"]["model_context_handoff_document_tokens"] = json!(256);
     fs::write(&config, serde_json::to_vec_pretty(&changed_config)?)?;
     let mut restarted = ConfiguredServer::start(&database, &config).await?;
     if let Err(error) = retry_handoff_hold.wait_entered().await {
         let state = get_session(&client, &restarted, &session_id).await?;
         return Err(Error::other(format!(
-            "prepared handoff request was not retried after restart: error={error}, model_requests={}, state={state}",
+            "handoff request was not rebuilt after restart: error={error}, model_requests={}, state={state}",
             model.request_count(),
         ))
         .into());
     }
-    sleep(Duration::from_millis(100)).await;
     let held_state = get_session(&client, &restarted, &session_id).await?;
     retry_handoff_hold.release();
     assert!(
         !held_state["active_activation"].is_null(),
-        "prepared handoff retry did not retain its original stream timeout: state={held_state}"
+        "rebuilt handoff request did not remain active at its provider barrier: state={held_state}"
     );
     assert_eq!(
         held_state["active_model_round"]["purpose"],
         "context_handoff"
     );
     assert_eq!(
-        held_state["active_model_round"]["request"]["maximum_attempts"], 2,
-        "prepared handoff retry did not retain its original attempt budget"
+        held_state["active_model_round"]["request"]["maximum_attempts"], 1,
+        "restart retained the abandoned request's attempt budget"
     );
 
     let requests = (0..model.request_count())
@@ -3429,11 +5023,15 @@ async fn e2e_handoff_restart_replays_frozen_request_and_queued_input() -> TestRe
     assert_eq!(
         requests.len(),
         2,
-        "restart did not retry one prepared handoff request"
+        "restart did not rebuild one handoff request"
+    );
+    assert_ne!(
+        requests[0], requests[1],
+        "restart replayed serialized provider request bytes"
     );
     assert_eq!(
-        requests[0], requests[1],
-        "restart reconstructed a different provider request instead of replaying the prepared envelope"
+        requests[1]["max_tokens"], 256,
+        "rebuilt handoff request did not use the current generation bound"
     );
 
     let final_state = timeout(Duration::from_secs(30), async {
@@ -3491,9 +5089,9 @@ async fn e2e_context_handoff_restart_reuses_committed_document() -> TestResult<(
     let database = TempDatabase::new("runtime-context-handoff-restart")?;
     let hold = ModelHold::new();
     let scripts = vec![
-        ModelScript::tool_call("restart-context-call-0", "fixture_tool", r#"{"stage":0}"#),
-        ModelScript::tool_call("restart-read-handoff", "read_context_handoff", r#"{}"#),
-        ModelScript::tool_call(
+        measured_tool_call("restart-context-call-0", "fixture_tool", r#"{"stage":0}"#),
+        measured_tool_call("restart-read-handoff", "read_context_handoff", r#"{}"#),
+        measured_tool_call(
             "restart-read-history",
             "read_session_history",
             r#"{"limit":16}"#,
@@ -3507,7 +5105,7 @@ async fn e2e_context_handoff_restart_reuses_committed_document() -> TestResult<(
         "result": {
             "content": format!(
                 "restart stage zero complete; {}",
-                "restart-handoff-source ".repeat(600)
+                "restart-handoff-source ".repeat(2_400)
             )
         }
     }))])
@@ -3523,11 +5121,13 @@ async fn e2e_context_handoff_restart_reuses_committed_document() -> TestResult<(
     )?;
     let mut server = ConfiguredServer::start(&database, &config).await?;
     let client = support::http_client()?;
-    let session_id = create_session(
+    let session_id = create_session_with_model_limits(
         &client,
         &server,
         &model.provider_url(),
         "create-context-handoff-restart",
+        24_000,
+        10_000,
     )
     .await?;
     post_message(
@@ -3623,14 +5223,17 @@ async fn e2e_context_handoff_restart_reuses_committed_document() -> TestResult<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e_hard_crash_recovery_exhausts_one_model_attempt_and_keeps_delivery_runnable(
-) -> TestResult<()> {
+async fn e2e_hard_crash_rebuilds_fresh_request_without_consuming_attempt_budget() -> TestResult<()>
+{
     let database = TempDatabase::new("runtime-crash-exhausted")?;
     let release = Arc::new(Notify::new());
-    let mut model = ModelFixture::start(vec![ModelScript::hold(
-        release,
-        ModelScript::final_text("must not be reached"),
-    )])
+    let mut model = ModelFixture::start(vec![
+        ModelScript::hold(
+            release.clone(),
+            ModelScript::final_text("discarded pre-crash candidate"),
+        ),
+        ModelScript::final_text("fresh request after crash"),
+    ])
     .await?;
     let mut tool = ToolFixture::start(Vec::new()).await?;
     let config = config_file(
@@ -3653,10 +5256,32 @@ async fn e2e_hard_crash_recovery_exhausts_one_model_attempt_and_keeps_delivery_r
     .await?;
     model.wait_for_requests(1).await?;
     server.stop().await?;
+    release.notify_waiters();
     let mut restarted = ConfiguredServer::start(&database, &config).await?;
-    let state = get_session(&client, &restarted, &session_id).await?;
-    assert!(state.to_string().contains("model_attempts_exhausted"));
+    model.wait_for_requests(2).await?;
+    let state = timeout(Duration::from_secs(5), async {
+        loop {
+            let state = get_session(&client, &restarted, &session_id).await?;
+            if state.to_string().contains("fresh request after crash")
+                && state["status"] == "idle"
+                && state["active_activation"].is_null()
+            {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| Error::new(ErrorKind::TimedOut, "fresh crash request did not finish"))??;
+    assert!(
+        state["last_model_attempts_exhausted"].is_null(),
+        "an interrupted request incorrectly consumed the fresh request's attempt budget: {state}"
+    );
     assert!(state.to_string().contains("queued before crash"));
+    assert_eq!(model.request_count(), 2);
+    assert!(model
+        .request(1)
+        .is_some_and(|request| request.to_string().contains("queued before crash")));
     restarted.stop().await?;
     model.stop().await?;
     tool.stop().await?;
@@ -3664,7 +5289,7 @@ async fn e2e_hard_crash_recovery_exhausts_one_model_attempt_and_keeps_delivery_r
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e_hard_crash_after_retry_fact_claims_one_scheduled_attempt() -> TestResult<()> {
+async fn e2e_restart_after_retry_decision_builds_fresh_request() -> TestResult<()> {
     let database = TempDatabase::new("runtime-crash-retry")?;
     let mut model = ModelFixture::start(vec![
         // A non-retryable provider response keeps aimux from consuming the
@@ -3682,6 +5307,10 @@ async fn e2e_hard_crash_after_retry_fact_claims_one_scheduled_attempt() -> TestR
         Some(&tool.adapter_url()),
         2,
     )?;
+    let mut config_value: Value = serde_json::from_slice(&fs::read(&config)?)?;
+    config_value["runtime"]["model_retry_base_ms"] = json!(5_000);
+    config_value["runtime"]["model_retry_max_ms"] = json!(5_000);
+    fs::write(&config, serde_json::to_vec_pretty(&config_value)?)?;
     let mut server = ConfiguredServer::start(&database, &config).await?;
     let client = support::http_client()?;
     let session_id =
@@ -3703,6 +5332,14 @@ async fn e2e_hard_crash_after_retry_fact_claims_one_scheduled_attempt() -> TestR
         1,
         "retry fact did not precede next attempt"
     );
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "crash-two-latest-message",
+        "latest durable input after retry decision",
+    )
+    .await?;
     server.stop().await?;
     let mut restarted = ConfiguredServer::start(&database, &config).await?;
     model.wait_for_requests(2).await?;
@@ -3725,6 +5362,19 @@ async fn e2e_hard_crash_after_retry_fact_claims_one_scheduled_attempt() -> TestR
         )
     })??;
     assert!(state.to_string().contains("retry recovery final"));
+    assert_eq!(model.request_count(), 2);
+    let first_request = model
+        .request(0)
+        .ok_or_else(|| Error::other("model fixture lost the pre-crash request"))?;
+    let rebuilt_request = model
+        .request(1)
+        .ok_or_else(|| Error::other("model fixture lost the rebuilt request"))?;
+    assert!(!first_request
+        .to_string()
+        .contains("latest durable input after retry decision"));
+    assert!(rebuilt_request
+        .to_string()
+        .contains("latest durable input after retry decision"));
     restarted.stop().await?;
     model.stop().await?;
     tool.stop().await?;
@@ -3756,7 +5406,7 @@ async fn e2e_model_stop_after_partial_tool_input_has_no_assistant_or_tool_effect
     )?;
     let mut server = ConfiguredServer::start(&database, &config).await?;
     let client = support::http_client()?;
-    let session_id = create_session(
+    let session_id = create_session_without_model_limits(
         &client,
         &server,
         &model.provider_url(),
@@ -3849,7 +5499,7 @@ async fn e2e_model_tool_call_preserves_assistant_text() -> TestResult<()> {
     )?;
     let mut server = ConfiguredServer::start(&database, &config).await?;
     let client = support::http_client()?;
-    let session_id = create_session(
+    let session_id = create_session_without_model_limits(
         &client,
         &server,
         &model.provider_url(),

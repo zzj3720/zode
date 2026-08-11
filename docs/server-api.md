@@ -285,6 +285,12 @@ The response shape is exact and versioned:
         "kind": "openai_compatible",
         "base_url": "https://models.example.test/v1",
         "models": ["model-a"],
+        "model_limits": {
+          "model-a": {
+            "context_window_tokens": 1000000,
+            "max_output_tokens": 384000
+          }
+        },
         "options": {}
       },
       "auth_methods": ["api_key", "oauth"],
@@ -356,6 +362,12 @@ non-secret execution descriptor:
   "kind": "openai_compatible",
   "base_url": "https://models.example.test/v1",
   "models": ["model-a"],
+  "model_limits": {
+    "model-a": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 384000
+    }
+  },
   "options": {}
 }
 ```
@@ -366,6 +378,12 @@ session create/model selection carries one explicit revision and same-key retry
 keeps it. Server validates bounds and safe URL schemes, while the target
 Endpoint independently enforces adapter support and outbound policy. Secret
 headers are auth-profile material and are rejected from this descriptor.
+`model_limits` is keyed only by names present in `models`. Its context window
+and maximum output are provider capabilities, not per-request reservations.
+The client copies the selected immutable entry with the descriptor revision;
+Server accepts and forwards it only when it exactly matches that entry. A
+legacy descriptor without an entry remains usable but cannot enable Endpoint's
+automatic context handoff for that model.
 
 One provider type may have any number of OAuth and API-key profiles. Profile
 routes are:
@@ -588,6 +606,10 @@ revision and removes the fence.
       "base_url": "https://models.example.test/v1",
       "options": {}
     },
+    "limits": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 384000
+    },
     "auth_profile_id": "profile-opaque",
     "minimum_auth_revision": 7
   },
@@ -602,8 +624,9 @@ key on every retry. Server never resolves a mutable default during admission.
 On a new admission, Server validates the Access assertion, Endpoint capability,
 model/profile compatibility, sharing policy, and that the full descriptor
 exactly matches its immutable revision before forwarding it with the concrete
-authority/profile/minimum replica revision. Operators still configure these
-resources once on Server rather than on each Endpoint. Server additionally
+authority/profile/minimum replica revision and the exact selected descriptor
+model-capability limits copied by the client. Operators still configure these resources once on Server
+rather than on each Endpoint. Server additionally
 injects its stable Endpoint-scoped `callback_base_url`; that configured value
 cannot vary across a same-key retry.
 
@@ -642,7 +665,7 @@ Endpoint-scoped route with the same key and Endpoint returns the original ULID.
 Server keeps no session receipt, mapping, or pending route.
 
 The Endpoint is always explicit in the URL; v0 never selects a device
-implicitly. `auth_profile_id`, `provider_execution`, and
+implicitly. `auth_profile_id`, `provider_execution`, `limits`, and
 `minimum_auth_revision` are required whenever `model` is present; omitting one
 returns `422` and never resolves a default. Omitting the entire model follows
 Endpoint's explicit non-runnable-session contract. The provider default is a UI

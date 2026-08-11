@@ -40,7 +40,13 @@ export type ProviderDescriptor = {
   kind: "openai_compatible";
   base_url: string;
   models: string[];
+  model_limits?: Record<string, ModelLimits>;
   options: Record<string, unknown>;
+};
+
+export type ModelLimits = {
+  context_window_tokens: number;
+  max_output_tokens: number;
 };
 
 export type Provider = {
@@ -155,6 +161,7 @@ export type Session = {
     provider_execution_kind?: string;
     provider_execution_base_url?: string;
     provider_execution_options?: Record<string, unknown>;
+    limits?: ModelLimits | null;
   } | null;
   transcript: TranscriptMessage[];
   wait: { reason?: string; deadline_ms?: number } | null;
@@ -655,6 +662,7 @@ export class ServerClient {
 }
 
 function executionBody(body: SessionExecutionRequest) {
+  const limits = body.provider.descriptor.model_limits?.[body.model];
   return {
     provider: body.provider.provider,
     model: body.model,
@@ -665,6 +673,7 @@ function executionBody(body: SessionExecutionRequest) {
       base_url: body.provider.descriptor.base_url,
       options: body.provider.descriptor.options,
     },
+    ...(limits ? { limits } : {}),
     auth_profile_id: body.profile.auth_profile_id,
     minimum_auth_revision: body.profile.revision,
   };

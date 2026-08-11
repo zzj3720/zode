@@ -84,9 +84,9 @@ contract.
 - Token deltas may eventually be transient; lifecycle transitions and final
   messages remain durable and reconnectable.
 - Public model retry/interruption events expose only zode attempt counters,
-  bounded delay, round identity, and safe error classification. Prepared model
-  envelopes, partial stream content/tool input, aimux HTTP attempts, and raw
-  provider errors remain private.
+  bounded delay, round identity, and safe error classification. Provider
+  request content is never persisted or exposed; partial stream content/tool
+  input, aimux HTTP attempts, and raw provider errors remain private.
 - A management Server may proxy Endpoint SSE, but Endpoint emits no
   Server-specific cursor or callback. The controller resumes with the same
   public `Last-Event-ID` contract as any standalone client.
