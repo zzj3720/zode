@@ -23,14 +23,15 @@ const { spawnSync } = require('node:child_process');
 
 const repository = path.resolve(__dirname, '..', '..');
 const entry = path.join(repository, 'release', 'local-channel.cjs');
+const baseEntry = process.env.ZODE_RELEASE_CHANNEL_BASE_ENTRY || entry;
 const baseArtifact = process.env.ZODE_RELEASE_CHANNEL_BASE_ARTIFACT;
 const candidateArtifact = process.env.ZODE_RELEASE_CHANNEL_ARTIFACT;
 const workspace = mkdtempSync(path.join(os.tmpdir(), 'zode-local-channel-revision-update-'));
 const channelRoot = path.join(workspace, 'channel');
 const quarantine = path.join(repository, 'target', 'test-recordings', 'quarantine', `local-channel-revision-update-${Date.now()}`);
 
-function run(args) {
-  return spawnSync(process.execPath, [entry, ...args], {
+function run(args, executable = entry) {
+  return spawnSync(process.execPath, [executable, ...args], {
     cwd: repository,
     env: { ...process.env },
     encoding: 'utf8',
@@ -79,7 +80,10 @@ function reapKnownProcesses() {
 }
 
 function cleanup() {
-  const stopped = run(['stop', '--channel-root', channelRoot]);
+  let stopped = run(['stop', '--channel-root', channelRoot]);
+  if (stopped.status !== 0 && baseEntry !== entry) {
+    stopped = run(['stop', '--channel-root', channelRoot], baseEntry);
+  }
   if (stopped.status !== 0) {
     reapKnownProcesses();
     try {
@@ -93,7 +97,8 @@ function cleanup() {
 }
 
 function main() {
-  if (!baseArtifact || !candidateArtifact || !existsSync(baseArtifact) || !existsSync(candidateArtifact)) {
+  if (!baseArtifact || !candidateArtifact || !existsSync(baseArtifact)
+    || !existsSync(candidateArtifact) || !existsSync(baseEntry)) {
     try { rmSync(workspace, { recursive: true, force: true }); } catch { /* no release process exists in blocked mode */ }
     process.stdout.write(JSON.stringify({ status: 'BLOCKED', code: 78, reason: 'missing_base_or_candidate_artifact' }) + '\n');
     process.exitCode = 78;
@@ -101,12 +106,25 @@ function main() {
   }
   const operations = [];
   try {
-    const installed = run(['install', '--artifact', path.resolve(baseArtifact), '--channel-root', channelRoot]);
+    const installed = run(
+      ['install', '--artifact', path.resolve(baseArtifact), '--channel-root', channelRoot],
+      baseEntry,
+    );
     operations.push({ operation: 'install', status: installed.status, stdout: installed.stdout, stderr: installed.stderr });
     if (installed.status !== 0 || json(installed.stdout)?.ok !== true) throw new Error(`base install failed: ${installed.stdout}${installed.stderr}`);
-    const started = run(['start', '--channel-root', channelRoot]);
+    const started = run(['start', '--channel-root', channelRoot], baseEntry);
     operations.push({ operation: 'start', status: started.status, stdout: started.stdout, stderr: started.stderr });
     if (started.status !== 0 || json(started.stdout)?.ok !== true) throw new Error(`base start failed: ${started.stdout}${started.stderr}`);
+    const stoppedBeforeUpdate = run(['stop', '--channel-root', channelRoot], baseEntry);
+    operations.push({
+      operation: 'stop_before_update',
+      status: stoppedBeforeUpdate.status,
+      stdout: stoppedBeforeUpdate.stdout,
+      stderr: stoppedBeforeUpdate.stderr,
+    });
+    if (stoppedBeforeUpdate.status !== 0 || json(stoppedBeforeUpdate.stdout)?.ok !== true) {
+      throw new Error(`base stop before cross-driver update failed: ${stoppedBeforeUpdate.stdout}${stoppedBeforeUpdate.stderr}`);
+    }
     const updated = run(['update', '--artifact', path.resolve(candidateArtifact), '--channel-root', channelRoot]);
     operations.push({ operation: 'update', status: updated.status, stdout: updated.stdout, stderr: updated.stderr });
     const updatedPayload = json(updated.stdout);

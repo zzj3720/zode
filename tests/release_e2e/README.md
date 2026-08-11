@@ -126,7 +126,10 @@ edge；`local_channel_edge_admission_e2e.cjs` 验证篡改的非 loopback 状态
 旧 current 经 candidate readiness 后原子推进到新 revision，并且更新后仍只保留
 一个健康的 current 实例；随后 stop→start 只重启实例而保留 previous
 rollback 指针；它要求 `ZODE_RELEASE_CHANNEL_BASE_ARTIFACT` 与
-`ZODE_RELEASE_CHANNEL_ARTIFACT`。
+`ZODE_RELEASE_CHANNEL_ARTIFACT`。验证 release-driver 自身升级时，还要用
+`ZODE_RELEASE_CHANNEL_BASE_ENTRY` 指向 base revision 的真实
+`release/local-channel.cjs`；场景先由该受信入口正常 stop，再由 candidate 入口
+完成同一持久根的 stage/promote，不能靠复制或改写旧 artifact 绕过 digest 绑定。
 `local_channel_node_runtime_e2e.cjs` 验证由一套 Node 启动后，另一套受信
 Node 仍能按 runtime 中的真实 executable path 检查并停止同一 edge。
 

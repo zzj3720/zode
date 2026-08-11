@@ -68,8 +68,9 @@ driver/Server/Endpoint 不读取 recorder、cassette 或 replay 输入；上述�
 
 外部 artifact 的 `install`/`bootstrap`/`stage` admission 先由 checkout 中的
 受信 driver 校验 manifest、组件 digest 和不可变树；不会先执行 artifact 自带
-的脚本。安装成功后，`promote`、`health` 和 `teardown` 才从 `current` 读取
-已安装且 digest 绑定的 driver。
+的脚本。同一次 `update` 的 `stage` 与 `promote` 必须由该 checkout 的同一受信
+driver 完成，允许 candidate 安全替换 driver digest 不同的旧 current；成功切换后，
+`health` 和 `teardown` 才从新 `current` 读取已安装且 digest 绑定的 driver。
 
 本机通道要求 artifact 的 `release-driver` digest 与执行 admission 的同一
 干净 checkout `release/driver` 相等；这样即使攻击者重新签出一份自洽
