@@ -30,6 +30,10 @@ const { spawn } = require('node:child_process');
 
 const repositoryRoot = path.resolve(__dirname, '..', '..');
 const { chromium } = require(path.join(repositoryRoot, 'web', 'e2e', 'node_modules', '@playwright', 'test'));
+const {
+  openManagement,
+  selectExecutionProfile,
+} = require(path.join(repositoryRoot, 'web', 'e2e', 'support', 'radix.cjs'));
 const channelEntry = path.join(repositoryRoot, 'release', 'channel.cjs');
 const localChannelEntry = path.join(repositoryRoot, 'release', 'local-channel.cjs');
 const runId = `${Date.now()}-${randomUUID()}`;
@@ -84,11 +88,11 @@ async function waitForAssistantMarkers(page, count, timeoutMs = 20_000) {
 }
 
 async function waitForDurableEventsConnection(page, timeoutMs = 20_000) {
-  await page.getByText('Durable events are connected', { exact: true }).waitFor({ timeout: timeoutMs });
+  await page.getByText('Connected to Endpoint', { exact: true }).waitFor({ timeout: timeoutMs });
 }
 
 async function sendComposerPrompt(page, prompt) {
-  const input = page.getByPlaceholder('Message Zode');
+  const input = page.getByPlaceholder('Message', { exact: true });
   const button = page.getByRole('button', { name: 'Send', exact: true });
   await input.waitFor({ timeout: 20_000 });
   const deadline = Date.now() + 20_000;
@@ -415,22 +419,42 @@ async function findOrCreateProfile(page, providerCard, { providerId, profileLabe
     }
   }
   await providerCard.getByRole('button', { name: 'Add API key profile' }).click();
-  await providerCard.getByLabel('Profile label').fill(profileLabel);
-  await providerCard.getByLabel('API key').fill(providerKey);
-  const makeDefault = providerCard.getByLabel('Make this the default profile');
+  const profileForm = providerCard.locator('form.nested-editor').filter({
+    hasText: 'Add API key profile',
+  });
+  await profileForm.getByLabel('Profile label').fill(profileLabel);
+  await profileForm.getByLabel('API key', { exact: true }).fill(providerKey);
+  const makeDefault = profileForm.getByLabel('Make this the default profile');
   if (persistentMode && await makeDefault.isChecked()) await makeDefault.uncheck();
-  await providerCard.getByLabel('Share with this machine').check();
+  await profileForm.getByLabel('Share with this machine').check();
   const [profileResponse] = await Promise.all([
     page.waitForResponse((response) =>
       response.request().method() === 'POST'
         && new URL(response.url()).pathname === `/v1/providers/${encodeURIComponent(providerId)}/auth-profiles`),
-    providerCard.getByRole('button', { name: 'Create profile' }).click(),
+    profileForm.getByRole('button', { name: 'Create profile' }).click(),
   ]);
   if (profileResponse.status() !== 201) fail(`profile create returned ${profileResponse.status()}`);
   const profilePayload = await profileResponse.json();
   const profileId = profilePayload.auth_profile_id || profilePayload.profile_id || null;
   if (!profileId) fail('profile create omitted auth profile id');
-  await page.getByText('Profile installed on the selected Endpoint.', { exact: true }).waitFor();
+  const deadline = Date.now() + 20_000;
+  let ready = false;
+  while (!ready && Date.now() < deadline) {
+    ready = await page.evaluate(async ({ providerId, profileId }) => {
+      const response = await fetch(
+        `/v1/providers/${encodeURIComponent(providerId)}/auth-profiles`,
+        { headers: { accept: 'application/json' } },
+      );
+      if (!response.ok) return false;
+      const profile = ((await response.json()).items || []).find(
+        (item) => (item.auth_profile_id || item.profile_id) === profileId,
+      );
+      return profile?.status === 'ready'
+        && (profile.distribution || []).some((replica) => replica.status === 'ready');
+    }, { providerId, profileId });
+    if (!ready) await page.waitForTimeout(100);
+  }
+  if (!ready) fail('profile did not become ready on the selected Endpoint');
   return profileId;
 }
 
@@ -819,9 +843,9 @@ async function main() {
       }
     });
     await page.goto(`${browserOrigin}/`, { waitUntil: 'domcontentloaded' });
-    await page.getByRole('link', { name: 'Sessions', exact: true }).waitFor();
-    await page.getByText('All-in-one ready', { exact: true }).waitFor();
-    await page.getByRole('link', { name: 'Providers' }).click();
+    await page.getByRole('heading', { name: 'What do you want to work on?', exact: true }).waitFor();
+    await page.getByRole('textbox', { name: 'New session message', exact: true }).waitFor();
+    await openManagement(page, 'Providers');
     await preparePersistentProvider(page);
     persistentOwnershipValidated = true;
     await page.getByRole('button', { name: 'Configure provider' }).click();
@@ -829,23 +853,26 @@ async function main() {
     await page.getByLabel('Base URL').fill(fixtures.providerBaseUrl);
     await page.getByLabel('Models').fill(modelId);
     await page.getByRole('button', { name: 'Save provider' }).click();
-    await page.getByText(`${providerId} is ready for an auth profile.`, { exact: true }).waitFor();
     await retainProviderOwnershipMarker(page);
     const providerCard = page.locator('article.resource-card').filter({
       has: page.getByRole('heading', { name: providerId, exact: true }),
     });
+    await providerCard.waitFor();
     createdProfileId = await findOrCreateProfile(page, providerCard, {
       providerId,
       profileLabel,
       providerKey: fixtures.providerKey,
     });
-    await page.getByRole('link', { name: 'Sessions' }).click();
-    await page.getByRole('button', { name: 'New session' }).click();
-    await page.getByLabel('Provider').selectOption(providerId);
-    await page.getByLabel('Model').selectOption(modelId);
-    const profileSelect = page.getByLabel('Auth profile');
-    await profileSelect.selectOption({ label: profileLabel });
-    await page.getByRole('button', { name: 'Start session' }).click();
+    await page.getByRole('navigation', { name: 'Primary', exact: true })
+      .getByRole('link', { name: 'New session', exact: true }).click();
+    const sessionComposer = page.locator('form#home-session-composer');
+    await selectExecutionProfile(
+      page,
+      sessionComposer.getByRole('button', { name: 'Choose model and reasoning', exact: true }),
+      modelId,
+      profileLabel,
+    );
+    await sessionComposer.getByRole('button', { name: 'Start session', exact: true }).click();
     await waitForDurableEventsConnection(page);
     await sendComposerPrompt(page, smokePrompt);
     await page.getByText(expectedAssistantPattern).waitFor({ timeout: 20_000 });

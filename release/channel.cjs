@@ -232,8 +232,9 @@ function invokeDriver(operation, root, artifact = null) {
   // An external artifact is data until the trusted checkout driver has
   // validated its immutable manifest. Never execute its embedded driver for
   // install/bootstrap/stage admission; those operations may copy or start
-  // files. Once installed, promote/health/teardown use the digest-bound copy
-  // under current.
+  // files. Stage and promote use the same trusted checkout driver so a driver
+  // upgrade can replace an older current; health/teardown use the digest-bound
+  // copy under current.
   if (artifact && ['install', 'bootstrap', 'stage'].includes(operation)) {
     const manifestPath = join(artifact, 'manifest.json');
     let manifest;
@@ -242,9 +243,11 @@ function invokeDriver(operation, root, artifact = null) {
     }
     assertTrustedDriverBinding(manifest, artifact);
   }
-  const driver = artifact && ['install', 'bootstrap', 'stage'].includes(operation)
-    ? SOURCE_DRIVER
-    : artifact ? driverForArtifact(artifact) : driverForCurrent(root);
+  let driver;
+  if (artifact && ['install', 'bootstrap', 'stage'].includes(operation)) driver = SOURCE_DRIVER;
+  else if (artifact) driver = driverForArtifact(artifact);
+  else if (operation === 'promote') driver = SOURCE_DRIVER;
+  else driver = driverForCurrent(root);
   const args = [operation, '--release-root', root];
   if (artifact) args.push('--artifact', artifact);
   args.push('--json');
