@@ -59,6 +59,7 @@ async function main() {
     request.on('end', () => {
       response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
       response.write('data: {"choices":[{"delta":{"content":"ZODE_E2_LIVE_OK"},"finish_reason":null}]}\n\n');
+      response.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
       response.end('data: [DONE]\n\n');
     });
   });
