@@ -23,8 +23,9 @@ use serde_json::{json, Value};
 use support::{
     authenticated_as, http_client, new_llm_live_recording_run_dir, require_ulid, response_text,
     scan_llm_recording_tree, spawn_db_blocking, sqlite_contains_secret, write_endpoint_config,
-    HttpFixture, LlmHttpProxy, LlmHttpRecording, LlmHttpRecordingMetadata, TempDatabase,
-    TestResult, TestZode, TEST_CONTROLLER_AUTHORITY, TEST_CONTROLLER_SECRET,
+    HttpFixture, LlmHttpProxy, LlmHttpRecording, LlmHttpRecordingMetadata, ModelFixture,
+    ModelScript, TempDatabase, TestResult, TestZode, ToolFixture, ToolScript,
+    TEST_CONTROLLER_AUTHORITY, TEST_CONTROLLER_SECRET,
 };
 use tokio::time::timeout;
 
@@ -441,7 +442,7 @@ async fn wait_for_terminal_activation(
     response: reqwest::Response,
     session_id: &str,
     provider_key: &str,
-) -> TestResult<()> {
+) -> TestResult<String> {
     timeout(BENCHMARK_TIMEOUT, async {
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::new();
@@ -503,7 +504,7 @@ async fn wait_for_terminal_activation(
                         saw_activation = false;
                         continue;
                     }
-                    return Ok(());
+                    return Ok(outcome.to_owned());
                 }
             }
         }
@@ -516,11 +517,11 @@ async fn run_benchmark(
     instruction: &str,
     shell_url: &str,
     provider_key: &str,
-    recorder: &LlmHttpProxy,
+    provider_base_url: &str,
     database: &TempDatabase,
 ) -> TestResult<Value> {
     let benchmark_started = Instant::now();
-    let provider_origin = url::Url::parse(&recorder.base_url(""))?
+    let provider_origin = url::Url::parse(provider_base_url)?
         .origin()
         .ascii_serialization();
     let config = benchmark_config(database.path(), &provider_origin, shell_url)?;
@@ -566,7 +567,7 @@ async fn run_benchmark(
                             "schema": "zode.provider-execution.v1",
                             "revision": 1,
                             "kind": "openai_compatible",
-                            "base_url": recorder.base_url("/zen/go/v1")
+                            "base_url": provider_base_url
                         },
                         "model": MODEL,
                         "limits": {
@@ -604,7 +605,8 @@ async fn run_benchmark(
         let message_admitted = benchmark_started.elapsed();
 
         let started = Instant::now();
-        wait_for_terminal_activation(events, &session_id, provider_key).await?;
+        let terminal_outcome =
+            wait_for_terminal_activation(events, &session_id, provider_key).await?;
         let state = public_json(
             authenticated_as(
                 client.get(endpoint.url(&format!("/v1/sessions/{session_id}"))),
@@ -614,14 +616,9 @@ async fn run_benchmark(
             provider_key,
         )
         .await?;
-        let has_assistant = state["transcript"].as_array().is_some_and(|messages| {
-            messages.iter().any(|message| {
-                message["role"] == "assistant"
-                    && message["content"]
-                        .as_str()
-                        .is_some_and(|text| !text.is_empty())
-            })
-        });
+        let has_assistant = state["transcript"]
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(|message| message["role"] == "assistant"));
         let has_pending_work = !state["wait"].is_null()
             || state["delivery"]["pending"]
                 .as_array()
@@ -629,13 +626,14 @@ async fn run_benchmark(
             || state["tool_calls"]
                 .as_array()
                 .is_some_and(|calls| calls.iter().any(|call| call["status"] == "running"));
-        if state["status"] != "idle"
+        if terminal_outcome != "finished"
+            || state["status"] != "idle"
             || !state["active_activation"].is_null()
             || has_pending_work
             || !has_assistant
         {
             return Err(Error::other(format!(
-                "DeepSWE terminal event did not converge to an idle session with a non-empty final assistant reply: {}",
+                "DeepSWE terminal event with outcome {terminal_outcome} did not converge to an idle session with a durable assistant message: {}",
                 benchmark_state_summary(&state)
             ))
             .into());
@@ -695,7 +693,15 @@ async fn e2e_live_deepswe_opencode_go_records_and_completes() -> TestResult<()> 
     )
     .await?;
 
-    let primary = run_benchmark(&instruction, &shell_url, &key, &recorder, &database).await;
+    let provider_base_url = recorder.base_url("/zen/go/v1");
+    let primary = run_benchmark(
+        &instruction,
+        &shell_url,
+        &key,
+        &provider_base_url,
+        &database,
+    )
+    .await;
     let mut cleanup_errors = Vec::new();
     let mut provider_recording_sha256 = None;
     if let Err(error) = recorder.stop().await {
@@ -783,6 +789,60 @@ async fn e2e_live_deepswe_opencode_go_records_and_completes() -> TestResult<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_deepswe_tool_only_terminal_attempt_reaches_verifier_boundary() -> TestResult<()> {
+    let mut model = ModelFixture::start(vec![
+        ModelScript::tool_call(
+            "tool-only-shell",
+            "shell",
+            r#"{"command":"printf tool-only"}"#,
+        ),
+        ModelScript::final_text(""),
+    ])
+    .await?;
+    let mut shell = ToolFixture::start(vec![ToolScript::Response(json!({
+        "status": "completed",
+        "result": {"content": "tool-only-ok"}
+    }))])
+    .await?;
+    let database = TempDatabase::new("deepswe-tool-only-terminal")?;
+
+    let primary = run_benchmark(
+        "Run one shell command and then finish without explanatory prose.",
+        &shell.adapter_url(),
+        REPLAY_PROVIDER_KEY,
+        &model.provider_url(),
+        &database,
+    )
+    .await;
+    let model_stop = model.stop().await;
+    let shell_stop = shell.stop().await;
+    model_stop?;
+    shell_stop?;
+    let state = primary?;
+
+    if model.request_count() != 2 || shell.completed_count() != 1 {
+        return Err(Error::other(
+            "DeepSWE tool-only terminal attempt did not cross both public effect boundaries",
+        )
+        .into());
+    }
+    if state["transcript"].as_array().is_none_or(|messages| {
+        messages.iter().any(|message| {
+            message["role"] == "assistant"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| !content.is_empty())
+        })
+    }) {
+        return Err(Error::other(
+            "DeepSWE tool-only terminal fixture unexpectedly emitted assistant prose",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "replays a retained DeepSWE recording against a real task container"]
 async fn e2e_replayed_deepswe_recording_completes_through_real_endpoint() -> TestResult<()> {
     let replay_path = required_path("ZODE_DEEPSWE_REPLAY_FILE")?;
@@ -817,7 +877,7 @@ async fn e2e_replayed_deepswe_recording_completes_through_real_endpoint() -> Tes
         &instruction,
         &shell_url,
         REPLAY_PROVIDER_KEY,
-        &recorder,
+        &recorder.base_url("/zen/go/v1"),
         &database,
     )
     .await;
@@ -962,7 +1022,7 @@ async fn e2e_recorded_deepswe_long_run_replays_through_real_endpoint() -> TestRe
             &instruction,
             &shell.url(),
             REPLAY_PROVIDER_KEY,
-            &recorder,
+            &recorder.base_url("/zen/go/v1"),
             &database,
         ),
     )
