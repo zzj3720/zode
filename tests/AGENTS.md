@@ -177,6 +177,12 @@ recording, fixture promotion, and replay.
   e2e_recorded_opencode_provider_roundtrip_and_restart -- --exact --nocapture`
   is the offline replay gate once the reviewed recording exists. Captured
   timing is opt-in; immediate replay is the default regression mode.
+- `cargo test --release --locked --test deepswe_e2e
+  e2e_recorded_deepswe_long_run_replays_through_real_endpoint -- --exact
+  --nocapture` is the canonical 1,442-event DeepSWE replay gate. The optimized
+  profile changes no assertions or replay semantics; it prevents debug-only
+  hashing and serialization overhead from dominating the long real-process
+  scenario.
 - `cargo fmt --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `rg '#\[cfg\(test\)\]|#\[test\]|#\[tokio::test\]' src --glob '*.rs'` must return no

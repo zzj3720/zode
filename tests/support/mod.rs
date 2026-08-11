@@ -1869,11 +1869,52 @@ impl LlmHttpRecording {
     }
 
     fn envelope_digest(&self) -> String {
-        let mut unsigned = self.clone();
-        unsigned.envelope_sha256.clear();
-        serde_json::to_vec(&unsigned)
-            .map(|bytes| sha256_hex(&bytes))
+        #[derive(Serialize)]
+        struct UnsignedRecording<'a> {
+            schema: &'a str,
+            recording_id: &'a str,
+            purpose: &'a str,
+            owner: &'a str,
+            boundary: &'a str,
+            secret_slots: &'a [String],
+            provider: &'a str,
+            model: &'a str,
+            requests: &'a [LlmHttpRecordingExchange],
+            envelope_sha256: &'static str,
+        }
+        let unsigned = UnsignedRecording {
+            schema: &self.schema,
+            recording_id: &self.recording_id,
+            purpose: &self.purpose,
+            owner: &self.owner,
+            boundary: &self.boundary,
+            secret_slots: &self.secret_slots,
+            provider: &self.provider,
+            model: &self.model,
+            requests: &self.requests,
+            envelope_sha256: "",
+        };
+        let mut hasher = Sha256::new();
+        let encoded = {
+            let mut writer = Sha256Writer(&mut hasher);
+            serde_json::to_writer(&mut writer, &unsigned)
+        };
+        encoded
+            .map(|()| format!("{:x}", hasher.finalize()))
             .unwrap_or_default()
+    }
+}
+
+struct Sha256Writer<'a>(&'a mut Sha256);
+
+impl Write for Sha256Writer<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -2133,7 +2174,7 @@ enum LlmHttpProxyMode {
         sink: std::sync::Arc<RecordingSink>,
     },
     Replay {
-        recording: LlmHttpRecording,
+        recording: std::sync::Arc<LlmHttpRecording>,
         captured_timing: bool,
         expected_authorization: Option<String>,
         terminal_hold: Option<std::sync::Arc<Notify>>,
@@ -2892,7 +2933,7 @@ impl LlmHttpProxy {
     ) -> TestResult<Self> {
         recording.validate()?;
         Self::start(LlmHttpProxyMode::Replay {
-            recording,
+            recording: std::sync::Arc::new(recording),
             captured_timing,
             expected_authorization,
             terminal_hold: None,
@@ -2911,7 +2952,7 @@ impl LlmHttpProxy {
     ) -> TestResult<Self> {
         recording.validate()?;
         Self::start(LlmHttpProxyMode::Replay {
-            recording,
+            recording: std::sync::Arc::new(recording),
             captured_timing,
             expected_authorization,
             terminal_hold: Some(terminal_hold),
@@ -2974,7 +3015,7 @@ impl LlmHttpProxy {
                     envelope_sha256: String::new(),
                 }
             }
-            LlmHttpProxyMode::Replay { recording, .. } => recording.clone(),
+            LlmHttpProxyMode::Replay { recording, .. } => recording.as_ref().clone(),
         };
         recording.with_digest()
     }
@@ -3550,7 +3591,7 @@ async fn record_llm_http_request(
 async fn replay_llm_http_request(
     state: std::sync::Arc<LlmHttpProxyState>,
     request: Request,
-    recording: LlmHttpRecording,
+    recording: std::sync::Arc<LlmHttpRecording>,
     captured_timing: bool,
     expected_authorization: Option<String>,
     terminal_hold: Option<std::sync::Arc<Notify>>,
@@ -3613,7 +3654,7 @@ async fn replay_llm_http_request(
             canonical_json: canonical_body.clone(),
         });
     state.observed_seen.notify_waiters();
-    let expected = {
+    let expected_index = {
         let mut next = state
             .next_replay
             .lock()
@@ -3631,11 +3672,12 @@ async fn replay_llm_http_request(
             record_replay_error(&state, "provider request did not match cassette");
             return llm_proxy_error(AxumStatusCode::CONFLICT);
         }
+        let expected_index = *next;
         *next += 1;
-        expected.clone()
+        expected_index
     };
-    let response = expected.response;
-    if matches!(response.outcome, LlmHttpResponseOutcome::TransportError) {
+    let response = &recording.requests[expected_index].response;
+    if matches!(&response.outcome, LlmHttpResponseOutcome::TransportError) {
         let state_for_stream = state.clone();
         if terminal_hold.is_some() {
             state_for_stream
@@ -3676,7 +3718,9 @@ async fn replay_llm_http_request(
         .map(|header| header.value.clone());
     let outcome = response.outcome.clone();
     let state_for_stream = state.clone();
+    let recording_for_stream = recording.clone();
     let stream = stream! {
+        let response = &recording_for_stream.requests[expected_index].response;
         let started = Instant::now();
         let total_chunks = response.chunks.len();
         let terminal_required = matches!(
@@ -3693,7 +3737,7 @@ async fn replay_llm_http_request(
         if total_chunks == 0 {
             completion.all_chunks_emitted = true;
         }
-        for (index, chunk) in response.chunks.into_iter().enumerate() {
+        for (index, chunk) in response.chunks.iter().enumerate() {
             if captured_timing {
                 let target = Duration::from_micros(chunk.at_us);
                 let elapsed = started.elapsed();

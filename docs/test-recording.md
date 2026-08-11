@@ -274,6 +274,11 @@ event trace must match the reviewed manifest after deterministic normalization
 of run-local identities and clocks. An unexpected provider request, tool call,
 event, duplicate, or unconsumed expected fact fails the E2E.
 
+The canonical DeepSWE live and replay runners use Cargo's optimized release
+profile. This does not skip or replace any assertion; it keeps the real
+Endpoint's hashing, JSON, reducer, and snapshot costs representative instead of
+letting the debug profile dominate a long deterministic replay.
+
 A separate Pier reconstruction mode may additionally start a fresh official
 benchmark environment. It derives each shell command and expected result from
 the same event trace, executes the command there for its filesystem side

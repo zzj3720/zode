@@ -417,7 +417,6 @@ async fn run_benchmark(
 
         let started = Instant::now();
         let mut saw_active_activation = false;
-        let mut stable_idle: Option<(Instant, u64, usize)> = None;
         loop {
             let state = public_json(
                 authenticated_as(
@@ -429,7 +428,6 @@ async fn run_benchmark(
             )
             .await?;
             saw_active_activation |= !state["active_activation"].is_null();
-            let transcript_len = state["transcript"].as_array().map_or(0, Vec::len);
             let has_assistant = state["transcript"].as_array().is_some_and(|messages| {
                 messages.iter().any(|message| {
                     message["role"] == "assistant"
@@ -450,23 +448,6 @@ async fn run_benchmark(
                 && state["active_activation"].is_null()
                 && !has_pending_work
             {
-                let stream_version = state["version"].as_u64().unwrap_or_default();
-                let unchanged_since = match stable_idle {
-                    Some((since, version, messages))
-                        if version == stream_version && messages == transcript_len =>
-                    {
-                        since
-                    }
-                    _ => {
-                        let since = Instant::now();
-                        stable_idle = Some((since, stream_version, transcript_len));
-                        since
-                    }
-                };
-                if unchanged_since.elapsed() < Duration::from_secs(5) {
-                    sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
                 if !has_assistant {
                     return Err(Error::other(format!(
                         "DeepSWE became idle without a non-empty final assistant reply: {}",
@@ -475,8 +456,6 @@ async fn run_benchmark(
                     .into());
                 }
                 return Ok(state);
-            } else {
-                stable_idle = None;
             }
             if started.elapsed() >= BENCHMARK_TIMEOUT {
                 return Err(Error::new(ErrorKind::TimedOut, "DeepSWE agent timed out").into());

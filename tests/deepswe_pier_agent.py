@@ -281,7 +281,7 @@ class ZodeDeepSweAgent(BaseAgent):
         return "zode-deepswe"
 
     def version(self) -> str:
-        return "6"
+        return "7"
 
     async def setup(self, environment: BaseEnvironment) -> None:
         probe = await environment.exec("git rev-parse HEAD", cwd="/app", timeout_sec=30)
@@ -326,6 +326,7 @@ class ZodeDeepSweAgent(BaseAgent):
         command = [
             "cargo",
             "test",
+            "--release",
             "--locked",
             "--test",
             "deepswe_e2e",
