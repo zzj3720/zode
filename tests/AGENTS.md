@@ -101,6 +101,24 @@ recording, fixture promotion, and replay.
   maintain a parallel shell transcript or import recorded events into storage.
   The provider cassette supplements only exact provider HTTP bytes that the
   product intentionally does not persist in events.
+- The canonical DeepSWE correctness replay reports elapsed time without a
+  machine-specific limit. Local performance diagnosis may explicitly set
+  `ZODE_DEEPSWE_REPLAY_MAX_MS` to turn a measured regression into a typed red;
+  the same explicit budget must be used before and after a performance repair.
+  `ZODE_DEEPSWE_REPLAY_MAX_ORDINARY_BOUNDARY_MS` similarly bounds the aggregate
+  ordinary provider/tool transition time while excluding recorded retry
+  backoff. `ZODE_DEEPSWE_REPLAY_MAX_FIXTURE_START_MS` isolates duplicate
+  cassette validation and fixture startup from both measures.
+  `ZODE_DEEPSWE_REPLAY_MAX_RETAINED_REQUEST_BYTES` bounds the replay index's
+  retained request-matching representation after cassette validation; response
+  bytes are excluded because the fixture must still deliver them.
+  `ZODE_DEEPSWE_REPLAY_MAX_DATABASE_BYTES` bounds the stopped Endpoint's SQLite
+  file set so a diagnostic snapshot cadence cannot silently duplicate the
+  growing long-task state throughout an otherwise-correct replay.
+- DeepSWE live and replay runs use the production snapshot policy by default.
+  `ZODE_DEEPSWE_SNAPSHOT_EVERY_EVENTS=off|N` is an explicit diagnostic override;
+  the generic short-E2E cadence of one snapshot per event must not leak into a
+  long benchmark.
 - Successful recordings may stay as ignored run artifacts. A recorded problem
   may not remain only in a live log: promote the sanitized cassette under
   `tests/fixtures/provider_recordings/`, bind it to a named real-process E2E,

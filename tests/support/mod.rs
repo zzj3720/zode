@@ -1483,6 +1483,79 @@ pub struct LlmHttpRecording {
     pub envelope_sha256: String,
 }
 
+pub struct ValidatedLlmHttpRecording(LlmHttpRecording);
+
+impl ValidatedLlmHttpRecording {
+    pub fn request_count(&self) -> usize {
+        self.0.requests.len()
+    }
+
+    fn into_hash_replay(self) -> TestResult<LlmHttpHashReplayRecording> {
+        let LlmHttpRecording {
+            secret_slots,
+            requests,
+            ..
+        } = self.0;
+        let requires_authorization = !secret_slots.is_empty();
+        let requests = requests
+            .into_iter()
+            .map(|exchange| {
+                let request = exchange.request;
+                Ok(LlmHttpHashReplayExchange {
+                    request: LlmHttpHashReplayRequest {
+                        method: request.method.into_boxed_str(),
+                        path: request.path.into_boxed_str(),
+                        semantic_headers: request.semantic_headers.into_boxed_slice(),
+                        raw_body_sha256: decode_sha256(&request.raw_body_sha256)?,
+                    },
+                    response: exchange.response,
+                })
+            })
+            .collect::<TestResult<Vec<_>>>()?
+            .into_boxed_slice();
+        let retained_request_match_bytes = requests
+            .iter()
+            .map(|exchange| exchange.request.retained_bytes())
+            .sum();
+        Ok(LlmHttpHashReplayRecording {
+            requires_authorization,
+            requests,
+            retained_request_match_bytes,
+        })
+    }
+}
+
+struct LlmHttpHashReplayRecording {
+    requires_authorization: bool,
+    requests: Box<[LlmHttpHashReplayExchange]>,
+    retained_request_match_bytes: usize,
+}
+
+struct LlmHttpHashReplayExchange {
+    request: LlmHttpHashReplayRequest,
+    response: LlmHttpRecordingResponse,
+}
+
+struct LlmHttpHashReplayRequest {
+    method: Box<str>,
+    path: Box<str>,
+    semantic_headers: Box<[LlmHttpHeader]>,
+    raw_body_sha256: [u8; 32],
+}
+
+impl LlmHttpHashReplayRequest {
+    fn retained_bytes(&self) -> usize {
+        self.method.len()
+            + self.path.len()
+            + self
+                .semantic_headers
+                .iter()
+                .map(|header| header.name.len() + header.value.len())
+                .sum::<usize>()
+            + self.raw_body_sha256.len()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmHttpRecordingExchange {
@@ -1576,6 +1649,29 @@ pub struct LlmHttpAttemptPlan {
 }
 
 impl LlmHttpRecording {
+    fn retained_request_match_bytes(&self) -> usize {
+        self.requests
+            .iter()
+            .map(|exchange| {
+                let request = &exchange.request;
+                request.method.len()
+                    + request.path.len()
+                    + request
+                        .semantic_headers
+                        .iter()
+                        .map(|header| header.name.len() + header.value.len())
+                        .sum::<usize>()
+                    + request.raw_body_hex.len()
+                    + request.canonical_json.as_ref().map_or(0, String::len)
+                    + request.raw_body_sha256.len()
+                    + request
+                        .canonical_json_sha256
+                        .as_ref()
+                        .map_or(0, String::len)
+            })
+            .sum()
+    }
+
     pub fn load(path: &Path) -> TestResult<Self> {
         Self::load_with_bound(path, MAX_LLM_RECORDING_BYTES)
     }
@@ -1600,6 +1696,10 @@ impl LlmHttpRecording {
         let recording: Self = serde_json::from_slice(&bytes)?;
         recording.validate()?;
         Ok(recording)
+    }
+
+    pub fn load_compressed_validated(path: &Path) -> TestResult<ValidatedLlmHttpRecording> {
+        Self::load_compressed(path).map(ValidatedLlmHttpRecording)
     }
 
     fn load_with_bound(path: &Path, max_bytes: u64) -> TestResult<Self> {
@@ -2088,6 +2188,25 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn decode_sha256(value: &str) -> TestResult<[u8; 32]> {
+    if value.len() != 64 {
+        return Err(IoError::other("SHA-256 digest has the wrong length").into());
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0])
+            .ok_or_else(|| IoError::other("SHA-256 digest encoding is invalid"))?;
+        let low = hex_nibble(pair[1])
+            .ok_or_else(|| IoError::other("SHA-256 digest encoding is invalid"))?;
+        digest[index] = (high << 4) | low;
+    }
+    Ok(digest)
+}
+
 pub fn canonical_json(body: &[u8]) -> TestResult<String> {
     canonical_json_from_value(&serde_json::from_slice(body)?)
 }
@@ -2174,11 +2293,88 @@ enum LlmHttpProxyMode {
         sink: std::sync::Arc<RecordingSink>,
     },
     Replay {
-        recording: std::sync::Arc<LlmHttpRecording>,
+        recording: LlmHttpReplayRecording,
         captured_timing: bool,
         expected_authorization: Option<String>,
         terminal_hold: Option<std::sync::Arc<Notify>>,
     },
+}
+
+#[derive(Clone)]
+enum LlmHttpReplayRecording {
+    Full(std::sync::Arc<LlmHttpRecording>),
+    Hashes(std::sync::Arc<LlmHttpHashReplayRecording>),
+}
+
+impl LlmHttpReplayRecording {
+    fn request_count(&self) -> usize {
+        match self {
+            Self::Full(recording) => recording.requests.len(),
+            Self::Hashes(recording) => recording.requests.len(),
+        }
+    }
+
+    fn response(&self, index: usize) -> Option<&LlmHttpRecordingResponse> {
+        match self {
+            Self::Full(recording) => recording
+                .requests
+                .get(index)
+                .map(|exchange| &exchange.response),
+            Self::Hashes(recording) => recording
+                .requests
+                .get(index)
+                .map(|exchange| &exchange.response),
+        }
+    }
+
+    fn request_matches(
+        &self,
+        index: usize,
+        method: &str,
+        path: &str,
+        semantic_headers: &[LlmHttpHeader],
+        body: &[u8],
+    ) -> bool {
+        match self {
+            Self::Full(recording) => recording.requests.get(index).is_some_and(|exchange| {
+                exchange.request.method == method
+                    && exchange.request.path == path
+                    && exchange.request.semantic_headers == semantic_headers
+                    && exchange.request.raw_body_sha256 == sha256_hex(body)
+            }),
+            Self::Hashes(recording) => recording.requests.get(index).is_some_and(|exchange| {
+                exchange.request.method.as_ref() == method
+                    && exchange.request.path.as_ref() == path
+                    && exchange.request.semantic_headers.as_ref() == semantic_headers
+                    && exchange.request.raw_body_sha256 == sha256(body)
+            }),
+        }
+    }
+
+    fn requires_authorization(&self) -> bool {
+        match self {
+            Self::Full(recording) => !recording.secret_slots.is_empty(),
+            Self::Hashes(recording) => recording.requires_authorization,
+        }
+    }
+
+    fn retains_observed_bodies(&self) -> bool {
+        matches!(self, Self::Full(_))
+    }
+
+    fn retained_request_match_bytes(&self) -> usize {
+        match self {
+            Self::Full(recording) => recording.retained_request_match_bytes(),
+            Self::Hashes(recording) => recording.retained_request_match_bytes,
+        }
+    }
+
+    fn full(&self) -> Option<&LlmHttpRecording> {
+        match self {
+            Self::Full(recording) => Some(recording),
+            Self::Hashes(_) => None,
+        }
+    }
 }
 
 struct RecordingSink {
@@ -2763,6 +2959,7 @@ struct LlmHttpProxyState {
     client: Client,
     mode: LlmHttpProxyMode,
     observed: std::sync::Mutex<Vec<LlmHttpObservedRequest>>,
+    observed_at: std::sync::Mutex<Vec<Instant>>,
     observed_seen: Notify,
     replay_chunk_count: AtomicU64,
     replay_chunk_seen: Notify,
@@ -2933,7 +3130,42 @@ impl LlmHttpProxy {
     ) -> TestResult<Self> {
         recording.validate()?;
         Self::start(LlmHttpProxyMode::Replay {
-            recording: std::sync::Arc::new(recording),
+            recording: LlmHttpReplayRecording::Full(std::sync::Arc::new(recording)),
+            captured_timing,
+            expected_authorization,
+            terminal_hold: None,
+        })
+        .await
+    }
+
+    /// Exact replay for large cassettes whose caller needs request timing and
+    /// count but does not inspect duplicate in-memory copies of request bodies.
+    /// The already-validated cassette and each incoming raw body are matched by
+    /// SHA-256, preserving exact-byte semantics without hex/canonical-JSON
+    /// expansion on every request.
+    pub async fn replay_hashes_with_authorization(
+        recording: LlmHttpRecording,
+        captured_timing: bool,
+        expected_authorization: Option<String>,
+    ) -> TestResult<Self> {
+        recording.validate()?;
+        Self::replay_validated_hashes_with_authorization(
+            ValidatedLlmHttpRecording(recording),
+            captured_timing,
+            expected_authorization,
+        )
+        .await
+    }
+
+    pub async fn replay_validated_hashes_with_authorization(
+        recording: ValidatedLlmHttpRecording,
+        captured_timing: bool,
+        expected_authorization: Option<String>,
+    ) -> TestResult<Self> {
+        Self::start(LlmHttpProxyMode::Replay {
+            recording: LlmHttpReplayRecording::Hashes(std::sync::Arc::new(
+                recording.into_hash_replay()?,
+            )),
             captured_timing,
             expected_authorization,
             terminal_hold: None,
@@ -2952,7 +3184,7 @@ impl LlmHttpProxy {
     ) -> TestResult<Self> {
         recording.validate()?;
         Self::start(LlmHttpProxyMode::Replay {
-            recording: std::sync::Arc::new(recording),
+            recording: LlmHttpReplayRecording::Full(std::sync::Arc::new(recording)),
             captured_timing,
             expected_authorization,
             terminal_hold: Some(terminal_hold),
@@ -2969,6 +3201,7 @@ impl LlmHttpProxy {
             client,
             mode,
             observed: std::sync::Mutex::new(Vec::new()),
+            observed_at: std::sync::Mutex::new(Vec::new()),
             observed_seen: Notify::new(),
             replay_chunk_count: AtomicU64::new(0),
             replay_chunk_seen: Notify::new(),
@@ -3015,7 +3248,10 @@ impl LlmHttpProxy {
                     envelope_sha256: String::new(),
                 }
             }
-            LlmHttpProxyMode::Replay { recording, .. } => recording.as_ref().clone(),
+            LlmHttpProxyMode::Replay { recording, .. } => recording
+                .full()
+                .cloned()
+                .ok_or_else(|| IoError::other("hash replay does not retain a full recording"))?,
         };
         recording.with_digest()
     }
@@ -3033,6 +3269,23 @@ impl LlmHttpProxy {
             .lock()
             .expect("LLM proxy observed mutex poisoned")
             .clone()
+    }
+
+    pub fn observed_request_times(&self) -> Vec<Instant> {
+        self.state
+            .observed_at
+            .lock()
+            .expect("LLM proxy observation-time mutex poisoned")
+            .clone()
+    }
+
+    pub fn replay_retained_request_match_bytes(&self) -> Option<usize> {
+        match &self.state.mode {
+            LlmHttpProxyMode::Replay { recording, .. } => {
+                Some(recording.retained_request_match_bytes())
+            }
+            LlmHttpProxyMode::Record { .. } => None,
+        }
     }
 
     pub async fn wait_for_recorded_chunks(&self, expected: u64) -> TestResult<()> {
@@ -3148,13 +3401,13 @@ impl LlmHttpProxy {
                     .next_replay
                     .lock()
                     .expect("LLM proxy replay mutex poisoned")
-                    == recording.requests.len()
+                    == recording.request_count()
                     && *self
                         .state
                         .replay_completed
                         .lock()
                         .expect("LLM replay completion mutex poisoned")
-                        == recording.requests.len()
+                        == recording.request_count()
                     && self
                         .state
                         .replay_error
@@ -3368,6 +3621,11 @@ async fn record_llm_http_request(
             raw_body_hex: request_record.raw_body_hex.clone(),
             canonical_json: canonical_body.clone(),
         });
+    state
+        .observed_at
+        .lock()
+        .expect("LLM proxy observation-time mutex poisoned")
+        .push(Instant::now());
     state.observed_seen.notify_waiters();
 
     sink.record_ingress(sequence, &method_name, &path, &body);
@@ -3591,7 +3849,7 @@ async fn record_llm_http_request(
 async fn replay_llm_http_request(
     state: std::sync::Arc<LlmHttpProxyState>,
     request: Request,
-    recording: std::sync::Arc<LlmHttpRecording>,
+    recording: LlmHttpReplayRecording,
     captured_timing: bool,
     expected_authorization: Option<String>,
     terminal_hold: Option<std::sync::Arc<Notify>>,
@@ -3615,10 +3873,8 @@ async fn replay_llm_http_request(
         Ok(body) => body,
         Err(_) => return llm_proxy_error(AxumStatusCode::BAD_REQUEST),
     };
-    let canonical_body = canonical_json(&body).ok();
     let semantic_headers = semantic_headers(&headers, true);
-    let raw_body_hex = hex_encode(&body);
-    if expected_authorization.is_some() || !recording.secret_slots.is_empty() {
+    if expected_authorization.is_some() || recording.requires_authorization() {
         if expected_authorization.is_none() {
             record_replay_error(&state, "replay requires an explicit authorization binding");
             return llm_proxy_error(AxumStatusCode::CONFLICT);
@@ -3642,6 +3898,11 @@ async fn replay_llm_http_request(
             return llm_proxy_error(AxumStatusCode::CONFLICT);
         }
     }
+    let (raw_body_hex, canonical_body) = if recording.retains_observed_bodies() {
+        (hex_encode(&body), canonical_json(&body).ok())
+    } else {
+        (String::new(), None)
+    };
     state
         .observed
         .lock()
@@ -3650,25 +3911,25 @@ async fn replay_llm_http_request(
             method: method.clone(),
             path: path.clone(),
             semantic_headers: semantic_headers.clone(),
-            raw_body_hex: raw_body_hex.clone(),
-            canonical_json: canonical_body.clone(),
+            raw_body_hex,
+            canonical_json: canonical_body,
         });
+    state
+        .observed_at
+        .lock()
+        .expect("LLM proxy observation-time mutex poisoned")
+        .push(Instant::now());
     state.observed_seen.notify_waiters();
     let expected_index = {
         let mut next = state
             .next_replay
             .lock()
             .expect("LLM proxy replay mutex poisoned");
-        let Some(expected) = recording.requests.get(*next) else {
+        if *next >= recording.request_count() {
             record_replay_error(&state, "unexpected provider request after cassette end");
             return llm_proxy_error(AxumStatusCode::CONFLICT);
-        };
-        if expected.request.method != method
-            || expected.request.path != path
-            || expected.request.semantic_headers != semantic_headers
-            || expected.request.raw_body_hex != raw_body_hex
-            || expected.request.canonical_json != canonical_body
-        {
+        }
+        if !recording.request_matches(*next, &method, &path, &semantic_headers, &body) {
             record_replay_error(&state, "provider request did not match cassette");
             return llm_proxy_error(AxumStatusCode::CONFLICT);
         }
@@ -3676,7 +3937,9 @@ async fn replay_llm_http_request(
         *next += 1;
         expected_index
     };
-    let response = &recording.requests[expected_index].response;
+    let response = recording
+        .response(expected_index)
+        .expect("matched replay request has a response");
     if matches!(&response.outcome, LlmHttpResponseOutcome::TransportError) {
         let state_for_stream = state.clone();
         if terminal_hold.is_some() {
@@ -3720,7 +3983,9 @@ async fn replay_llm_http_request(
     let state_for_stream = state.clone();
     let recording_for_stream = recording.clone();
     let stream = stream! {
-        let response = &recording_for_stream.requests[expected_index].response;
+        let response = recording_for_stream
+            .response(expected_index)
+            .expect("matched replay request has a streaming response");
         let started = Instant::now();
         let total_chunks = response.chunks.len();
         let terminal_required = matches!(

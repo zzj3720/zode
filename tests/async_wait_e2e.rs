@@ -4131,7 +4131,7 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
     let incident = IncidentRecorder::new_with_fixture(
         E2E,
         "retain the first public cancellation failure and both concurrent tool exchanges",
-        "e2e_cancel_one_tool_does_not_cancel_siblings.v2",
+        "e2e_cancel_one_tool_does_not_cancel_siblings.v3",
     )?;
     let database = TempDatabase::new("async-cancel-sibling")?;
     let release_cancelled = Arc::new(Notify::new());
@@ -4313,6 +4313,24 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
     cancelled_proxy.release_replay();
     sibling_proxy.release_replay();
     incident.wait_for_completions("tool.sibling", 1).await?;
+    incident.wait_for_requests("provider.model", 2).await?;
+    incident.wait_for_completions("provider.model", 2).await?;
+    let final_state = timeout(Duration::from_secs(5), async {
+        loop {
+            let state = read_session(&client, &server, &session_id).await?;
+            if state.to_string().contains("cancel sibling final") {
+                return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "cancel-sibling final assistant projection timed out",
+        )
+    })??;
     let sibling_completed = wait_for_tool_status(
         &client,
         &incident,
@@ -4338,12 +4356,11 @@ async fn e2e_cancel_one_tool_does_not_cancel_siblings() -> TestResult<()> {
     assert_eq!(sibling_completed["allowed_actions"], json!([]));
     assert_eq!(incident.request_count("tool.cancel"), 1);
     assert_eq!(incident.request_count("tool.sibling"), 1);
-    let state = read_session(&client, &server, &session_id).await?;
     let events = replay_events_through_version(
         &client,
         &server,
         &session_id,
-        state["version"]
+        final_state["version"]
             .as_u64()
             .ok_or_else(|| Error::other("cancel sibling GET omitted version"))?,
     )

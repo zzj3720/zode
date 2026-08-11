@@ -56,19 +56,8 @@ pub(super) fn materialize_boundary_blocking(
             SessionEvent::DeliveryAcknowledged { through_queue_id },
         ));
         let command_id = format!("delivery-boundary:v1:{through_queue_id}");
-        match store.append_owned(
-            owner,
-            session_id,
-            state.stream_version,
-            &command_id,
-            &drafts,
-        ) {
-            Ok(append) => {
-                let state = store
-                    .rehydrate_owned(owner, session_id)
-                    .map_err(|_| "materialize_rehydrate")?;
-                return Ok((Some(append), state));
-            }
+        match store.append_owned(owner, session_id, &state, &command_id, &drafts) {
+            Ok(appended) => return Ok((Some(appended.append), appended.state)),
             Err(StoreError::OptimisticConcurrency { .. }) => {
                 state = store
                     .rehydrate_owned(owner, session_id)
@@ -129,10 +118,11 @@ pub(super) async fn append_tool_batch(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
+    state: SessionState,
     input: ToolBatchInput,
 ) -> Result<(AppendResult, SessionState), &'static str> {
     tokio::task::spawn_blocking(move || {
-        append_tool_batch_blocking(&*store, &owner, &session_id, &input)
+        append_tool_batch_blocking(&*store, &owner, &session_id, state, &input)
     })
     .await
     .map_err(|_| "tool_batch_join")?
@@ -142,6 +132,7 @@ pub(super) fn append_tool_batch_blocking(
     store: &dyn EventStore,
     owner: &SessionOwner,
     session_id: &str,
+    mut state: SessionState,
     input: &ToolBatchInput,
 ) -> Result<(AppendResult, SessionState), &'static str> {
     let ToolBatchInput {
@@ -163,9 +154,6 @@ pub(super) fn append_tool_batch_blocking(
         source_queue_id: None,
     };
     for _ in 0..16 {
-        let state = store
-            .rehydrate_owned(owner, session_id)
-            .map_err(|_| "tool_batch_rehydrate")?;
         if let Some(existing) = state
             .transcript
             .iter()
@@ -257,20 +245,13 @@ pub(super) fn append_tool_batch_blocking(
                 },
             ));
         }
-        match store.append_owned(
-            owner,
-            session_id,
-            state.stream_version,
-            &command_id,
-            &drafts,
-        ) {
-            Ok(append) => {
-                let state = store
+        match store.append_owned(owner, session_id, &state, &command_id, &drafts) {
+            Ok(appended) => return Ok((appended.append, appended.state)),
+            Err(StoreError::OptimisticConcurrency { .. }) => {
+                state = store
                     .rehydrate_owned(owner, session_id)
                     .map_err(|_| "tool_batch_rehydrate")?;
-                return Ok((append, state));
             }
-            Err(StoreError::OptimisticConcurrency { .. }) => continue,
             Err(_) => return Err("tool_batch_append"),
         }
     }
@@ -281,6 +262,7 @@ pub(super) async fn append_tool_results(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
+    state: SessionState,
     batch_identity: String,
     tool_calls: Vec<ToolCall>,
     results: Vec<Result<ToolExecutionResult, ToolError>>,
@@ -290,6 +272,7 @@ pub(super) async fn append_tool_results(
             &*store,
             &owner,
             &session_id,
+            state,
             &batch_identity,
             &tool_calls,
             &results,
@@ -303,6 +286,7 @@ pub(super) fn append_tool_results_blocking(
     store: &dyn EventStore,
     owner: &SessionOwner,
     session_id: &str,
+    mut state: SessionState,
     batch_identity: &str,
     tool_calls: &[ToolCall],
     results: &[Result<ToolExecutionResult, ToolError>],
@@ -312,9 +296,6 @@ pub(super) fn append_tool_results_blocking(
         .map(|call| tool_result_message_id(batch_identity, &call.tool_call_id))
         .collect::<Vec<_>>();
     for _ in 0..16 {
-        let state = store
-            .rehydrate_owned(owner, session_id)
-            .map_err(|_| "tool_results_rehydrate")?;
         let all_messages_present = result_message_ids.iter().all(|message_id| {
             state
                 .transcript
@@ -511,20 +492,13 @@ pub(super) fn append_tool_results_blocking(
             ));
         }
         let command_id = format!("tool-results-command:v1:{batch_identity}");
-        match store.append_owned(
-            owner,
-            session_id,
-            state.stream_version,
-            &command_id,
-            &drafts,
-        ) {
-            Ok(append) => {
-                let state = store
+        match store.append_owned(owner, session_id, &state, &command_id, &drafts) {
+            Ok(appended) => return Ok((appended.append, appended.state)),
+            Err(StoreError::OptimisticConcurrency { .. }) => {
+                state = store
                     .rehydrate_owned(owner, session_id)
                     .map_err(|_| "tool_results_rehydrate")?;
-                return Ok((append, state));
             }
-            Err(StoreError::OptimisticConcurrency { .. }) => continue,
             Err(_) => return Err("tool_results_append"),
         }
     }
@@ -655,19 +629,8 @@ pub(super) fn append_background_tool_result_blocking(
                 },
             },
         ));
-        match store.append_owned(
-            owner,
-            session_id,
-            state.stream_version,
-            &command_id,
-            &drafts,
-        ) {
-            Ok(append) => {
-                let state = store
-                    .rehydrate_owned(owner, session_id)
-                    .map_err(|_| "background_tool_rehydrate")?;
-                return Ok(Some((append, state)));
-            }
+        match store.append_owned(owner, session_id, &state, &command_id, &drafts) {
+            Ok(appended) => return Ok(Some((appended.append, appended.state))),
             Err(StoreError::OptimisticConcurrency { .. }) => continue,
             Err(StoreError::CommandIdempotencyConflict { .. })
             | Err(StoreError::EventIdempotencyConflict { .. }) => continue,
@@ -751,11 +714,19 @@ pub(super) async fn append_assistant(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
+    state: SessionState,
     trigger_message_id: String,
     content: String,
 ) -> Result<(AppendResult, SessionState), &'static str> {
     tokio::task::spawn_blocking(move || {
-        append_assistant_blocking(&*store, &owner, &session_id, &trigger_message_id, &content)
+        append_assistant_blocking(
+            &*store,
+            &owner,
+            &session_id,
+            state,
+            &trigger_message_id,
+            &content,
+        )
     })
     .await
     .map_err(|_| "assistant_join")?
@@ -765,6 +736,7 @@ pub(super) fn append_assistant_blocking(
     store: &dyn EventStore,
     owner: &SessionOwner,
     session_id: &str,
+    mut state: SessionState,
     trigger_message_id: &str,
     content: &str,
 ) -> Result<(AppendResult, SessionState), &'static str> {
@@ -782,9 +754,6 @@ pub(super) fn append_assistant_blocking(
     };
 
     for _ in 0..16 {
-        let state = store
-            .rehydrate_owned(owner, session_id)
-            .map_err(|_| "assistant_rehydrate")?;
         if let Some(existing) = state
             .transcript
             .iter()
@@ -831,20 +800,13 @@ pub(super) fn append_assistant_blocking(
                 wake_wait: false,
             },
         ));
-        match store.append_owned(
-            owner,
-            session_id,
-            state.stream_version,
-            &command_id,
-            &drafts,
-        ) {
-            Ok(append) => {
-                let state = store
+        match store.append_owned(owner, session_id, &state, &command_id, &drafts) {
+            Ok(appended) => return Ok((appended.append, appended.state)),
+            Err(StoreError::OptimisticConcurrency { .. }) => {
+                state = store
                     .rehydrate_owned(owner, session_id)
                     .map_err(|_| "assistant_rehydrate")?;
-                return Ok((append, state));
             }
-            Err(StoreError::OptimisticConcurrency { .. }) => continue,
             Err(_) => return Err("assistant_append"),
         }
     }

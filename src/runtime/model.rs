@@ -39,6 +39,16 @@ pub struct ModelTokenUsage {
     pub output_tokens: u64,
 }
 
+struct PreparedModelRequestInput<'a> {
+    owner: &'a SessionOwner,
+    session_id: &'a str,
+    auth_revision: u64,
+    state: SessionState,
+    request: ModelRequest,
+    identity: &'a PreparedRequestIdentity,
+    purpose: ModelRequestPurpose,
+}
+
 pub trait ModelExecutor: Send + Sync {
     fn complete<'a>(
         &'a self,
@@ -229,13 +239,17 @@ impl Runtime {
 
     async fn execute_prepared_model_request(
         self: &Arc<Self>,
-        owner: &SessionOwner,
-        session_id: &str,
-        selection: &SessionModelSelection,
-        request: ModelRequest,
-        request_identity: &PreparedRequestIdentity,
-        purpose: ModelRequestPurpose,
+        input: PreparedModelRequestInput<'_>,
     ) -> Result<PreparedModelExecution, &'static str> {
+        let PreparedModelRequestInput {
+            owner,
+            session_id,
+            auth_revision,
+            mut state,
+            request,
+            identity: request_identity,
+            purpose,
+        } = input;
         let request_id = request_identity.request_id.clone();
         let mut attempt_number = request_identity.attempt_number;
         let mut attempt_id = request_identity.attempt_id.clone();
@@ -253,9 +267,12 @@ impl Runtime {
                 });
             match completion {
                 Ok(outcome) => {
-                    return Ok(PreparedModelExecution::Completed {
-                        outcome,
-                        attempt_id,
+                    return Ok(PreparedModelExecution {
+                        state,
+                        completion: PreparedModelCompletion::Completed {
+                            outcome,
+                            attempt_id,
+                        },
                     });
                 }
                 Err(ModelError::AuthReplicaUnavailable) => {
@@ -297,7 +314,10 @@ impl Runtime {
                             "credential replica unavailable",
                         )
                         .await?;
-                    return Ok(PreparedModelExecution::Terminal(Box::new(terminal)));
+                    return Ok(PreparedModelExecution {
+                        state: terminal,
+                        completion: PreparedModelCompletion::Terminal,
+                    });
                 }
                 Err(error) => {
                     let error_class = model_error_class(&error);
@@ -315,6 +335,7 @@ impl Runtime {
                     )
                     .await?;
                     self.observe_commit(&failed.0, &failed.1).await;
+                    state = failed.1.clone();
                     if attempt_number >= request_identity.maximum_attempts {
                         let exhausted = append_model_attempts_exhausted(
                             self.store.clone(),
@@ -337,7 +358,10 @@ impl Runtime {
                                 terminal_message,
                             )
                             .await?;
-                        return Ok(PreparedModelExecution::Terminal(Box::new(terminal)));
+                        return Ok(PreparedModelExecution {
+                            state: terminal,
+                            completion: PreparedModelCompletion::Terminal,
+                        });
                     }
                     let next_number = attempt_number.saturating_add(1);
                     let next_id =
@@ -360,23 +384,26 @@ impl Runtime {
                         maximum_attempts: request_identity.maximum_attempts,
                         error_class: error_class.to_owned(),
                     };
-                    let scheduled = append_runtime_event(
+                    let scheduled = append_runtime_event_from_state(
                         self.store.clone(),
                         owner.clone(),
                         session_id.to_owned(),
+                        state,
                         format!("model-retry:{request_id}:{next_number}"),
                         format!("model-retry-event:{request_id}:{next_number}"),
                         SessionEvent::ModelStepRetryScheduled { schedule },
                     )
                     .await?;
                     self.observe_commit(&scheduled.0, &scheduled.1).await;
+                    state = scheduled.1;
                     if delay > 0 {
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
-                    let started = append_runtime_event(
+                    let started = append_runtime_event_from_state(
                         self.store.clone(),
                         owner.clone(),
                         session_id.to_owned(),
+                        state,
                         format!("model-attempt-start:{request_id}:{next_number}"),
                         format!("model-attempt-start-event:{request_id}:{next_number}"),
                         SessionEvent::ModelAttemptStarted {
@@ -385,12 +412,13 @@ impl Runtime {
                             request_id: request_id.clone(),
                             attempt_id: next_id.clone(),
                             attempt_number: next_number,
-                            auth_revision: selection.auth_revision,
+                            auth_revision,
                             started_at_ms: current_time_ms(),
                         },
                     )
                     .await?;
                     self.observe_commit(&started.0, &started.1).await;
+                    state = started.1;
                     attempt_number = next_number;
                     attempt_id = next_id;
                 }
@@ -674,22 +702,24 @@ impl Runtime {
             .or(request.max_output_tokens)
             .ok_or("context_handoff_output_limit_missing")?;
         let execution = self
-            .execute_prepared_model_request(
+            .execute_prepared_model_request(PreparedModelRequestInput {
                 owner,
                 session_id,
-                selection,
+                auth_revision: selection.auth_revision,
+                state: prepared_state,
                 request,
-                &request_identity,
-                ModelRequestPurpose::ContextHandoff,
-            )
+                identity: &request_identity,
+                purpose: ModelRequestPurpose::ContextHandoff,
+            })
             .await?;
-        let (outcome, attempt_id) = match execution {
-            PreparedModelExecution::Completed {
+        let (outcome, attempt_id) = match execution.completion {
+            PreparedModelCompletion::Completed {
                 outcome,
                 attempt_id,
             } => (outcome, attempt_id),
-            PreparedModelExecution::Terminal(state) => return Ok(*state),
+            PreparedModelCompletion::Terminal => return Ok(execution.state),
         };
+        let completed_state = execution.state;
         let encoded_document = outcome.text.trim();
         let decoded_document =
             serde_json::from_str::<ContextHandoffModelDocument>(encoded_document);
@@ -706,13 +736,11 @@ impl Runtime {
             || document.is_empty()
             || document_tokens > u64::from(document_token_limit)
         {
-            let current =
-                rehydrate(self.store.clone(), owner.clone(), session_id.to_owned()).await?;
             return self
                 .finish_context_handoff_plan_failure(
                     owner,
                     session_id,
-                    current,
+                    completed_state,
                     "context handoff returned an invalid bounded document",
                     Some((&request_identity, &attempt_id)),
                 )
@@ -859,22 +887,24 @@ impl Runtime {
         request.round_id = request_identity.round_id.clone();
         let tools = request.tools.clone();
         let execution = self
-            .execute_prepared_model_request(
+            .execute_prepared_model_request(PreparedModelRequestInput {
                 owner,
                 session_id,
-                selection,
+                auth_revision: selection.auth_revision,
+                state: _prepared_state,
                 request,
-                &request_identity,
-                ModelRequestPurpose::Conversation,
-            )
+                identity: &request_identity,
+                purpose: ModelRequestPurpose::Conversation,
+            })
             .await?;
-        let (outcome, attempt_id) = match execution {
-            PreparedModelExecution::Completed {
+        let (outcome, attempt_id) = match execution.completion {
+            PreparedModelCompletion::Completed {
                 outcome,
                 attempt_id,
             } => (outcome, attempt_id),
-            PreparedModelExecution::Terminal(state) => return Ok((Vec::new(), *state)),
+            PreparedModelCompletion::Terminal => return Ok((Vec::new(), execution.state)),
         };
+        let completed_state = execution.state;
         let request_id = request_identity.request_id.clone();
         let usage = match outcome.usage.as_ref() {
             Some(usage) => {
@@ -912,10 +942,11 @@ impl Runtime {
             }
             None => None,
         };
-        let completed = append_runtime_event(
+        let completed = append_runtime_event_from_state(
             self.store.clone(),
             owner.clone(),
             session_id.to_owned(),
+            completed_state,
             format!("model-request-complete:{request_id}"),
             format!("model-request-complete-event:{request_id}"),
             SessionEvent::ModelRequestCompleted {
@@ -933,6 +964,7 @@ impl Runtime {
                 self.store.clone(),
                 owner.clone(),
                 session_id.to_owned(),
+                completed.1,
                 round_identity,
                 outcome.text,
             )
@@ -949,6 +981,7 @@ impl Runtime {
             self.store.clone(),
             owner.clone(),
             session_id.to_owned(),
+            completed.1,
             ToolBatchInput {
                 round_identity,
                 assistant_content: outcome.text.clone(),
@@ -998,6 +1031,7 @@ impl Runtime {
             self.store.clone(),
             owner.clone(),
             session_id.to_owned(),
+            initial_commit.1,
             batch_identity,
             outcome.tool_calls,
             results,

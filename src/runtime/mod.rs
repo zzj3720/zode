@@ -48,8 +48,7 @@ use crate::{
         ToolError as DomainToolError, TranscriptMessage, TranscriptRole, WaitSource,
         WAIT_MAX_SECONDS, WAIT_MIN_SECONDS,
     },
-    storage::{AppendResult, EventStore, SnapshotRecord, StoreError, MAX_OWNED_SESSION_SCAN_LIMIT},
-    REDUCER_SCHEMA_VERSION, STATE_SCHEMA_VERSION,
+    storage::{AppendResult, EventStore, StoreError, MAX_OWNED_SESSION_SCAN_LIMIT},
 };
 
 #[derive(Debug)]
@@ -676,15 +675,8 @@ impl Runtime {
             let store = self.store.clone();
             let snapshot_state = state.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let snapshot = SnapshotRecord::from_state(
-                    snapshot_state.session_id.clone(),
-                    &snapshot_state,
-                    STATE_SCHEMA_VERSION,
-                    REDUCER_SCHEMA_VERSION,
-                )
-                .map_err(|_| "snapshot_encode")?;
                 store
-                    .write_snapshot(&snapshot)
+                    .write_state_snapshot(&snapshot_state)
                     .map_err(|_| "snapshot_write")
             })
             .await;

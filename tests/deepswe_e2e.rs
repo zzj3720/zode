@@ -17,6 +17,7 @@ use axum::{
     Router,
 };
 use deepswe_support::{file_sha256, DeepSweEventTrace, DeepSweToolExchange};
+use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use support::{
@@ -25,7 +26,7 @@ use support::{
     HttpFixture, LlmHttpProxy, LlmHttpRecording, LlmHttpRecordingMetadata, TempDatabase,
     TestResult, TestZode, TEST_CONTROLLER_AUTHORITY, TEST_CONTROLLER_SECRET,
 };
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 const PROVIDER: &str = "opencode-go";
 const MODEL: &str = "deepseek-v4-flash";
@@ -48,6 +49,7 @@ struct EventToolFixtureState {
     exchanges: Vec<DeepSweToolExchange>,
     next: Mutex<usize>,
     error: Mutex<Option<String>>,
+    observed_at: Mutex<Vec<Instant>>,
 }
 
 struct EventToolFixture {
@@ -61,6 +63,7 @@ impl EventToolFixture {
             exchanges: trace.tool_exchanges()?,
             next: Mutex::new(0),
             error: Mutex::new(None),
+            observed_at: Mutex::new(Vec::new()),
         });
         let server = HttpFixture::start(
             Router::new()
@@ -147,6 +150,14 @@ impl EventToolFixture {
         Ok(())
     }
 
+    fn observed_request_times(&self) -> Vec<Instant> {
+        self.state
+            .observed_at
+            .lock()
+            .expect("event-derived tool fixture observation-time mutex poisoned")
+            .clone()
+    }
+
     async fn stop(&mut self) -> TestResult<()> {
         self.server.stop().await
     }
@@ -156,6 +167,11 @@ async fn replay_event_tool_request(
     State(state): State<Arc<EventToolFixtureState>>,
     Json(body): Json<Value>,
 ) -> (axum::http::StatusCode, Json<Value>) {
+    state
+        .observed_at
+        .lock()
+        .expect("event-derived tool fixture observation-time mutex poisoned")
+        .push(Instant::now());
     let command = body["input"]["command"].as_str();
     let expected = {
         let mut next = state
@@ -195,6 +211,58 @@ async fn replay_event_tool_request(
         axum::http::StatusCode::OK,
         Json(json!({"result": {"content": expected.result_content}})),
     )
+}
+
+fn report_boundary_gaps(provider: Vec<Instant>, tool: Vec<Instant>) -> u128 {
+    let mut observations = provider
+        .into_iter()
+        .map(|at| (at, 'P'))
+        .chain(tool.into_iter().map(|at| (at, 'T')))
+        .collect::<Vec<_>>();
+    observations.sort_unstable_by_key(|(at, _)| *at);
+    let mut buckets = std::collections::BTreeMap::<[char; 2], Vec<u128>>::new();
+    for pair in observations.windows(2) {
+        buckets
+            .entry([pair[0].1, pair[1].1])
+            .or_default()
+            .push(pair[1].0.duration_since(pair[0].0).as_micros());
+    }
+    let mut ordinary_total_us = 0;
+    for (transition, mut gaps) in buckets {
+        let quarter = (gaps.len() / 4).max(1);
+        let mut first_quarter = gaps.iter().take(quarter).copied().collect::<Vec<_>>();
+        let mut last_quarter = gaps.iter().rev().take(quarter).copied().collect::<Vec<_>>();
+        first_quarter.sort_unstable();
+        last_quarter.sort_unstable();
+        let first_quarter_p50 = first_quarter[first_quarter.len() / 2];
+        let last_quarter_p50 = last_quarter[last_quarter.len() / 2];
+        let growth_percent = last_quarter_p50
+            .saturating_mul(100)
+            .checked_div(first_quarter_p50)
+            .unwrap_or(u128::MAX);
+        if transition != ['P', 'P'] {
+            ordinary_total_us += gaps.iter().sum::<u128>();
+        }
+        gaps.sort_unstable();
+        let percentile = |numerator: usize| {
+            let index = gaps.len().saturating_sub(1).saturating_mul(numerator) / 100;
+            gaps[index]
+        };
+        eprintln!(
+            "ZODE_DEEPSWE_BOUNDARY_GAPS transition={}{} count={} total_ms={} p50_us={} p95_us={} max_us={} first_quarter_p50_us={} last_quarter_p50_us={} growth_percent={}",
+            transition[0],
+            transition[1],
+            gaps.len(),
+            gaps.iter().sum::<u128>() / 1_000,
+            percentile(50),
+            percentile(95),
+            gaps.last().copied().unwrap_or_default(),
+            first_quarter_p50,
+            last_quarter_p50,
+            growth_percent,
+        );
+    }
+    ordinary_total_us
 }
 
 fn benchmark_state_summary(state: &Value) -> Value {
@@ -267,6 +335,25 @@ fn provider_key(auth_file: &Path) -> TestResult<String> {
         .ok_or_else(|| Error::new(ErrorKind::InvalidData, "OpenCode Go key is unavailable").into())
 }
 
+fn sqlite_file_set_bytes(path: &Path) -> TestResult<u64> {
+    let mut total = 0_u64;
+    for suffix in ["", "-wal", "-shm"] {
+        let candidate = if suffix.is_empty() {
+            path.to_owned()
+        } else {
+            let mut value = path.as_os_str().to_owned();
+            value.push(suffix);
+            PathBuf::from(value)
+        };
+        match fs::metadata(candidate) {
+            Ok(metadata) => total = total.saturating_add(metadata.len()),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(total)
+}
+
 fn benchmark_config(
     database: &Path,
     provider_origin: &str,
@@ -292,6 +379,30 @@ fn benchmark_config(
     let path = write_endpoint_config(database, vec![tool], 3)?;
     let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
     config["provider_execution"]["allowed_base_url_origins"] = json!([provider_origin]);
+    // The generic E2E config snapshots every event so short snapshot tests can
+    // exercise that path. A long benchmark instead inherits the production
+    // policy unless a diagnostic run explicitly selects a cadence below.
+    config["runtime"]["snapshot_every_events"] = Value::Null;
+    if let Ok(value) = env::var("ZODE_DEEPSWE_SNAPSHOT_EVERY_EVENTS") {
+        config["runtime"]["snapshot_every_events"] = if value == "off" {
+            Value::Null
+        } else {
+            let cadence = value.parse::<u64>().map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "ZODE_DEEPSWE_SNAPSHOT_EVERY_EVENTS must be `off` or a positive integer",
+                )
+            })?;
+            if cadence == 0 {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "ZODE_DEEPSWE_SNAPSHOT_EVERY_EVENTS must be `off` or a positive integer",
+                )
+                .into());
+            }
+            json!(cadence)
+        };
+    }
     // DeepSeek Flash advertises a one-million-token context and a much larger
     // output capability. Ordinary and handoff requests deliberately ask for
     // at most 128K so long reasoning can finish without reserving the model's
@@ -326,6 +437,70 @@ async fn public_json(
     })
 }
 
+async fn wait_for_terminal_activation(
+    response: reqwest::Response,
+    session_id: &str,
+    provider_key: &str,
+) -> TestResult<()> {
+    timeout(BENCHMARK_TIMEOUT, async {
+        let mut stream = response.bytes_stream();
+        let mut buffer = Vec::new();
+        let mut saw_activation = false;
+        loop {
+            let chunk = stream.next().await.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "Endpoint-wide SSE ended before the benchmark activation finished",
+                )
+            })??;
+            buffer.extend_from_slice(&chunk);
+            while let Some(end) = buffer
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|position| position + 2)
+            {
+                let frame = buffer.drain(..end).collect::<Vec<_>>();
+                if frame
+                    .windows(provider_key.len())
+                    .any(|window| window == provider_key.as_bytes())
+                    || frame
+                        .windows(TEST_CONTROLLER_SECRET.len())
+                        .any(|window| window == TEST_CONTROLLER_SECRET.as_bytes())
+                {
+                    return Err(Error::other("public SSE exposed credential material").into());
+                }
+                let text = std::str::from_utf8(&frame)?;
+                let event = text.lines().find_map(|line| line.strip_prefix("event: "));
+                let data = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .map(serde_json::from_str::<Value>)
+                    .transpose()?;
+                let Some(data) = data else {
+                    continue;
+                };
+                if data["session_id"] != session_id {
+                    continue;
+                }
+                let kind = event.or_else(|| data["kind"].as_str());
+                if kind == Some("activation_started") {
+                    saw_activation = true;
+                } else if kind == Some("activation_finished") {
+                    if !saw_activation {
+                        return Err(Error::other(
+                            "benchmark activation finished before its durable start was observed",
+                        )
+                        .into());
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| Error::new(ErrorKind::TimedOut, "DeepSWE agent timed out"))?
+}
+
 async fn run_benchmark(
     instruction: &str,
     shell_url: &str,
@@ -333,6 +508,7 @@ async fn run_benchmark(
     recorder: &LlmHttpProxy,
     database: &TempDatabase,
 ) -> TestResult<Value> {
+    let benchmark_started = Instant::now();
     let provider_origin = url::Url::parse(&recorder.base_url(""))?
         .origin()
         .ascii_serialization();
@@ -343,6 +519,7 @@ async fn run_benchmark(
         &[provider_key, TEST_CONTROLLER_SECRET],
     )
     .await?;
+    let endpoint_started = benchmark_started.elapsed();
     let client = http_client()?;
     let primary = async {
         public_json(
@@ -402,7 +579,6 @@ async fn run_benchmark(
         if events.status() != StatusCode::OK {
             return Err(Error::other("Endpoint-wide SSE did not open").into());
         }
-        let _events = events;
         public_json(
             authenticated_as(
                 client.post(endpoint.url(&format!("/v1/sessions/{session_id}/messages"))),
@@ -414,58 +590,61 @@ async fn run_benchmark(
             provider_key,
         )
         .await?;
+        let message_admitted = benchmark_started.elapsed();
 
         let started = Instant::now();
-        let mut saw_active_activation = false;
-        loop {
-            let state = public_json(
-                authenticated_as(
-                    client.get(endpoint.url(&format!("/v1/sessions/{session_id}"))),
-                    SUBJECT,
-                ),
-                StatusCode::OK,
-                provider_key,
-            )
-            .await?;
-            saw_active_activation |= !state["active_activation"].is_null();
-            let has_assistant = state["transcript"].as_array().is_some_and(|messages| {
-                messages.iter().any(|message| {
-                    message["role"] == "assistant"
-                        && message["content"]
-                            .as_str()
-                            .is_some_and(|text| !text.is_empty())
-                })
-            });
-            let has_pending_work = !state["wait"].is_null()
-                || state["delivery"]["pending"]
-                    .as_array()
-                    .is_some_and(|deliveries| !deliveries.is_empty())
-                || state["tool_calls"]
-                    .as_array()
-                    .is_some_and(|calls| calls.iter().any(|call| call["status"] == "running"));
-            if saw_active_activation
-                && state["status"] == "idle"
-                && state["active_activation"].is_null()
-                && !has_pending_work
-            {
-                if !has_assistant {
-                    return Err(Error::other(format!(
-                        "DeepSWE became idle without a non-empty final assistant reply: {}",
-                        benchmark_state_summary(&state)
-                    ))
-                    .into());
-                }
-                return Ok(state);
-            }
-            if started.elapsed() >= BENCHMARK_TIMEOUT {
-                return Err(Error::new(ErrorKind::TimedOut, "DeepSWE agent timed out").into());
-            }
-            sleep(Duration::from_secs(1)).await;
+        wait_for_terminal_activation(events, &session_id, provider_key).await?;
+        let state = public_json(
+            authenticated_as(
+                client.get(endpoint.url(&format!("/v1/sessions/{session_id}"))),
+                SUBJECT,
+            ),
+            StatusCode::OK,
+            provider_key,
+        )
+        .await?;
+        let has_assistant = state["transcript"].as_array().is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["role"] == "assistant"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|text| !text.is_empty())
+            })
+        });
+        let has_pending_work = !state["wait"].is_null()
+            || state["delivery"]["pending"]
+                .as_array()
+                .is_some_and(|deliveries| !deliveries.is_empty())
+            || state["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| calls.iter().any(|call| call["status"] == "running"));
+        if state["status"] != "idle"
+            || !state["active_activation"].is_null()
+            || has_pending_work
+            || !has_assistant
+        {
+            return Err(Error::other(format!(
+                "DeepSWE terminal event did not converge to an idle session with a non-empty final assistant reply: {}",
+                benchmark_state_summary(&state)
+            ))
+            .into());
         }
+        eprintln!(
+            "ZODE_DEEPSWE_JOURNEY endpoint_start_ms={} admission_ms={} active_ms={}",
+            endpoint_started.as_millis(),
+            (message_admitted - endpoint_started).as_millis(),
+            started.elapsed().as_millis(),
+        );
+        Ok(state)
     }
     .await;
 
     let stop = endpoint.stop(&[provider_key, TEST_CONTROLLER_SECRET]).await;
+    let endpoint_stopped = benchmark_started.elapsed();
+    eprintln!(
+        "ZODE_DEEPSWE_JOURNEY_STOP elapsed_ms={}",
+        endpoint_stopped.as_millis()
+    );
     match (primary, stop) {
         (Ok(state), Ok(())) => Ok(state),
         (Err(error), Ok(())) => Err(error),
@@ -616,7 +795,7 @@ async fn e2e_replayed_deepswe_recording_completes_through_real_endpoint() -> Tes
     let promotion_recording = promotion_path.as_ref().map(|_| recording.clone());
     let exchange_count = recording.requests.len();
     let database = TempDatabase::new("deepswe-replay")?;
-    let mut recorder = LlmHttpProxy::replay_with_authorization(
+    let mut recorder = LlmHttpProxy::replay_hashes_with_authorization(
         recording,
         false,
         Some(REPLAY_PROVIDER_KEY.to_owned()),
@@ -658,6 +837,83 @@ async fn e2e_replayed_deepswe_recording_completes_through_real_endpoint() -> Tes
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_recorded_deepswe_long_run_replays_through_real_endpoint() -> TestResult<()> {
+    let replay_started = Instant::now();
+    let performance_budget = env::var("ZODE_DEEPSWE_REPLAY_MAX_MS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|milliseconds| *milliseconds > 0)
+                .map(Duration::from_millis)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "ZODE_DEEPSWE_REPLAY_MAX_MS must be a positive integer",
+                    )
+                })
+        })
+        .transpose()?;
+    let ordinary_boundary_budget = env::var("ZODE_DEEPSWE_REPLAY_MAX_ORDINARY_BOUNDARY_MS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u128>()
+                .ok()
+                .filter(|milliseconds| *milliseconds > 0)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "ZODE_DEEPSWE_REPLAY_MAX_ORDINARY_BOUNDARY_MS must be a positive integer",
+                    )
+                })
+        })
+        .transpose()?;
+    let fixture_start_budget = env::var("ZODE_DEEPSWE_REPLAY_MAX_FIXTURE_START_MS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u128>()
+                .ok()
+                .filter(|milliseconds| *milliseconds > 0)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "ZODE_DEEPSWE_REPLAY_MAX_FIXTURE_START_MS must be a positive integer",
+                    )
+                })
+        })
+        .transpose()?;
+    let retained_request_budget = env::var("ZODE_DEEPSWE_REPLAY_MAX_RETAINED_REQUEST_BYTES")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|bytes| *bytes > 0)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "ZODE_DEEPSWE_REPLAY_MAX_RETAINED_REQUEST_BYTES must be a positive integer",
+                    )
+                })
+        })
+        .transpose()?;
+    let database_budget = env::var("ZODE_DEEPSWE_REPLAY_MAX_DATABASE_BYTES")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|bytes| *bytes > 0)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "ZODE_DEEPSWE_REPLAY_MAX_DATABASE_BYTES must be a positive integer",
+                    )
+                })
+        })
+        .transpose()?;
     if file_sha256(Path::new(TRACKED_LLM_REPLAY))? != TRACKED_LLM_REPLAY_SHA256 {
         return Err(Error::other("DeepSWE provider cassette file digest is invalid").into());
     }
@@ -670,19 +926,24 @@ async fn e2e_recorded_deepswe_long_run_replays_through_real_endpoint() -> TestRe
     if trace.event_count() != 1_442 || trace.tool_count()? != 158 {
         return Err(Error::other("DeepSWE event trace has the wrong causal extent").into());
     }
-    let recording = LlmHttpRecording::load_compressed(Path::new(TRACKED_LLM_REPLAY))?;
-    if recording.requests.len() != 177 {
+    let recording = LlmHttpRecording::load_compressed_validated(Path::new(TRACKED_LLM_REPLAY))?;
+    if recording.request_count() != 177 {
         return Err(Error::other("DeepSWE cassette has the wrong exchange count").into());
     }
+    let fixtures_loaded = replay_started.elapsed();
     let instruction = trace.instruction()?;
     let mut shell = EventToolFixture::start(&trace).await?;
     let database = TempDatabase::new("deepswe-tracked-replay")?;
-    let mut recorder = LlmHttpProxy::replay_with_authorization(
+    let mut recorder = LlmHttpProxy::replay_validated_hashes_with_authorization(
         recording,
         false,
         Some(REPLAY_PROVIDER_KEY.to_owned()),
     )
     .await?;
+    let retained_request_bytes = recorder
+        .replay_retained_request_match_bytes()
+        .ok_or_else(|| Error::other("DeepSWE provider fixture did not start in replay mode"))?;
+    let fixtures_started = replay_started.elapsed();
 
     let primary = timeout(
         LOCAL_REPLAY_TIMEOUT,
@@ -696,6 +957,11 @@ async fn e2e_recorded_deepswe_long_run_replays_through_real_endpoint() -> TestRe
     )
     .await
     .map_err(|_| Error::new(ErrorKind::TimedOut, "tracked DeepSWE replay timed out"))?;
+    let journey_finished = replay_started.elapsed();
+    let ordinary_boundary_us = report_boundary_gaps(
+        recorder.observed_request_times(),
+        shell.observed_request_times(),
+    );
     let provider_exhausted = recorder.replay_exhausted();
     let shell_exhausted = shell.assert_exhausted();
     let provider_stop = recorder.stop().await;
@@ -706,6 +972,7 @@ async fn e2e_recorded_deepswe_long_run_replays_through_real_endpoint() -> TestRe
     provider_stop?;
     shell_stop?;
     shell_exhausted?;
+    let fixtures_stopped = replay_started.elapsed();
     let state = primary?;
     if !provider_exhausted {
         return Err(Error::other("DeepSWE provider replay was not exhausted").into());
@@ -713,8 +980,67 @@ async fn e2e_recorded_deepswe_long_run_replays_through_real_endpoint() -> TestRe
     shell.assert_durable_outcomes(&state)?;
     let database_path = database.path().to_owned();
     spawn_db_blocking(move || trace.assert_matches_stopped_database(&database_path)).await??;
+    let database_bytes = sqlite_file_set_bytes(database.path())?;
+    let database_verified = replay_started.elapsed();
     if !state["context_handoff"].is_null() {
         return Err(Error::other("DeepSWE replay handed off below its context threshold").into());
+    }
+    let elapsed = replay_started.elapsed();
+    eprintln!(
+        "ZODE_DEEPSWE_REPLAY_PERF elapsed_ms={} load_ms={} fixture_start_ms={} journey_ms={} fixture_stop_ms={} database_verify_ms={} retained_request_bytes={} database_bytes={}",
+        elapsed.as_millis(),
+        fixtures_loaded.as_millis(),
+        (fixtures_started - fixtures_loaded).as_millis(),
+        (journey_finished - fixtures_started).as_millis(),
+        (fixtures_stopped - journey_finished).as_millis(),
+        (database_verified - fixtures_stopped).as_millis(),
+        retained_request_bytes,
+        database_bytes,
+    );
+    if let Some(budget) = performance_budget {
+        if elapsed > budget {
+            return Err(Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "DeepSWE replay completed correctly in {} ms but exceeded the explicit {} ms performance budget",
+                    elapsed.as_millis(),
+                    budget.as_millis()
+                ),
+            )
+            .into());
+        }
+    }
+    if ordinary_boundary_budget.is_some_and(|budget| ordinary_boundary_us > budget * 1_000) {
+        return Err(Error::new(
+            ErrorKind::TimedOut,
+            format!(
+                "DeepSWE replay completed correctly but ordinary provider/tool boundary transitions took {} ms",
+                ordinary_boundary_us / 1_000
+            ),
+        )
+        .into());
+    }
+    let fixture_start_ms = (fixtures_started - fixtures_loaded).as_millis();
+    if fixture_start_budget.is_some_and(|budget| fixture_start_ms > budget) {
+        return Err(Error::new(
+            ErrorKind::TimedOut,
+            format!(
+                "DeepSWE replay completed correctly but validated fixture startup took {fixture_start_ms} ms"
+            ),
+        )
+        .into());
+    }
+    if retained_request_budget.is_some_and(|budget| retained_request_bytes > budget) {
+        return Err(Error::other(format!(
+            "DeepSWE replay completed correctly but retained {retained_request_bytes} request-matching bytes"
+        ))
+        .into());
+    }
+    if database_budget.is_some_and(|budget| database_bytes > budget) {
+        return Err(Error::other(format!(
+            "DeepSWE replay completed correctly but retained {database_bytes} SQLite bytes"
+        ))
+        .into());
     }
     Ok(())
 }

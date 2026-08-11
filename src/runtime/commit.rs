@@ -68,7 +68,7 @@ pub(super) fn append_model_attempt_failure_blocking(
         match store.append_owned(
             owner,
             session_id,
-            state.stream_version,
+            &state,
             &command_id,
             &[EventDraft::new(
                 event_id.clone(),
@@ -77,12 +77,7 @@ pub(super) fn append_model_attempt_failure_blocking(
                 },
             )],
         ) {
-            Ok(append) => {
-                let state = store
-                    .rehydrate_owned(owner, session_id)
-                    .map_err(|_| "model_failure_rehydrate")?;
-                return Ok((append, state));
-            }
+            Ok(appended) => return Ok((appended.append, appended.state)),
             Err(StoreError::OptimisticConcurrency { .. }) => continue,
             Err(_) => return Err("model_failure_append"),
         }
@@ -168,12 +163,17 @@ pub(super) struct PreparedRequestIdentity {
     pub(super) attempt_number: u32,
 }
 
-pub(super) enum PreparedModelExecution {
+pub(super) struct PreparedModelExecution {
+    pub(super) state: SessionState,
+    pub(super) completion: PreparedModelCompletion,
+}
+
+pub(super) enum PreparedModelCompletion {
     Completed {
         outcome: ModelOutcome,
         attempt_id: String,
     },
-    Terminal(Box<SessionState>),
+    Terminal,
 }
 
 pub(super) struct ModelRoundInput<'a> {
@@ -306,19 +306,8 @@ pub(super) async fn append_context_handoff_plan(
             if already_prepared {
                 return Ok((replayed_append(&session_id, &command_id, &current), current));
             }
-            match store.append_owned(
-                &owner,
-                &session_id,
-                current.stream_version,
-                &command_id,
-                &drafts,
-            ) {
-                Ok(append) => {
-                    let current = store
-                        .rehydrate_owned(&owner, &session_id)
-                        .map_err(|_| "context_handoff_prepare_rehydrate")?;
-                    return Ok((append, current));
-                }
+            match store.append_owned(&owner, &session_id, &current, &command_id, &drafts) {
+                Ok(appended) => return Ok((appended.append, appended.state)),
                 Err(StoreError::OptimisticConcurrency { .. }) => continue,
                 Err(StoreError::CommandIdempotencyConflict { .. }) => {
                     return Err("context_handoff_prepare_conflict");
@@ -348,10 +337,25 @@ pub(super) async fn append_runtime_event(
     event_id: String,
     event: SessionEvent,
 ) -> Result<(AppendResult, SessionState), &'static str> {
-    append_runtime_events(
+    let state = rehydrate(store.clone(), owner.clone(), session_id.clone()).await?;
+    append_runtime_event_from_state(store, owner, session_id, state, command_id, event_id, event)
+        .await
+}
+
+pub(super) async fn append_runtime_event_from_state(
+    store: Arc<dyn EventStore>,
+    owner: SessionOwner,
+    session_id: String,
+    state: SessionState,
+    command_id: String,
+    event_id: String,
+    event: SessionEvent,
+) -> Result<(AppendResult, SessionState), &'static str> {
+    append_runtime_events_from_state(
         store,
         owner,
         session_id,
+        state,
         command_id,
         vec![EventDraft::new(event_id, event)],
     )
@@ -365,25 +369,27 @@ pub(super) async fn append_runtime_events(
     command_id: String,
     events: Vec<EventDraft>,
 ) -> Result<(AppendResult, SessionState), &'static str> {
+    let state = rehydrate(store.clone(), owner.clone(), session_id.clone()).await?;
+    append_runtime_events_from_state(store, owner, session_id, state, command_id, events).await
+}
+
+pub(super) async fn append_runtime_events_from_state(
+    store: Arc<dyn EventStore>,
+    owner: SessionOwner,
+    session_id: String,
+    mut state: SessionState,
+    command_id: String,
+    events: Vec<EventDraft>,
+) -> Result<(AppendResult, SessionState), &'static str> {
     tokio::task::spawn_blocking(move || {
         for _ in 0..16 {
-            let state = store
-                .rehydrate_owned(&owner, &session_id)
-                .map_err(|_| "runtime_event_rehydrate")?;
-            match store.append_owned(
-                &owner,
-                &session_id,
-                state.stream_version,
-                &command_id,
-                &events,
-            ) {
-                Ok(append) => {
-                    let state = store
+            match store.append_owned(&owner, &session_id, &state, &command_id, &events) {
+                Ok(appended) => return Ok((appended.append, appended.state)),
+                Err(StoreError::OptimisticConcurrency { .. }) => {
+                    state = store
                         .rehydrate_owned(&owner, &session_id)
                         .map_err(|_| "runtime_event_rehydrate")?;
-                    return Ok((append, state));
                 }
-                Err(StoreError::OptimisticConcurrency { .. }) => continue,
                 Err(_) => {
                     return Err("runtime_event_append");
                 }
@@ -421,7 +427,7 @@ pub(super) async fn append_expired_timer(
             match store.append_owned(
                 &owner,
                 &session_id,
-                state.stream_version,
+                &state,
                 &format!("wait-expired:{}", timer.wait_id),
                 &[EventDraft::new(
                     format!("wait-expired-event:{}", timer.wait_id),
@@ -430,12 +436,7 @@ pub(super) async fn append_expired_timer(
                     },
                 )],
             ) {
-                Ok(append) => {
-                    let state = store
-                        .rehydrate_owned(&owner, &session_id)
-                        .map_err(|_| "timer_rehydrate")?;
-                    return Ok(Some((append, state)));
-                }
+                Ok(appended) => return Ok(Some((appended.append, appended.state))),
                 Err(StoreError::OptimisticConcurrency { .. }) => continue,
                 Err(_) => return Err("timer_append"),
             }
@@ -567,10 +568,11 @@ pub(super) async fn prepare_model_round(
             request,
             maximum_attempts,
         )?;
-        let append = append_runtime_events(
+        let append = append_runtime_events_from_state(
             store.clone(),
             owner.clone(),
             session_id.clone(),
+            current,
             format!("model-round:{round_id}"),
             vec![
                 EventDraft::new(
@@ -608,10 +610,11 @@ pub(super) async fn prepare_model_round(
                 request,
                 maximum_attempts,
             )?;
-            let append = append_runtime_event(
+            let append = append_runtime_event_from_state(
                 store.clone(),
                 owner.clone(),
                 session_id.clone(),
+                current,
                 format!("model-request:{request_id}"),
                 request_draft.event_id,
                 request_draft.event,
@@ -646,10 +649,11 @@ pub(super) async fn prepare_model_round(
         .map(|schedule| schedule.next_attempt_id.clone())
         .unwrap_or_else(|| stable_digest("model-attempt", &format!("{request_id}:1")));
     if round.attempt.is_none() {
-        let append = append_runtime_event(
+        let append = append_runtime_event_from_state(
             store,
             owner,
             session_id,
+            current,
             format!("model-attempt-start:{request_id}:{attempt_number}"),
             format!("model-attempt-start-event:{request_id}:{attempt_number}"),
             SessionEvent::ModelAttemptStarted {
@@ -721,19 +725,8 @@ pub(super) async fn append_context_handoff_document(
                     },
                 ),
             ];
-            match store.append_owned(
-                &owner,
-                &session_id,
-                state.stream_version,
-                &command_id,
-                &events,
-            ) {
-                Ok(append) => {
-                    let state = store
-                        .rehydrate_owned(&owner, &session_id)
-                        .map_err(|_| "context_handoff_rehydrate")?;
-                    return Ok((append, state));
-                }
+            match store.append_owned(&owner, &session_id, &state, &command_id, &events) {
+                Ok(appended) => return Ok((appended.append, appended.state)),
                 Err(StoreError::OptimisticConcurrency { .. }) => continue,
                 Err(StoreError::CommandIdempotencyConflict { .. }) => {
                     let state = store
@@ -820,19 +813,8 @@ pub(super) async fn append_context_handoff_failure(
                     finished_at_ms,
                 },
             ));
-            match store.append_owned(
-                &owner,
-                &session_id,
-                state.stream_version,
-                &command_id,
-                &events,
-            ) {
-                Ok(append) => {
-                    let state = store
-                        .rehydrate_owned(&owner, &session_id)
-                        .map_err(|_| "context_handoff_failure_rehydrate")?;
-                    return Ok((append, state));
-                }
+            match store.append_owned(&owner, &session_id, &state, &command_id, &events) {
+                Ok(appended) => return Ok((appended.append, appended.state)),
                 Err(StoreError::OptimisticConcurrency { .. }) => continue,
                 Err(StoreError::CommandIdempotencyConflict { .. }) => {
                     let state = store
@@ -942,19 +924,14 @@ pub(super) async fn append_model_attempts_exhausted(
             match store.append_owned(
                 &owner,
                 &session_id,
-                state.stream_version,
+                &state,
                 &command_id,
                 &[EventDraft::new(
                     event_id.clone(),
                     SessionEvent::ModelAttemptsExhausted { fact },
                 )],
             ) {
-                Ok(append) => {
-                    let state = store
-                        .rehydrate_owned(&owner, &session_id)
-                        .map_err(|_| "model_exhaustion_rehydrate")?;
-                    return Ok((append, state));
-                }
+                Ok(appended) => return Ok((appended.append, appended.state)),
                 Err(StoreError::OptimisticConcurrency { .. }) => continue,
                 Err(StoreError::CommandIdempotencyConflict { .. }) => {
                     let state = store
