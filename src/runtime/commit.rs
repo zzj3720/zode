@@ -7,7 +7,7 @@ pub(super) async fn append_model_attempt_failure_with_error(
     trigger_message_id: String,
     error_class: ModelAttemptErrorClass,
     error_message: &'static str,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     tokio::task::spawn_blocking(move || {
         append_model_attempt_failure_blocking(
             &*store,
@@ -29,7 +29,7 @@ pub(super) fn append_model_attempt_failure_blocking(
     trigger_message_id: &str,
     error_class: ModelAttemptErrorClass,
     error_message: &str,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     let failure = ModelAttemptFailure {
         trigger_message_id: trigger_message_id.to_owned(),
         error: ModelAttemptError {
@@ -43,7 +43,7 @@ pub(super) fn append_model_attempt_failure_blocking(
 
     for _ in 0..16 {
         let state = store
-            .rehydrate_owned(owner, session_id)
+            .rehydrate_verified_owned(owner, session_id)
             .map_err(|_| "model_failure_rehydrate")?;
         if let Some(existing) = state.terminal_model_failure_for_last_user() {
             if existing == &failure {
@@ -65,7 +65,7 @@ pub(super) fn append_model_attempt_failure_blocking(
         }) {
             return Err("model_failure_trigger");
         }
-        match store.append_owned(
+        match store.append_verified_owned(
             owner,
             session_id,
             &state,
@@ -85,14 +85,14 @@ pub(super) fn append_model_attempt_failure_blocking(
     Err("model_failure_concurrency")
 }
 
-pub(super) async fn rehydrate(
+pub(super) async fn rehydrate_verified(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
-) -> Result<crate::domain::SessionState, &'static str> {
+) -> Result<VerifiedSessionState, &'static str> {
     tokio::task::spawn_blocking(move || {
         store
-            .rehydrate_owned(&owner, &session_id)
+            .rehydrate_verified_owned(&owner, &session_id)
             .map_err(|_| "rehydrate_store")
     })
     .await
@@ -164,7 +164,7 @@ pub(super) struct PreparedRequestIdentity {
 }
 
 pub(super) struct PreparedModelExecution {
-    pub(super) state: SessionState,
+    pub(super) state: VerifiedSessionState,
     pub(super) completion: PreparedModelCompletion,
 }
 
@@ -177,7 +177,7 @@ pub(super) enum PreparedModelCompletion {
 }
 
 pub(super) struct ModelRoundInput<'a> {
-    pub(super) state: &'a SessionState,
+    pub(super) state: &'a VerifiedSessionState,
     pub(super) selection: &'a SessionModelSelection,
     pub(super) request: &'a ModelRequest,
     pub(super) round_identity: &'a str,
@@ -246,11 +246,11 @@ pub(super) async fn append_context_handoff_plan(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
-    state: &SessionState,
+    state: &VerifiedSessionState,
     plan: ContextHandoffPlan,
     request: &ModelRequest,
     maximum_attempts: u32,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     if state.active_model_round.as_ref().is_some_and(|round| {
         round
             .attempt
@@ -292,7 +292,7 @@ pub(super) async fn append_context_handoff_plan(
     tokio::task::spawn_blocking(move || {
         for _ in 0..16 {
             let current = store
-                .rehydrate_owned(&owner, &session_id)
+                .rehydrate_verified_owned(&owner, &session_id)
                 .map_err(|_| "context_handoff_prepare_rehydrate")?;
             let already_prepared = current.pending_context_handoff.as_ref() == Some(&plan)
                 && current.active_model_round.as_ref().is_some_and(|round| {
@@ -306,7 +306,7 @@ pub(super) async fn append_context_handoff_plan(
             if already_prepared {
                 return Ok((replayed_append(&session_id, &command_id, &current), current));
             }
-            match store.append_owned(&owner, &session_id, &current, &command_id, &drafts) {
+            match store.append_verified_owned(&owner, &session_id, &current, &command_id, &drafts) {
                 Ok(appended) => return Ok((appended.append, appended.state)),
                 Err(StoreError::OptimisticConcurrency { .. }) => continue,
                 Err(StoreError::CommandIdempotencyConflict { .. }) => {
@@ -336,8 +336,8 @@ pub(super) async fn append_runtime_event(
     command_id: String,
     event_id: String,
     event: SessionEvent,
-) -> Result<(AppendResult, SessionState), &'static str> {
-    let state = rehydrate(store.clone(), owner.clone(), session_id.clone()).await?;
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
+    let state = rehydrate_verified(store.clone(), owner.clone(), session_id.clone()).await?;
     append_runtime_event_from_state(store, owner, session_id, state, command_id, event_id, event)
         .await
 }
@@ -346,11 +346,11 @@ pub(super) async fn append_runtime_event_from_state(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
-    state: SessionState,
+    state: VerifiedSessionState,
     command_id: String,
     event_id: String,
     event: SessionEvent,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     append_runtime_events_from_state(
         store,
         owner,
@@ -368,8 +368,8 @@ pub(super) async fn append_runtime_events(
     session_id: String,
     command_id: String,
     events: Vec<EventDraft>,
-) -> Result<(AppendResult, SessionState), &'static str> {
-    let state = rehydrate(store.clone(), owner.clone(), session_id.clone()).await?;
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
+    let state = rehydrate_verified(store.clone(), owner.clone(), session_id.clone()).await?;
     append_runtime_events_from_state(store, owner, session_id, state, command_id, events).await
 }
 
@@ -377,17 +377,17 @@ pub(super) async fn append_runtime_events_from_state(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
-    mut state: SessionState,
+    mut state: VerifiedSessionState,
     command_id: String,
     events: Vec<EventDraft>,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     tokio::task::spawn_blocking(move || {
         for _ in 0..16 {
-            match store.append_owned(&owner, &session_id, &state, &command_id, &events) {
+            match store.append_verified_owned(&owner, &session_id, &state, &command_id, &events) {
                 Ok(appended) => return Ok((appended.append, appended.state)),
                 Err(StoreError::OptimisticConcurrency { .. }) => {
                     state = store
-                        .rehydrate_owned(&owner, &session_id)
+                        .rehydrate_verified_owned(&owner, &session_id)
                         .map_err(|_| "runtime_event_rehydrate")?;
                 }
                 Err(_) => {
@@ -406,11 +406,11 @@ pub(super) async fn append_expired_timer(
     owner: SessionOwner,
     session_id: String,
     now_ms: i64,
-) -> Result<Option<(AppendResult, SessionState)>, &'static str> {
+) -> Result<Option<(AppendResult, VerifiedSessionState)>, &'static str> {
     tokio::task::spawn_blocking(move || {
         for _ in 0..16 {
             let state = store
-                .rehydrate_owned(&owner, &session_id)
+                .rehydrate_verified_owned(&owner, &session_id)
                 .map_err(|_| "timer_rehydrate")?;
             let Some(timer) = state.active_timer.clone() else {
                 return Ok(None);
@@ -424,7 +424,7 @@ pub(super) async fn append_expired_timer(
             {
                 return Ok(None);
             }
-            match store.append_owned(
+            match store.append_verified_owned(
                 &owner,
                 &session_id,
                 &state,
@@ -451,9 +451,9 @@ pub(super) async fn start_activation(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
-    state: &SessionState,
+    state: &VerifiedSessionState,
     selection: &SessionSelection,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     let activation_id = stable_digest(
         "activation",
         &format!(
@@ -470,10 +470,11 @@ pub(super) async fn start_activation(
         .as_ref()
         .map(|model| model.auth_revision)
         .ok_or("activation_without_model")?;
-    append_runtime_event(
+    append_runtime_event_from_state(
         store,
         owner,
         session_id,
+        state.clone(),
         format!("activation-start:{activation_id}"),
         format!("activation-start-event:{activation_id}"),
         SessionEvent::ActivationStarted {
@@ -491,18 +492,19 @@ pub(super) async fn finish_activation(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
-    state: &SessionState,
+    state: &VerifiedSessionState,
     activation_id: String,
     outcome: ActivationOutcome,
-) -> Result<Option<(AppendResult, SessionState)>, &'static str> {
+) -> Result<Option<(AppendResult, VerifiedSessionState)>, &'static str> {
     if state.active_activation.is_none() {
         return Ok(None);
     }
     Ok(Some(
-        append_runtime_event(
+        append_runtime_event_from_state(
             store,
             owner,
             session_id,
+            state.clone(),
             format!("activation-finish:{activation_id}"),
             format!("activation-finish-event:{activation_id}"),
             SessionEvent::ActivationFinished {
@@ -522,8 +524,8 @@ pub(super) async fn prepare_model_round(
     input: ModelRoundInput<'_>,
 ) -> Result<
     (
-        Vec<(AppendResult, SessionState)>,
-        SessionState,
+        Vec<(AppendResult, VerifiedSessionState)>,
+        VerifiedSessionState,
         PreparedRequestIdentity,
     ),
     &'static str,
@@ -691,14 +693,14 @@ pub(super) async fn append_context_handoff_document(
     identity: &PreparedRequestIdentity,
     attempt_id: &str,
     handoff: ContextHandoffDocument,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     let identity = identity.clone();
     let attempt_id = attempt_id.to_owned();
     tokio::task::spawn_blocking(move || {
         let command_id = format!("context-handoff:{}", handoff.handoff_id);
         for _ in 0..16 {
             let state = store
-                .rehydrate_owned(&owner, &session_id)
+                .rehydrate_verified_owned(&owner, &session_id)
                 .map_err(|_| "context_handoff_rehydrate")?;
             if state
                 .latest_context_handoff
@@ -725,12 +727,12 @@ pub(super) async fn append_context_handoff_document(
                     },
                 ),
             ];
-            match store.append_owned(&owner, &session_id, &state, &command_id, &events) {
+            match store.append_verified_owned(&owner, &session_id, &state, &command_id, &events) {
                 Ok(appended) => return Ok((appended.append, appended.state)),
                 Err(StoreError::OptimisticConcurrency { .. }) => continue,
                 Err(StoreError::CommandIdempotencyConflict { .. }) => {
                     let state = store
-                        .rehydrate_owned(&owner, &session_id)
+                        .rehydrate_verified_owned(&owner, &session_id)
                         .map_err(|_| "context_handoff_rehydrate")?;
                     if state
                         .latest_context_handoff
@@ -754,10 +756,10 @@ pub(super) async fn append_context_handoff_failure(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
-    state: &SessionState,
+    state: &VerifiedSessionState,
     message: &'static str,
     completed_request: Option<(&PreparedRequestIdentity, &str)>,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     let plan = state
         .pending_context_handoff
         .as_ref()
@@ -776,7 +778,7 @@ pub(super) async fn append_context_handoff_failure(
         let command_id = format!("context-handoff-failure:{plan_id}");
         for _ in 0..16 {
             let state = store
-                .rehydrate_owned(&owner, &session_id)
+                .rehydrate_verified_owned(&owner, &session_id)
                 .map_err(|_| "context_handoff_failure_rehydrate")?;
             if state.active_activation.is_none()
                 && state.pending_context_handoff.is_none()
@@ -813,12 +815,12 @@ pub(super) async fn append_context_handoff_failure(
                     finished_at_ms,
                 },
             ));
-            match store.append_owned(&owner, &session_id, &state, &command_id, &events) {
+            match store.append_verified_owned(&owner, &session_id, &state, &command_id, &events) {
                 Ok(appended) => return Ok((appended.append, appended.state)),
                 Err(StoreError::OptimisticConcurrency { .. }) => continue,
                 Err(StoreError::CommandIdempotencyConflict { .. }) => {
                     let state = store
-                        .rehydrate_owned(&owner, &session_id)
+                        .rehydrate_verified_owned(&owner, &session_id)
                         .map_err(|_| "context_handoff_failure_rehydrate")?;
                     if state.active_activation.is_none()
                         && state.pending_context_handoff.is_none()
@@ -842,7 +844,7 @@ pub(super) async fn append_model_lifecycle_failure(
     owner: SessionOwner,
     session_id: String,
     input: ModelFailureInput<'_>,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     let ModelFailureInput {
         identity,
         attempt_id,
@@ -883,7 +885,7 @@ pub(super) async fn append_model_attempts_exhausted(
     identity: &PreparedRequestIdentity,
     attempt_id: &str,
     attempt_number: u32,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     let command_id = format!("model-attempts-exhausted:{}", identity.request_id);
     let event_id = format!("model-attempts-exhausted-event:{}", identity.request_id);
     let activation_id = identity.activation_id.clone();
@@ -907,7 +909,7 @@ pub(super) async fn append_model_attempts_exhausted(
         };
         for _ in 0..16 {
             let state = store
-                .rehydrate_owned(&owner, &session_id)
+                .rehydrate_verified_owned(&owner, &session_id)
                 .map_err(|_| "model_exhaustion_rehydrate")?;
             if matches_fact(&state) {
                 return Ok((replayed_append(&session_id, &command_id, &state), state));
@@ -921,7 +923,7 @@ pub(super) async fn append_model_attempts_exhausted(
                 maximum_attempts,
                 finished_at_ms: current_time_ms(),
             };
-            match store.append_owned(
+            match store.append_verified_owned(
                 &owner,
                 &session_id,
                 &state,
@@ -935,7 +937,7 @@ pub(super) async fn append_model_attempts_exhausted(
                 Err(StoreError::OptimisticConcurrency { .. }) => continue,
                 Err(StoreError::CommandIdempotencyConflict { .. }) => {
                     let state = store
-                        .rehydrate_owned(&owner, &session_id)
+                        .rehydrate_verified_owned(&owner, &session_id)
                         .map_err(|_| "model_exhaustion_rehydrate")?;
                     if matches_fact(&state) {
                         return Ok((replayed_append(&session_id, &command_id, &state), state));

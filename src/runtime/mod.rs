@@ -48,7 +48,9 @@ use crate::{
         ToolError as DomainToolError, TranscriptMessage, TranscriptRole, WaitSource,
         WAIT_MAX_SECONDS, WAIT_MIN_SECONDS,
     },
-    storage::{AppendResult, EventStore, StoreError, MAX_OWNED_SESSION_SCAN_LIMIT},
+    storage::{
+        AppendResult, EventStore, StoreError, VerifiedSessionState, MAX_OWNED_SESSION_SCAN_LIMIT,
+    },
 };
 
 #[derive(Debug)]
@@ -647,8 +649,9 @@ impl Runtime {
         self: &Arc<Self>,
         owner: SessionOwner,
         session_id: String,
-    ) -> Result<SessionState, &'static str> {
-        let mut state = rehydrate(self.store.clone(), owner.clone(), session_id.clone()).await?;
+    ) -> Result<VerifiedSessionState, &'static str> {
+        let mut state =
+            rehydrate_verified(self.store.clone(), owner.clone(), session_id.clone()).await?;
         if state.active_activation.is_some() {
             state = self
                 .recover_async_tools(owner.clone(), session_id.clone(), state)
@@ -766,7 +769,8 @@ impl Runtime {
         session_id: String,
         ready: &mut Option<oneshot::Sender<()>>,
     ) -> Result<(), &'static str> {
-        let mut state = rehydrate(self.store.clone(), owner.clone(), session_id.clone()).await?;
+        let mut state =
+            rehydrate_verified(self.store.clone(), owner.clone(), session_id.clone()).await?;
         let Some(selection) = state
             .active_activation
             .as_ref()
@@ -986,8 +990,8 @@ impl Runtime {
         self: &Arc<Self>,
         owner: &SessionOwner,
         session_id: &str,
-        state: SessionState,
-    ) -> Result<SessionState, &'static str> {
+        state: VerifiedSessionState,
+    ) -> Result<VerifiedSessionState, &'static str> {
         let Some(activation) = state.active_activation.as_ref() else {
             return Ok(state);
         };
@@ -1033,9 +1037,10 @@ impl Runtime {
                 READ_CONTEXT_HANDOFF_TOOL_NAME | READ_SESSION_HISTORY_TOOL_NAME
             )
         }) {
-            rehydrate(self.store.clone(), owner.clone(), session_id.to_owned())
+            rehydrate_verified(self.store.clone(), owner.clone(), session_id.to_owned())
                 .await
                 .ok()
+                .map(VerifiedSessionState::into_state)
         } else {
             None
         };

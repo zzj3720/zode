@@ -327,8 +327,8 @@ pub(super) fn reconcile_tool_call_blocking(
                     .get(tool_call_id)
                     .cloned()
                     .ok_or(RuntimeCommandError::NotFound)?;
-                let admitted =
-                    (!appended.append.replayed).then_some((appended.append, appended.state));
+                let admitted = (!appended.append.replayed)
+                    .then_some((appended.append, appended.state.into_state()));
                 return Ok((record, admitted));
             }
             Err(StoreError::OptimisticConcurrency { .. }) => continue,
@@ -375,7 +375,7 @@ pub(super) fn append_retry_dispatch_unknown_blocking(
                 },
             )],
         ) {
-            Ok(appended) => return Ok(Some((appended.append, appended.state))),
+            Ok(appended) => return Ok(Some((appended.append, appended.state.into_state()))),
             Err(StoreError::OptimisticConcurrency { .. }) => continue,
             Err(StoreError::CommandIdempotencyConflict { .. })
             | Err(StoreError::EventIdempotencyConflict { .. }) => return Ok(None),

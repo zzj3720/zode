@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeMap,
+    ops::Deref,
     path::Path,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use rusqlite::{
@@ -50,7 +51,32 @@ pub struct AppendResult {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionAppendResult {
     pub append: AppendResult,
-    pub state: SessionState,
+    pub state: VerifiedSessionState,
+}
+
+/// One immutable session projection bound to the integrity anchor that proved
+/// it.  The fields are private so callers cannot pair a valid proof with a
+/// modified projection; a new value can only come from a successful storage
+/// read or append.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerifiedSessionState {
+    state: Arc<SessionState>,
+    prefix_digest: Vec<u8>,
+    state_digest: Vec<u8>,
+}
+
+impl VerifiedSessionState {
+    pub fn into_state(self) -> SessionState {
+        Arc::try_unwrap(self.state).unwrap_or_else(|state| (*state).clone())
+    }
+}
+
+impl Deref for VerifiedSessionState {
+    type Target = SessionState;
+
+    fn deref(&self) -> &Self::Target {
+        self.state.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -273,11 +299,26 @@ pub trait EventStore: Send + Sync {
         events: &[EventDraft],
     ) -> Result<SessionAppendResult, StoreError>;
 
+    fn append_verified_owned(
+        &self,
+        owner: &SessionOwner,
+        stream_id: &str,
+        current: &VerifiedSessionState,
+        command_id: &str,
+        events: &[EventDraft],
+    ) -> Result<SessionAppendResult, StoreError>;
+
     fn rehydrate_owned(
         &self,
         owner: &SessionOwner,
         stream_id: &str,
     ) -> Result<SessionState, RehydrateError>;
+
+    fn rehydrate_verified_owned(
+        &self,
+        owner: &SessionOwner,
+        stream_id: &str,
+    ) -> Result<VerifiedSessionState, RehydrateError>;
 
     fn read_stream_owned(
         &self,
@@ -1369,15 +1410,12 @@ fn append_in_transaction(
             });
         }
         let existing_events = read_events_by_command(transaction, stream_id, command_id, head)?;
-        let state = match preverified.take() {
-            Some(restored) => restored.state,
-            None => {
-                rehydrate_from_view(transaction, stream_id)
-                    .map_err(|error| rehydrate_error_into_store_error(error, stream_id))?
-                    .state
-            }
+        let restored = match preverified.take() {
+            Some(restored) => restored,
+            None => rehydrate_from_view(transaction, stream_id)
+                .map_err(|error| rehydrate_error_into_store_error(error, stream_id))?,
         };
-        if state.stream_version != head {
+        if restored.state.stream_version != head {
             return Err(StoreError::RehydrationIntegrity {
                 stream_id: stream_id.into(),
                 version: head,
@@ -1391,7 +1429,7 @@ fn append_in_transaction(
                 stream_version: last_version,
                 replayed: true,
             },
-            state,
+            state: seal_verified_state(restored)?,
         });
     }
 
@@ -1439,10 +1477,11 @@ fn append_in_transaction(
     // not become a second durable semantic event. Compute this projection
     // before any authority insert so an invalid batch still appends nothing.
     let mut effective_drafts = Vec::with_capacity(events.len());
-    let mut candidate_state = rehydrated.state.clone();
+    let mut candidate_state = rehydrated.state;
     for draft in events {
-        let next = candidate_state.apply_event(&draft.event)?;
-        if next != candidate_state {
+        let mut next = candidate_state.apply_event_from_valid_state(&draft.event)?;
+        if next.stream_version != candidate_state.stream_version {
+            next.remember_committed_event_id(&draft.event_id)?;
             effective_drafts.push(draft.clone());
         }
         candidate_state = next;
@@ -1454,13 +1493,22 @@ fn append_in_transaction(
         // was stale/no-op. The key is a digest of the command identity, never
         // the caller's raw idempotency value.
         let command_digest = hex_encode(&digest_bytes(command_id.as_bytes()));
-        effective_drafts.push(EventDraft::new(
+        let draft = EventDraft::new(
             format!("command-noop:v1:{command_digest}"),
             SessionEvent::DedupeRecorded {
                 key: format!("command:{command_digest}"),
             },
-        ));
+        );
+        candidate_state = candidate_state.apply_event_from_valid_state(&draft.event)?;
+        candidate_state.remember_committed_event_id(&draft.event_id)?;
+        effective_drafts.push(draft);
     }
+    // The carried projection proves the unchanged prefix once. Event-local
+    // transition checks protect every step above; one complete validation of
+    // the resulting batch still prevents an invalid reducer result from being
+    // committed without rescanning the same history before and after every
+    // event.
+    candidate_state.validate()?;
 
     let mut stored_events = Vec::with_capacity(effective_drafts.len());
     for (index, draft) in effective_drafts.iter().enumerate() {
@@ -1517,9 +1565,9 @@ fn append_in_transaction(
             event: draft.event.clone(),
         };
         rehydrated.prefix_digest = extend_prefix_digest(&rehydrated.prefix_digest, &fingerprint);
-        rehydrated.state = rehydrated.state.apply_record(&record)?;
         stored_events.push(record);
     }
+    rehydrated.state = candidate_state;
 
     let stream_version = expected_version
         .checked_add(u64::try_from(effective_drafts.len()).map_err(|_| {
@@ -1603,6 +1651,7 @@ fn append_in_transaction(
             return Err(StoreError::InvalidSessionCreateReceipt);
         }
     }
+    let resulting_state_digest = state_digest(&rehydrated.state)?;
     transaction.execute(
         "INSERT INTO commands
             (stream_id, command_id, fingerprint_version, request_hash,
@@ -1634,7 +1683,7 @@ fn append_in_transaction(
             i64::from(STATE_SCHEMA_VERSION),
             i64::from(REDUCER_SCHEMA_VERSION),
             STATE_DIGEST_VERSION,
-            state_digest(&rehydrated.state)?,
+            &resulting_state_digest,
         ],
     )?;
 
@@ -1646,7 +1695,11 @@ fn append_in_transaction(
             stream_version,
             replayed: false,
         },
-        state: rehydrated.state,
+        state: VerifiedSessionState {
+            state: Arc::new(rehydrated.state),
+            prefix_digest: rehydrated.prefix_digest,
+            state_digest: resulting_state_digest,
+        },
     })
 }
 
@@ -1766,6 +1819,32 @@ fn verified_current_state(
         state: current.clone(),
         prefix_digest: verified.head.anchor.prefix_digest.clone(),
         state_digest: Some(digest),
+    })
+}
+
+fn verified_carried_state(
+    owner: &SessionOwner,
+    stream_id: &str,
+    current: &VerifiedSessionState,
+    verified: &VerifiedOwnedHead,
+) -> Result<RehydratedState, StoreError> {
+    if current.session_id != stream_id
+        || current.owner.as_ref() != Some(owner)
+        || current.created_at_ms != Some(verified.creation.created_at_ms)
+        || current.status != verified.projected_status
+        || current.stream_version != verified.head.version
+        || !digest_matches(&current.prefix_digest, &verified.head.anchor.prefix_digest)
+        || !digest_matches(&current.state_digest, &verified.head.anchor.state_digest)
+    {
+        return Err(StoreError::RehydrationIntegrity {
+            stream_id: stream_id.into(),
+            version: current.stream_version,
+        });
+    }
+    Ok(RehydratedState {
+        state: current.state.as_ref().clone(),
+        prefix_digest: current.prefix_digest.clone(),
+        state_digest: Some(current.state_digest.clone()),
     })
 }
 
@@ -1975,7 +2054,7 @@ impl EventStore for SqliteEventStore {
         transaction.commit()?;
         Ok(SessionCreateResult {
             append: appended.append,
-            state: appended.state,
+            state: appended.state.into_state(),
         })
     }
 
@@ -2026,6 +2105,39 @@ impl EventStore for SqliteEventStore {
         Ok(appended)
     }
 
+    fn append_verified_owned(
+        &self,
+        owner: &SessionOwner,
+        stream_id: &str,
+        current: &VerifiedSessionState,
+        command_id: &str,
+        events: &[EventDraft],
+    ) -> Result<SessionAppendResult, StoreError> {
+        require_text("stream_id", stream_id)?;
+        require_text("command_id", command_id)?;
+        validate_event_batch(events)?;
+        let request_hash = hash_events(events)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let verified = verified_owned_head(&transaction, owner, stream_id)?;
+        let preverified = verified_carried_state(owner, stream_id, current, &verified)?;
+        let appended = append_in_transaction(
+            &transaction,
+            stream_id,
+            current.stream_version,
+            AppendCommand {
+                id: command_id,
+                fingerprint_version: COMMAND_FINGERPRINT_VERSION,
+                request_hash: &request_hash,
+            },
+            Some(preverified),
+            events,
+        )?;
+        mark_projections_clean(&transaction)?;
+        transaction.commit()?;
+        Ok(appended)
+    }
+
     fn rehydrate_owned(
         &self,
         owner: &SessionOwner,
@@ -2039,6 +2151,24 @@ impl EventStore for SqliteEventStore {
         let result = (|| {
             let verified = verified_owned_stream(&transaction, owner, stream_id)?;
             Ok(verified.rehydrated.state)
+        })();
+        transaction.commit().map_err(StoreError::from)?;
+        result
+    }
+
+    fn rehydrate_verified_owned(
+        &self,
+        owner: &SessionOwner,
+        stream_id: &str,
+    ) -> Result<VerifiedSessionState, RehydrateError> {
+        require_text("stream_id", stream_id)?;
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(StoreError::from)?;
+        let result = (|| {
+            let verified = verified_owned_stream(&transaction, owner, stream_id)?;
+            seal_verified_state(verified.rehydrated).map_err(RehydrateError::from)
         })();
         transaction.commit().map_err(StoreError::from)?;
         result
@@ -2709,6 +2839,26 @@ struct RehydratedState {
     state: SessionState,
     prefix_digest: Vec<u8>,
     state_digest: Option<Vec<u8>>,
+}
+
+fn seal_verified_state(mut restored: RehydratedState) -> Result<VerifiedSessionState, StoreError> {
+    let state_digest = match restored.state_digest.take() {
+        Some(digest) => digest,
+        None => state_digest(&restored.state)?,
+    };
+    if restored.prefix_digest.len() != INTEGRITY_DIGEST_BYTES
+        || state_digest.len() != INTEGRITY_DIGEST_BYTES
+    {
+        return Err(StoreError::RehydrationIntegrity {
+            stream_id: restored.state.session_id.clone(),
+            version: restored.state.stream_version,
+        });
+    }
+    Ok(VerifiedSessionState {
+        state: Arc::new(restored.state),
+        prefix_digest: restored.prefix_digest,
+        state_digest,
+    })
 }
 
 #[derive(Debug)]

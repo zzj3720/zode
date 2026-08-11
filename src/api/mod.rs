@@ -1023,7 +1023,7 @@ async fn append_message(
                 &[EventDraft::new(event_id, event)],
             )
             .map_err(ServiceError::store)?;
-        Ok((appended.append, appended.state))
+        Ok((appended.append, appended.state.into_state()))
     })
     .await
     .map_err(ApiError::from_service)?;
@@ -1130,7 +1130,7 @@ async fn select_model(
                 )],
             )
             .map_err(ServiceError::store)?;
-        Ok((appended.append, appended.state))
+        Ok((appended.append, appended.state.into_state()))
     })
     .await
     .map_err(ApiError::from_service)?;
@@ -1391,7 +1391,7 @@ fn enqueue_model_delivery(
             &spec.command_id,
             &[EventDraft::new(spec.event_id.clone(), event)],
         ) {
-            Ok(appended) => return Ok((appended.append, appended.state)),
+            Ok(appended) => return Ok((appended.append, appended.state.into_state())),
             Err(StoreError::OptimisticConcurrency { .. }) => {
                 current = store
                     .rehydrate_owned(owner, session_id)

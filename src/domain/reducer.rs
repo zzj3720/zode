@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::{HashMap, HashSet};
 
 impl SessionState {
     pub fn new(session_id: impl Into<String>) -> Self {
@@ -32,6 +33,23 @@ impl SessionState {
 
     pub fn apply_event(&self, event: &SessionEvent) -> Result<Self, DomainError> {
         self.validate()?;
+        let next = self.apply_event_from_valid_state(event)?;
+        next.validate()?;
+        Ok(next)
+    }
+
+    /// Apply one event to a projection whose complete invariants were already
+    /// verified by the caller.
+    ///
+    /// Storage uses this only while carrying its opaque verified projection
+    /// through one append transaction. Public reducer entry points continue to
+    /// validate both the input and the resulting state. Event-local checks stay
+    /// here so a verified projection cannot admit an invalid transition merely
+    /// because its unchanged history was not scanned again.
+    pub(crate) fn apply_event_from_valid_state(
+        &self,
+        event: &SessionEvent,
+    ) -> Result<Self, DomainError> {
         self.validate_event_position(event)?;
         event.validate()?;
         let mut next = self.clone();
@@ -49,7 +67,6 @@ impl SessionState {
             .stream_version
             .checked_add(1)
             .ok_or(DomainError::VersionOverflow)?;
-        next.validate()?;
         Ok(next)
     }
 
@@ -121,6 +138,27 @@ impl SessionState {
         Ok(next)
     }
 
+    /// Attach the immutable event identity after storage has committed an
+    /// event whose semantic payload was already reduced with `apply_event`.
+    ///
+    /// Storage uses this to carry one batch projection through the append
+    /// transaction instead of reducing every event a second time after its
+    /// row receives a global position. Global position and command identity
+    /// do not participate in the session projection; the event ID is the only
+    /// record-level fact retained by `SessionState`.
+    pub(crate) fn remember_committed_event_id(
+        &mut self,
+        event_id: &str,
+    ) -> Result<(), DomainError> {
+        validate_identifier("event_id", event_id)?;
+        let event_key = format!("event:{event_id}");
+        if self.dedupe_facts.contains(&event_key) {
+            return Err(DomainError::DuplicateEventId(event_id.to_owned()));
+        }
+        self.dedupe_facts.remember(event_key);
+        Ok(())
+    }
+
     /// Rebuild a projection from the immutable event records in stream order.
     ///
     /// This is intentionally the only replay path exposed by the domain.  It
@@ -181,14 +219,18 @@ impl SessionState {
             _ => return Err(DomainError::SessionNotCreated),
         }
         self.dedupe_facts.validate()?;
-        let mut message_ids = BTreeSet::new();
-        let mut declared_tool_calls = BTreeMap::new();
+        let mut message_ids = HashSet::with_capacity(self.transcript.len());
+        let mut user_message_ids = HashSet::new();
+        let mut declared_tool_calls = HashMap::new();
         for message in &self.transcript {
             validate_message(message)?;
             if !message_ids.insert(message.message_id.as_str()) {
                 return Err(DomainError::ConflictingTranscriptMessage(
                     message.message_id.clone(),
                 ));
+            }
+            if message.role == TranscriptRole::User {
+                user_message_ids.insert(message.message_id.as_str());
             }
             if !message.tool_calls.is_empty() && message.role != TranscriptRole::Assistant {
                 return Err(DomainError::InvalidState(
@@ -218,10 +260,7 @@ impl SessionState {
         }
         if let Some(failure) = &self.last_model_attempt_failure {
             validate_model_attempt_failure(failure)?;
-            if !self.transcript.iter().any(|message| {
-                message.role == TranscriptRole::User
-                    && message.message_id == failure.trigger_message_id
-            }) {
+            if !user_message_ids.contains(failure.trigger_message_id.as_str()) {
                 return Err(DomainError::InvalidState(
                     "model attempt failure has no causal user message".into(),
                 ));
@@ -335,11 +374,7 @@ impl SessionState {
                     "pending context handoff has an invalid generation".into(),
                 ));
             }
-            if !self
-                .transcript
-                .iter()
-                .any(|message| message.message_id == plan.covered_through_message_id)
-            {
+            if !message_ids.contains(plan.covered_through_message_id.as_str()) {
                 return Err(DomainError::InvalidState(
                     "pending context handoff boundary is absent from history".into(),
                 ));
@@ -347,11 +382,7 @@ impl SessionState {
         }
         if let Some(handoff) = &self.latest_context_handoff {
             validate_context_handoff_document(handoff)?;
-            if !self
-                .transcript
-                .iter()
-                .any(|message| message.message_id == handoff.covered_through_message_id)
-            {
+            if !message_ids.contains(handoff.covered_through_message_id.as_str()) {
                 return Err(DomainError::InvalidState(
                     "context handoff boundary is absent from history".into(),
                 ));
@@ -422,7 +453,7 @@ impl SessionState {
                 max: MAX_ASYNC_TOOL_CALLS,
             });
         }
-        let mut callback_tool_ids = BTreeSet::new();
+        let mut callback_tool_ids = HashSet::with_capacity(self.callback_bindings.len());
         for (callback_id, binding) in &self.callback_bindings {
             validate_callback_binding(binding)?;
             if callback_id != &binding.callback_id {

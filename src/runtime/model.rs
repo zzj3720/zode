@@ -43,7 +43,7 @@ struct PreparedModelRequestInput<'a> {
     owner: &'a SessionOwner,
     session_id: &'a str,
     auth_revision: u64,
-    state: SessionState,
+    state: VerifiedSessionState,
     request: ModelRequest,
     identity: &'a PreparedRequestIdentity,
     purpose: ModelRequestPurpose,
@@ -61,8 +61,8 @@ impl Runtime {
         self: &Arc<Self>,
         owner: SessionOwner,
         session_id: String,
-        state: SessionState,
-    ) -> Result<SessionState, &'static str> {
+        state: VerifiedSessionState,
+    ) -> Result<VerifiedSessionState, &'static str> {
         let Some(round) = state.active_model_round.clone() else {
             return Ok(state);
         };
@@ -117,9 +117,9 @@ impl Runtime {
         self: &Arc<Self>,
         owner: SessionOwner,
         session_id: String,
-        mut state: SessionState,
+        mut state: VerifiedSessionState,
         attempt: crate::domain::ModelAttemptRecord,
-    ) -> Result<SessionState, &'static str> {
+    ) -> Result<VerifiedSessionState, &'static str> {
         let Some(request) = state
             .active_model_round
             .as_ref()
@@ -203,8 +203,8 @@ impl Runtime {
         self: &Arc<Self>,
         owner: SessionOwner,
         session_id: String,
-        mut state: SessionState,
-    ) -> Result<SessionState, &'static str> {
+        mut state: VerifiedSessionState,
+    ) -> Result<VerifiedSessionState, &'static str> {
         let records = state
             .async_tool_calls
             .values()
@@ -430,11 +430,11 @@ impl Runtime {
         self: &Arc<Self>,
         owner: &SessionOwner,
         session_id: &str,
-        mut state: SessionState,
+        mut state: VerifiedSessionState,
         purpose: ModelRequestPurpose,
         error_class: ModelAttemptErrorClass,
         error_message: &'static str,
-    ) -> Result<SessionState, &'static str> {
+    ) -> Result<VerifiedSessionState, &'static str> {
         match purpose {
             ModelRequestPurpose::Conversation => {
                 if state
@@ -482,8 +482,8 @@ impl Runtime {
         owner: &SessionOwner,
         session_id: &str,
         selection: &SessionModelSelection,
-        mut state: SessionState,
-    ) -> Result<SessionState, &'static str> {
+        mut state: VerifiedSessionState,
+    ) -> Result<VerifiedSessionState, &'static str> {
         let Some(limits) = selection.limits.as_ref() else {
             // Historical selections predate durable model capabilities. They
             // remain executable, but the runtime must not invent a context
@@ -614,8 +614,8 @@ impl Runtime {
         owner: &SessionOwner,
         session_id: &str,
         selection: &SessionModelSelection,
-        state: &SessionState,
-    ) -> Result<SessionState, &'static str> {
+        state: &VerifiedSessionState,
+    ) -> Result<VerifiedSessionState, &'static str> {
         let plan = state
             .pending_context_handoff
             .clone()
@@ -781,10 +781,10 @@ impl Runtime {
         self: &Arc<Self>,
         owner: &SessionOwner,
         session_id: &str,
-        state: SessionState,
+        state: VerifiedSessionState,
         message: &'static str,
         completed_request: Option<(&PreparedRequestIdentity, &str)>,
-    ) -> Result<SessionState, &'static str> {
+    ) -> Result<VerifiedSessionState, &'static str> {
         let failed = append_context_handoff_failure(
             self.store.clone(),
             owner.clone(),
@@ -802,8 +802,8 @@ impl Runtime {
         self: &Arc<Self>,
         owner: &SessionOwner,
         session_id: &str,
-        mut state: SessionState,
-    ) -> Result<SessionState, &'static str> {
+        mut state: VerifiedSessionState,
+    ) -> Result<VerifiedSessionState, &'static str> {
         let trigger_message_id = state
             .transcript
             .iter()
@@ -831,9 +831,15 @@ impl Runtime {
         owner: &SessionOwner,
         session_id: &str,
         selection: &SessionModelSelection,
-        state: &SessionState,
+        state: &VerifiedSessionState,
         round_identity: String,
-    ) -> Result<(Vec<(AppendResult, SessionState)>, SessionState), &'static str> {
+    ) -> Result<
+        (
+            Vec<(AppendResult, VerifiedSessionState)>,
+            VerifiedSessionState,
+        ),
+        &'static str,
+    > {
         let mut tools = self
             .tools
             .definitions(&state.selection.tools)
