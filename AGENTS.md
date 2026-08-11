@@ -470,6 +470,11 @@ behavioral finding discovered during development, construct a black-box E2E
 that fails through the owning real process/browser and public HTTP/SSE entry,
 then make it pass. If the required process or route does not exist,
 implementing that smallest real entry and the red E2E comes before the fix.
+Source inspection, a plausible race, stronger-test advice, or a reviewer risk
+argument is not an accepted behavioral finding by itself and cannot block an
+otherwise-ready delivery. If the claimed behavior cannot be made stably red
+through that public E2E, reject the finding and do not change production code
+for it.
 Compiler, formatter, lint, and architectural type-boundary failures remain
 mandatory static gates; they do not justify adding a non-E2E test.
 
@@ -566,9 +571,11 @@ fabricate or relabel a later capture as the historical first occurrence.
   reports concrete correctness, recovery, security, simplicity, or operability
   findings and does not silently patch the implementation it reviews.
 - Every behavioral review finding must state a constructible public red E2E.
-  Send it to the assigned E2E owner, who demonstrates that failure before the
-  task's implementation owner fixes production code. Production workers and
-  reviewers may not rewrite a frozen E2E to fit their preferred implementation.
+  The review finding is accepted only after that E2E stably demonstrates the
+  claimed failure against the running product. A finding without such a red is
+  rejected, does not block merge, and must not cause a production change.
+  Production workers and reviewers may not rewrite a frozen E2E to fit their
+  preferred implementation.
 - Send the fix back to the same reviewer until its findings converge, then use
   an independent final repository review to catch cross-module failures.
 - Do not resolve review comments by weakening E2Es, adding parallel fallback

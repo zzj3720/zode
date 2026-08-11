@@ -904,4 +904,8 @@ Development order is strict:
 An implementation worker or reviewer may not weaken, skip, internally bypass,
 or rewrite a red E2E to fit a fix. Build failures and purely static dependency
 violations use compiler/lint/architecture gates; any issue observable through a
-running product requires its own red E2E first.
+running product requires its own red E2E first. Reviewer prose, source-level
+risk, or a request for stronger coverage is not a behavioral finding and cannot
+block delivery until the claimed behavior is stably red through that real
+public path. If no such red can be constructed, reject the finding and do not
+change production behavior for it.
