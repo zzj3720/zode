@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File, OpenOptions},
     io::{Error, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
@@ -169,7 +169,7 @@ impl DeepSweEventTrace {
         Ok(trace)
     }
 
-    pub fn promote_immutable(&self, path: &Path, forbidden: &[&str]) -> TestResult<String> {
+    pub fn write_private(&self, path: &Path, forbidden: &[&str]) -> TestResult<String> {
         if path.exists() {
             return Err(Error::other("DeepSWE event trace destination already exists").into());
         }
@@ -196,7 +196,6 @@ impl DeepSweEventTrace {
                 .open(&temporary)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444))?;
             fs::hard_link(&temporary, path)?;
             File::open(parent)?.sync_all()?;
             Ok(())

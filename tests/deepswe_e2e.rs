@@ -567,7 +567,7 @@ async fn e2e_live_deepswe_opencode_go_records_and_completes() -> TestResult<()> 
             })
             .await
             {
-                Ok(Ok(trace)) => match trace.promote_immutable(
+                Ok(Ok(trace)) => match trace.write_private(
                     &quarantine.join("event-trace.json"),
                     &[&key, TEST_CONTROLLER_SECRET],
                 ) {

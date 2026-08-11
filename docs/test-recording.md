@@ -235,6 +235,11 @@ The trace preserves each ordered semantic event's schema version, type, and
 payload. Test-only loading is byte-bounded, checks a whole-trace digest, and
 rejects missing, extra, reordered, or changed events.
 
+A live run first writes that trace as a create-new private `0600` file inside
+the `0700` quarantine root, so the complete raw tree remains private and can be
+scanned as one unit. Only the verified archive or a later reviewed promotion is
+immutable; creating the trace must not make a quarantine member world-readable.
+
 The replay harness classifies trace entries by their role without importing
 them into storage:
 
