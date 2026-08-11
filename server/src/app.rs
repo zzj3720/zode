@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
     body::to_bytes,
     extract::{Extension, OriginalUri, Path, Query, Request, State},
     http::{header, uri::Authority, HeaderMap, Method, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{sse::Event, sse::KeepAlive, sse::Sse, IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
@@ -19,7 +19,7 @@ use crate::{
     config::Deployment,
     provider_authority::{
         CreateAuthProfileRequest, ProviderAuthority, ProviderError, PutProviderDescriptorRequest,
-        SetDefaultAuthProfileRequest,
+        SetDefaultAuthProfileRequest, SharingRequest, StartOAuthAttemptRequest,
     },
     session_proxy::{
         CreateSessionRequest, ModelSelectionRequest, ProxyJson, SessionProxy, SessionProxyError,
@@ -112,12 +112,54 @@ pub(crate) fn router(
             delete(delete_auth_profile),
         )
         .route(
+            "/v1/providers/{provider}/auth-attempts",
+            post(start_oauth_attempt),
+        )
+        .route("/v1/auth-attempts/{attempt_id}", get(get_oauth_attempt))
+        .route(
+            "/v1/auth-attempts/{attempt_id}/events",
+            get(stream_oauth_attempt_events),
+        )
+        .route(
+            "/v1/auth-attempts/{attempt_id}/answers",
+            post(answer_oauth_attempt),
+        )
+        .route(
+            "/v1/auth-attempts/{attempt_id}/cancel",
+            post(cancel_oauth_attempt),
+        )
+        .route(
+            "/v1/auth-attempts/{attempt_id}/authorize-tickets",
+            post(mint_oauth_authorize_ticket),
+        )
+        .route(
+            "/v1/auth-attempts/{attempt_id}/authorize",
+            get(redeem_oauth_authorize_ticket),
+        )
+        .route("/v1/oauth/callback", get(oauth_callback))
+        .route(
             "/v1/providers/{provider}/default-auth-profile",
             put(set_default_auth_profile),
         )
         .route(
             "/v1/auth-profiles/{profile_id}/replicas",
             get(list_auth_profile_replicas),
+        )
+        .route(
+            "/v1/auth-profiles/{profile_id}/sharing",
+            put(update_auth_profile_sharing),
+        )
+        .route(
+            "/v1/auth-profiles/{profile_id}/refresh-operations",
+            post(start_auth_refresh),
+        )
+        .route(
+            "/v1/auth-refresh-operations/{operation_id}",
+            get(get_auth_refresh),
+        )
+        .route(
+            "/v1/auth-refresh-operations/{operation_id}/events",
+            get(stream_auth_refresh_events),
         )
         .route(
             "/v1/endpoints/{endpoint_id}/sessions",
@@ -136,8 +178,20 @@ pub(crate) fn router(
             put(select_model),
         )
         .route(
-            "/v1/endpoints/{endpoint_id}/sessions/{session_id}/events",
-            get(stream_session_events),
+            "/v1/endpoints/{endpoint_id}/sessions/{session_id}/tool-calls/{tool_call_id}",
+            get(get_tool_call),
+        )
+        .route(
+            "/v1/endpoints/{endpoint_id}/sessions/{session_id}/tool-calls/{tool_call_id}/cancel",
+            post(cancel_tool_call),
+        )
+        .route(
+            "/v1/endpoints/{endpoint_id}/sessions/{session_id}/tool-calls/{tool_call_id}/reconcile",
+            post(reconcile_tool_call),
+        )
+        .route(
+            "/v1/endpoints/{endpoint_id}/events",
+            get(stream_endpoint_events),
         )
         .fallback(management_fallback)
         .with_state(state.clone())
@@ -379,12 +433,369 @@ async fn create_auth_profile(
         .map_err(|_| ApiError::payload_too_large())?;
     let request: CreateAuthProfileRequest =
         serde_json::from_slice(&body).map_err(|_| ApiError::invalid())?;
+    let status = if request.is_replacement() {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
     let profile = state
         .providers
         .create_profile(&actor, &idempotency_key, &provider, request)
         .await
         .map_err(ApiError::from_provider)?;
-    Ok((StatusCode::CREATED, Json(profile)).into_response())
+    Ok((status, Json(profile)).into_response())
+}
+
+async fn start_oauth_attempt(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Extension(actor): Extension<ActorContext>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let idempotency_key = one_header(request.headers(), "idempotency-key")?;
+    let body = to_bytes(request.into_body(), MAX_PROFILE_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::payload_too_large())?;
+    let request: StartOAuthAttemptRequest =
+        serde_json::from_slice(&body).map_err(|_| ApiError::invalid())?;
+    let attempt = state
+        .providers
+        .start_oauth_attempt(&actor, &idempotency_key, &provider, request)
+        .await
+        .map_err(ApiError::from_provider)?;
+    Ok((
+        StatusCode::CREATED,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(attempt),
+    )
+        .into_response())
+}
+
+async fn get_oauth_attempt(
+    State(state): State<AppState>,
+    Path(attempt_id): Path<String>,
+    Extension(actor): Extension<ActorContext>,
+) -> Result<Response, ApiError> {
+    let attempt = state
+        .providers
+        .get_oauth_attempt(&actor, &attempt_id)
+        .await
+        .map_err(ApiError::from_provider)?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(attempt)).into_response())
+}
+
+async fn stream_oauth_attempt_events(
+    State(state): State<AppState>,
+    Path(attempt_id): Path<String>,
+    Extension(actor): Extension<ActorContext>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    stream_provider_control_resource(
+        state,
+        actor,
+        attempt_id,
+        headers,
+        ProviderControlKind::OAuthAttempt,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ProviderControlKind {
+    OAuthAttempt,
+    AuthRefresh,
+}
+
+async fn stream_provider_control_resource(
+    state: AppState,
+    actor: ActorContext,
+    resource_id: String,
+    headers: HeaderMap,
+    kind: ProviderControlKind,
+) -> Result<Response, ApiError> {
+    match kind {
+        ProviderControlKind::OAuthAttempt => {
+            state
+                .providers
+                .get_oauth_attempt(&actor, &resource_id)
+                .await
+        }
+        ProviderControlKind::AuthRefresh => {
+            state.providers.get_auth_refresh(&actor, &resource_id).await
+        }
+    }
+    .map_err(ApiError::from_provider)?;
+    let after = optional_one_header(&headers, "last-event-id")?
+        .map(|value| value.parse::<u64>().map_err(|_| ApiError::invalid()))
+        .transpose()?
+        .unwrap_or(0);
+    let expiry = actor.assertion_expiry_deadline();
+    let signal = state.providers.control_signal();
+    let providers = Arc::clone(&state.providers);
+    let stream = futures_util::stream::unfold(
+        (
+            providers,
+            actor,
+            resource_id,
+            after,
+            VecDeque::<crate::store::ProviderControlEvent>::new(),
+            signal,
+            expiry,
+        ),
+        move |(providers, actor, resource_id, mut after, mut pending, signal, expiry)| async move {
+            loop {
+                if tokio::time::Instant::now() >= expiry {
+                    return None;
+                }
+                if let Some(event) = pending.pop_front() {
+                    after = event.sequence;
+                    let frame = Event::default()
+                        .id(event.sequence.to_string())
+                        .event(match kind {
+                            ProviderControlKind::OAuthAttempt => "oauth_attempt",
+                            ProviderControlKind::AuthRefresh => "auth_refresh",
+                        })
+                        .data(event.event_json);
+                    return Some((
+                        Ok::<Event, Infallible>(frame),
+                        (
+                            providers,
+                            actor,
+                            resource_id,
+                            after,
+                            pending,
+                            signal,
+                            expiry,
+                        ),
+                    ));
+                }
+                let notified = signal.notified();
+                let events = match kind {
+                    ProviderControlKind::OAuthAttempt => {
+                        providers
+                            .oauth_attempt_events(&actor, &resource_id, after)
+                            .await
+                    }
+                    ProviderControlKind::AuthRefresh => {
+                        providers
+                            .auth_refresh_events(&actor, &resource_id, after)
+                            .await
+                    }
+                };
+                match events {
+                    Ok(events) if !events.is_empty() => {
+                        pending.extend(events);
+                    }
+                    Ok(_) => {
+                        tokio::select! {
+                            _ = notified => {}
+                            _ = tokio::time::sleep_until(expiry) => return None,
+                        }
+                    }
+                    Err(_) => return None,
+                }
+            }
+        },
+    );
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response())
+}
+
+async fn start_auth_refresh(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+    Extension(actor): Extension<ActorContext>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let idempotency_key = one_header(request.headers(), "idempotency-key")?;
+    let body = to_bytes(request.into_body(), 1)
+        .await
+        .map_err(|_| ApiError::payload_too_large())?;
+    if !body.is_empty() {
+        return Err(ApiError::invalid());
+    }
+    let operation = state
+        .providers
+        .start_auth_refresh(&actor, &idempotency_key, &profile_id)
+        .await
+        .map_err(ApiError::from_provider)?;
+    Ok((StatusCode::ACCEPTED, Json(operation)).into_response())
+}
+
+async fn get_auth_refresh(
+    State(state): State<AppState>,
+    Path(operation_id): Path<String>,
+    Extension(actor): Extension<ActorContext>,
+) -> Result<Json<Value>, ApiError> {
+    state
+        .providers
+        .get_auth_refresh(&actor, &operation_id)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_provider)
+}
+
+async fn stream_auth_refresh_events(
+    State(state): State<AppState>,
+    Path(operation_id): Path<String>,
+    Extension(actor): Extension<ActorContext>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    stream_provider_control_resource(
+        state,
+        actor,
+        operation_id,
+        headers,
+        ProviderControlKind::AuthRefresh,
+    )
+    .await
+}
+
+async fn answer_oauth_attempt(
+    Path(_attempt_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let _idempotency_key = one_header(request.headers(), "idempotency-key")?;
+    let _ = to_bytes(request.into_body(), MAX_PROFILE_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::payload_too_large())?;
+    Err(ApiError::from_provider(ProviderError::Conflict))
+}
+
+async fn cancel_oauth_attempt(
+    State(state): State<AppState>,
+    Path(attempt_id): Path<String>,
+    Extension(actor): Extension<ActorContext>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let idempotency_key = one_header(request.headers(), "idempotency-key")?;
+    let body = to_bytes(request.into_body(), 1)
+        .await
+        .map_err(|_| ApiError::payload_too_large())?;
+    if !body.is_empty() {
+        return Err(ApiError::invalid());
+    }
+    let attempt = state
+        .providers
+        .cancel_oauth_attempt(&actor, &idempotency_key, &attempt_id)
+        .await
+        .map_err(ApiError::from_provider)?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(attempt)).into_response())
+}
+
+async fn mint_oauth_authorize_ticket(
+    State(state): State<AppState>,
+    Path(attempt_id): Path<String>,
+    Extension(actor): Extension<ActorContext>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let idempotency_key = one_header(request.headers(), "idempotency-key")?;
+    let body = to_bytes(request.into_body(), 1)
+        .await
+        .map_err(|_| ApiError::payload_too_large())?;
+    if !body.is_empty() {
+        return Err(ApiError::invalid());
+    }
+    let ticket = state
+        .providers
+        .mint_oauth_ticket(&actor, &idempotency_key, &attempt_id)
+        .await
+        .map_err(ApiError::from_provider)?;
+    Ok((
+        StatusCode::CREATED,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(ticket),
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OAuthAuthorizeQuery {
+    ticket: String,
+}
+
+async fn redeem_oauth_authorize_ticket(
+    State(state): State<AppState>,
+    Path(attempt_id): Path<String>,
+    Extension(actor): Extension<ActorContext>,
+    Query(query): Query<OAuthAuthorizeQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value != "same-origin")
+        || headers
+            .get("sec-fetch-mode")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value != "navigate")
+    {
+        return Err(ApiError::invalid());
+    }
+    let location = state
+        .providers
+        .redeem_oauth_ticket(&actor, &attempt_id, &query.ticket)
+        .await
+        .map_err(ApiError::from_provider)?;
+    Ok((
+        StatusCode::FOUND,
+        [
+            (header::LOCATION, location),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+            (
+                header::HeaderName::from_static("referrer-policy"),
+                "no-referrer".to_owned(),
+            ),
+        ],
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OAuthCallbackQuery {
+    state: String,
+    code: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+async fn oauth_callback(
+    State(state): State<AppState>,
+    Extension(actor): Extension<ActorContext>,
+    Query(query): Query<OAuthCallbackQuery>,
+) -> Result<Response, ApiError> {
+    if query
+        .error_description
+        .as_ref()
+        .is_some_and(|value| value.len() > 2 * 1024 || value.chars().any(char::is_control))
+    {
+        return Err(ApiError::invalid());
+    }
+    let location = state
+        .providers
+        .oauth_callback(
+            &actor,
+            &query.state,
+            query.code.as_deref(),
+            query.error.as_deref(),
+        )
+        .await
+        .map_err(ApiError::from_provider)?;
+    Ok((
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, location),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+            (
+                header::HeaderName::from_static("referrer-policy"),
+                "no-referrer".to_owned(),
+            ),
+        ],
+    )
+        .into_response())
 }
 
 async fn set_default_auth_profile(
@@ -432,6 +843,25 @@ async fn list_auth_profile_replicas(
         .await
         .map(Json)
         .map_err(ApiError::from_provider)
+}
+
+async fn update_auth_profile_sharing(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+    Extension(actor): Extension<ActorContext>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let idempotency_key = one_header(request.headers(), "idempotency-key")?;
+    let body = to_bytes(request.into_body(), MAX_PROFILE_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::payload_too_large())?;
+    let request: SharingRequest = serde_json::from_slice(&body).map_err(|_| ApiError::invalid())?;
+    let profile = state
+        .providers
+        .update_profile_sharing(&actor, &idempotency_key, &profile_id, request)
+        .await
+        .map_err(ApiError::from_provider)?;
+    Ok((StatusCode::ACCEPTED, Json(profile)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -521,28 +951,87 @@ async fn select_model(
         serde_json::from_slice(&body).map_err(|_| ApiError::invalid())?;
     state
         .sessions
-        .select_model(
+        .select_model(&actor, &endpoint_id, &session_id, &idempotency_key, request)
+        .await
+        .map(proxy_json_response)
+        .map_err(ApiError::from_session_proxy)
+}
+
+async fn get_tool_call(
+    State(state): State<AppState>,
+    Path((endpoint_id, session_id, tool_call_id)): Path<(String, String, String)>,
+    Extension(actor): Extension<ActorContext>,
+) -> Result<Response, ApiError> {
+    state
+        .sessions
+        .get_tool_call(&actor, &endpoint_id, &session_id, &tool_call_id)
+        .await
+        .map(proxy_json_response)
+        .map_err(ApiError::from_session_proxy)
+}
+
+async fn cancel_tool_call(
+    State(state): State<AppState>,
+    Path((endpoint_id, session_id, tool_call_id)): Path<(String, String, String)>,
+    Extension(actor): Extension<ActorContext>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let idempotency_key = one_header(request.headers(), "idempotency-key")?;
+    let body = to_bytes(request.into_body(), MAX_SESSION_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::payload_too_large())?;
+    let body = serde_json::from_slice(&body).map_err(|_| ApiError::invalid())?;
+    state
+        .sessions
+        .cancel_tool_call(
             &actor,
             &endpoint_id,
             &session_id,
+            &tool_call_id,
             &idempotency_key,
-            request,
+            body,
         )
         .await
         .map(proxy_json_response)
         .map_err(ApiError::from_session_proxy)
 }
 
-async fn stream_session_events(
+async fn reconcile_tool_call(
     State(state): State<AppState>,
-    Path((endpoint_id, session_id)): Path<(String, String)>,
+    Path((endpoint_id, session_id, tool_call_id)): Path<(String, String, String)>,
+    Extension(actor): Extension<ActorContext>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let idempotency_key = one_header(request.headers(), "idempotency-key")?;
+    let body = to_bytes(request.into_body(), MAX_SESSION_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::payload_too_large())?;
+    let body = serde_json::from_slice(&body).map_err(|_| ApiError::invalid())?;
+    state
+        .sessions
+        .reconcile_tool_call(
+            &actor,
+            &endpoint_id,
+            &session_id,
+            &tool_call_id,
+            &idempotency_key,
+            body,
+        )
+        .await
+        .map(proxy_json_response)
+        .map_err(ApiError::from_session_proxy)
+}
+
+async fn stream_endpoint_events(
+    State(state): State<AppState>,
+    Path(endpoint_id): Path<String>,
     Extension(actor): Extension<ActorContext>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let last_event_id = optional_one_header(&headers, "last-event-id")?;
     state
         .sessions
-        .stream_events(&actor, &endpoint_id, &session_id, last_event_id.as_deref())
+        .stream_events(&actor, &endpoint_id, last_event_id.as_deref())
         .await
         .map_err(ApiError::from_session_proxy)
 }
@@ -605,12 +1094,21 @@ async fn probe_endpoint(
     State(state): State<AppState>,
     Path(endpoint_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    state
-        .catalog
-        .probe_endpoint_by_id(&endpoint_id)
-        .await
-        .map(Json)
-        .map_err(ApiError::from_catalog)
+    match state.catalog.probe_endpoint_by_id(&endpoint_id).await {
+        Ok(observation) => {
+            state.providers.request_reconciliation();
+            Ok(Json(observation))
+        }
+        Err(CatalogError::EndpointUnavailable) => {
+            state
+                .providers
+                .observe_endpoint_unreachable(&endpoint_id)
+                .await
+                .map_err(ApiError::from_provider)?;
+            Err(ApiError::from_catalog(CatalogError::EndpointUnavailable))
+        }
+        Err(error) => Err(ApiError::from_catalog(error)),
+    }
 }
 
 fn one_header(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {
@@ -710,6 +1208,18 @@ impl ApiError {
                 status: StatusCode::CONFLICT,
                 code: "operation_conflict",
                 message: "management operation conflicts",
+                retryable: false,
+            },
+            ProviderError::ReceiptUnavailable => Self {
+                status: StatusCode::CONFLICT,
+                code: "idempotency_receipt_unavailable",
+                message: "the original operation response is unavailable",
+                retryable: false,
+            },
+            ProviderError::ReauthRequired => Self {
+                status: StatusCode::CONFLICT,
+                code: "reauth_required",
+                message: "the auth profile requires relogin",
                 retryable: false,
             },
             ProviderError::Internal => Self {

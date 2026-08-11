@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     convert::Infallible,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -34,7 +34,7 @@ use crate::{
     },
     domain::{
         ActiveWait, AsyncToolCallRecord, CompletionMode, DeliveryKind, DurablePayload, EventDraft,
-        EventRecord, ProviderExecutionSelection, QueuedDelivery, SessionEvent,
+        EventRecord, ModelLimits, ProviderExecutionSelection, QueuedDelivery, SessionEvent,
         SessionModelSelection, SessionOwner, SessionSelection, SessionState, ToolCall,
         TranscriptMessage, MAX_ERROR_MESSAGE_BYTES, MAX_IDENTIFIER_BYTES,
     },
@@ -44,7 +44,8 @@ use crate::{
         MAX_REPLICA_REQUEST_BYTES,
     },
     runtime::{
-        CallbackCompletion, Runtime, RuntimeCommandError, RuntimeStreamEvent, TransientModelEvent,
+        CallbackCompletion, Runtime, RuntimeCommandError, RuntimeStreamEvent,
+        RuntimeStreamSubscription, TransientModelEvent,
     },
     storage::{
         EventStore, RehydrateError, SessionCreate, SessionCreateCommand, SessionListCursor,
@@ -199,10 +200,19 @@ struct CreateModelSelection {
     provider: String,
     provider_execution: CreateProviderExecutionSelection,
     model: String,
+    #[serde(default)]
+    limits: Option<CreateModelLimits>,
     auth_authority_id: String,
     auth_profile_id: String,
     #[serde(default = "default_auth_revision", alias = "minimum_auth_revision")]
     auth_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateModelLimits {
+    context_window_tokens: u64,
+    max_output_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -530,7 +540,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/callbacks/{callback_id}",
             post(complete_external_callback),
         )
-        .route("/v1/sessions/{id}/events", get(stream_events))
+        .route("/v1/events", get(stream_endpoint_events))
         .with_state(state)
 }
 
@@ -1544,9 +1554,8 @@ fn service_error_from_domain(error: crate::domain::DomainError) -> ServiceError 
     }
 }
 
-async fn stream_events(
+async fn stream_endpoint_events(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let context = state
@@ -1555,110 +1564,198 @@ async fn stream_events(
         .map_err(ApiError::from_control)?;
     let after = parse_last_event_id(&headers).map_err(ApiError::from_service)?;
     let owner = SessionOwner::new(context.authority_id(), context.subject());
-    let receiver = state.runtime.stream_publisher().subscribe();
-    let store = state.store.clone();
-    let id = session_id.clone();
-    let replay_owner = owner.clone();
-    let replay = run_blocking(move || read_events_after(&*store, &id, &replay_owner, after))
+    let subscription = subscribe_runtime_stream(&state)
         .await
         .map_err(ApiError::from_service)?;
+    let initial_records =
+        read_owned_event_batch(state.store.clone(), owner.clone(), after.unwrap_or(0))
+            .await
+            .map_err(ApiError::from_service)?;
+    let initial_batch_was_full = initial_records.len() == READ_GLOBAL_BATCH_SIZE;
+    let initial_catch_up_pending = !initial_records.is_empty();
 
     let stream = async_stream::stream! {
         yield Ok::<SseEvent, Infallible>(SseEvent::default().comment("stream-open"));
         let mut last_position = after.unwrap_or(0);
-        for record in replay {
-            if record.global_position > last_position {
-                last_position = record.global_position;
-                if let Some(public) = public_event(&record) {
-                    yield Ok::<SseEvent, Infallible>(sse_event(public));
+        let mut owned_sessions = BTreeSet::new();
+        let mut receiver = subscription.receiver;
+        let mut skip_through_sequence = subscription.fence.sequence;
+        let mut catch_up_through = subscription.fence.durable_position;
+        let mut catch_up_pending = initial_catch_up_pending;
+        let mut retry_barriers = subscription.fence.retry_barriers;
+        retry_barriers.retain(|_, position| *position > last_position);
+        let mut blocked_transient = None::<TransientModelEvent>;
+        let mut prefer_live = true;
+        let mut catch_up_batch = VecDeque::from(initial_records);
+        let mut catch_up_batch_was_full = initial_batch_was_full;
+
+        'stream: loop {
+            if let Some(event) = blocked_transient.take() {
+                if retry_barriers
+                    .get(&event.session_id)
+                    .is_some_and(|position| *position > last_position)
+                {
+                    blocked_transient = Some(event);
+                } else {
+                    retry_barriers.remove(&event.session_id);
+                    prefer_live = false;
+                    yield Ok::<SseEvent, Infallible>(transient_model_event(event));
+                    continue;
                 }
             }
-        }
 
-        let mut receiver = receiver;
-        let mut transient_reliable = true;
-        loop {
-            match receiver.recv().await {
-                Ok(RuntimeStreamEvent::Transient(event)) => {
-                    if transient_reliable && event.session_id == session_id {
-                        yield Ok::<SseEvent, Infallible>(transient_model_event(event));
+            let live = if catch_up_pending && blocked_transient.is_none() && prefer_live {
+                match receiver.try_recv() {
+                    Ok(message) => Some(Ok(message)),
+                    Err(broadcast::error::TryRecvError::Empty) => None,
+                    Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                        Some(Err(broadcast::error::RecvError::Lagged(skipped)))
+                    }
+                    Err(broadcast::error::TryRecvError::Closed) => {
+                        Some(Err(broadcast::error::RecvError::Closed))
                     }
                 }
-                Ok(RuntimeStreamEvent::Durable(event)) => {
-                    if event.stream_id != session_id || event.global_position <= last_position {
+            } else if !catch_up_pending && blocked_transient.is_none() {
+                Some(receiver.recv().await)
+            } else {
+                None
+            };
+
+            if let Some(live) = live {
+                match live {
+                    Ok(message) if message.sequence <= skip_through_sequence => continue,
+                    Ok(message) => match message.event {
+                        RuntimeStreamEvent::Transient(event) => {
+                            if !owned_sessions.contains(&event.session_id) {
+                                match session_is_owned(
+                                    state.store.clone(),
+                                    owner.clone(),
+                                    event.session_id.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(true) => {
+                                        owned_sessions.insert(event.session_id.clone());
+                                    }
+                                    Ok(false) => continue,
+                                    Err(_) => {
+                                        yield Ok::<SseEvent, Infallible>(SseEvent::default()
+                                            .event("error")
+                                            .data(sse_internal_error_data()));
+                                        break 'stream;
+                                    }
+                                }
+                            }
+                            if retry_barriers
+                                .get(&event.session_id)
+                                .is_some_and(|position| *position > last_position)
+                            {
+                                blocked_transient = Some(event);
+                                prefer_live = false;
+                            } else {
+                                prefer_live = false;
+                                yield Ok::<SseEvent, Infallible>(transient_model_event(event));
+                                continue;
+                            }
+                        }
+                        RuntimeStreamEvent::Durable(event) => {
+                            if event.global_position <= last_position {
+                                continue;
+                            }
+                            catch_up_through = catch_up_through.max(event.global_position);
+                            catch_up_pending = true;
+                            if durable_fences_following_transient(&event) {
+                                retry_barriers
+                                    .insert(event.stream_id.clone(), event.global_position);
+                            }
+                        }
+                    },
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        match subscribe_runtime_stream(&state).await {
+                            Ok(next) => {
+                                receiver = next.receiver;
+                                skip_through_sequence = next.fence.sequence;
+                                catch_up_through =
+                                    catch_up_through.max(next.fence.durable_position);
+                                catch_up_pending = true;
+                                retry_barriers = next.fence.retry_barriers;
+                                retry_barriers.retain(|_, position| *position > last_position);
+                                blocked_transient = None;
+                                catch_up_batch.clear();
+                                catch_up_batch_was_full = false;
+                                prefer_live = false;
+                            }
+                            Err(_) => {
+                                yield Ok::<SseEvent, Infallible>(SseEvent::default()
+                                    .event("error")
+                                    .data(sse_internal_error_data()));
+                                break 'stream;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break 'stream,
+                }
+            }
+
+            if !catch_up_pending {
+                continue;
+            }
+
+            if catch_up_batch.is_empty() {
+                match read_owned_event_batch(
+                    state.store.clone(),
+                    owner.clone(),
+                    last_position,
+                )
+                .await
+                {
+                    Ok(records) if records.is_empty() => {
+                        catch_up_pending = false;
+                        prefer_live = true;
                         continue;
                     }
-                    // Publication is a causal notification, while storage is
-                    // still the durable ordering authority. Catch up only
-                    // through this notification so a later committed final
-                    // cannot leapfrog transient text already queued between
-                    // the two durable boundaries.
-                    let notified_position = event.global_position;
-                    let store = state.store.clone();
-                    let id = session_id.clone();
-                    let owner = owner.clone();
-                    match run_blocking(move || {
-                        read_session_events_after(&*store, &owner, &id, last_position)
-                    })
-                    .await
-                    {
-                        Ok(records) => {
-                            for record in records {
-                                if record.global_position > notified_position {
-                                    break;
-                                }
-                                if record.global_position <= last_position {
-                                    continue;
-                                }
-                                last_position = record.global_position;
-                                if let Some(public) = public_event(&record) {
-                                    yield Ok::<SseEvent, Infallible>(sse_event(public));
-                                }
-                            }
-                            transient_reliable = true;
-                        }
-                        Err(_) => {
-                            yield Ok::<SseEvent, Infallible>(SseEvent::default()
-                                .event("error")
-                                .data(sse_internal_error_data()));
-                            break;
-                        }
+                    Ok(records) => {
+                        catch_up_batch_was_full = records.len() == READ_GLOBAL_BATCH_SIZE;
+                        catch_up_batch = records.into();
+                    }
+                    Err(_) => {
+                        yield Ok::<SseEvent, Infallible>(SseEvent::default()
+                            .event("error")
+                            .data(sse_internal_error_data()));
+                        break 'stream;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // Lag means at least one best-effort transient candidate
-                    // is missing, so suppress provisional text until the next
-                    // target-session durable boundary. Durable facts recover
-                    // losslessly from storage.
-                    transient_reliable = false;
-                    let store = state.store.clone();
-                    let id = session_id.clone();
-                    let owner = owner.clone();
-                    match run_blocking(move || {
-                        read_session_events_after(&*store, &owner, &id, last_position)
-                    })
-                    .await
-                    {
-                        Ok(records) => {
-                            for record in records {
-                                if record.global_position <= last_position {
-                                    continue;
-                                }
-                                last_position = record.global_position;
-                                if let Some(public) = public_event(&record) {
-                                    yield Ok::<SseEvent, Infallible>(sse_event(public));
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            yield Ok::<SseEvent, Infallible>(SseEvent::default()
-                                .event("error")
-                                .data(sse_internal_error_data()));
-                            break;
-                        }
-                    }
+            }
+
+            while let Some(record) = catch_up_batch.pop_front() {
+                if record.global_position > catch_up_through {
+                    catch_up_batch.clear();
+                    catch_up_pending = false;
+                    prefer_live = true;
+                    break;
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+                if record.global_position <= last_position {
+                    continue;
+                }
+                last_position = record.global_position;
+                owned_sessions.insert(record.stream_id.clone());
+                retry_barriers.retain(|_, position| *position > last_position);
+                let reached_fence = last_position == catch_up_through;
+                let exhausted_short_batch =
+                    catch_up_batch.is_empty() && !catch_up_batch_was_full;
+                if reached_fence || exhausted_short_batch {
+                    catch_up_batch.clear();
+                    catch_up_pending = false;
+                }
+                prefer_live = true;
+                if let Some(public) = public_event(&record) {
+                    yield Ok::<SseEvent, Infallible>(sse_event(public));
+                    tokio::task::yield_now().await;
+                    break;
+                }
+                if !catch_up_pending {
+                    break;
+                }
             }
         }
     };
@@ -1700,6 +1797,10 @@ fn model_selection_from_request(model: CreateModelSelection) -> SessionModelSele
             options: model.provider_execution.options,
         },
         model: model.model,
+        limits: model.limits.map(|limits| ModelLimits {
+            context_window_tokens: limits.context_window_tokens,
+            max_output_tokens: limits.max_output_tokens,
+        }),
         auth_authority_id: model.auth_authority_id,
         auth_profile_id: model.auth_profile_id,
         auth_revision: model.auth_revision,
@@ -1823,46 +1924,47 @@ fn list_owned_sessions(
         .map_err(ServiceError::store)?
 }
 
-fn read_events_after(
-    store: &dyn EventStore,
-    session_id: &str,
-    owner: &SessionOwner,
-    after: Option<u64>,
-) -> Result<Vec<EventRecord>, ServiceError> {
-    after.map_or_else(
-        || {
+async fn subscribe_runtime_stream(
+    state: &AppState,
+) -> Result<RuntimeStreamSubscription, ServiceError> {
+    let publisher = state.runtime.stream_publisher();
+    let store = state.store.clone();
+    run_blocking(move || {
+        publisher.subscribe_with_fence(|| {
             store
-                .read_stream_owned(owner, session_id, 0)
+                .latest_global_position()
                 .map_err(ServiceError::read_store)
-        },
-        |position| read_session_events_after(store, owner, session_id, position),
-    )
+        })
+    })
+    .await
 }
 
-fn read_session_events_after(
-    store: &dyn EventStore,
-    owner: &SessionOwner,
-    session_id: &str,
-    mut after_position: u64,
+async fn read_owned_event_batch(
+    store: Arc<dyn EventStore>,
+    owner: SessionOwner,
+    after: u64,
 ) -> Result<Vec<EventRecord>, ServiceError> {
-    let mut matching = Vec::new();
-    loop {
-        let batch = store
-            .read_session_events(owner, session_id, after_position, READ_GLOBAL_BATCH_SIZE)
-            .map_err(ServiceError::read_store)?;
-        let full_batch = batch.len() == READ_GLOBAL_BATCH_SIZE;
-        if let Some(last) = batch.last() {
-            after_position = last.global_position;
-        }
-        matching.extend(
-            batch
-                .into_iter()
-                .filter(|event| event.stream_id == session_id),
-        );
-        if !full_batch {
-            return Ok(matching);
-        }
-    }
+    run_blocking(move || {
+        store
+            .read_owned_events(&owner, after, READ_GLOBAL_BATCH_SIZE)
+            .map_err(ServiceError::read_store)
+    })
+    .await
+}
+
+async fn session_is_owned(
+    store: Arc<dyn EventStore>,
+    owner: SessionOwner,
+    session_id: String,
+) -> Result<bool, ServiceError> {
+    run_blocking(
+        move || match store.read_session_events(&owner, &session_id, 0, 0) {
+            Ok(_) => Ok(true),
+            Err(StoreError::SessionNotFound) => Ok(false),
+            Err(error) => Err(ServiceError::read_store(error)),
+        },
+    )
+    .await
 }
 
 async fn run_blocking<T, F>(operation: F) -> Result<T, ServiceError>
@@ -1996,7 +2098,6 @@ fn session_view(state: SessionState) -> Value {
             "selection_version": activation.selection_version,
             "minimum_auth_revision": activation.minimum_auth_revision,
             "started_at_ms": activation.started_at_ms,
-            "rounds_started": activation.rounds_started,
             "model": activation.selection.model.map(public_model),
             "tools": activation.selection.tools,
         })
@@ -2005,6 +2106,7 @@ fn session_view(state: SessionState) -> Value {
         json!({
             "activation_id": round.activation_id,
             "round_id": round.round_id,
+            "purpose": round.purpose,
             "delivery_through_queue_id": round.delivery_through_queue_id,
             "request": round.request.map(|request| json!({
                 "request_id": request.request_id,
@@ -2034,6 +2136,17 @@ fn session_view(state: SessionState) -> Value {
             "maximum_attempts": fact.maximum_attempts,
             "finished_at_ms": fact.finished_at_ms,
             "reason": "model_attempts_exhausted",
+        })
+    });
+    let context_handoff = state.latest_context_handoff.map(|handoff| {
+        json!({
+            "handoff_id": handoff.handoff_id,
+            "previous_handoff_id": handoff.previous_handoff_id,
+            "generation": handoff.next_generation,
+            "covered_through_message_id": handoff.covered_through_message_id,
+            "source_tokens": handoff.source_tokens,
+            "document_tokens": handoff.document_tokens,
+            "token_accounting_version": handoff.token_accounting_version,
         })
     });
     let pending = state
@@ -2068,6 +2181,7 @@ fn session_view(state: SessionState) -> Value {
         "active_activation": active_activation,
         "active_model_round": active_model_round,
         "last_model_attempts_exhausted": last_model_attempts_exhausted,
+        "context_handoff": context_handoff,
     })
 }
 
@@ -2080,6 +2194,7 @@ fn public_model(model: SessionModelSelection) -> Value {
         "provider_execution_base_url": model.provider_execution.base_url,
         "provider_execution_options": model.provider_execution.options,
         "model": model.model,
+        "limits": model.limits,
         "auth_authority_id": model.auth_authority_id,
         "auth_profile_id": model.auth_profile_id,
         "auth_revision": model.auth_revision,
@@ -2111,21 +2226,34 @@ fn public_wait(wait: ActiveWait) -> Value {
 }
 
 fn public_tool(record: AsyncToolCallRecord) -> Value {
-    let status = record.status.clone();
-    let reconciliation = public_reconciliation(&status);
+    let allowed_actions = public_tool_actions(&record);
+    let reconciliation = public_reconciliation(&record);
     json!({
         "tool_call_id": record.tool_call_id,
         "tool_name": record.tool_name,
-        "status": status,
+        "status": record.status,
         "started_at_ms": record.started_at_ms,
         "auto_wait_seconds": record.auto_wait_seconds,
         "completion_mode": public_completion_mode(&record.completion_mode),
+        "allowed_actions": allowed_actions,
         "result": record.result.map(public_payload),
         "error": record.error.map(public_tool_error),
         "cancel_reason": record.cancel_reason,
         "completed_at_ms": record.completed_at_ms,
         "reconciliation": reconciliation,
     })
+}
+
+fn public_tool_actions(record: &AsyncToolCallRecord) -> Vec<&'static str> {
+    match record.status {
+        crate::domain::AsyncToolStatus::Planned | crate::domain::AsyncToolStatus::Running => {
+            vec!["cancel"]
+        }
+        crate::domain::AsyncToolStatus::UnknownOutcome if record.retry_dispatch_deduplicated => {
+            vec!["retry_dispatch"]
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn public_completion_mode(mode: &CompletionMode) -> &'static str {
@@ -2158,8 +2286,11 @@ fn public_payload(payload: DurablePayload) -> Value {
     }
 }
 
-fn public_reconciliation(status: &crate::domain::AsyncToolStatus) -> Value {
-    if matches!(status, crate::domain::AsyncToolStatus::UnknownOutcome) {
+fn public_reconciliation(record: &AsyncToolCallRecord) -> Value {
+    if matches!(
+        record.status,
+        crate::domain::AsyncToolStatus::UnknownOutcome
+    ) {
         json!({ "reason": "unknown_outcome" })
     } else {
         Value::Null
@@ -2176,13 +2307,20 @@ fn public_tool_error(error: crate::domain::ToolError) -> Value {
     json!({ "class": class, "message": message })
 }
 
+fn durable_fences_following_transient(record: &EventRecord) -> bool {
+    matches!(&record.event, SessionEvent::ModelStepRetryScheduled { .. })
+}
+
 fn public_event(record: &EventRecord) -> Option<PublicEvent> {
-    // Durable storage contains private coordination facts (prepared request
-    // envelopes, attempt claims, dedupe/index details).  They remain in the
-    // stream for replay but never become public SSE frames.
+    // Durable storage contains private lifecycle claims and dedupe/index
+    // details. They remain in the stream for replay but never become public
+    // SSE frames. Provider request content is never persisted here.
     let kind = match &record.event {
         SessionEvent::ModelRequestPrepared { .. }
+        | SessionEvent::ModelRequestDeclared { .. }
+        | SessionEvent::ContextHandoffPlanned { .. }
         | SessionEvent::ModelAttemptStarted { .. }
+        | SessionEvent::ModelRequestAbandoned { .. }
         | SessionEvent::ModelRequestCompleted { .. }
         | SessionEvent::WaitTimerScheduled { .. }
         | SessionEvent::AsyncToolCallCallbackPlanned { .. }
@@ -2195,6 +2333,8 @@ fn public_event(record: &EventRecord) -> Option<PublicEvent> {
         }
         SessionEvent::ModelAttemptsExhausted { .. } => "model_attempts_exhausted",
         SessionEvent::ModelStepRetryScheduled { .. } => "model_step_retrying",
+        SessionEvent::ContextHandoffCreated { .. } => "context_handoff_created",
+        SessionEvent::ContextHandoffFailed { .. } => "context_handoff_failed",
         SessionEvent::AsyncToolCallCallbackCompleted { .. } => "async_tool_call_completed",
         SessionEvent::AsyncToolCallCallbackFailed { .. } => "async_tool_call_failed",
         SessionEvent::SessionCreated { .. }
@@ -2288,13 +2428,33 @@ fn public_event_data(event: &SessionEvent) -> Value {
         SessionEvent::ModelRoundStarted {
             activation_id,
             round_id,
+            purpose,
             delivery_through_queue_id,
             started_at_ms,
         } => json!({
             "activation_id": activation_id,
             "round_id": round_id,
+            "purpose": purpose,
             "delivery_through_queue_id": delivery_through_queue_id,
             "started_at_ms": started_at_ms,
+        }),
+        SessionEvent::ContextHandoffCreated { handoff } => json!({
+            "handoff_id": handoff.handoff_id,
+            "previous_handoff_id": handoff.previous_handoff_id,
+            "generation": handoff.next_generation,
+            "covered_through_message_id": handoff.covered_through_message_id,
+            "source_tokens": handoff.source_tokens,
+            "document_tokens": handoff.document_tokens,
+            "token_accounting_version": handoff.token_accounting_version,
+        }),
+        SessionEvent::ContextHandoffFailed {
+            plan_id,
+            error,
+            finished_at_ms,
+        } => json!({
+            "plan_id": plan_id,
+            "error": serializable(error),
+            "finished_at_ms": finished_at_ms,
         }),
         SessionEvent::ModelAttemptFailedFact {
             activation_id,

@@ -463,16 +463,16 @@ async fn assert_final_sse(
     session_id: &str,
     version: u64,
 ) -> TestResult<()> {
-    let response =
-        authenticated(client.get(process.url(&format!("/v1/sessions/{session_id}/events"))?))
-            .header("Last-Event-ID", version.saturating_sub(1).to_string())
-            .send_with_timeout()
-            .await?;
+    let response = authenticated(client.get(process.url("/v1/events")?))
+        .header("Last-Event-ID", version.saturating_sub(1).to_string())
+        .send_with_timeout()
+        .await?;
     assert_eq!(response.status(), StatusCode::OK);
     let mut events = SseFrames::new(response);
     let final_event = events.next().await?;
     assert_eq!(final_event.id, version);
     assert_eq!(final_event.event, "message_appended");
+    assert_eq!(final_event.data["session_id"], session_id);
     assert_eq!(final_event.data["version"], version);
     Ok(())
 }
@@ -2092,10 +2092,9 @@ async fn assert_corrupt_public_views(
     let get_status = get_response.status();
     let get_body = response_text(get_response).await?;
 
-    let sse_response =
-        authenticated(client.get(process.url(&format!("/v1/sessions/{session_id}/events"))?))
-            .send_with_timeout()
-            .await?;
+    let sse_response = authenticated(client.get(process.url("/v1/events")?))
+        .send_with_timeout()
+        .await?;
     let sse_status = sse_response.status();
     let sse_body = if sse_status == StatusCode::INTERNAL_SERVER_ERROR {
         response_text(sse_response).await?
@@ -2232,11 +2231,9 @@ async fn e2e_tail_payload_mutation_with_restored_head_anchor_is_not_blessed() ->
                     .await?;
             let get_status = get_response.status();
             let get_body = response_text(get_response).await?;
-            let sse_response = authenticated(
-                client.get(restarted.url(&format!("/v1/sessions/{session_id}/events"))),
-            )
-            .send_with_timeout()
-            .await?;
+            let sse_response = authenticated(client.get(restarted.url("/v1/events")))
+                .send_with_timeout()
+                .await?;
             let sse_status = sse_response.status();
             let sse_body = if sse_status == StatusCode::INTERNAL_SERVER_ERROR {
                 response_text(sse_response).await?
@@ -2757,10 +2754,9 @@ async fn e2e_healthy_indexes_open_without_writer_rebuild() -> TestResult<()> {
                     .await?;
             let get_status = response.status();
             let get_body = response_text(response).await?;
-            let sse_response =
-                authenticated(client.get(format!("{base_url}/v1/sessions/{session_id}/events")))
-                    .send_with_timeout()
-                    .await?;
+            let sse_response = authenticated(client.get(format!("{base_url}/v1/events")))
+                .send_with_timeout()
+                .await?;
             let sse_status = sse_response.status();
             let mut connected = SseFrames::new(sse_response);
             let first_record = connected.next().await?;

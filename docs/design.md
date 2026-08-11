@@ -105,8 +105,8 @@ Each session projection contains at least:
 - stable session identity and selected provider/model/profile reference;
 - stream version and command/delivery dedupe facts;
 - transcript messages and assistant tool calls;
-- bounded, versioned opaque model-continuation envelopes needed to resume the
-  selected native provider protocol;
+- bounded provider-continuation facts that are part of committed assistant
+  output and are needed by a later model round;
 - ordered delivery queue plus materialization position;
 - execution state: idle or one active activation;
 - at most one active wait;
@@ -120,16 +120,16 @@ objects, SQLite rows, process handles, futures, subscribers, clocks, raw
 credentials, and unbounded tool output cannot appear in the projection.
 
 Native thought signatures or continuation tokens that must survive the next
-round use a model-neutral durable envelope containing provider type, codec
-version, semantic kind, and bounded opaque bytes. The domain never parses
-those bytes. Arbitrary provider response metadata, raw stream frames,
-authorization data, and headers are not accepted into that envelope.
+round are stored only as bounded semantic facts attached to the committed
+assistant result. The domain never persists a provider request, raw stream
+frames, authorization data, headers, or a copy of the transcript for this
+purpose.
 
 Representative semantic events include:
 
 - `SessionCreated`, `DeliveryQueued`, `DeliveryMaterialized`;
-- `ActivationStarted`, `ModelRoundStarted`, `ModelRequestPrepared`,
-  `ModelAttemptStarted`, `ModelAttemptFailed`, `ModelAttemptInterrupted`,
+- `ActivationStarted`, `ModelRoundStarted`, `ModelAttemptStarted`,
+  `ModelAttemptFailed`, `ModelAttemptInterrupted`,
   `ModelStepRetryScheduled`, `ModelRequestCompleted`,
   `AssistantMessageCommitted`, `ActivationFinished`;
 - `AsyncToolCallStarted`, `AsyncToolCallCompleted`,
@@ -237,8 +237,8 @@ an unrelated corruption or migration fixture.
 | Concurrent equal creates atomically select one creation event and return byte-identical canonical `201` results | `e2e_concurrent_create_receipt_and_event_are_atomic` | core anchor exists |
 | The create-receipt projection rebuilds from the verified creation event and exact replay survives restart | `e2e_create_receipt_projection_rebuilds_from_verified_creation_event` | anchor green; projection-repair implementation already present |
 | One scoped create digest resolving to multiple verified streams is corruption and never chooses a winner | `e2e_conflicting_create_receipt_projection_fails_closed` | anchor green; verified projection repair fails closed before READY |
-| Subject ownership under one authority covers list/read/message/SSE with existence-safe failures and independently scoped create keys | `e2e_session_ownership_safe_not_found_and_ordered_sse` and `e2e_session_list_is_subject_scoped` | core anchors exist |
-| Authority ownership with the same opaque subject independently scopes create receipts and blocks cross-authority list/read/message/SSE | `e2e_authority_subject_create_receipts_are_scoped` plus `e2e_session_authority_ownership_isolates_list_read_message_and_sse` | receipt anchor exists; access-hardening anchor required red |
+| Subject ownership under one authority covers list/read/message with existence-safe failures, filters the Endpoint-wide SSE, and independently scopes create keys | `e2e_session_ownership_safe_not_found_and_ordered_sse`, `e2e_session_list_is_subject_scoped`, and `e2e_endpoint_event_stream_multiplexes_owned_sessions_and_reconnects_once` | Endpoint-wide real-process anchor is green in the current candidate; exact-main and fixed-install acceptance remain pending |
+| Authority ownership with the same opaque subject independently scopes create receipts and blocks cross-authority list/read/message while filtering Endpoint SSE | `e2e_authority_subject_create_receipts_are_scoped` plus `e2e_session_authority_ownership_isolates_list_read_message_and_sse` | receipt anchor exists; access-hardening anchor required red |
 | List uses owner-bound opaque keyset pagination by durable creation position and resumes identically after restart | `e2e_session_list_keyset_is_owner_bound_and_restart_stable` | functional follow-up; required red before pagination implementation |
 | History without the supported immutable owner fact cannot be claimed, repaired, or migrated to a guessed owner | `e2e_ownerless_session_history_fails_closed` | anchor green; startup fails closed without migration |
 
@@ -334,8 +334,9 @@ Activation proceeds as follows:
    round boundary;
 3. construct each model request only from the projection committed at its
    round boundary;
-4. run model/tool rounds until the assistant finishes, a wait ends the
-   activation, an error is committed, or a configured safety budget is reached;
+4. run model/tool rounds without a numeric round ceiling until the assistant
+   finishes, a durable wait ends the activation, an explicit supported
+   cancellation occurs, or a typed execution error is committed;
 5. commit the terminal activation fact and make any queued wakeable deliveries
    runnable for a later activation.
 
@@ -362,6 +363,13 @@ An HTTP or SSE disconnect does not cancel an activation. Runtime shutdown stops
 accepting new claims, gives bounded time to commit safe outcomes, and relies on
 startup reconciliation for anything left active.
 
+Model/tool progress is bounded by effect-level limits—provider request idle and
+retry budgets, tool deadlines, waits, token-bounded context, storage bounds, and
+explicit cancellation—not by counting rounds. A legitimate autonomous tool
+loop may execute for as many rounds as its task requires. Runtime fairness comes
+from asynchronous effect boundaries and scheduling, never from converting an
+unfinished task into `Finished` after an arbitrary count.
+
 ## 8. Model and tool rounds
 
 All model requests use aimux streaming. The provider adapter preserves text,
@@ -376,17 +384,160 @@ established. Those wire attempts are adapter observability, emitted through
 secret-safe tracing/metrics, and are not session-domain events. A session
 records one logical model request around the aimux call.
 
-Before calling aimux, zode commits `ModelRequestPrepared` with stable
-activation/round/request IDs, captured provider execution descriptor revision
-and fingerprint, model/profile selection, maximum zode attempt count, minimum
-auth-replica revision, prompt and tool-schema
-fingerprints, and a reference to the complete bounded, credential-free
-model-neutral request envelope from which the aimux adapter constructs its
-call. Large envelopes use the immutable blob store. The logical request is
-prepared once. Immediately before each call to aimux, zode resolves the exact
-ready credential replica and commits `ModelAttemptStarted` with a fresh attempt
-ID, monotonic attempt number, and concrete auth revision. Authorization headers
-and credential material are never part of the envelope or event.
+Immediately before each aimux call, zode assembles one transient request in
+memory from the latest committed session projection, the current round
+boundary, the selected execution facts, and the current tool contract. The
+request object may be reused by bounded retries while that process and model
+round are alive, but it is never serialized into a session event, storage
+snapshot, or blob. In particular, events never copy the provider-neutral
+transcript, tool definitions, system prompt, or request controls.
+
+Once an HTTP request has been sent, its bytes cannot be changed. This is a
+transport fact, not a durable "frozen request" abstraction. Inputs and effect
+completions committed while it is in flight remain durable and are materialized
+before the next model round. Zode commits only the lifecycle facts needed to
+explain execution: stable activation/round/request and attempt IDs, selected
+execution and credential revisions or fingerprints, attempt number, and its
+outcome. Immediately before dispatch it resolves the exact ready credential
+replica and commits `ModelAttemptStarted`; authorization headers and credential
+material never enter session events.
+
+If Endpoint stops with a model request in flight, that transient request is
+gone. Recovery records the attempt as interrupted, discards every uncommitted
+partial candidate, materializes all currently committed deliveries, and starts
+a new model round from the latest durable facts when work remains. It does not
+replay the old request ID, transcript, tools, controls, or bytes and does not
+require the new nondeterministic model result to match the pre-crash result.
+
+### Durable agent handoff and fresh context generations
+
+The append-only transcript and one provider context generation are different
+objects. Public session history always reduces from every original semantic
+event and is never deleted, rewritten, summarized in place, or replaced by a
+storage snapshot. Every selected model carries its advertised context-window
+and output-capability limits. Endpoint separately configures the actual output
+requested for an ordinary round and an independent safety buffer; the usable
+input budget is the context window minus both values. The model's advertised
+maximum output capability is not itself reserved unless the request actually
+asks for that much output. The default ordinary request asks for at most
+128,000 output tokens and keeps a further 32,000-token safety buffer, so a
+1,000,000-token model has an 840,000-token ordinary input budget. The safety
+buffer is the headroom that lets the handoff request consume the bounded source
+after ordinary rounds stop; the handoff still reserves its own output allowance
+and may never exceed the model's absolute context window. Handoff generation
+and durable handoff-document bounds are separate controls.
+
+The v0 accountant is versioned and provider-independent. After a successful
+provider round it anchors on provider-reported input usage for that exact
+context generation, selection, tool schema, and committed result, then
+estimates only newly appended durable messages. It calibrates that tail with
+the highest observed ratio between provider input usage and the corresponding
+local estimate. Provider-reported output usage is retained as usage evidence
+but is not added wholesale to the next input: private reasoning that is not in
+the durable transcript is not replayed, while visible assistant/tool content is
+already part of the newly appended tail. Before a valid anchor exists, or when
+those identities change, the local estimate uses four UTF-8 bytes per token as
+a coarse baseline plus explicit per-message and per-tool framing, with no
+second multiplier. The independent context buffer above is the safety reserve;
+the byte baseline is never represented as an exact tokenizer result. A later
+provider tokenizer may make this estimate more precise, but it may not allow a
+request beyond the selected model budget
+or change the durable source boundary. These boundaries are frozen by
+`e2e_model_request_reserves_128k_output_and_independent_context_buffer`,
+`e2e_unanchored_model_input_uses_four_byte_fallback_without_hidden_multiplier`, and
+`e2e_provider_usage_anchor_excludes_discarded_reasoning_output_from_next_input`.
+
+When the next request would cross the handoff threshold, Endpoint asks the
+current agent to write an explicit bounded handoff document through the same
+selected provider/aimux and credential path, with no tools and no Server
+mediation. The handoff records the current objective, completed facts,
+unresolved work, exact identities and constraints, relevant failures, and
+external-effect outcomes needed by a successor context. It is an agent-authored
+durable document, not an implicit rewrite or summary injected into later model
+input. This step cannot emit user-visible assistant text or dispatch effects.
+
+The handoff request is a separate summarization request, not another turn of
+the executable conversation. Endpoint presents the selected history prefix as
+bounded inert source data under one handoff-only system instruction; it does
+not replay operational system prompts, assistant tool declarations, or tool
+results as live provider roles in that request. The response must be a
+versioned plain handoff document. Tool-call wire syntax, an empty document, or
+an unversioned response is not a handoff and cannot advance the context
+generation. This keeps an agent from continuing to execute work while Endpoint
+mistakes the resulting tool markup for a durable handoff. The real-provider
+regression is frozen by
+`e2e_context_handoff_source_is_inert_and_document_is_plain_text`.
+
+The provider completion budget for generating that document and the maximum
+durable document size are separate controls. Reasoning-capable
+models may spend completion tokens before emitting the document; that private
+reasoning allowance must not enlarge the committed handoff or be persisted as
+its content. The handoff-only system instruction states the exact maximum
+UTF-8 size of the decoded `document` string derived from the durable document
+limit; the fixed versioned JSON wrapper is provider wire framing, not durable
+document content, and is bounded by the separate generation limit. Endpoint
+does not rely on an unstated configuration value that the selected model cannot
+observe. After a restart, Endpoint reconstructs a new handoff request from the
+durable handoff plan and latest committed facts; it does not replay serialized
+request bytes. Hitting the generation limit without a valid document is
+a retryable model-attempt failure, while a response whose extracted document
+exceeds the durable limit is an invalid handoff. Endpoint never persists
+provider reasoning as a fallback document. The decoded/wire distinction is
+frozen by `e2e_context_handoff_source_is_inert_and_document_is_plain_text`.
+The independent plain-text storage bound and complete paged retrieval are
+frozen by
+`e2e_context_handoff_plain_document_pages_without_generic_payload_limit`.
+
+The accepted result commits one typed `ContextHandoffCreated` fact containing
+the source history boundary and digest, a bounded first-class plain-text
+document field and digest, token-accounting version and counts,
+context-generation number, and the exact selected execution descriptor. The
+document is not wrapped in the generic inline JSON payload type; its decoded
+UTF-8 limit is therefore the advertised document limit rather than an encoded
+JSON-envelope limit. Endpoint then starts the next context
+generation for the same session, activation, and user task. Its automatic model
+input contains only normal initial/system constraints, a bounded bootstrap
+notice that a handoff exists, and facts committed after the handoff boundary.
+It does not contain the old transcript or handoff body.
+
+A completed model/tool batch can add enough durable content to cross both the
+handoff threshold and the provider ceiling at once. In that case Endpoint uses
+the newest earlier source boundary whose handoff request still fits the input
+budget and whose remaining tail is a self-contained provider conversation
+(including every assistant declaration needed by a retained tool result). The
+handoff covers that earlier prefix; every later message remains verbatim in the
+first fresh generation. Endpoint does not truncate the tool result, discard
+history, or misclassify the completed tool result as a failed user admission.
+This continuation is frozen by
+`e2e_large_history_result_crossing_handoff_threshold_continues_in_fresh_context`.
+
+Every fresh generation exposes two runtime-owned, read-only tools. One opens
+the latest durable handoff, may assert its expected ID, and returns its plain
+document in bounded UTF-8 chunks with an explicit next offset. The other pages
+transcript metadata and reads bounded chunks of a named historical message.
+The successor agent uses those tools to inspect the handoff and any original
+history it needs before it continues. Results enter the ordinary durable tool
+transcript, so later model requests and another handoff can cite exactly what
+was read. Neither tool can
+mutate history, dispatch an external effect, create a Server mirror, or return
+another actor's session.
+
+Handoff planning, attempt, commit, and restart recovery use the same lifecycle
+rules as ordinary model steps without persisting a request snapshot. The
+document commit and context-
+generation advance are atomic. A crash cannot make a document cover uncommitted
+history, advance twice, or silently fall back to the old unbounded prompt. If a
+valid bounded handoff cannot be produced before the provider input ceiling, the
+activation ends with a typed handoff failure rather than truncating history,
+sending an over-budget request, or pretending the task completed.
+
+Input admitted while the handoff request is active remains a durable queued
+delivery and cannot alter bytes already sent to the provider. Immediately after the
+handoff commits, Endpoint materializes those deliveries in order and includes
+them in the first request of the fresh generation. If Endpoint restarts before
+the handoff commits, it records the interrupted attempt and builds a new
+handoff request from the durable plan; queued deliveries remain durable and
+reach the first fresh-generation request after a document commits.
 
 Credential resolution reads only the exact installed profile selected for the
 session and the newest ready revision satisfying its required minimum. It never
@@ -395,11 +546,11 @@ stale tombstoned revision. A credential revision replaced during an already
 sent request affects only a later request.
 
 If aimux ultimately returns a retryable error, including an error after the
-stream began, zode may retry the same model step under a configured bounded
+stream began, zode may retry the current in-memory model step under a configured bounded
 attempt budget. It commits `ModelAttemptFailed` and
 `ModelStepRetryScheduled` with the classified error, delay, and next attempt
-number. Every attempt in that retry group references the same prepared request
-fingerprint; deliveries arriving during the group wait for
+number. No retry group is recoverable from serialized request content;
+deliveries arriving during the live group wait for
 the next actual model-round boundary. Aimux `Retry-After` hints and bounded
 jittered backoff are honored. Auth, invalid request/model, schema conversion,
 and other non-retryable failures end the activation without retry.
@@ -594,8 +745,8 @@ The runtime sees two narrow ports:
   lease for one provider attempt.
 
 A secret lease is neither serializable nor cloneable into session state. It is
-resolved after `ModelRequestPrepared` and immediately before the corresponding
-aimux call; only its concrete revision enters `ModelAttemptStarted`. Session
+resolved immediately before the corresponding aimux call; only its concrete
+revision enters `ModelAttemptStarted`. Session
 creation may check that an eligible replica currently exists, but stores only
 the selected identity and minimum revision. Replay-only create returns its
 event-derived receipt before that current replica check, and a later model
@@ -620,7 +771,8 @@ Server-managed profile.
 The initial versioned resources are:
 
 - create/read sessions, append messages, and select the model/profile;
-- `GET /v1/sessions/{session_id}/events` using SSE and `Last-Event-ID`;
+- `GET /v1/events` using one Endpoint-wide SSE and Endpoint-scoped
+  `Last-Event-ID`;
 - read/cancel/reconcile async tool calls and accept authenticated external
   completion;
 - read Endpoint identity, health, and provider/tool capabilities;
@@ -634,11 +786,14 @@ Exact request and public event schemas are versioned in the API adapter as they
 are introduced. Mutations return only after durable commit/admission, not after
 an entire agent run.
 
-SSE IDs are durable global event positions. A publisher serializes cursor
-advancement and backfills all committed positions from storage, so handler
-completion order cannot reorder or lose events. A subscriber subscribes before
-replay, deduplicates by cursor, and recovers lag from storage. Durable lifecycle
-and final-message events reconnect; token deltas may remain transient.
+SSE IDs are durable Endpoint-global event positions. One authenticated stream
+multiplexes the public events of every session owned by the controller authority
+and subject, and each frame carries `session_id`. A publisher serializes cursor
+advancement and backfills all eligible committed positions from storage, so
+handler completion order cannot reorder or lose events. A subscriber subscribes
+before replay, deduplicates by the Endpoint cursor, and recovers lag from
+storage. Durable lifecycle and final-message events reconnect; token deltas may
+remain transient. Session lifecycle never owns the stream.
 
 Public failures use a stable envelope such as
 `{"error":{"code":"internal_error","message":"internal server error","retryable":false}}`.
@@ -722,10 +877,10 @@ The main scenario groups are:
 
 | Area | Required public scenario | Current executable anchors |
 | --- | --- | --- |
-| HTTP/event store | create, message, semantic idempotency, GET/list ownership, ordered SSE reconnect, restart | `e2e_create_message_sse_reconnect_get_restart`; `e2e_create_generates_ulid_and_binds_idempotency_payload`; `e2e_concurrent_create_receipt_and_event_are_atomic`; `e2e_session_ownership_safe_not_found_and_ordered_sse` |
+| HTTP/event store | create, message, semantic idempotency, GET/list ownership, one Endpoint-wide ordered SSE across owned sessions, reconnect, restart | `e2e_endpoint_event_stream_multiplexes_owned_sessions_and_reconnects_once`; `e2e_create_message_sse_reconnect_get_restart`; `e2e_create_generates_ulid_and_binds_idempotency_payload`; `e2e_concurrent_create_receipt_and_event_are_atomic`; `e2e_session_ownership_safe_not_found_and_ordered_sse` |
 | Snapshot/recovery | bounded snapshot-plus-tail restore, every configured runtime/API snapshot cadence point, corrupt fallback, dirty-index repair, healthy read-only startup | `sqlite_storage_e2e::e2e_sqlite_snapshot_cursor_follows_public_commits`; `sqlite_storage_e2e::e2e_snapshot_cannot_override_event_stream`; `sqlite_storage_e2e::e2e_corrupt_latest_snapshot_falls_back`; `e2e_runtime_commits_honor_snapshot_cadence_and_restart`; `sqlite_storage_e2e::e2e_sqlite_restart_rebuilds_derived_indexes_and_allows_harmless_extra_index`; storage-corruption cases in `reviewer_findings_e2e` |
-| Model activation | real aimux fake provider, final assistant event, input/completion arriving mid-request steers the next round when one exists, otherwise wakes the next activation; active model change remains deferred to the next activation; configured round budget stops feedback loops while allowing a queued user to wake a fresh activation; every accepted input and assistant round remains durably ordered online and after restart without a new client command | `e2e_golden_assembled_model_tool_loop_survives_restart`; `e2e_round_boundary_steering_waits_for_the_next_model_round`; `e2e_round_boundary_final_defers_steering_to_next_activation`; `e2e_max_rounds_per_activation_stops_tool_feedback_loop`; `e2e_concurrent_inputs_preserve_both_assistant_rounds`; `e2e_restart_recovers_queued_input_without_another_command` |
-| Model retry | aimux bounded pre-stream retry remains one logical runtime request; after stream establishment zode owns bounded step retry; first-chunk/chunk-idle disconnects become typed terminal failures without a stuck activation; a restart after a persisted failure fact completes the missing retry or terminal boundary; no partial assistant/tool effect; hard-crash interrupted-attempt recovery | `e2e_model_pre_stream_rate_limit_is_one_logical_request`; `e2e_model_partial_stream_retry_has_no_partial_tool_effect`; `e2e_provider_process_exit_finishes_activation_without_stuck_working`; `e2e_restart_reconciles_failed_model_attempt_before_retry_schedule`; `e2e_restart_reconciles_failed_model_attempt_before_terminal_finish`; `e2e_hard_crash_recovery_exhausts_one_model_attempt_and_keeps_delivery_runnable`; `e2e_hard_crash_after_retry_fact_claims_one_scheduled_attempt` |
+| Model activation and context growth | real aimux fake provider, final assistant event, input/completion arriving during a sent request enters the next round; active model change remains deferred to the next activation; no numeric round ceiling truncates autonomous work; actual request output and the independent safety buffer are both reserved from the selected model context, provider input usage calibrates only the newly appended durable tail, and discarded hidden reasoning output is not counted as replayable next-round input. Before the first usage anchor, the fallback is exactly four UTF-8 bytes per token plus explicit framing; it has no second hidden multiplier because the independent buffer is the safety reserve. Before token exhaustion the current agent writes a durable handoff from inert source data rather than an executable replay of prior tool roles, the fresh context reads that versioned plain document and paginated original history through runtime-owned tools, and a completed tool result that leaps across the provider ceiling moves the handoff boundary earlier while retaining the self-contained tail verbatim. Provider requests exist only in memory: session events never copy transcript/tools/request controls, and restart records the old attempt as interrupted before rebuilding a new conversation or handoff request from the latest durable facts and queued input. Handoff planning is atomic, tool-call markup cannot be committed as a handoff, and no request exceeds the provider input budget; every accepted input and assistant round remains durably ordered | `e2e_golden_assembled_model_tool_loop_survives_restart`; `e2e_round_boundary_steering_waits_for_the_next_model_round`; `e2e_round_boundary_final_defers_steering_to_next_activation`; `e2e_long_task_continues_until_final`; `e2e_recorded_deepswe_long_run_replays_through_real_endpoint`; `e2e_model_request_reserves_128k_output_and_independent_context_buffer`; `e2e_unanchored_model_input_uses_four_byte_fallback_without_hidden_multiplier`; `e2e_provider_usage_anchor_excludes_discarded_reasoning_output_from_next_input`; `e2e_context_handoff_source_is_inert_and_document_is_plain_text`; `e2e_large_history_result_crossing_handoff_threshold_continues_in_fresh_context`; `e2e_delivery_admitted_during_handoff_reaches_first_fresh_context`; `e2e_handoff_restart_rebuilds_from_durable_plan_and_queued_input`; `e2e_context_handoff_restart_reuses_committed_document`; `e2e_context_handoff_request_never_exceeds_provider_input_budget`; `e2e_context_handoff_plan_is_atomic_across_storage_failure`; `e2e_model_request_lifecycle_does_not_persist_request_content`; `e2e_restart_rebuilds_conversation_from_latest_durable_facts`; `e2e_concurrent_inputs_preserve_both_assistant_rounds` |
+| Model retry | aimux bounded pre-stream retry remains one logical runtime request; after stream establishment zode owns bounded retry only while the transient request remains in memory; first-chunk/chunk-idle disconnects and a clean SSE EOF without a provider finish become typed failures rather than a successful empty turn. Restart completes any missing failure boundary, then rebuilds a new round from current durable facts instead of replaying request content; no partial assistant/tool effect survives | `e2e_model_pre_stream_rate_limit_is_one_logical_request`; `e2e_model_partial_stream_retry_has_no_partial_tool_effect`; `e2e_model_clean_eof_without_finish_retries_in_memory_step`; `e2e_provider_process_exit_finishes_activation_without_stuck_working`; `e2e_restart_reconciles_failed_model_attempt_before_terminal_finish`; `e2e_restart_rebuilds_conversation_from_latest_durable_facts`; `e2e_hard_crash_rebuilds_fresh_request_without_consuming_attempt_budget`; `e2e_restart_after_retry_decision_builds_fresh_request` |
 | Tool batch | configured ordinary adapter arguments are schema-valid and invalid ones fail before side effects; the runtime-owned `wait_for` contract is unchanged; fast/slow/failing concurrent calls, provider-order results, one shared foreground window | `e2e_invalid_model_tool_arguments_are_rejected_before_side_effect`; `e2e_mixed_tool_batch_is_concurrent_ordered_and_waits_once`; existing `e2e_explicit_wait_*` anchors |
 | Async/wait | early result, auto wait, explicit-wait precedence, user/timer race, completion wake, timeout without cancel, maximum 600 seconds | `e2e_explicit_wait_last_wins_without_skipping_ordinary_tool`; `e2e_explicit_wait_zero_is_rejected`; `e2e_explicit_wait_above_maximum_is_rejected`; `e2e_explicit_wait_legacy_high_value_is_rejected`; `e2e_auto_wait_timeout_does_not_cancel_running_tool`; `e2e_two_session_waits_do_not_cross` |
 | Terminal races | cancel/complete/callback first-wins, duplicate semantic callback, unknown-outcome cancel/unsupported mark-failed rejected, no second wake/event | `e2e_external_completion_first_wins_and_wakes_one_next_activation`; `e2e_restart_remote_response_becomes_unknown_and_cancel_cannot_rewrite_it`; `e2e_restart_unknown_response_rejects_unsupported_mark_failed` |
@@ -749,4 +904,8 @@ Development order is strict:
 An implementation worker or reviewer may not weaken, skip, internally bypass,
 or rewrite a red E2E to fit a fix. Build failures and purely static dependency
 violations use compiler/lint/architecture gates; any issue observable through a
-running product requires its own red E2E first.
+running product requires its own red E2E first. Reviewer prose, source-level
+risk, or a request for stronger coverage is not a behavioral finding and cannot
+block delivery until the claimed behavior is stably red through that real
+public path. If no such red can be constructed, reject the finding and do not
+change production behavior for it.

@@ -308,7 +308,7 @@ async function exerciseOptionsContract(harness, endpointCaptureSetId) {
     );
     expect(descriptor?.options).toEqual(OPTIONS);
 
-    const profile = await requireStatus(
+    const acceptedProfile = await requireStatus(
       await managementJson(
         harness,
         "POST",
@@ -325,7 +325,23 @@ async function exerciseOptionsContract(harness, endpointCaptureSetId) {
       201,
       "profile create and replica distribution",
     );
-    expect(profile?.status).toBe("ready");
+    expect(["pending", "ready"]).toContain(acceptedProfile?.status);
+    let profile = acceptedProfile;
+    await expect.poll(async () => {
+      const projection = await managementJson(
+        harness,
+        "GET",
+        `/v1/providers/${PROVIDER}/auth-profiles`,
+      );
+      if (projection.status !== 200) return `http:${projection.status}`;
+      profile = projection.json?.items?.find(
+        (candidate) => candidate.profile_id === acceptedProfile.auth_profile_id,
+      );
+      return profile?.status;
+    }, {
+      message: "profile replica distribution must converge before session creation",
+      timeout: 15_000,
+    }).toBe("ready");
 
     const created = await requireStatus(
       await managementJson(

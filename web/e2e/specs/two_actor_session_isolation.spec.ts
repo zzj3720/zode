@@ -60,7 +60,7 @@ function isExpectedActorIsolationNotFound(actor: AccessActor, method: string, pa
   if (method === "POST" && /^\/v1\/endpoints\/[^/]+\/sessions\/[^/]+\/messages(?:\?.*)?$/.test(path)) return true;
   if (method !== "GET") return false;
   return (
-    /^\/v1\/endpoints\/[^/]+\/sessions\/[^/]+(?:\/events)?(?:\?.*)?$/.test(path)
+    /^\/v1\/endpoints\/[^/]+\/sessions\/[^/]+(?:\?.*)?$/.test(path)
     || /^\/v1\/sessions\/[^/]+(?:\?.*)?$/.test(path)
     || /^\/endpoints\/[^/]+\/sessions\/[^/]+(?:\?.*)?$/.test(path)
   );
@@ -270,7 +270,9 @@ class ExchangeRecorder {
       .sort((left, right) => left.sequence - right.sequence)[0];
     if (!candidate) return undefined;
     if (!cassetteExactResponseMatches(candidate.response, this.classificationContract.exact_response)) {
-      throw new Error("first failure response no longer matches the cassette exact-response contract");
+      throw new Error(
+        `first failure response no longer matches the cassette exact-response contract: ${candidate.actor} ${candidate.method} ${candidate.path} -> ${candidate.response.status} ${candidate.response.responseCode ?? "no-code"}`,
+      );
     }
     const barrier = this.classificationContract.positive_catalog_barrier;
     if (barrier.observed) {
@@ -480,30 +482,56 @@ async function waitForReplicaReady(
   return last as PublicResponse;
 }
 
-async function waitForAssistant(
+async function readEndpointEventsUntil(
   page: Page,
   actor: AccessActor,
   path: string,
+  requiredValues: string[],
   recorder: ExchangeRecorder,
 ): Promise<{ status: number; data: string }> {
-  const result = await page.evaluate(async ({ path, marker }) => {
-    const response = await fetch(path, { headers: { accept: "text/event-stream" } });
-    if (!response.ok || !response.body) return { status: response.status, data: "", headers: Object.fromEntries(response.headers.entries()) };
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
+  const result = await page.evaluate(async ({ path, requiredValues }) => {
+    const controller = new AbortController();
+    let status = 0;
+    let headers: Record<string, string> = {};
     let data = "";
-    const deadline = Date.now() + 20_000;
-    while (Date.now() < deadline) {
-      const next = await reader.read();
-      if (next.done) break;
-      data += decoder.decode(next.value, { stream: true });
-      if (data.includes(marker)) {
-        await reader.cancel().catch(() => undefined);
-        return { status: response.status, data, headers: Object.fromEntries(response.headers.entries()) };
+    const read = (async () => {
+      try {
+        const response = await fetch(path, {
+          headers: { accept: "text/event-stream" },
+          signal: controller.signal,
+        });
+        status = response.status;
+        headers = Object.fromEntries(response.headers.entries());
+        if (!response.ok || !response.body) return { status, data, headers };
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        try {
+          while (!controller.signal.aborted) {
+            const next = await reader.read();
+            if (next.done) break;
+            data += decoder.decode(next.value, { stream: true });
+            if (requiredValues.every((value) => data.includes(value))) break;
+          }
+        } finally {
+          void reader.cancel().catch(() => undefined);
+        }
+      } catch {
+        // The bounded timeout below returns the safely observed prefix.
       }
-    }
-    return { status: response.status, data, headers: Object.fromEntries(response.headers.entries()) };
-  }, { path, marker: ASSISTANT_MARKER });
+      return { status, data, headers };
+    })();
+    let timer = 0;
+    const timeout = new Promise<{ status: number; data: string; headers: Record<string, string> }>((resolveTimeout) => {
+      timer = window.setTimeout(() => {
+        controller.abort();
+        resolveTimeout({ status, data, headers });
+      }, 20_000);
+    });
+    const observed = await Promise.race([read, timeout]);
+    window.clearTimeout(timer);
+    controller.abort();
+    return observed;
+  }, { path, requiredValues });
   if (recorder.isBrowserPage(page)) {
     recorder.completeBrowserResult(
       actor,
@@ -602,10 +630,14 @@ async function expectSharedProviderResource(
   expect(containsValue(endpointReplica, profileId)).toBe(true);
 
   await gotoPublic(page, "actor-b", stack.actorB.baseUrl, "/providers", recorder);
+  await expect(page.locator("body")).toContainText(PROFILE_LABEL, { timeout: 15_000 });
+  await expect(resourceCard(page, PROVIDER_NAME)).toContainText(
+    new RegExp(`${ENDPOINT_LABEL}[^\\n]*(?:ready|installed)`, "i"),
+  );
   const providerText = await page.locator("body").innerText();
   expect(providerText).toContain(PROFILE_LABEL);
-  expect(providerText).toMatch(/deployment[ -]shared|shared deployment/i);
-  expect(providerText).toMatch(/ready|installed|distributed/i);
+  expect(providerText).toContain(ENDPOINT_LABEL);
+  expect(providerText).toMatch(/ready|installed/i);
   for (const forbidden of [/\bpersonal\b/i, /\bowner\b/i, /\bworkspace\b/i, /\brole\b/i, /\bgrant\b/i]) {
     expect(providerText).not.toMatch(forbidden);
   }
@@ -620,7 +652,7 @@ function watchDirectEndpointRequests(page: Page, endpointBaseUrl: string): strin
 }
 
 function isEndpointSessionPath(path: string): boolean {
-  return path === "/v1/sessions" || /^\/v1\/sessions\/[^/]+(?:\/messages|\/events)?$/.test(path);
+  return path === "/v1/events" || path === "/v1/sessions" || /^\/v1\/sessions\/[^/]+(?:\/messages)?$/.test(path);
 }
 
 function assertEndpointOwnershipTrace(
@@ -642,15 +674,20 @@ function assertEndpointOwnershipTrace(
   expect(createRequests.length).toBeGreaterThanOrEqual(3);
   const actorASubject = createRequests[0]?.subject;
   expect(actorASubject).not.toBeNull();
-  const actorAReplay = createRequests.find((observation, index) => index > 0 && observation.subject === actorASubject);
-  expect(actorAReplay).toBeDefined();
-  expect(actorAReplay?.requestBodyDigest).toBe(createRequests[0]?.requestBodyDigest);
-  expect(actorAReplay?.status).toBe(createRequests[0]?.status);
-  expect(actorAReplay?.responseBodyDigest).toBe(createRequests[0]?.responseBodyDigest);
+  const actorACreates = createRequests.filter(
+    (observation) => observation.subject === actorASubject,
+  );
+  expect(actorACreates.map((observation) => observation.status)).toEqual([404, 201, 201]);
+  expect(actorACreates[1]?.requestBodyDigest).toBe(actorACreates[0]?.requestBodyDigest);
+  expect(actorACreates[2]?.requestBodyDigest).toBe(actorACreates[1]?.requestBodyDigest);
+  expect(actorACreates[2]?.responseBodyDigest).toBe(actorACreates[1]?.responseBodyDigest);
   const actorBCreate = createRequests.find((observation) => observation.subject !== actorASubject);
   expect(actorBCreate).toBeDefined();
-  expect(actorBCreate?.requestBodyDigest).toBe(createRequests[0]?.requestBodyDigest);
-  expect(actorBCreate?.status).toBe(201);
+  const actorBCreates = createRequests.filter(
+    (observation) => observation.subject === actorBCreate?.subject,
+  );
+  expect(actorBCreates.map((observation) => observation.status)).toEqual([404, 201]);
+  expect(actorBCreates[1]?.requestBodyDigest).toBe(actorACreates[1]?.requestBodyDigest);
   expect(actorBCreate?.subject).not.toBe(actorASubject);
   const subjects = new Set(observations.map((observation) => observation.subject));
   expect(subjects.size).toBe(2);
@@ -658,21 +695,26 @@ function assertEndpointOwnershipTrace(
 
   const actorASessionPath = `/v1/sessions/${admission.sessionId}`;
   const actorBSessionPath = `/v1/sessions/${actorBSessionId}`;
-  const actorAOwned = observations.filter(
-    (observation) => observation.subject === actorASubject && observation.path.includes(actorASessionPath),
+  const actorAOwnedReads = observations.filter(
+    (observation) =>
+      observation.subject === actorASubject &&
+      observation.method === "GET" &&
+      observation.path === actorASessionPath,
   );
-  expect(actorAOwned.length).toBeGreaterThan(0);
-  expect(actorAOwned.every((observation) => observation.status !== 404)).toBe(true);
+  expect(actorAOwnedReads.length).toBeGreaterThan(0);
+  expect(actorAOwnedReads.every((observation) => observation.status === 200)).toBe(true);
 
   const actorAMessageRequests = observations.filter(
     (observation) => observation.subject === actorASubject
       && observation.path === `${actorASessionPath}/messages`
       && observation.idempotencyKey === SESSION_MESSAGE_IDEMPOTENCY_KEY,
   );
-  expect(actorAMessageRequests.length).toBeGreaterThanOrEqual(2);
+  expect(actorAMessageRequests.map((observation) => observation.status)).toEqual([404, 202, 202]);
   expect(actorAMessageRequests[1]?.requestBodyDigest).toBe(actorAMessageRequests[0]?.requestBodyDigest);
-  expect(actorAMessageRequests[1]?.status).toBe(actorAMessageRequests[0]?.status);
-  expect(actorAMessageRequests[1]?.responseBodyDigest).toBe(actorAMessageRequests[0]?.responseBodyDigest);
+  expect(actorAMessageRequests[2]?.requestBodyDigest).toBe(actorAMessageRequests[1]?.requestBodyDigest);
+  expect(actorAMessageRequests[2]?.responseBodyDigest).toBe(
+    actorAMessageRequests[1]?.responseBodyDigest,
+  );
 
   const actorBSubject = actorBCreate?.subject;
   expect(actorBSubject).not.toBeNull();
@@ -698,26 +740,30 @@ function assertEndpointOwnershipTrace(
   expect(actorASubject).not.toBe(actorBSubject);
 }
 
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function profileCard(page: Page, label: string) {
-  return page.getByRole("article", { name: new RegExp(escapeRegex(label)) });
-}
-
-function distributionRow(card: ReturnType<typeof profileCard>, endpointLabel: string) {
-  return card.getByRole("group", { name: new RegExp(escapeRegex(endpointLabel)) });
+function resourceCard(page: Page, heading: string) {
+  return page.locator("article").filter({
+    has: page.getByRole("heading", { name: heading, exact: true }),
+  });
 }
 
 async function openProviders(page: Page): Promise<void> {
-  await page.getByRole("link", { name: "Providers" }).click();
-  await expect(page.getByRole("heading", { name: "Providers" })).toBeVisible();
+  await openManagementPage(page, "Providers");
+  await expect(page.getByRole("heading", { name: "Providers", exact: true })).toBeVisible();
 }
 
 async function openEndpoints(page: Page): Promise<void> {
-  await page.getByRole("link", { name: "Endpoints" }).click();
-  await expect(page.getByRole("heading", { name: "Endpoints" })).toBeVisible();
+  await openManagementPage(page, "Endpoints");
+  await expect(page.getByRole("heading", { name: "Endpoints", exact: true })).toBeVisible();
+}
+
+async function openManagementPage(page: Page, name: "Endpoints" | "Providers"): Promise<void> {
+  const link = page.getByRole("link", { name, exact: true });
+  if (await link.isVisible()) {
+    await link.click();
+    return;
+  }
+  await page.getByRole("button", { name: "Zode", exact: true }).click();
+  await page.getByRole("menuitem", { name, exact: true }).click();
 }
 
 async function configureSharedResourcesViaUi(
@@ -727,13 +773,13 @@ async function configureSharedResourcesViaUi(
   onProfileCreated?: (resource: { endpointId: string; profileId: string }) => void,
 ): Promise<{ endpointId: string; profileId: string; descriptorRevision: number; profileRevision: number }> {
   await page.goto(`${stack.actorA.baseUrl}/providers`, { waitUntil: "domcontentloaded" });
-  await expect(page.getByRole("heading", { name: "Providers" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Providers", exact: true })).toBeVisible();
   await openEndpoints(page);
   await page.getByRole("button", { name: "Add remote Endpoint" }).click();
   const endpointDialog = page.getByRole("dialog", { name: "Add remote Endpoint" });
   await endpointDialog.getByLabel("Endpoint label").fill(ENDPOINT_LABEL);
   await endpointDialog.getByLabel("Endpoint URL").fill(stack.endpointBaseUrl);
-  await endpointDialog.getByLabel("Controller credential (write-only)").fill(stack.endpointControlSecret);
+  await endpointDialog.getByLabel(/^Controller credential(?: \(write-only\))?$/).fill(stack.endpointControlSecret);
   const endpointResponsePromise = page.waitForResponse(
     (response) => response.request().method() === "POST" && new URL(response.url()).pathname === "/v1/endpoints",
   );
@@ -744,38 +790,43 @@ async function configureSharedResourcesViaUi(
   const endpointId = String(endpointBody.endpoint_id ?? "");
   expect(endpointId).not.toBe("");
   await expect(endpointDialog).toBeHidden();
-  await expect(page.getByRole("article", { name: new RegExp(escapeRegex(ENDPOINT_LABEL)) })).toContainText(/online|ready/i);
+  await expect(resourceCard(page, ENDPOINT_LABEL)).toContainText(/online|ready/i);
 
   await openProviders(page);
   await page.getByRole("button", { name: "Configure provider" }).click();
-  const providerDialog = page.getByRole("dialog", { name: "Configure provider" });
-  await providerDialog.getByLabel("Provider name").fill(PROVIDER_NAME);
-  await providerDialog.getByLabel("Provider kind").selectOption("openai_compatible");
-  await providerDialog.getByLabel("Execution base URL").fill(stack.providerBaseUrl);
-  await providerDialog.getByLabel("Model").fill(PROVIDER_MODEL);
+  const providerForm = page.locator("form").filter({
+    has: page.getByRole("heading", { name: "Configure provider", exact: true }),
+  });
+  await providerForm.getByLabel("Provider ID").fill(PROVIDER_NAME);
+  await providerForm.getByLabel("Base URL").fill(stack.providerBaseUrl);
+  await providerForm.getByLabel("Models").fill(PROVIDER_MODEL);
   const descriptorResponsePromise = page.waitForResponse(
     (response) => response.request().method() === "PUT" && new URL(response.url()).pathname === `/v1/providers/${PROVIDER_NAME}`,
   );
-  await providerDialog.getByRole("button", { name: "Save provider" }).click();
+  await providerForm.getByRole("button", { name: "Save provider" }).click();
   const descriptorResponse = await descriptorResponsePromise;
   expect(descriptorResponse.status()).toBe(200);
   const descriptorBody = (await descriptorResponse.json()) as Record<string, unknown>;
   const descriptorRevision = Number(descriptorBody.revision ?? 0);
   expect(descriptorRevision).toBeGreaterThan(0);
-  await expect(providerDialog).toBeHidden();
+  await expect(providerForm).toBeHidden();
 
-  await page.getByRole("button", { name: "Add API-key profile" }).click();
-  const profileDialog = page.getByRole("dialog", { name: "Add API-key profile" });
-  await profileDialog.getByLabel("Profile label").fill(PROFILE_LABEL);
-  const apiKey = profileDialog.getByLabel("API key (write-only)");
+  const providerCard = resourceCard(page, PROVIDER_NAME);
+  await providerCard.getByRole("button", { name: "Add API key profile" }).click();
+  const profileForm = providerCard
+    .locator("form.nested-editor")
+    .filter({ hasText: "Add API key profile" });
+  await expect(profileForm).toBeVisible();
+  await profileForm.getByLabel("Profile label").fill(PROFILE_LABEL);
+  const apiKey = profileForm.getByLabel("API key", { exact: true });
   await expect(apiKey).toHaveAttribute("type", "password");
   await apiKey.fill(stack.providerSecret);
-  await profileDialog.getByRole("checkbox", { name: "Make this the default profile" }).check();
-  await profileDialog.getByRole("checkbox", { name: `Share with ${ENDPOINT_LABEL}` }).check();
+  await profileForm.getByRole("checkbox", { name: "Make this the default profile" }).check();
+  await profileForm.getByRole("checkbox", { name: `Share with ${ENDPOINT_LABEL}` }).check();
   const profileResponsePromise = page.waitForResponse(
     (response) => response.request().method() === "POST" && new URL(response.url()).pathname === `/v1/providers/${PROVIDER_NAME}/auth-profiles`,
   );
-  await profileDialog.getByRole("button", { name: "Create API-key profile" }).click();
+  await profileForm.getByRole("button", { name: "Create profile" }).click();
   const profileResponse = await profileResponsePromise;
   expect(profileResponse.status()).toBe(201);
   const profileBody = (await profileResponse.json()) as Record<string, unknown>;
@@ -784,17 +835,15 @@ async function configureSharedResourcesViaUi(
   expect(profileId).not.toBe("");
   expect(profileRevision).toBeGreaterThan(0);
   onProfileCreated?.({ endpointId, profileId });
-  await expect(profileDialog).toBeHidden();
-  const card = profileCard(page, PROFILE_LABEL);
-  await expect(card).toContainText(/explicit default|default profile/i);
-  const distribution = distributionRow(card, ENDPOINT_LABEL);
+  await expect(profileForm).toBeHidden();
+  await expect(providerCard).toContainText(PROFILE_LABEL);
+  await expect(providerCard).toContainText(/explicit default|default profile/i);
   await expect.poll(async () => {
-    if ((await distribution.count()) === 0) return "";
-    return (await distribution.innerText()).toLowerCase();
+    return (await providerCard.innerText()).toLowerCase();
   }, {
     timeout: 15_000,
     intervals: [100, 250, 500, 1_000],
-  }).toMatch(/\bready\b|\binstalled\b/);
+  }).toMatch(new RegExp(`${ENDPOINT_LABEL.toLowerCase()}[^\\n]*(?:ready|installed)`));
   return { endpointId, profileId, descriptorRevision, profileRevision };
 }
 
@@ -866,17 +915,6 @@ async function configureSharedResources(
   expect(profileId).not.toBe("");
   expect(profileRevision).toBeGreaterThan(0);
   recorder.arm([endpointId, profileId]);
-
-  const sharing = await publicRequest(
-    page,
-    "actor-a",
-    "PUT",
-    `/v1/auth-profiles/${profileId}/sharing`,
-    { mode: SHARING_MODE, endpoint_ids: [endpointId] },
-    "two-actor-profile-share",
-    recorder,
-  );
-  expect([200, 202]).toContain(sharing.status);
 
   await waitForReplicaReady(page, "actor-a", profileId, endpointId, recorder);
   recorder.arm([endpointId, profileId]);
@@ -975,17 +1013,24 @@ async function assertSessionIsolation(
   sessionId: string,
   recorder: ExchangeRecorder,
   includeProviderRound: boolean,
-  actorBSessionId?: string,
+  actorBSessionId: string,
   recordPublic = true,
 ): Promise<void> {
   const sessionPath = `/v1/endpoints/${resource.endpointId}/sessions/${sessionId}`;
+  const endpointEventsPath = `/v1/endpoints/${resource.endpointId}/events`;
   const sessionRoute = `/endpoints/${resource.endpointId}/sessions/${sessionId}`;
   const listPath = `/v1/endpoints/${resource.endpointId}/sessions`;
   const forbidden = [stack.providerSecret, stack.endpointControlSecret];
   let actorAMessageResponse: PublicResponse | undefined;
 
   if (includeProviderRound) {
-    const stream = waitForAssistant(pageA, "actor-a", `${sessionPath}/events`, recorder);
+    const stream = readEndpointEventsUntil(
+      pageA,
+      "actor-a",
+      endpointEventsPath,
+      [sessionId, ASSISTANT_MARKER],
+      recorder,
+    );
     const message = await publicRequest(
       pageA,
       "actor-a",
@@ -1049,17 +1094,18 @@ async function assertSessionIsolation(
   const actorBRead = await publicRequest(pageB, "actor-b", "GET", sessionPath, undefined, undefined, recorder, recordPublic);
   await expectSafeNotFound(actorBRead, forbidden);
 
-  const actorBStream = await publicRequest(
+  const actorBStream = await readEndpointEventsUntil(
     pageB,
     "actor-b",
-    "GET",
-    `${sessionPath}/events`,
-    undefined,
-    undefined,
+    endpointEventsPath,
+    [actorBSessionId],
     recorder,
-    recordPublic,
   );
-  await expectSafeNotFound(actorBStream, forbidden);
+  expect(actorBStream.status).toBe(200);
+  expect(actorBStream.data).toContain(actorBSessionId);
+  expect(actorBStream.data).not.toContain(sessionId);
+  expect(actorBStream.data).not.toContain(ASSISTANT_MARKER);
+  for (const secret of forbidden) expect(actorBStream.data).not.toContain(secret);
 
   const actorBSameBodyMutation = await publicRequest(
     pageB,
@@ -1102,14 +1148,16 @@ async function assertSessionIsolation(
 
   await gotoPublic(pageA, "actor-a", stack.actorA.baseUrl, sessionRoute, recorder);
   expect(new URL(pageA.url()).pathname).toBe(sessionRoute);
-  const actorABody = await pageA.locator("body").innerText();
-  if (includeProviderRound) expect(actorABody).toContain(ASSISTANT_MARKER);
+  if (includeProviderRound) {
+    await expect(pageA.locator("body")).toContainText(ASSISTANT_MARKER, { timeout: 15_000 });
+  }
 
   await gotoPublic(pageB, "actor-b", stack.actorB.baseUrl, sessionRoute, recorder);
   expect(new URL(pageB.url()).pathname).toBe(sessionRoute);
-  const actorBBody = await pageB.locator("body").innerText();
-  expect(actorBBody).not.toContain(ASSISTANT_MARKER);
-  expect(actorBBody).toMatch(/not found|unavailable|cannot|access/i);
+  await expect(pageB.locator("body")).toContainText(/not found|unavailable|cannot|access/i, {
+    timeout: 15_000,
+  });
+  await expect(pageB.locator("body")).not.toContainText(ASSISTANT_MARKER);
 
   const idOnly = await publicRequest(pageB, "actor-b", "GET", `/v1/sessions/${sessionId}`, undefined, undefined, recorder, recordPublic);
   expect(idOnly.status).toBe(404);
@@ -1210,6 +1258,8 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
         stack.endpointTransport.assertReplayConsumed();
       }
     } catch (error) {
+      await contextA.close().catch(() => undefined);
+      await contextB.close().catch(() => undefined);
       await recorder.flush();
       if (replay) {
         await recorder.assertReplayConsumed();
@@ -1257,19 +1307,29 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
     let sessionId = "";
     let actorBSessionId = "";
     try {
-      const resource = await configureSharedResourcesViaUi(pageA, stack, recorder, ({ endpointId, profileId }) => {
-        armed = true;
-        recorder.arm([endpointId, profileId]);
-      });
+      const resource = await test.step("actor A configures shared deployment resources in the UI", () =>
+        configureSharedResourcesViaUi(pageA, stack, recorder, ({ endpointId, profileId }) => {
+          armed = true;
+          recorder.arm([endpointId, profileId]);
+        }),
+      );
       armed = true;
       recorder.arm([resource.endpointId, resource.profileId]);
-      await expectSharedProviderResource(pageB, stack, resource.endpointId, resource.profileId, recorder);
+      await test.step("actor B observes the same deployment resources", () =>
+        expectSharedProviderResource(pageB, stack, resource.endpointId, resource.profileId, recorder),
+      );
       stack.endpointTransport.arm([resource.endpointId, resource.profileId]);
-      const admission = await createActorASession(pageA, stack, resource, recorder);
+      const admission = await test.step("actor A creates an Endpoint-owned session", () =>
+        createActorASession(pageA, stack, resource, recorder),
+      );
       sessionId = admission.sessionId;
       armed = true;
-      actorBSessionId = await assertCreateIdempotencyScope(pageA, pageB, stack, resource, admission, recorder);
-      await assertSessionIsolation(pageA, pageB, stack, resource, sessionId, recorder, true, actorBSessionId);
+      actorBSessionId = await test.step("session creation idempotency remains actor scoped", () =>
+        assertCreateIdempotencyScope(pageA, pageB, stack, resource, admission, recorder),
+      );
+      await test.step("session content remains isolated between actors", () =>
+        assertSessionIsolation(pageA, pageB, stack, resource, sessionId, recorder, true, actorBSessionId),
+      );
       assertEndpointOwnershipTrace(stack, admission, actorBSessionId);
       expect(await serverStoresContainSessionMirrors(stack, [sessionId, actorBSessionId])).toBe(false);
       expect(directEndpointRequestsA).toHaveLength(0);
@@ -1282,6 +1342,8 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
         stack.endpointTransport.assertReplayConsumed();
       }
     } catch (error) {
+      await contextA.close().catch(() => undefined);
+      await contextB.close().catch(() => undefined);
       await recorder.flush();
       if (replay) {
         await recorder.assertReplayConsumed();

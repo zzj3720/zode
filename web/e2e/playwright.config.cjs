@@ -3,6 +3,7 @@
 const { defineConfig } = require('@playwright/test');
 
 module.exports = defineConfig({
+  globalSetup: require.resolve('./support/global-setup.cjs'),
   testDir: '.',
   testMatch: [
     'support/smoke.spec.cjs',

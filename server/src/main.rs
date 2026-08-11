@@ -9,7 +9,13 @@ mod store;
 mod ui_assets;
 
 use std::{
-    env, future::IntoFuture, io::Write, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
+    env,
+    future::{Future, IntoFuture},
+    io::Write,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
 };
 
 use access::AccessVerifier;
@@ -104,10 +110,20 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let providers = Arc::new(ProviderAuthority::new(
+    let providers = match ProviderAuthority::new(
         Arc::clone(&store),
         Arc::clone(&catalog),
-    ));
+        config.provider_auth_adapters(),
+        config.management_origin().to_owned(),
+    ) {
+        Ok(providers) => Arc::new(providers),
+        Err(_) => {
+            eprintln!(
+                "ZODE_SERVER_STARTUP_FAILURE code=provider_auth_unavailable phase=provider_auth"
+            );
+            std::process::exit(1);
+        }
+    };
     let sessions = match SessionProxy::new(Arc::clone(&store), config.callback_origin().to_owned())
     {
         Ok(sessions) => Arc::new(sessions),
@@ -207,6 +223,8 @@ async fn serve_until_shutdown(
     listen_addr: SocketAddr,
     router: Router,
 ) -> Result<(), std::io::Error> {
+    let shutdown_signal = arm_shutdown_signal()?;
+    tokio::pin!(shutdown_signal);
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     let address = listener.local_addr()?;
 
@@ -223,7 +241,7 @@ async fn serve_until_shutdown(
 
     tokio::select! {
         result = &mut serving => result,
-        () = shutdown_signal() => {
+        () = &mut shutdown_signal => {
             let _ = shutdown.send(());
             match tokio::time::timeout(SERVER_DRAIN_TIMEOUT, &mut serving).await {
                 Ok(result) => result,
@@ -233,24 +251,21 @@ async fn serve_until_shutdown(
     }
 }
 
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(signal) => signal,
-                Err(_) => {
-                    let _ = tokio::signal::ctrl_c().await;
-                    return;
-                }
-            };
+#[cfg(unix)]
+fn arm_shutdown_signal() -> Result<impl Future<Output = ()>, std::io::Error> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    Ok(async move {
         tokio::select! {
             _ = terminate.recv() => {}
-            _ = tokio::signal::ctrl_c() => {}
+            _ = interrupt.recv() => {}
         }
-    }
-    #[cfg(not(unix))]
-    {
+    })
+}
+
+#[cfg(not(unix))]
+fn arm_shutdown_signal() -> Result<impl Future<Output = ()>, std::io::Error> {
+    Ok(async {
         let _ = tokio::signal::ctrl_c().await;
-    }
+    })
 }

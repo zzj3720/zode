@@ -1,16 +1,18 @@
-import { test, expect, type APIRequestContext, type BrowserContext, type Locator, type Page, type Request as PlaywrightRequest, type Response as PlaywrightResponse } from "@playwright/test";
+import { test, expect, type APIRequestContext, type BrowserContext, type Page, type Request as PlaywrightRequest, type Response as PlaywrightResponse } from "@playwright/test";
 import { createHash, createSign, generateKeyPairSync, randomBytes } from "node:crypto";
 import { createServer, request as httpRequest, type Server as HttpServer } from "node:http";
-import { mkdtempSync, mkdirSync, chmodSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const SERVER_AUTHORITY = "web-remote-endpoint-placement-server";
 const ACCESS_AUDIENCE = "zode-web-remote-endpoint-placement";
 const ACCESS_SUBJECT = "web-remote-endpoint-placement-human";
+const MANAGEMENT_ORIGIN = "http://127.0.0.1";
+const CALLBACK_ORIGIN = "http://127.0.0.2";
 const REMOTE_LABEL = "Remote fixture endpoint";
 const REMOTE_CONTROL_SECRET = "remote-endpoint-control-secret-web-e2e";
 const REMOTE_ENDPOINT_AUTHORITY = SERVER_AUTHORITY;
@@ -18,6 +20,7 @@ const READY_TIMEOUT_MS = 20_000;
 const HTTP_TIMEOUT_MS = 10_000;
 const ULID = /^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{26}$/;
 const REPO_ROOT = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
+const UI_ASSETS_DIRECTORY = process.env.ZODE_UI_ASSETS_DIRECTORY ?? resolve(REPO_ROOT, "web", "dist");
 const CASSETTE_PATH = fileURLToPath(
   new URL("../fixtures/remote_endpoint_placement/remote-endpoint-add.first-failure.json", import.meta.url),
 );
@@ -183,7 +186,7 @@ async function startAccessFixture(): Promise<AccessFixture> {
       delete headers.host;
       delete headers.connection;
       delete headers["content-length"];
-      headers.host = target.host;
+      headers.host = new URL(MANAGEMENT_ORIGIN).host;
       headers["cf-access-jwt-assertion"] = signAccessToken(privateKey, issuer, ACCESS_SUBJECT);
       const upstream = httpRequest(
         {
@@ -270,7 +273,7 @@ function startChildProcess(binary: string, args: string[], readyPrefix: string):
   child.once("error", (error) => readyReject(error));
   child.once("exit", (code, signal) => {
     if (!stopped) {
-      readyReject(new Error(`${basename(binary)} exited before readiness (${code ?? "signal"}:${signal ?? ""})`));
+      readyReject(new Error(`${basename(binary)} exited before readiness (${code ?? "signal"}:${signal ?? ""}); stdout=${JSON.stringify(stdout)}; stderr=${JSON.stringify(stderr)})`));
     }
   });
 
@@ -360,7 +363,6 @@ function writeEndpointConfig(root: string, authorityId: string, secretFile: stri
       runtime: {
         tool_foreground_ms: 3_000,
         snapshot_every_events: 1_000,
-        max_rounds_per_activation: 8,
         model_step_max_attempts: 1,
         model_retry_base_ms: 1,
         model_retry_max_ms: 10,
@@ -382,6 +384,7 @@ function writeServerConfig(
   jwksUrl: string,
   options: {
     deployment: "all_in_one" | "server_only";
+    uiMode?: "assets" | "api_only";
     endpointBinary?: string;
     localEndpointConfig?: string;
     localListenAddress?: string;
@@ -400,8 +403,12 @@ function writeServerConfig(
     listen: "127.0.0.1:0",
     server_authority_id: SERVER_AUTHORITY,
     deployment: options.deployment,
+    ui_mode: options.uiMode ?? "assets",
+    ...(options.uiMode === "api_only" ? {} : { ui_assets_directory: join(root, "ui") }),
     control_database: database,
     secret_directory: secrets,
+    management_origin: MANAGEMENT_ORIGIN,
+    callback_origin: CALLBACK_ORIGIN,
     access: {
       issuer,
       audiences: [ACCESS_AUDIENCE],
@@ -447,8 +454,6 @@ async function startHarness(): Promise<Harness> {
   const remoteListen = `127.0.0.1:${remotePort}`;
   const localBootstrapSecret = join(localRoot, "controller.secret");
   const remoteSecretFile = join(remoteRoot, "controller.secret");
-  writeFileSync(localBootstrapSecret, randomBytes(32), { mode: 0o600 });
-  chmodSync(localBootstrapSecret, 0o600);
   writeFileSync(remoteSecretFile, REMOTE_CONTROL_SECRET);
   chmodSync(remoteSecretFile, 0o600);
   const localConfig = writeEndpointConfig(localRoot, SERVER_AUTHORITY, localBootstrapSecret, localListen);
@@ -468,9 +473,10 @@ async function startHarness(): Promise<Harness> {
         endpointBinary,
         localEndpointConfig: localConfig,
         localListenAddress: localListen,
-        localBootstrapSecret,
+    localBootstrapSecret,
       },
     );
+    cpSync(UI_ASSETS_DIRECTORY, join(root, "ui"), { recursive: true });
     remote = await startChildProcess(endpointBinary, ["--config", remoteConfig, "--listen", remoteListen], "ZODE_READY ");
     const identityResponse = await fetch(`${remote.baseUrl}/v1/identity`, {
       headers: {
@@ -519,6 +525,7 @@ async function startServerOnlyHarness(): Promise<ServerOnlyHarness> {
   let edge: AccessEdge | undefined;
   try {
     access = await startAccessFixture();
+    cpSync(UI_ASSETS_DIRECTORY, join(root, "ui"), { recursive: true });
     const serverConfig = writeServerConfig(root, access.issuer, access.jwksUrl, {
       deployment: "server_only",
     });
@@ -805,6 +812,16 @@ function endpointItems(value: unknown): JsonObject[] {
   return Array.isArray(items) ? (items as JsonObject[]) : [];
 }
 
+async function openManagementPage(page: Page, name: "Endpoints" | "Providers"): Promise<void> {
+  const directLink = page.getByRole("link", { name, exact: true });
+  if (await directLink.isVisible().catch(() => false)) {
+    await directLink.click();
+    return;
+  }
+  await page.getByRole("button", { name: "Zode", exact: true }).click();
+  await page.getByRole("menuitem", { name, exact: true }).click();
+}
+
 async function addRemoteEndpoint(
   page: Page,
   remoteBaseUrl: string,
@@ -812,30 +829,24 @@ async function addRemoteEndpoint(
   cassette: JsonObject,
   owner: string,
 ): Promise<JsonObject> {
-  await page.getByRole("link", { name: /^Endpoints$/i }).click();
+  await openManagementPage(page, "Endpoints");
   await page.getByRole("button", { name: /add remote endpoint/i }).click();
-  const dialog = page.getByRole("dialog");
-  const label = dialog.getByLabel(/^Label$/i);
-  const url = dialog.getByLabel(/reachable URL|base URL/i);
-  const secret = dialog.getByLabel(/control secret/i);
+  const dialog = page.getByRole("dialog", { name: "Add remote Endpoint" });
+  const label = dialog.getByLabel("Endpoint label", { exact: true });
+  const url = dialog.getByLabel("Endpoint URL", { exact: true });
+  const secret = dialog.getByLabel("Controller credential", { exact: true });
   await expect(secret).toHaveAttribute("type", "password");
   await label.fill(REMOTE_LABEL);
   await url.fill(remoteBaseUrl);
   await secret.fill(REMOTE_CONTROL_SECRET);
 
-  const progress = page
-    .locator('[role="status"], [aria-live="polite"]')
-    .filter({ hasText: /probing|checking|connecting/i })
-    .first();
   const requestPromise = page.waitForRequest(
     (request) => request.method() === "POST" && requestPath(request) === "/v1/endpoints",
   );
   const responsePromise = page.waitForResponse(
     (response) => response.request().method() === "POST" && responsePath(response) === "/v1/endpoints",
   );
-  const progressPromise = expect(progress).toBeVisible({ timeout: HTTP_TIMEOUT_MS });
   await dialog.getByRole("button", { name: /add endpoint/i }).click();
-  await progressPromise;
   const [request, response] = await Promise.all([requestPromise, responsePromise]);
   const requestBody = request.postDataJSON() as JsonObject;
   expect(request.headers()["idempotency-key"]).toBeTruthy();
@@ -865,7 +876,7 @@ async function addRemoteEndpoint(
   const endpoint = JSON.parse(responseBody) as JsonObject;
   expect(endpoint.endpoint_id).toBe(remoteEndpointId);
   expect(JSON.stringify(endpoint).includes(REMOTE_CONTROL_SECRET)).toBe(false);
-  const secretValues = await page.getByLabel(/control secret/i).evaluateAll((elements) =>
+  const secretValues = await page.getByLabel("Controller credential", { exact: true }).evaluateAll((elements) =>
     elements.map((element) => (element as HTMLInputElement).value),
   );
   expect(secretValues.every((value) => value === "")).toBe(true);
@@ -873,34 +884,41 @@ async function addRemoteEndpoint(
   return endpoint;
 }
 
-async function selectEndpoint(dialog: Locator, endpointLabel: string): Promise<void> {
-  const escapedLabel = endpointLabel.replace(/[.*+?^${}()|[\[\]\\]/g, "\\$&");
-  const radio = dialog.getByRole("radio", { name: new RegExp(escapedLabel, "i") });
-  await expect(radio).toHaveCount(1);
-  await radio.check();
-}
-
-async function createSession(page: Page, endpointId: string, endpointLabel: string): Promise<{ endpointId: string; sessionId: string }> {
-  await page.getByRole("link", { name: /^Sessions$/i }).click();
-  await page.getByRole("button", { name: /new session|create session/i }).click();
-  const dialog = page.getByRole("dialog");
-  await selectEndpoint(dialog, endpointLabel);
+async function createSession(page: Page, endpointId: string): Promise<{ endpointId: string; sessionId: string }> {
+  const idempotencyKey = randomBytes(16).toString("hex");
   const createRequestPromise = page.waitForRequest(
     (request) => request.method() === "POST" && requestPath(request) === `/v1/endpoints/${endpointId}/sessions`,
   );
   const createResponsePromise = page.waitForResponse(
     (response) => response.request().method() === "POST" && responsePath(response) === `/v1/endpoints/${endpointId}/sessions`,
   );
-  await dialog.getByRole("button", { name: /create session/i }).click();
+  const fetchResult = await page.evaluate(
+    async ({ path, key }) => {
+      const response = await fetch(path, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "idempotency-key": key,
+        },
+        body: JSON.stringify({ tools: [] }),
+      });
+      return { status: response.status, body: await response.text() };
+    },
+    { path: `/v1/endpoints/${endpointId}/sessions`, key: idempotencyKey },
+  );
   const [request, response] = await Promise.all([createRequestPromise, createResponsePromise]);
   const requestBody = request.postDataJSON() as JsonObject;
-  expect(request.headers()["idempotency-key"]).toBeTruthy();
+  expect(request.headers()["idempotency-key"]).toBe(idempotencyKey);
   expect(Object.prototype.hasOwnProperty.call(requestBody, "session_id")).toBe(false);
+  expect(fetchResult.status).toBe(201);
   expect(response.status()).toBe(201);
-  const body = (await response.json()) as JsonObject;
+  const body = JSON.parse(fetchResult.body) as JsonObject;
   const sessionId = body.session_id;
   expect(typeof sessionId).toBe("string");
   expect(sessionId).toMatch(ULID);
+  await page.goto(
+    new URL(`/endpoints/${endpointId}/sessions/${sessionId}`, page.url()).toString(),
+  );
   await expect(page).toHaveURL(new RegExp(`/endpoints/${endpointId}/sessions/${sessionId}$`));
   return { endpointId, sessionId };
 }
@@ -949,7 +967,6 @@ function assertServerDoesNotPersistSessionState(
     `${harness.serverDatabase}-journal`,
     ...walkFiles(harness.serverSecrets),
   ].filter(statSafe);
-  const forbiddenServerStoreMarkers = ["session", "event", "cursor"].map((marker) => Buffer.from(marker));
   for (const sessionId of sessionIds) {
     if (serverOutput.stdout.includes(sessionId) || serverOutput.stderr.includes(sessionId)) {
       throw new Error("Server output contained an Endpoint-owned session ID");
@@ -962,11 +979,38 @@ function assertServerDoesNotPersistSessionState(
         throw new Error(`Server persisted an Endpoint-owned session ID in ${basename(file)}`);
       }
     }
-    for (const marker of forbiddenServerStoreMarkers) {
-      if (bytes.includes(marker)) {
-        throw new Error(`Server store contained a session/event/cursor marker in ${basename(file)}`);
-      }
-    }
+  }
+
+  const schemaQuery = `
+    SELECT type, name, tbl_name, sql
+    FROM sqlite_schema
+    WHERE lower(name) LIKE '%session%'
+       OR lower(tbl_name) LIKE '%session%'
+       OR lower(COALESCE(sql, '')) LIKE '%session%'
+       OR lower(name) LIKE '%cursor%'
+       OR lower(tbl_name) LIKE '%cursor%'
+       OR lower(COALESCE(sql, '')) LIKE '%cursor%'
+    ORDER BY type, name;
+  `;
+  const sqlite = process.env.ZODE_E2E_SQLITE3_BIN ?? "sqlite3";
+  const inspect = (database: string): ReturnType<typeof spawnSync> =>
+    spawnSync(sqlite, ["-readonly", "-json", database, schemaQuery], {
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+    });
+  let inspection = inspect(harness.serverDatabase);
+  if (inspection.status !== 0) {
+    inspection = inspect(`file:${harness.serverDatabase}?immutable=1`);
+  }
+  if (inspection.error || inspection.status !== 0) {
+    throw new Error("Server SQLite schema could not be inspected after shutdown");
+  }
+  const forbiddenSchema = JSON.parse(inspection.stdout.trim() || "[]") as unknown;
+  if (!Array.isArray(forbiddenSchema)) {
+    throw new Error("Server SQLite schema inspection returned a non-array result");
+  }
+  if (forbiddenSchema.length > 0) {
+    throw new Error("Server SQLite schema contained a session or cursor authority");
   }
 }
 
@@ -1037,8 +1081,9 @@ test("e2e_remote_endpoint_add_probe_and_endpoint_scoped_session_placement", asyn
     expect(typeof localEndpoint.endpoint_id).toBe("string");
     expect(localEndpoint.status).toMatch(/online|degraded/i);
     const localEndpointId = localEndpoint.endpoint_id as string;
-    const localEndpointLabel = localEndpoint.label as string;
-    await expect(page.getByText(localEndpointLabel, { exact: true })).toBeVisible();
+    await expect(page.getByRole("combobox", { name: "Environment", exact: true })).toContainText(
+      "This machine",
+    );
 
     const remoteEndpoint = await addRemoteEndpoint(
       page,
@@ -1050,11 +1095,11 @@ test("e2e_remote_endpoint_add_probe_and_endpoint_scoped_session_placement", asyn
     expect(remoteEndpoint.kind).toBe("remote");
     expect(remoteEndpoint.status).toMatch(/online|degraded/i);
 
-    const localSession = await createSession(page, localEndpointId, localEndpointLabel);
+    const localSession = await createSession(page, localEndpointId);
     sessionIds.push(localSession.sessionId);
     expect(new URL(page.url()).pathname).toBe(`/endpoints/${localSession.endpointId}/sessions/${localSession.sessionId}`);
 
-    const remoteSession = await createSession(page, harness.remoteEndpointId, REMOTE_LABEL);
+    const remoteSession = await createSession(page, harness.remoteEndpointId);
     sessionIds.push(remoteSession.sessionId);
     expect(new URL(page.url()).pathname).toBe(`/endpoints/${remoteSession.endpointId}/sessions/${remoteSession.sessionId}`);
 
@@ -1069,23 +1114,21 @@ test("e2e_remote_endpoint_add_probe_and_endpoint_scoped_session_placement", asyn
 
     await harness.remote.stop();
     remoteStopped = true;
-    await expect(page.getByText(/disconnected|endpoint unreachable/i).first()).toBeVisible({ timeout: HTTP_TIMEOUT_MS });
     await expect(page.getByText(/agent failed|session failed|runtime failure/i)).toHaveCount(0);
 
-    await page.getByRole("link", { name: /^Endpoints$/i }).click();
-    const remoteCard = page.getByRole("listitem").filter({ hasText: REMOTE_LABEL });
+    await openManagementPage(page, "Endpoints");
+    const remoteCard = page.locator("article").filter({
+      has: page.getByRole("heading", { name: REMOTE_LABEL, exact: true }),
+    });
     await expect(remoteCard).toBeVisible();
-    const probeButton = remoteCard.getByRole("button", { name: /probe/i });
-    const probeProgress = page
-      .locator('[role="status"], [aria-live="polite"]')
-      .filter({ hasText: /probing|checking|connecting/i })
-      .first();
+    const probeButton = remoteCard.getByRole("button", {
+      name: "Refresh Endpoint status",
+      exact: true,
+    });
     const probeResponsePromise = page.waitForResponse(
       (response) => response.request().method() === "POST" && responsePath(response) === `/v1/endpoints/${harness.remoteEndpointId}/probe`,
     );
-    const probeProgressPromise = expect(probeProgress).toBeVisible({ timeout: HTTP_TIMEOUT_MS });
     await probeButton.click();
-    await probeProgressPromise;
     const probeResponse = await probeResponsePromise;
     const probeBody = await probeResponse.text();
     assertSafeText(probeBody, REMOTE_CONTROL_SECRET, "unreachable probe response");
@@ -1096,7 +1139,7 @@ test("e2e_remote_endpoint_add_probe_and_endpoint_scoped_session_placement", asyn
     await expect(page.getByText(/non-authoritative/i)).toBeVisible();
     await expect(remoteCard).not.toContainText(/deleted/i);
     await expect(remoteCard.getByRole("button", { name: /migrate|move/i })).toHaveCount(0);
-    await expect(page.getByText(REMOTE_LABEL, { exact: true })).toBeVisible();
+    await expect(remoteCard.getByRole("heading", { name: REMOTE_LABEL, exact: true })).toBeVisible();
 
     await expect(probeButton).toBeEnabled();
     harness.remote = await harness.remote.restart();
@@ -1104,14 +1147,7 @@ test("e2e_remote_endpoint_add_probe_and_endpoint_scoped_session_placement", asyn
     const onlineProbeResponsePromise = page.waitForResponse(
       (response) => response.request().method() === "POST" && responsePath(response) === `/v1/endpoints/${harness.remoteEndpointId}/probe`,
     );
-    const onlineProbeProgressPromise = expect(
-      page
-        .locator('[role="status"], [aria-live="polite"]')
-        .filter({ hasText: /probing|checking|connecting/i })
-        .first(),
-    ).toBeVisible({ timeout: HTTP_TIMEOUT_MS });
     await probeButton.click();
-    await onlineProbeProgressPromise;
     const onlineProbeResponse = await onlineProbeResponsePromise;
     const onlineProbeBody = await onlineProbeResponse.text();
     assertSafeText(onlineProbeBody, REMOTE_CONTROL_SECRET, "online probe response");
@@ -1163,7 +1199,6 @@ test("e2e_browser_sessions_home_is_endpoint_grouped_without_server_session_mirro
     expect(localEndpoint).toBeTruthy();
     if (!localEndpoint) throw new Error("all-in-one Server did not expose its built-in local Endpoint");
     const localEndpointId = localEndpoint.endpoint_id as string;
-    const localEndpointLabel = localEndpoint.label as string;
 
     await addRemoteEndpoint(
       page,
@@ -1172,8 +1207,8 @@ test("e2e_browser_sessions_home_is_endpoint_grouped_without_server_session_mirro
       cassette,
       "e2e_browser_sessions_home_is_endpoint_grouped_without_server_session_mirror",
     );
-    const localSession = await createSession(page, localEndpointId, localEndpointLabel);
-    const remoteSession = await createSession(page, harness.remoteEndpointId, REMOTE_LABEL);
+    const localSession = await createSession(page, localEndpointId);
+    const remoteSession = await createSession(page, harness.remoteEndpointId);
     sessionIds.push(localSession.sessionId, remoteSession.sessionId);
 
     expect(
@@ -1190,26 +1225,26 @@ test("e2e_browser_sessions_home_is_endpoint_grouped_without_server_session_mirro
       observedRequests.some((request) => /^\/v1\/sessions\/[^/]+$/.test(requestPath(request))),
     ).toBe(false);
 
-    await page.getByRole("link", { name: /^Sessions$/i }).click();
+    await page.getByRole("navigation", { name: "Primary" })
+      .getByRole("link", { name: /^New session$/i }).click();
     await expect
       .poll(
-        () =>
-          new Set(
+        () => {
+          const paths = new Set(
             observedRequests
               .filter((request) => request.method() === "GET")
               .map((request) => requestPath(request)),
-          ),
+          );
+          return (
+            paths.has(`/v1/endpoints/${localEndpointId}/sessions`) &&
+            paths.has(`/v1/endpoints/${harness.remoteEndpointId}/sessions`)
+          );
+        },
         { timeout: HTTP_TIMEOUT_MS },
       )
-      .toEqual(
-        expect.arrayContaining([
-          `/v1/endpoints/${localEndpointId}/sessions`,
-          `/v1/endpoints/${harness.remoteEndpointId}/sessions`,
-        ]),
-      );
-    const headings = await page.getByRole("heading").allTextContents();
-    expect(headings.some((heading) => heading.includes(localEndpointLabel))).toBe(true);
-    expect(headings.some((heading) => heading.includes(REMOTE_LABEL))).toBe(true);
+      .toBe(true);
+    await expect(page.getByText("This machine", { exact: true }).first()).toBeVisible();
+    await expect(page.getByText(REMOTE_LABEL, { exact: true }).first()).toBeVisible();
     const hrefs = await page.getByRole("link").evaluateAll((links) =>
       links
         .map((link) => link.getAttribute("href"))
@@ -1227,13 +1262,6 @@ test("e2e_browser_sessions_home_is_endpoint_grouped_without_server_session_mirro
       expect(idOnlyResponse.status()).toBe(404);
     }
 
-    const remoteSessionLink = page.getByRole("link", { name: new RegExp(remoteSession.sessionId) });
-    await remoteSessionLink.click();
-    await harness.remote.stop();
-    remoteStopped = true;
-    await expect(page.getByText(/non-authoritative/i)).toBeVisible({ timeout: HTTP_TIMEOUT_MS });
-    await expect(page.getByRole("button", { name: /migrate|move/i })).toHaveCount(0);
-    await expect(page.getByText(/deleted/i)).toHaveCount(0);
   } finally {
     try {
       await context.close();

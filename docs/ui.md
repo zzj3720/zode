@@ -21,8 +21,10 @@ The UI lets a user:
 
 The first UI is a management application, not an Endpoint dashboard pasted on
 top of raw routes. Every session link carries the Endpoint-owned pair
-`(endpoint_id, session_id)` and every stream uses the Endpoint event cursor
-proxied by Server.
+`(endpoint_id, session_id)`. Each browser application graph opens at most one
+SSE connection per Endpoint and keeps one Endpoint event cursor proxied by
+Server; sessions consume frames dispatched by `session_id` and never own a
+connection or cursor.
 
 The canonical browser route is
 `/endpoints/{endpoint_id}/sessions/{session_id}`. There is no ID-only session
@@ -45,15 +47,15 @@ with that private source.
 
 At the 1920 by 1080 desktop reference viewport, the required shell is:
 
-- a fixed 274 px left navigation pane separated from the main surface by a
+- a fixed 275 px left navigation pane separated from the main surface by a
   single-pixel boundary;
-- navigation background `#27363b`, selected-row background `#38464b`, main
-  background `#181818`, secondary surface `#242424`, and composer surface
-  `#2a2a2a`;
-- primary text near `#f5f6f6`, secondary text near `#dfe1e1`, subdued text with
-  at least AA contrast, and amber `#f39c12` only for the same narrow status or
+- navigation background `#000000`, selected-row background
+  `rgba(255, 255, 255, 0.12)`, main background `#181818`, and both secondary
+  and composer surfaces `#212121`;
+- primary text `#ffffff`, secondary text `rgba(255, 255, 255, 0.7)`, subdued
+  text with at least AA contrast, and orange `#ff8549` only for the same narrow status or
   attention role visible in the reference;
-- a 56 px main header and a 736 px maximum-width thread column centered in the
+- a 46 px main header and a 736 px maximum-width thread column centered in the
   space to the right of the navigation pane;
 - a 736 px composer aligned to that column, 16 px from the viewport bottom,
   with a 24 px outer radius and content-driven height;
@@ -91,12 +93,15 @@ The visual contract is executable through these named browser E2Es:
   the visible streaming, waiting, tool, error, reconnect, and focus states on
   the same shell.
 
-The pixel E2E pins browser version, device scale, fonts, viewport, and product
-state. It may mask only dynamic user text, IDs, timestamps, token content, and
-carets; it may not mask layout, surfaces, icons, status labels, controls, or
-focus state. Measured geometry and palette have a one-CSS-pixel/one-channel
-maximum deviation, and the masked full-page screenshot has a maximum changed-
-pixel ratio of 0.2%. The source capture itself is never the committed golden.
+The pixel E2E pins browser version, operating-system rendering platform, device
+scale, fonts, viewport, and product state. Each supported verification platform
+uses its own accepted zode-rendered golden so native system-font rasterization
+does not weaken the common geometry, palette, or pixel thresholds. It may mask
+only dynamic user text, IDs, timestamps, token content, and carets; it may not
+mask layout, surfaces, icons, status labels, controls, or focus state. Measured
+geometry and palette have a one-CSS-pixel/one-channel maximum deviation, and
+the masked full-page screenshot has a maximum changed-pixel ratio of 0.2%. The
+source capture itself is never the committed golden.
 A missing route or empty Router is classified as blocked shallow evidence; the
 first retained visual red is the first real rendered mismatch after static UI
 delivery works.
@@ -104,14 +109,17 @@ delivery works.
 The private source may be read only in an explicit local calibration run whose
 path is supplied outside tracked files. That run writes comparison artifacts to
 the ignored 0600 quarantine and never records the source path, bytes, or digest
-in a tracked fixture. After independent acceptance, promote only the zode-
-rendered screenshot as the immutable regression golden. Default and CI browser
-runs compare against that zode golden and must work without access to the
-private source.
+in a tracked fixture. After independent acceptance, or after the user approves
+an already merged zode-owned visual implementation as the baseline, an
+explicit local acceptance run may create the missing zode-rendered golden once;
+it may never overwrite an existing golden. Default and CI browser runs compare
+against that zode golden and must work without access to the private source.
 
 ## 3. Navigation
 
-The v0 information architecture has four primary destinations:
+The v0 information architecture has four destinations. Sessions remain in the
+always-visible navigation; the compact Manage entry exposes the three
+management destinations without adding another visual hierarchy:
 
 1. **Sessions**: Endpoint-grouped live session lists, create action,
    active/offline/waiting status, Endpoint and model summary.
@@ -166,7 +174,11 @@ Before session create, the UI resolves the visible provider default to one
 explicit auth profile, full immutable non-secret provider-execution descriptor,
 and minimum installed auth revision. It freezes that request body with the
 idempotency key for all retries; a changed default or descriptor never mutates
-an in-flight create.
+an in-flight create. If Server rejects that frozen create because a provider
+descriptor advanced, the logic refreshes the authoritative provider catalog,
+keeps the draft and form open on the latest valid selection, and requires a
+new explicit submission. That rejected command is not presented as an unknown
+admission and is never retried with silently changed bytes.
 
 An existing session's execution recovery form starts from that session's
 current provider, model, and auth profile whenever each remains available. A
@@ -226,11 +238,18 @@ One provider type can contain many OAuth or API-key profiles. Cards/rows show:
 - kind, readiness, expiry, and explicit default;
 - profile revision;
 - sharing scope and per-Endpoint distribution summary;
-- actions to set default, edit sharing, refresh/relogin, or delete.
+- actions to set default, replace an API key, edit sharing, refresh/relogin, or
+  delete.
 
 Adding an API key uses a write-only secret field. OAuth opens the protected
 Server redirect and follows attempt events for redirect, device code, prompt,
 progress, success, failure, or cancellation.
+
+Replacing an API key uses another write-only field and preserves the logical
+profile identity, label, default selection, and sharing policy. The UI follows
+the resulting higher revision through the same per-Endpoint pending, stale,
+unreachable, and ready distribution states; it never stores or redisplays the
+secret.
 
 An OAuth redirect ticket stays in memory only. An explicit button navigates
 with `location.replace`; it is not rendered as a prefetchable anchor, copied to
@@ -284,8 +303,9 @@ At minimum, distinct experiences exist for:
   bodies.
 - Keep `endpoint_id` and Endpoint-generated `session_id` together in links,
   query keys, and open tabs. Never look up a session by `session_id` alone.
-- Resume each session stream with its Endpoint event ID. Server has no global
-  session event ID or durable session cursor; Server-owned OAuth attempt
+- Resume each Endpoint stream with its Endpoint event ID. Opening, closing, or
+  switching sessions does not replace that connection or reset its cursor.
+  Server has no durable Endpoint/session cursor; Server-owned OAuth attempt
   streams may have their own attempt-local cursor.
 - Reconnect SSE with `Last-Event-ID`, deduplicate durable frames, and reconcile
   lists through Server queries after lag/error.
@@ -374,7 +394,12 @@ Required browser scenarios:
 - refresh success, crash recovery, and refresh-unknown relogin states without a
   blind retry action;
 - distribution pending, stale, unreachable, ready, and removed states;
-- session SSE disconnect/reconnect without duplicate final messages;
+- one Endpoint SSE multiplexes at least two sessions across navigation, and
+  disconnect/reconnect does not miss or duplicate either session's durable
+  final message;
+- switching from one session to another clears the previous unsent draft
+  without submitting it
+  (`e2e_browser_switching_sessions_clears_the_previous_unsent_draft`);
 - same-session execution recovery in a multi-provider catalog, including
   current-selection defaults, no-op submission, refresh, and legal
   Server/Endpoint restart without changing session identity or history;

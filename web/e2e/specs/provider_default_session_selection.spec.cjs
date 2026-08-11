@@ -6,6 +6,7 @@ const {
   ProductBehaviorFailure,
   createWebE2EHarness,
 } = require("../support/harness.cjs");
+const { expectSelectedExecutionProfile } = require("../support/radix.cjs");
 
 const E2E_NAME = "e2e_browser_provider_default_profile_is_preselected_for_new_session";
 const CLASSIFICATION = "PROVIDER_DEFAULT_PROFILE_NOT_PRESELECTED";
@@ -52,24 +53,34 @@ function firstPublicRecord(records) {
 }
 
 async function configureProvider(page, harness) {
-  await page.getByRole("link", { name: "Providers", exact: true }).click();
-  await page.getByRole("button", { name: "Configure provider", exact: true }).click();
+  await openManagement(page, "Providers");
+  const configure = page.getByRole("button", { name: "Configure provider", exact: true });
+  await configure.focus();
+  await page.keyboard.press("Enter");
   const form = page.locator("form.editor-panel").filter({ hasText: "Configure provider" });
+  await form.getByRole("button", { name: "Cancel", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await expect(form).toBeHidden();
+  await expect(configure).toBeFocused();
+  await configure.focus();
+  await page.keyboard.press("Enter");
   await form.getByLabel("Provider ID").fill(PROVIDER);
-  await form.getByLabel("Provider kind").selectOption("openai_compatible");
   await form.getByLabel("Base URL").fill(`${harness.providerProxy.baseUrl}/v1`);
   await form.getByLabel("Models").fill(MODEL);
+  const save = form.getByRole("button", { name: "Save provider", exact: true });
+  await save.focus();
   await Promise.all([
     page.waitForResponse((response) =>
       response.request().method() === "PUT"
         && new URL(response.url()).pathname === `/v1/providers/${PROVIDER}`),
-    form.getByRole("button", { name: "Save provider", exact: true }).click(),
+    page.keyboard.press("Enter"),
   ]);
   await expect(form).toBeHidden();
+  await expect(configure).toBeFocused();
 }
 
 async function addRemoteEndpoint(page, harness) {
-  await page.getByRole("link", { name: "Endpoints", exact: true }).click();
+  await openManagement(page, "Endpoints");
   await page.getByRole("button", { name: "Add remote Endpoint", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Add remote Endpoint" });
   await dialog.getByLabel("Endpoint label").fill(ENDPOINT_LABEL);
@@ -84,7 +95,7 @@ async function addRemoteEndpoint(page, harness) {
 }
 
 async function createProfile(page, harness, label, makeDefault) {
-  await page.getByRole("link", { name: "Providers", exact: true }).click();
+  await openManagement(page, "Providers");
   const card = page.locator("article.resource-card").filter({ hasText: PROVIDER }).first();
   await card.getByRole("button", { name: "Add API key profile", exact: true }).click();
   const form = card.locator("form.nested-editor");
@@ -102,6 +113,20 @@ async function createProfile(page, harness, label, makeDefault) {
   ]);
   if (response.status() !== 201) throw new Error(`profile create returned ${response.status()}`);
   await expect(form).toBeHidden();
+}
+
+async function openManagement(page, name) {
+  const settingsLink = page.getByRole("link", { name, exact: true });
+  if (await settingsLink.isVisible()) {
+    await settingsLink.click();
+    return;
+  }
+  let link = page.getByRole("menuitem", { name, exact: true });
+  if (!(await link.isVisible())) {
+    await page.getByRole("button", { name: "Zode", exact: true }).click();
+    link = page.getByRole("menuitem", { name, exact: true });
+  }
+  await link.click();
 }
 
 async function armProviderRead(page) {
@@ -125,7 +150,7 @@ test(E2E_NAME, async ({ page }) => {
   let primaryError;
   try {
     await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "What do you want to work on?", exact: true })).toBeVisible();
     await addRemoteEndpoint(page, harness);
     await configureProvider(page, harness);
     await createProfile(page, harness, "First profile", false);
@@ -133,11 +158,14 @@ test(E2E_NAME, async ({ page }) => {
     captureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 24 });
     await armProviderRead(page);
     try {
-      await page.getByRole("link", { name: "Sessions", exact: true }).click();
-      await page.getByRole("button", { name: "New session", exact: true }).click();
-      const form = page.locator("form.editor-panel").filter({ hasText: "New session" });
-      const selected = form.getByLabel("Auth profile").locator("option:checked");
-      await expect(selected).toHaveText("Second default profile");
+      await page.getByRole("navigation", { name: "Primary", exact: true })
+        .getByRole("link", { name: "New session", exact: true }).click();
+      await expectSelectedExecutionProfile(
+        page,
+        page.getByRole("button", { name: "Choose model and reasoning", exact: true }),
+        MODEL,
+        "Second default profile",
+      );
     } catch (error) {
       throw new ProductBehaviorFailure(CLASSIFICATION, FIRST_OBSERVED, {
         cause: error instanceof Error ? error.message : String(error),
@@ -147,7 +175,12 @@ test(E2E_NAME, async ({ page }) => {
     primaryError = error;
   } finally {
     try {
+      if (!page.isClosed()) await page.close();
       await harness.journal.waitForIdle();
+      if (!captureSetId) {
+        if (!primaryError) throw new Error("default selection capture was never opened");
+        throw primaryError;
+      }
       const records = recordsFor(harness, captureSetId);
       const firstFailure = firstPublicRecord(records);
       if (!firstFailure) throw new Error("default selection capture contained no public exchange");

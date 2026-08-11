@@ -2,7 +2,7 @@
 mod process_capture;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     env,
     error::Error,
     fs::{self, OpenOptions},
@@ -10,7 +10,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::{mpsc, Arc, Mutex},
+    sync::{mpsc, Arc, Mutex, OnceLock},
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -97,6 +97,50 @@ fn e2e_server_missing_subject_key_never_becomes_ready() -> TestResult {
     }
     config.assert_persistent_secret_free()?;
     startup_result
+}
+
+#[test]
+fn e2e_generic_oauth_adapter_rejects_unimplemented_exact_result_reconciliation() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let config = ConfigFixture::new(temp.path())?;
+    let mut value: Value = serde_json::from_slice(&fs::read(&config.config_path)?)?;
+    value["provider_auth_adapters"] = json!([{
+        "provider": "readiness-provider",
+        "kind": "oauth2_authorization_code_pkce",
+        "authorization_endpoint": "http://127.0.0.1:65534/oauth/authorize",
+        "token_endpoint": "http://127.0.0.1:65534/oauth/token",
+        "client_id": "readiness-client",
+        "client_secret_file": null,
+        "scopes": ["models.execute"],
+        "refresh_recovery": "exact_result_reconcile"
+    }]);
+    fs::write(&config.config_path, serde_json::to_vec_pretty(&value)?)?;
+
+    let mut server = ServerChild::spawn(&config.config_path)?;
+    let observation = server.observe(READY_TIMEOUT)?;
+    let stopped = server.stop()?;
+    assert_safe_output(
+        "unsupported generic OAuth refresh recovery",
+        &stopped,
+        &config.forbidden_markers(),
+    )?;
+    if matches!(observation, Observation::Ready) || stopped.contains_ready() {
+        return Err(io::Error::other(
+            "generic OAuth adapter accepted an unimplemented exact-result recovery contract",
+        )
+        .into());
+    }
+    if stopped.status.success() {
+        return Err(io::Error::other("generic OAuth adapter rejection exited successfully").into());
+    }
+    let stderr = String::from_utf8_lossy(&stopped.output.stderr);
+    if !stderr.contains("generic OAuth adapter refresh recovery is unsupported") {
+        return Err(io::Error::other(
+            "generic OAuth adapter rejection did not expose the stable safe startup reason",
+        )
+        .into());
+    }
+    assert_listen_released(config.listen_addr)
 }
 
 #[test]
@@ -320,10 +364,15 @@ fn e2e_server_existing_control_store_owner_marker_identity_mismatch_failure_remo
     }
     let [wal, shm] = sqlite_sidecars(&config.control_database)?;
     for path in [lock_path, anchor_path, wal, shm] {
-        if path.exists() {
+        let relative = path
+            .strip_prefix(&config.root)
+            .map_err(|_| io::Error::other("sidecar path escaped readiness test root"))?
+            .to_string_lossy()
+            .into_owned();
+        if path.exists() && !before.0.contains_key(&relative) {
             return Err(io::Error::other(format!(
-                "owner marker identity mismatch left replacement sidecar {}",
-                path.display()
+                "owner marker identity mismatch left new replacement sidecar {}",
+                path.display(),
             ))
             .into());
         }
@@ -405,10 +454,15 @@ fn e2e_server_existing_control_store_lock_marker_identity_mismatch_failure_remov
     }
     let [wal, shm] = sqlite_sidecars(&config.control_database)?;
     for path in [lock_path, anchor_path, wal, shm] {
-        if path.exists() {
+        let relative = path
+            .strip_prefix(&config.root)
+            .map_err(|_| io::Error::other("sidecar path escaped readiness test root"))?
+            .to_string_lossy()
+            .into_owned();
+        if path.exists() && !before.0.contains_key(&relative) {
             return Err(io::Error::other(format!(
-                "lock marker identity mismatch left replacement sidecar {}",
-                path.display()
+                "lock marker identity mismatch left new replacement sidecar {}",
+                path.display(),
             ))
             .into());
         }
@@ -599,7 +653,7 @@ fn e2e_server_control_lock_sidecar_replacement_cannot_allow_second_owner() -> Te
         "lock-sidecar replacement second Server",
         &second_observation,
         &second_stopped,
-        CONTROL_STORE_INTEGRITY_FAILURE,
+        SERVER_ALREADY_OWNED_FAILURE,
         &forbidden,
     )
 }
@@ -717,7 +771,7 @@ fn e2e_server_control_lock_pair_replacement_cannot_allow_second_owner() -> TestR
         "lock-pair replacement second Server",
         &second_observation,
         &second_stopped,
-        CONTROL_STORE_INTEGRITY_FAILURE,
+        SERVER_ALREADY_OWNED_FAILURE,
         &forbidden,
     )
 }
@@ -920,6 +974,57 @@ fn e2e_server_control_database_path_with_uri_delimiter_restarts_ready() -> TestR
         .into());
     }
     assert_listen_released(config.listen_addr)
+}
+
+#[test]
+fn e2e_server_crash_with_committed_wal_and_missing_shm_recovers_same_control_facts() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let config = ConfigFixture::new(temp.path())?;
+    let forbidden = config.forbidden_markers();
+
+    let mut first = ServerChild::spawn(&config.config_path)?;
+    let first_observation = first.observe(READY_TIMEOUT)?;
+    if !matches!(first_observation, Observation::Ready) {
+        let _ = first.stop()?;
+        return Err(io::Error::other(
+            first_observation.failure_summary("crash-recovery first Server"),
+        )
+        .into());
+    }
+    let first_stopped = first.stop()?;
+    assert_safe_output("crash-recovery first Server", &first_stopped, &forbidden)?;
+
+    let [wal, shm] = sqlite_sidecars(&config.control_database)?;
+    if !wal.is_file() || fs::metadata(&wal)?.len() == 0 {
+        return Err(io::Error::other(
+            "crashed Server did not leave a committed non-empty WAL to recover",
+        )
+        .into());
+    }
+    if shm.exists() {
+        fs::remove_file(&shm)?;
+    }
+
+    let mut restarted = ServerChild::spawn(&config.config_path)?;
+    let restart_observation = restarted.observe(READY_TIMEOUT)?;
+    let restarted_stopped = if matches!(restart_observation, Observation::Ready) {
+        restarted.graceful_stop()?
+    } else {
+        restarted.stop()?
+    };
+    assert_safe_output(
+        "crash-recovery restarted Server",
+        &restarted_stopped,
+        &forbidden,
+    )?;
+    if !matches!(restart_observation, Observation::Ready) {
+        return Err(io::Error::other(
+            restart_observation.failure_summary("crash-recovery restarted Server"),
+        )
+        .into());
+    }
+    assert_listen_released(config.listen_addr)?;
+    config.assert_persistent_secret_free()
 }
 
 #[test]
@@ -1852,8 +1957,14 @@ fn establish_ready_baseline(config: &ConfigFixture, label: &str) -> TestResult {
     let stopped = baseline.graceful_stop()?;
     assert_safe_output(label, &stopped, &config.forbidden_markers())?;
     assert_listen_released(config.listen_addr)?;
-    if !running || !stopped.contains_ready() {
-        return Err(io::Error::other(observation.failure_summary("baseline Server")).into());
+    if !running || !stopped.contains_ready() || !stopped.status.success() {
+        return Err(io::Error::other(format!(
+            "{}; exit={:?}; stderr={}",
+            observation.failure_summary("baseline Server"),
+            stopped.status.code(),
+            String::from_utf8_lossy(&stopped.output.stderr),
+        ))
+        .into());
     }
     Ok(())
 }
@@ -1867,11 +1978,16 @@ fn finish_cases(label: &str, failures: Vec<String>) -> TestResult {
 }
 
 fn unused_loopback_addr(excluded: &[SocketAddr]) -> TestResult<SocketAddr> {
+    static ALLOCATED: OnceLock<Mutex<HashSet<SocketAddr>>> = OnceLock::new();
+    let mut allocated = ALLOCATED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map_err(|_| io::Error::other("readiness port allocator lock poisoned"))?;
     for _ in 0..32 {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         drop(listener);
-        if address.port() != 0 && !excluded.contains(&address) {
+        if address.port() != 0 && !excluded.contains(&address) && allocated.insert(address) {
             return Ok(address);
         }
     }
@@ -2609,6 +2725,11 @@ impl ServerChild {
                 }
             }
         }
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("zode-server child was already reaped"))?;
+        let _ = wait_child_bounded(child)?;
         self.finish_stop()
     }
 

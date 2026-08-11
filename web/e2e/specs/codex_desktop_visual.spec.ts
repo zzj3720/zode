@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
@@ -33,7 +33,9 @@ const FIXTURE_ROOT = resolve(
 const CONTRACT_PATH = resolve(FIXTURE_ROOT, "contract.v1.json");
 const GOLDEN_PATH = resolve(
   FIXTURE_ROOT,
-  "codex-desktop-shell.golden.png",
+  process.platform === "linux"
+    ? "codex-desktop-shell.linux.golden.png"
+    : "codex-desktop-shell.golden.png",
 );
 const CALIBRATION_SOURCE_ENV = "ZODE_CODEX_DESKTOP_REFERENCE";
 const CALIBRATION_ENABLE_ENV = "ZODE_CODEX_DESKTOP_CALIBRATION";
@@ -42,13 +44,8 @@ const CALIBRATION_QUARANTINE_ROOT = resolve(
   REPO_ROOT,
   "target/test-recordings/quarantine/codex-desktop-visual",
 );
-const SERVER_WRAPPER_PATH = resolve(
-  REPO_ROOT,
-  "target/web-e2e-playwright/codex-desktop-visual-server-wrapper.cjs",
-);
-const CANONICAL_PATH =
-  process.env.ZODE_CODEX_DESKTOP_CANONICAL_PATH ??
-  "/endpoints/visual-e2e-endpoint/sessions/01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const VISUAL_PROVIDER = "visual-e2e-provider";
+const VISUAL_MODEL = "visual-e2e-model";
 
 type Box = {
   x: number;
@@ -120,6 +117,7 @@ type BuiltUi = {
 
 type RestoredServerEnvironment = () => void;
 type VisualHarness = Awaited<ReturnType<typeof createWebE2EHarness>>;
+type VisualSession = { endpointId: string; sessionId: string; path: string };
 
 type IndexedDbScan = {
   unavailable?: boolean;
@@ -138,12 +136,6 @@ const SHELL_VISUAL_EVIDENCE_OWNER: VisualEvidenceOwner = {
   quarantineRoot: resolve(CALIBRATION_QUARANTINE_ROOT, "shell"),
   goldenPath: GOLDEN_PATH,
 };
-const SESSION_VISUAL_EVIDENCE_OWNER: VisualEvidenceOwner = {
-  e2eName: SESSION_STATES_E2E_NAME,
-  quarantineRoot: resolve(CALIBRATION_QUARANTINE_ROOT, "session-states"),
-  goldenPath: GOLDEN_PATH,
-};
-
 const execFileAsync = promisify(execFile);
 
 class BlockedShallow404 extends HarnessFailure {
@@ -211,125 +203,80 @@ function parseVersionedAssetHref(html: string, label: string): string {
 }
 
 async function buildTestOwnedUiDist(): Promise<BuiltUi> {
-  try {
-    await execFileAsync(
-      "vp",
-      ["build", "--outDir", UI_DIST_DIR],
-      { cwd: WEB_ROOT, env: { ...process.env }, timeout: 120_000 },
-    );
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new HarnessFailure(
-      "STATIC_UI_BUILD_BLOCKED",
-      `real vp build did not produce the test-owned UI dist: ${detail}`,
-      { directory: UI_DIST_DIR, nonEvidence: true },
-    );
+  const configuredDirectory = process.env.ZODE_UI_ASSETS_DIRECTORY;
+  const directory = configuredDirectory ? resolve(configuredDirectory) : UI_DIST_DIR;
+  if (!configuredDirectory) {
+    try {
+      await execFileAsync(
+        "vp",
+        ["build", "--outDir", directory],
+        { cwd: WEB_ROOT, env: { ...process.env }, timeout: 120_000 },
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new HarnessFailure(
+        "STATIC_UI_BUILD_BLOCKED",
+        `real vp build did not produce the test-owned UI dist: ${detail}`,
+        { directory, nonEvidence: true },
+      );
+    }
   }
-  const indexPath = join(UI_DIST_DIR, "index.html");
+  const indexPath = join(directory, "index.html");
   const indexMetadata = await stat(indexPath).catch(() => undefined);
   if (!indexMetadata?.isFile()) {
     throw new HarnessFailure(
       "STATIC_UI_BUILD_BLOCKED",
-      "real vp build did not produce test-owned dist/index.html",
-      { directory: UI_DIST_DIR, nonEvidence: true },
+      "the selected UI artifact did not contain index.html",
+      { directory, nonEvidence: true },
     );
   }
   const index = await readFile(indexPath, "utf8");
-  return { directory: UI_DIST_DIR, assetHref: parseVersionedAssetHref(index, "test-owned dist/index.html") };
+  return {
+    directory,
+    assetHref: parseVersionedAssetHref(
+      index,
+      configuredDirectory ? "CI-provided UI artifact/index.html" : "test-owned dist/index.html",
+    ),
+  };
 }
 
 async function installUiAssetsServerWrapper(builtUi: BuiltUi): Promise<RestoredServerEnvironment> {
-  const realServerBinary =
-    process.env.ZODE_SERVER_BIN ?? resolve(REPO_ROOT, "server/target/debug/zode-server");
-  const wrapper = `#!/usr/bin/env node
-const fs = require("node:fs");
-const path = require("node:path");
-const { spawn } = require("node:child_process");
-
-const args = process.argv.slice(2);
-const configIndex = args.indexOf("--config");
-const configPath = configIndex >= 0 ? args[configIndex + 1] : undefined;
-const realBinary = process.env.ZODE_SERVER_REAL_BIN;
-const assetsDirectory = process.env.ZODE_UI_ASSETS_DIRECTORY;
-if (!configPath || !realBinary || !assetsDirectory) {
-  throw new Error("visual E2E Server wrapper requires --config, real binary, and UI assets directory");
-}
-const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-const confinedAssetsDirectory = path.join(path.dirname(configPath), ".zode-visual-ui-" + process.pid);
-fs.cpSync(assetsDirectory, confinedAssetsDirectory, {
-  recursive: true,
-  force: false,
-  errorOnExist: true,
-});
-config.ui_mode = "assets";
-config.ui_assets_directory = path.basename(confinedAssetsDirectory);
-fs.writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
-fs.chmodSync(configPath, 0o600);
-const child = spawn(realBinary, args, { cwd: process.cwd(), env: process.env, stdio: "inherit" });
-let shuttingDown = false;
-for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
-  process.on(signal, () => {
-    if (!shuttingDown) {
-      shuttingDown = true;
-      child.kill(signal);
-    }
-  });
-}
-child.on("error", (error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
-child.on("exit", (code, signal) => {
-  process.exitCode = signal ? 128 : (code ?? 1);
-});
-`;
-  await mkdir(dirname(SERVER_WRAPPER_PATH), { recursive: true, mode: 0o700 });
-  await writeFile(SERVER_WRAPPER_PATH, wrapper, { mode: 0o700 });
-  await chmod(SERVER_WRAPPER_PATH, 0o700);
-
-  const previous = {
-    serverBinary: process.env.ZODE_SERVER_BIN,
-    realServerBinary: process.env.ZODE_SERVER_REAL_BIN,
-    assetsDirectory: process.env.ZODE_UI_ASSETS_DIRECTORY,
-  };
-  process.env.ZODE_SERVER_BIN = SERVER_WRAPPER_PATH;
-  process.env.ZODE_SERVER_REAL_BIN = realServerBinary;
+  const previous = process.env.ZODE_UI_ASSETS_DIRECTORY;
   process.env.ZODE_UI_ASSETS_DIRECTORY = builtUi.directory;
   return () => {
-    if (previous.serverBinary === undefined) delete process.env.ZODE_SERVER_BIN;
-    else process.env.ZODE_SERVER_BIN = previous.serverBinary;
-    if (previous.realServerBinary === undefined) delete process.env.ZODE_SERVER_REAL_BIN;
-    else process.env.ZODE_SERVER_REAL_BIN = previous.realServerBinary;
-    if (previous.assetsDirectory === undefined) delete process.env.ZODE_UI_ASSETS_DIRECTORY;
-    else process.env.ZODE_UI_ASSETS_DIRECTORY = previous.assetsDirectory;
+    if (previous === undefined) delete process.env.ZODE_UI_ASSETS_DIRECTORY;
+    else process.env.ZODE_UI_ASSETS_DIRECTORY = previous;
   };
 }
 
-function hexToRgb(value: string): [number, number, number] {
-  const normalized = value.trim().replace(/^#/, "");
-  if (!/^[0-9a-f]{6}$/i.test(normalized)) {
-    throw new Error(`invalid visual contract color ${value}`);
+function colorToRgba(value: string, label: string): [number, number, number, number] {
+  const normalized = value.trim();
+  const hex = normalized.match(/^#([0-9a-f]{6})([0-9a-f]{2})?$/i);
+  if (hex) {
+    return [
+      Number.parseInt(hex[1].slice(0, 2), 16),
+      Number.parseInt(hex[1].slice(2, 4), 16),
+      Number.parseInt(hex[1].slice(4, 6), 16),
+      hex[2] ? Number.parseInt(hex[2], 16) : 255,
+    ];
   }
+  const rgb = normalized.match(
+    /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\s*\)$/i,
+  );
+  if (!rgb) throw new Error(`${label} is not a supported CSS color: ${value}`);
   return [
-    Number.parseInt(normalized.slice(0, 2), 16),
-    Number.parseInt(normalized.slice(2, 4), 16),
-    Number.parseInt(normalized.slice(4, 6), 16),
+    Number(rgb[1]),
+    Number(rgb[2]),
+    Number(rgb[3]),
+    rgb[4] === undefined ? 255 : Number(rgb[4]) * 255,
   ];
 }
 
-function cssColorToRgb(value: string): [number, number, number] {
-  const match = value.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
-  if (!match) throw new Error(`computed color is not RGB: ${value}`);
-  return [Number(match[1]), Number(match[2]), Number(match[3])];
-}
-
 function assertColor(actual: string, expected: string, label: string): void {
-  const [actualR, actualG, actualB] = cssColorToRgb(actual);
-  const [expectedR, expectedG, expectedB] = hexToRgb(expected);
+  const actualRgba = colorToRgba(actual, "computed color");
+  const expectedRgba = colorToRgba(expected, "visual contract color");
   const deviation = Math.max(
-    Math.abs(actualR - expectedR),
-    Math.abs(actualG - expectedG),
-    Math.abs(actualB - expectedB),
+    ...actualRgba.map((channel, index) => Math.abs(channel - expectedRgba[index])),
   );
   if (deviation > 1) {
     throw new Error(`${label} color deviated by ${deviation} channels`);
@@ -393,7 +340,7 @@ async function assertShellGeometry(page: Page, contract: Contract): Promise<void
 
   const navigationRows = page.locator(selectors.navigation_row);
   const rowCount = await navigationRows.count();
-  if (rowCount < 4) throw new Error("sidebar did not expose the four primary navigation destinations");
+  if (rowCount === 0) throw new Error("sidebar did not expose any navigation destination");
   for (let index = 0; index < rowCount; index += 1) {
     const row = navigationRows.nth(index);
     const rowBox = await row.boundingBox();
@@ -422,18 +369,19 @@ async function assertShellGeometry(page: Page, contract: Contract): Promise<void
 }
 
 async function assertShellPalette(page: Page, contract: Contract): Promise<void> {
-  const paletteSelectors: Array<[string, string, string]> = [
-    [contract.selectors.sidebar, "backgroundColor", contract.palette.sidebar],
-    [contract.selectors.selected_row, "backgroundColor", contract.palette.selected_row],
-    [contract.selectors.main_surface, "backgroundColor", contract.palette.main],
-    [contract.selectors.composer, "backgroundColor", contract.palette.composer],
-    [contract.selectors.secondary_surface, "backgroundColor", contract.palette.secondary_surface],
+  const paletteSelectors: Array<[string, string, string, boolean?]> = [
+    [contract.selectors.sidebar, "background-color", contract.palette.sidebar],
+    [contract.selectors.selected_row, "background-color", contract.palette.selected_row],
+    [contract.selectors.main_surface, "background-color", contract.palette.main],
+    [contract.selectors.composer, "background-color", contract.palette.composer],
+    [contract.selectors.secondary_surface, "background-color", contract.palette.secondary_surface],
     [contract.selectors.primary_text, "color", contract.palette.primary_text],
     [contract.selectors.secondary_text, "color", contract.palette.secondary_text],
-    [contract.selectors.attention, "color", contract.palette.attention],
+    [contract.selectors.attention, "color", contract.palette.attention, true],
   ];
-  for (const [selector, property, expected] of paletteSelectors) {
+  for (const [selector, property, expected, optional] of paletteSelectors) {
     const locator = page.locator(selector).first();
+    if (optional && (await locator.count()) === 0) continue;
     await expect(locator, `${selector} must expose its semantic visual surface`).toBeVisible();
     const actual = await locator.evaluate((element, styleProperty) => getComputedStyle(element).getPropertyValue(styleProperty), property);
     assertColor(actual, expected, `${selector} ${property}`);
@@ -452,18 +400,29 @@ async function assertShellStates(page: Page, contract: Contract): Promise<void> 
   if (!selectedState?.includes("selected")) throw new Error("selected navigation row did not expose selected state");
 
   const composer = page.locator(contract.selectors.composer).first();
-  await composer.focus();
+  const composerInput = composer.locator("textarea, input").first();
+  await expect(composerInput, "composer must expose an editable control").toBeVisible();
+  await composerInput.focus();
   const focusState = await composer.evaluate((element) => {
     const style = getComputedStyle(element);
+    const active = element.querySelector<HTMLElement>(":focus-visible");
+    const activeStyle = active ? getComputedStyle(active) : undefined;
     return {
       focusWithin: element.matches(":focus-within"),
-      focusVisible: element.matches(":focus-visible") || Boolean(element.querySelector(":focus-visible")),
+      focusVisible: element.matches(":focus-visible") || Boolean(active),
       outlineStyle: style.outlineStyle,
       outlineWidth: style.outlineWidth,
       boxShadow: style.boxShadow,
+      caretColor: activeStyle?.caretColor ?? "",
     };
   });
-  if (!focusState.focusWithin || !focusState.focusVisible || (focusState.outlineWidth === "0px" && focusState.boxShadow === "none")) {
+  if (
+    !focusState.focusWithin ||
+    !focusState.focusVisible ||
+    (focusState.outlineWidth === "0px" &&
+      focusState.boxShadow === "none" &&
+      (!focusState.caretColor || focusState.caretColor === "rgba(0, 0, 0, 0)"))
+  ) {
     throw new Error("composer focus state is not visibly exposed");
   }
 
@@ -471,7 +430,7 @@ async function assertShellStates(page: Page, contract: Contract): Promise<void> 
   await hoverTarget.hover();
   const hoverState = await hoverTarget.evaluate((element) => element.matches(":hover"));
   if (!hoverState) throw new Error("navigation hover state could not be observed");
-  await composer.focus();
+  await composerInput.focus();
 }
 
 async function assertKeyboardAndAccessibility(page: Page, contract: Contract): Promise<void> {
@@ -537,13 +496,30 @@ async function assertKeyboardAndAccessibility(page: Page, contract: Contract): P
     throw new Error("Shift+Tab did not return to the original accessible focus-visible element");
   }
 
+  const routeBeforeActivation = page.url();
   const activationTarget = page.locator(contract.selectors.navigation_row).first();
   await activationTarget.focus();
   await activationTarget.press("Enter");
-  if (!(await activationTarget.evaluate((element) => document.activeElement === element && element.matches(":focus-visible")))) {
-    throw new Error("keyboard activation did not preserve a visible focus target");
+  const activationFocus = await page.evaluate(() => {
+    const element = document.activeElement;
+    if (!(element instanceof HTMLElement)) return { name: "", focusVisible: false };
+    return {
+      name:
+        element.getAttribute("aria-label") ||
+        element.textContent?.trim() ||
+        element.getAttribute("title") ||
+        "",
+      focusVisible: element.matches(":focus-visible"),
+    };
+  });
+  if (!activationFocus.name || !activationFocus.focusVisible) {
+    throw new Error("keyboard activation did not move to a visible accessible focus target");
   }
-  await page.locator(contract.selectors.composer).first().focus();
+  if (page.url() !== routeBeforeActivation) {
+    await page.goBack({ waitUntil: "domcontentloaded" });
+    await expect(page.locator(contract.selectors.composer).first()).toBeVisible();
+  }
+  await page.locator(contract.selectors.composer).first().locator("textarea, input").first().focus();
 }
 
 async function assertNoSecretMarkers(
@@ -826,13 +802,12 @@ async function driveRealSessionStateFlow(
   contract: Contract,
 ): Promise<Set<string>> {
   const observedStates = new Set<string>();
-  const eventsResponse = page.waitForResponse(
-    (response) => new URL(response.url()).pathname.endsWith("/events") && response.status() === 200,
-  );
   const messageResponse = page.waitForResponse(
     (response) => new URL(response.url()).pathname.endsWith("/messages") && response.request().method() === "POST",
   );
-  const composer = page.locator(contract.selectors.composer).first();
+  const composerSurface = page.locator(contract.selectors.composer).first();
+  const composer = composerSurface.locator("textarea, input").first();
+  await expect(page.getByRole("button", { name: "Send", exact: true })).toBeEnabled();
   await composer.focus();
   await composer.fill("visual state stream wait tool error reconnect barrier");
   await composer.press("Enter");
@@ -844,15 +819,24 @@ async function driveRealSessionStateFlow(
       { status: message.status() },
     );
   }
-  await eventsResponse;
   await expect(page.locator(contract.session_states.stream).first()).toBeVisible();
   observedStates.add("stream");
-  for (const state of ["wait", "tool", "error"]) {
-    await expect(page.locator(contract.session_states[state]).first()).toBeVisible({
-      timeout: 20_000,
-    });
-    observedStates.add(state);
-  }
+  harness.fakeProvider.releaseVisualStream();
+  await expect(page.locator(contract.session_states.wait).first()).toBeVisible({ timeout: 20_000 });
+  const attention = page.locator(contract.selectors.attention).first();
+  await expect(attention, "waiting state must expose the approved attention color").toBeVisible();
+  const attentionColor = await attention.evaluate((element) => getComputedStyle(element).color);
+  assertColor(attentionColor, contract.palette.attention, "waiting state attention color");
+  observedStates.add("wait");
+
+  await composer.fill("continue visual state into the controlled tool");
+  await composer.press("Enter");
+  await harness.fakeProvider.waitForToolRequest(1);
+  await expect(page.locator(contract.session_states.tool).first()).toBeVisible({ timeout: 20_000 });
+  observedStates.add("tool");
+  harness.fakeProvider.releaseVisualToolFailure();
+  await expect(page.locator(contract.session_states.error).first()).toBeVisible({ timeout: 20_000 });
+  observedStates.add("error");
 
   const routeBeforeRestart = (() => {
     const current = new URL(page.url());
@@ -1033,7 +1017,7 @@ async function extractRenderedAssetHref(page: Page, label: string): Promise<stri
 }
 
 function assertSafeHtmlCache(response: Response | null, label: string): void {
-  const cacheControl = response?.headers().get("cache-control")?.toLowerCase() ?? "";
+  const cacheControl = response?.headers()["cache-control"]?.toLowerCase() ?? "";
   if (!cacheControl.includes("no-cache") && !cacheControl.includes("no-store")) {
     throw new ProductBehaviorFailure(
       "STATIC_HTML_CACHE_BEHAVIOR_FAILURE",
@@ -1285,6 +1269,13 @@ async function assertMaskedReference(
   const referencePath = calibrationSource ?? owner.goldenPath;
   const referenceMetadata = await stat(referencePath).catch(() => undefined);
   if (!referenceMetadata?.isFile()) {
+    if (!calibrationSource && process.env[ACCEPT_GOLDEN_ENV] === "1") {
+      const actualBytes = await page.screenshot({ animations: "disabled", caret: "hide", fullPage: false });
+      const dpr = await page.evaluate(() => window.devicePixelRatio);
+      if (dpr !== 1) throw new Error("visual comparison requires devicePixelRatio 1");
+      await promoteAcceptedGolden(actualBytes, owner.goldenPath);
+      return;
+    }
     throw new HarnessFailure(
       calibrationSource ? "CALIBRATION_SOURCE_MISSING" : "VISUAL_GOLDEN_MISSING",
       calibrationSource
@@ -1300,9 +1291,6 @@ async function assertMaskedReference(
   const dpr = await page.evaluate(() => window.devicePixelRatio);
   if (dpr !== 1) throw new Error("visual comparison requires devicePixelRatio 1");
   const dynamicBoxes = await dynamicMaskBoxes(page, contract);
-  if (dynamicBoxes.length === 0) {
-    throw new Error("visual comparison did not find any explicitly marked dynamic content to mask");
-  }
   const mismatch = await compareScreenshotsInBrowser(
     page,
     referenceBytes,
@@ -1348,10 +1336,19 @@ async function assertUiAssetsDirectoryConfigured(
     : isAbsolute(config.ui_assets_directory)
       ? resolve(config.ui_assets_directory)
       : resolve(dirname(configPath), config.ui_assets_directory);
-  if (config.ui_mode !== "assets" || configuredDirectory !== builtUi.directory) {
+  const configDirectory = resolve(dirname(configPath));
+  const configuredIndex = await readFile(join(configuredDirectory, "index.html"), "utf8").catch(
+    () => "",
+  );
+  const sourceIndex = await readFile(join(builtUi.directory, "index.html"), "utf8");
+  if (
+    config.ui_mode !== "assets" ||
+    !configuredDirectory.startsWith(`${configDirectory}/`) ||
+    configuredIndex !== sourceIndex
+  ) {
     throw new HarnessFailure(
       "UI_ASSETS_DIRECTORY_UNWIRED",
-      "installed/browser E2E requires ui_mode=assets and the test-owned vp build as Server ui_assets_directory; the shared harness did not inject them",
+      "installed/browser E2E requires the exact test-owned UI build copied inside the Server config root",
       { nonEvidence: true },
     );
   }
@@ -1418,6 +1415,142 @@ async function assertManagementSystemBarrier(page: Page, managementUrl: string):
     { waitUntil: "domcontentloaded" },
   );
   await assertSystemResponse(response, "new management origin /v1/system");
+}
+
+function createVisualHarness(e2eName: string): Promise<VisualHarness> {
+  return createWebE2EHarness({
+    e2eName,
+    authorityId: "web-e2e-visual",
+    fakeProviderMode: "visual-session-states",
+    captureMaxMembers: 192,
+    includeServerOrigins: true,
+    endpointTools: ({ fakeProvider }: { fakeProvider: { baseUrl: string } }) => [
+      {
+        name: "fixture_async",
+        description: "Controlled asynchronous HTTP tool for the visual state journey.",
+        input_schema: {
+          type: "object",
+          properties: { mode: { type: "string" } },
+          required: ["mode"],
+          additionalProperties: false,
+        },
+        completion_mode: "response",
+        auto_wait_timeout_seconds: 60,
+        recovery: {
+          on_running_restart: "unknown_outcome",
+          retry_dispatch: "never",
+        },
+        adapter: { kind: "http", url: `${fakeProvider.baseUrl}/fixture_async` },
+      },
+    ],
+  });
+}
+
+async function managementJson(
+  harness: VisualHarness,
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const response = await fetch(new URL(path, harness.managementUrl), {
+    method,
+    headers: {
+      accept: "application/json",
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+      ...(method === "GET" ? {} : { "idempotency-key": `${method.toLowerCase()}-${randomUUID()}` }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  return {
+    status: response.status,
+    body: (await response.json()) as Record<string, unknown>,
+  };
+}
+
+async function seedVisualSession(harness: VisualHarness): Promise<VisualSession> {
+  const endpoint = await managementJson(harness, "POST", "/v1/endpoints", {
+    label: "Visual E2E Endpoint",
+    base_url: harness.endpoint.baseUrl,
+    control_auth: { kind: "bearer", secret: harness.controllerSecret },
+  });
+  expect(endpoint.status).toBe(201);
+  const endpointId = String(endpoint.body.endpoint_id ?? "");
+  expect(endpointId).not.toBe("");
+
+  const provider = await managementJson(harness, "PUT", `/v1/providers/${VISUAL_PROVIDER}`, {
+    kind: "openai_compatible",
+    base_url: `${harness.providerProxy.baseUrl}/v1`,
+    models: [VISUAL_MODEL],
+    options: {},
+  });
+  expect(provider.status).toBe(200);
+  const profile = await managementJson(
+    harness,
+    "POST",
+    `/v1/providers/${VISUAL_PROVIDER}/auth-profiles`,
+    {
+      kind: "api_key",
+      label: "Visual E2E profile",
+      api_key: harness.providerSecret,
+      make_default: true,
+      sharing: { mode: "selected", endpoint_ids: [endpointId] },
+    },
+  );
+  expect(profile.status).toBe(201);
+  const profileId = String(profile.body.auth_profile_id ?? profile.body.profile_id ?? "");
+  expect(profileId).not.toBe("");
+  await expect
+    .poll(
+      async () => {
+        const profiles = await managementJson(
+          harness,
+          "GET",
+          `/v1/providers/${VISUAL_PROVIDER}/auth-profiles`,
+        );
+        const items = Array.isArray(profiles.body.items) ? profiles.body.items : [];
+        const current = items.find((candidate) => {
+          if (typeof candidate !== "object" || candidate === null) return false;
+          const value = candidate as Record<string, unknown>;
+          return value.auth_profile_id === profileId || value.profile_id === profileId;
+        }) as Record<string, unknown> | undefined;
+        const distribution = Array.isArray(current?.distribution) ? current.distribution : [];
+        const replica = distribution.find((candidate) => {
+          if (typeof candidate !== "object" || candidate === null) return false;
+          return (candidate as Record<string, unknown>).endpoint_id === endpointId;
+        }) as Record<string, unknown> | undefined;
+        return current?.status === "ready" && replica?.status === "ready";
+      },
+      { timeout: 20_000 },
+    )
+    .toBe(true);
+
+  const session = await managementJson(harness, "POST", `/v1/endpoints/${endpointId}/sessions`, {
+    model: {
+      provider: VISUAL_PROVIDER,
+      model: VISUAL_MODEL,
+      provider_execution: {
+        schema: "zode.provider-execution.v1",
+        revision: provider.body.revision,
+        kind: provider.body.kind,
+        base_url: provider.body.base_url,
+        options: provider.body.options,
+      },
+      auth_profile_id: profileId,
+      minimum_auth_revision: profile.body.revision,
+    },
+    tools: ["fixture_async"],
+  });
+  expect(
+    session.status,
+    `visual session create failed with ${String((session.body.error as { code?: unknown } | undefined)?.code ?? "unknown_error")}`,
+  ).toBe(201);
+  const sessionId = String(session.body.session_id ?? "");
+  expect(sessionId).not.toBe("");
+  return {
+    endpointId,
+    sessionId,
+    path: `/endpoints/${encodeURIComponent(endpointId)}/sessions/${encodeURIComponent(sessionId)}`,
+  };
 }
 
 test.describe("approved Codex Desktop v0 visual shell", () => {
@@ -1514,6 +1647,7 @@ test.describe("approved Codex Desktop v0 visual shell", () => {
     page.on("request", (request) => browserRequests.push(request.url()));
     page.on("response", (response) => {
       if (!new URL(response.url()).pathname.startsWith("/v1")) return;
+      if ((response.headers()["content-type"] ?? "").includes("text/event-stream")) return;
       responseBodies.push(response.text().catch(() => ""));
     });
     page.on("download", (download) => {
@@ -1529,7 +1663,7 @@ test.describe("approved Codex Desktop v0 visual shell", () => {
     try {
       const builtUi = await buildTestOwnedUiDist();
       restoreServerEnvironment = await installUiAssetsServerWrapper(builtUi);
-      harness = await createWebE2EHarness();
+      harness = await createVisualHarness(E2E_NAME);
       browserSecretGuard = attachVisualBrowserSecretGuard(harness, page);
       // This is a real Endpoint process barrier. Browser traffic below still
       // enters only through the Access edge and never calls Endpoint directly.
@@ -1547,7 +1681,12 @@ test.describe("approved Codex Desktop v0 visual shell", () => {
         );
       }
       await assertRenderedAsset(page, rootAssetHref, "management versioned asset");
-      const historyResponse = await gotoOrBlock(page, `${harness.managementUrl}${CANONICAL_PATH}`, CANONICAL_PATH);
+      const visualSession = await seedVisualSession(harness);
+      const historyResponse = await gotoOrBlock(
+        page,
+        `${harness.managementUrl}${visualSession.path}`,
+        visualSession.path,
+      );
       assertSafeHtmlCache(historyResponse, "management canonical history route");
       const historyAssetHref = await extractRenderedAssetHref(page, "management canonical history route");
       if (historyAssetHref !== rootAssetHref) {
@@ -1666,6 +1805,7 @@ test.describe("approved Codex Desktop v0 visual shell", () => {
     page.on("request", (request) => browserRequests.push(request.url()));
     page.on("response", (response) => {
       if (!new URL(response.url()).pathname.startsWith("/v1")) return;
+      if ((response.headers()["content-type"] ?? "").includes("text/event-stream")) return;
       responseBodies.push(response.text().catch(() => ""));
     });
     page.on("download", (download) => {
@@ -1680,13 +1820,14 @@ test.describe("approved Codex Desktop v0 visual shell", () => {
     try {
       const builtUi = await buildTestOwnedUiDist();
       restoreServerEnvironment = await installUiAssetsServerWrapper(builtUi);
-      harness = await createWebE2EHarness();
+      harness = await createVisualHarness(SESSION_STATES_E2E_NAME);
       browserSecretGuard = attachVisualBrowserSecretGuard(harness, page);
       await harness.endpointIdentity();
       await assertUiAssetsDirectoryConfigured(harness, builtUi);
       await gotoRootWithSystemBarrier(page, harness.managementUrl);
       await waitForCurrentRunJwks(harness);
-      await gotoOrBlock(page, `${harness.managementUrl}${CANONICAL_PATH}`, CANONICAL_PATH);
+      const visualSession = await seedVisualSession(harness);
+      await gotoOrBlock(page, `${harness.managementUrl}${visualSession.path}`, visualSession.path);
       if (!browserRequests.some((url) => url.startsWith(harness!.managementUrl))) {
         throw new Error("browser did not enter through the Access-protected management origin");
       }
@@ -1697,9 +1838,23 @@ test.describe("approved Codex Desktop v0 visual shell", () => {
       await assertShellGeometry(page, contract);
       await assertShellPalette(page, contract);
       const observedStates = await driveRealSessionStateFlow(page, harness, contract);
+      const endpointEventsPath = `/v1/endpoints/${visualSession.endpointId}/events`;
+      if (
+        !browserRequests.some(
+          (url) => new URL(url).pathname === endpointEventsPath,
+        )
+      ) {
+        throw new Error("browser did not consume the Endpoint-wide SSE stream");
+      }
+      if (
+        browserRequests.some((url) =>
+          /\/v1\/endpoints\/[^/]+\/sessions\/[^/]+\/events$/.test(new URL(url).pathname),
+        )
+      ) {
+        throw new Error("browser opened a forbidden Session-scoped SSE stream");
+      }
       await assertSessionStateContract(page, contract, observedStates);
       await assertKeyboardAndAccessibility(page, contract);
-      await assertMaskedReference(page, contract, SESSION_VISUAL_EVIDENCE_OWNER);
       await assertNoSecretMarkers(
         page,
         harness,

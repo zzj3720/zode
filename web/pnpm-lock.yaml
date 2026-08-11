@@ -23,6 +23,9 @@ importers:
       '@phosphor-icons/web':
         specifier: ^2.1.2
         version: 2.1.2
+      '@preact/signals-core':
+        specifier: 1.14.4
+        version: 1.14.4
       '@preact/signals-react':
         specifier: ^3.2.1
         version: 3.12.0(react@19.2.8)

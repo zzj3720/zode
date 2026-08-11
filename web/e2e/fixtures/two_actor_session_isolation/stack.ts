@@ -6,6 +6,12 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { buildUiAssets } = require("../../support/harness.cjs") as {
+  buildUiAssets: (directory: string, options?: { sourceDirectory?: string }) => Promise<void>;
+};
 
 export type AccessActor = "actor-a" | "actor-b";
 
@@ -17,6 +23,7 @@ export const ASSISTANT_MARKER = "TWO_ACTOR_ISOLATION_OK";
 export const SERVER_AUTHORITY = "two-actor-server-authority";
 export const ENDPOINT_AUTHORITY = SERVER_AUTHORITY;
 export const ACCESS_AUDIENCE = "zode-web-two-actor-e2e";
+const MANAGEMENT_ORIGIN = "https://management.test";
 
 const READY_TIMEOUT_MS = 15_000;
 const CHILD_STOP_TIMEOUT_MS = 5_000;
@@ -146,7 +153,7 @@ function digestBytes(value: Buffer): string {
 }
 
 function isSessionEndpointPath(path: string): boolean {
-  return path === "/v1/sessions" || /^\/v1\/sessions\/[^/]+(?:\/messages|\/events)?$/.test(path);
+  return path === "/v1/events" || path === "/v1/sessions" || /^\/v1\/sessions\/[^/]+(?:\/messages)?$/.test(path);
 }
 
 function normalizeText(value: string, dynamicIds: string[]): string {
@@ -252,6 +259,7 @@ async function closeServer(server: Server): Promise<void> {
   if (!server.listening) return;
   await new Promise<void>((resolveClose, reject) => {
     server.close((error) => (error ? reject(error) : resolveClose()));
+    server.closeAllConnections();
   });
 }
 
@@ -372,10 +380,10 @@ async function startAccessEdge(access: AccessFixture, actor: AccessActor, initia
   const server = createServer((incoming, outgoing) => {
     const destination = new URL(incoming.url ?? "/", `${target}/`);
     const headers = hopByHopHeaders(incoming.headers);
-    headers.host = destination.host;
+    headers.host = new URL(MANAGEMENT_ORIGIN).host;
     headers["cf-access-jwt-assertion"] = access.sign(actor);
-    if (headers.origin) headers.origin = target;
-    if (headers.referer) headers.referer = `${target}/`;
+    if (headers.origin) headers.origin = MANAGEMENT_ORIGIN;
+    if (headers.referer) headers.referer = `${MANAGEMENT_ORIGIN}/`;
     const upstream = httpRequest(destination, {
       method: incoming.method,
       headers,
@@ -592,6 +600,7 @@ async function startEndpointTransport(
         else outgoing.destroy();
         return;
       }
+      finish(false, observation.status || 502, Buffer.concat(responseChunks));
       outgoing.destroy();
     });
     if (body.length > 0) upstream.write(body);
@@ -675,6 +684,7 @@ async function startProviderFixture(): Promise<Provider> {
       ].join("");
       responseText(response, 200, "text/event-stream", body);
     });
+    request.resume();
   });
   const baseUrl = await listen(server);
   return {
@@ -796,7 +806,6 @@ async function writeEndpointConfig(root: string, providerOrigin: string): Promis
     }],
     runtime: {
       tool_foreground_ms: 100,
-      max_rounds_per_activation: 8,
       model_step_max_attempts: 1,
       model_retry_base_ms: 1,
       model_retry_max_ms: 10,
@@ -812,15 +821,26 @@ async function writeEndpointConfig(root: string, providerOrigin: string): Promis
   return { config, database };
 }
 
-async function writeServerConfig(root: string, access: AccessFixture, subjectKey: string, controlDatabase: string, secretDirectory: string): Promise<string> {
+async function writeServerConfig(
+  root: string,
+  access: AccessFixture,
+  callbackOrigin: string,
+  uiAssetsDirectory: string,
+  subjectKey: string,
+  controlDatabase: string,
+  secretDirectory: string,
+): Promise<string> {
   await mkdir(secretDirectory, { recursive: true });
   const config = join(root, "server-config.json");
   await writeFile(config, json({
     schema: "zode.server-config.v1",
     listen: "127.0.0.1:0",
+    management_origin: MANAGEMENT_ORIGIN,
+    callback_origin: callbackOrigin,
     server_authority_id: SERVER_AUTHORITY,
     deployment: "server_only",
-    ui_mode: "api_only",
+    ui_mode: "assets",
+    ui_assets_directory: uiAssetsDirectory,
     control_database: controlDatabase,
     secret_directory: secretDirectory,
     access: {
@@ -992,6 +1012,8 @@ export async function createTwoActorStack(options: TwoActorStackOptions = {}): P
 
   const access = await startAccessFixture();
   const provider = await startProviderFixture();
+  const uiAssetsDirectory = join(initialServerRoot, "ui");
+  await buildUiAssets(uiAssetsDirectory);
   const endpointConfig = await writeEndpointConfig(endpointRoot, provider.baseUrl);
   const endpointBinary = childExecutable("ZODE_ENDPOINT_BIN", "target/debug/zode");
   const serverBinary = childExecutable("ZODE_SERVER_BIN", "server/target/debug/zode-server");
@@ -1004,7 +1026,15 @@ export async function createTwoActorStack(options: TwoActorStackOptions = {}): P
   const serverRoots = [initialServerRoot];
   const initialServerDatabase = join(initialServerRoot, "server.sqlite3");
   const initialServerSecrets = join(initialServerRoot, "server-secrets");
-  const initialServerConfig = await writeServerConfig(initialServerRoot, access, subjectKey, initialServerDatabase, initialServerSecrets);
+  const initialServerConfig = await writeServerConfig(
+    initialServerRoot,
+    access,
+    provider.baseUrl,
+    uiAssetsDirectory,
+    subjectKey,
+    initialServerDatabase,
+    initialServerSecrets,
+  );
   const server = await spawnReady(serverBinary, ["--config", initialServerConfig], "ZODE_SERVER_READY ");
   const actorA = await startAccessEdge(access, "actor-a", server.baseUrl);
   const actorB = await startAccessEdge(access, "actor-b", server.baseUrl);
@@ -1036,7 +1066,17 @@ export async function createTwoActorStack(options: TwoActorStackOptions = {}): P
       serverRoots.push(freshRoot);
       const database = join(freshRoot, "server.sqlite3");
       const secrets = join(freshRoot, "server-secrets");
-      const config = await writeServerConfig(freshRoot, access, subjectKey, database, secrets);
+      const freshUiAssets = join(freshRoot, "ui");
+      await buildUiAssets(freshUiAssets, { sourceDirectory: uiAssetsDirectory });
+      const config = await writeServerConfig(
+        freshRoot,
+        access,
+        provider.baseUrl,
+        freshUiAssets,
+        subjectKey,
+        database,
+        secrets,
+      );
       const restarted = await spawnReady(serverBinary, ["--config", config], "ZODE_SERVER_READY ");
       stack.server = restarted;
       actorA.setTarget(restarted.baseUrl);

@@ -49,7 +49,7 @@ const REQUIRED_SURFACE = [
   'web/tsconfig.json',
   'web/index.html',
   'web/src',
-  'web/src/main.ts',
+  'web/src/main.tsx',
   'web/vite.config.ts',
   'release/driver',
   'release/build.cjs',

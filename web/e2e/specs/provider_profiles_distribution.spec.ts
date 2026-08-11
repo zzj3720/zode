@@ -9,7 +9,7 @@ import {
   type ServerResponse,
 } from 'node:http';
 import { readFileSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,6 +18,21 @@ import { createInterface } from 'node:readline';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Readable } from 'node:stream';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const { buildUiAssets } = require('../support/harness.cjs') as {
+  buildUiAssets: (directory: string) => Promise<void>;
+};
+const { selectExecutionProfile, selectRadixValue } = require('../support/radix.cjs') as {
+  selectExecutionProfile: (
+    page: Page,
+    trigger: Locator,
+    model: string,
+    profileLabel: string,
+  ) => Promise<void>;
+  selectRadixValue: (page: Page, trigger: Locator, value: string) => Promise<void>;
+};
 
 type Scenario = {
   schema: string;
@@ -56,6 +71,8 @@ type Scenario = {
     firstFailureRule: string;
   };
 };
+
+const MANAGEMENT_ORIGIN = 'https://management.test';
 
 type RouteContract = {
   method: string;
@@ -157,6 +174,14 @@ async function expectResponseAfter(
   expect(new URL(response.url()).pathname, `${label} path`).toBe(contract.path);
   if (contract.path === '/v1/providers' && response.status() === 404) {
     throw new ShallowNonEvidence404(label);
+  }
+  if (response.status() !== contract.status) {
+    const body = await response.json().catch(() => undefined) as JsonObject | undefined;
+    const error = body && typeof body.error === 'object' && body.error !== null
+      ? body.error as JsonObject
+      : undefined;
+    const code = typeof error?.code === 'string' ? ` (${error.code})` : '';
+    throw new Error(`${label} status: expected ${contract.status}, received ${response.status()}${code}`);
   }
   expect(response.status(), `${label} status`).toBe(contract.status);
   return response;
@@ -368,7 +393,9 @@ class AccessEdge {
     }
     const target = new URL(request.url ?? '/', this.targetOrigin);
     const headers = safeForwardHeaders(request.headers);
-    headers.host = new URL(this.baseUrl).host;
+    headers.host = new URL(MANAGEMENT_ORIGIN).host;
+    if (headers.origin) headers.origin = MANAGEMENT_ORIGIN;
+    if (headers.referer) headers.referer = `${MANAGEMENT_ORIGIN}/`;
     headers['cf-access-jwt-assertion'] = this.access.token(this.actor);
     if (body.length > 0) headers['content-length'] = String(body.length);
     const upstream = httpRequest(
@@ -719,11 +746,11 @@ async function expectEndpointRequest(
 ): Promise<void> {
   await expect
     .poll(
-      () => proxy.requests.slice(after).filter((request) => endpointExchangeMatches(request, contract)).length,
+      () => proxy.requests.filter((request) => endpointExchangeMatches(request, contract)).slice(after).length,
       { timeout: ACTION_TIMEOUT_MS },
     )
     .toBeGreaterThan(0);
-  const request = proxy.requests.slice(after).find((item) => endpointExchangeMatches(item, contract));
+  const request = proxy.requests.filter((item) => endpointExchangeMatches(item, contract)).at(after);
   if (!request) throw new Error(`${label} request was not observed`);
   expect(request.method, `${label} method`).toBe(contract.method);
   expect(request.path, `${label} path`).toBe(contract.path);
@@ -737,11 +764,11 @@ async function expectEndpointResponse(
 ): Promise<void> {
   await expect
     .poll(
-      () => proxy.responses.slice(after).filter((response) => endpointExchangeMatches(response, contract)).length,
+      () => proxy.responses.filter((response) => endpointExchangeMatches(response, contract)).slice(after).length,
       { timeout: ACTION_TIMEOUT_MS },
     )
     .toBeGreaterThan(0);
-  const response = proxy.responses.slice(after).find((item) => endpointExchangeMatches(item, contract));
+  const response = proxy.responses.filter((item) => endpointExchangeMatches(item, contract)).at(after);
   if (!response) throw new Error(`${label} response was not observed`);
   expect(response.method, `${label} method`).toBe(contract.method);
   expect(response.path, `${label} path`).toBe(contract.path);
@@ -801,7 +828,6 @@ async function writeEndpointConfig(
     ],
     runtime: {
       tool_foreground_ms: 100,
-      max_rounds_per_activation: 8,
       model_step_max_attempts: 1,
       model_retry_base_ms: 1,
       model_retry_max_ms: 10,
@@ -817,7 +843,13 @@ async function writeEndpointConfig(
   return configPath;
 }
 
-async function writeServerConfig(root: string, access: AccessFixture): Promise<string> {
+async function writeServerConfig(
+  root: string,
+  access: AccessFixture,
+  callbackOrigin: string,
+  uiAssetsDirectory: string,
+  oauthProviderOrigin: string,
+): Promise<string> {
   const database = join(root, 'server.sqlite3');
   const secretDirectory = join(root, 'server-secrets');
   const subjectKey = join(root, 'subject.key');
@@ -828,8 +860,12 @@ async function writeServerConfig(root: string, access: AccessFixture): Promise<s
   await writePrivateJson(configPath, {
     schema: 'zode.server-config.v1',
     listen: '127.0.0.1:0',
+    management_origin: MANAGEMENT_ORIGIN,
+    callback_origin: callbackOrigin,
     server_authority_id: SERVER_AUTHORITY,
     deployment: 'server_only',
+    ui_mode: 'assets',
+    ui_assets_directory: uiAssetsDirectory,
     control_database: database,
     secret_directory: secretDirectory,
     access: {
@@ -839,6 +875,18 @@ async function writeServerConfig(root: string, access: AccessFixture): Promise<s
       subject_key_file: subjectKey,
       subject_key_version: 1,
     },
+    provider_auth_adapters: [
+      {
+        provider: scenario.provider,
+        kind: 'oauth2_authorization_code_pkce',
+        authorization_endpoint: `${oauthProviderOrigin}/oauth/authorize`,
+        token_endpoint: `${oauthProviderOrigin}/oauth/token`,
+        client_id: 'zode-provider-profiles-e2e',
+        client_secret_file: null,
+        scopes: ['models.execute'],
+        refresh_recovery: 'same_operation_id_idempotent',
+      },
+    ],
   });
   return configPath;
 }
@@ -968,7 +1016,11 @@ class ProviderDistributionEnvironment {
     this.recorder = recorder;
   }
 
-  static async start(secretMarkers: string[], owner: string): Promise<ProviderDistributionEnvironment> {
+  static async start(
+    secretMarkers: string[],
+    owner: string,
+    endpointControlSecrets: readonly string[],
+  ): Promise<ProviderDistributionEnvironment> {
     const serverBinary =
       process.env.ZODE_SERVER_BIN ??
       process.env.CARGO_BIN_EXE_zode_server ??
@@ -993,10 +1045,9 @@ class ProviderDistributionEnvironment {
       ZODE_WEB_E2E_OAUTH_FIXTURE_ORIGIN: oauthProvider.origin,
     };
     try {
-      for (const [index, endpointLabel] of ['Endpoint A', 'Endpoint B'].entries()) {
+      for (const [index, controlSecret] of endpointControlSecrets.entries()) {
         const endpointRoot = join(root, `endpoint-${index + 1}`);
         const endpointDatabase = join(endpointRoot, 'endpoint.sqlite3');
-        const controlSecret = `web-e2e-controller-${index + 1}-${randomUUID()}`;
         const configPath = await writeEndpointConfig(
           endpointRoot,
           endpointDatabase,
@@ -1014,9 +1065,16 @@ class ProviderDistributionEnvironment {
         const proxy = new EndpointProxy(endpoint.baseUrl);
         await proxy.start();
         environment.endpointProxies.push(proxy);
-        void endpointLabel;
       }
-      const serverConfig = await writeServerConfig(root, access);
+      const uiAssetsDirectory = join(root, 'ui');
+      await buildUiAssets(uiAssetsDirectory);
+      const serverConfig = await writeServerConfig(
+        root,
+        access,
+        recorder.baseUrl,
+        uiAssetsDirectory,
+        oauthProvider.origin,
+      );
       environment.server = await spawnReady(
         serverBinary,
         ['--config', serverConfig],
@@ -1158,11 +1216,20 @@ async function openActorBrowserSession(
 }
 
 function profileCard(page: Page, label: string): Locator {
-  return page.getByRole('article', { name: new RegExp(escapeRegex(label)) });
+  return page
+    .locator('.profile-row')
+    .filter({ has: page.getByRole('button', { name: 'Delete profile', exact: true }) })
+    .filter({ hasText: label });
+}
+
+function resourceArticle(page: Page, heading: string): Locator {
+  return page.getByRole('article').filter({
+    has: page.getByRole('heading', { name: heading, exact: true }),
+  });
 }
 
 function distributionRow(card: Locator, endpointLabel: string): Locator {
-  return card.getByRole('group', { name: new RegExp(escapeRegex(endpointLabel)) });
+  return card.filter({ hasText: endpointLabel });
 }
 
 type ProfileResource = {
@@ -1188,8 +1255,8 @@ async function expectDistributionStatus(
     )
     .toMatch(new RegExp(`\\b${escapeRegex(status)}\\b`, 'i'));
   await browserRouteLedger(page).expectAll(
-    resolveRoute(seamMatrix.replicas, { profile_id: profile.profileId }),
-    `replica state for ${profile.profileId}`,
+    resolveRoute(seamMatrix.profileList, { provider: scenario.provider }),
+    `profile distribution projection for ${profile.profileId}`,
   );
 }
 
@@ -1259,23 +1326,37 @@ async function gotoProvidersWithBootstrap(
       after,
     );
   }
-  await expect(page.getByRole('heading', { name: 'Providers' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Providers', exact: true })).toBeVisible();
 }
 
 async function openProviders(page: Page): Promise<void> {
+  const heading = page.getByRole('heading', { name: 'Providers', exact: true });
+  if (await heading.isVisible()) return;
   const ledger = browserRouteLedger(page);
   const after = ledger.mark();
-  await page.getByRole('link', { name: 'Providers' }).click();
+  await openManagementPage(page, 'Providers');
   await ledger.expectNext(resolveRoute(seamMatrix.bootstrap.providers), 'providers navigation', after);
-  await expect(page.getByRole('heading', { name: 'Providers' })).toBeVisible();
+  await expect(heading).toBeVisible();
 }
 
 async function openEndpoints(page: Page): Promise<void> {
+  const heading = page.getByRole('heading', { name: 'Endpoints', exact: true });
+  if (await heading.isVisible()) return;
   const ledger = browserRouteLedger(page);
   const after = ledger.mark();
-  await page.getByRole('link', { name: 'Endpoints' }).click();
+  await openManagementPage(page, 'Endpoints');
   await ledger.expectNext(resolveRoute(seamMatrix.endpointCatalog.read), 'Endpoint catalog read', after);
-  await expect(page.getByRole('heading', { name: 'Endpoints' })).toBeVisible();
+  await expect(heading).toBeVisible();
+}
+
+async function openManagementPage(page: Page, name: 'Endpoints' | 'Providers'): Promise<void> {
+  const link = page.getByRole('link', { name, exact: true });
+  if (await link.isVisible()) {
+    await link.click();
+    return;
+  }
+  await page.getByRole('button', { name: 'Zode', exact: true }).click();
+  await page.getByRole('menuitem', { name, exact: true }).click();
 }
 
 async function addRemoteEndpoint(
@@ -1290,7 +1371,7 @@ async function addRemoteEndpoint(
   const dialog = page.getByRole('dialog', { name: 'Add remote Endpoint' });
   await dialog.getByLabel('Endpoint label').fill(label);
   await dialog.getByLabel('Endpoint URL').fill(baseUrl);
-  const secret = dialog.getByLabel('Controller credential (write-only)');
+  const secret = dialog.getByLabel(/^Controller credential(?: \(write-only\))?$/);
   await expect(secret).toHaveAttribute('type', 'password');
   await secret.fill(controlSecret);
   const response = await expectResponseAfter(
@@ -1304,7 +1385,9 @@ async function addRemoteEndpoint(
   expect(JSON.stringify(responseBody)).not.toContain(controlSecret);
   await expectEndpointCatalogBarrier(proxy, label);
   await expect(dialog).toBeHidden();
-  const endpoint = page.getByRole('article', { name: new RegExp(escapeRegex(label)) });
+  const endpoint = page.getByRole('article').filter({
+    has: page.getByRole('heading', { name: label, exact: true }),
+  });
   await expect(endpoint).toContainText(/online|ready/i);
   return String(responseBody.endpoint_id);
 }
@@ -1312,29 +1395,30 @@ async function addRemoteEndpoint(
 async function configureProvider(page: Page, recorderBaseUrl: string): Promise<void> {
   await openProviders(page);
   await page.getByRole('button', { name: 'Configure provider' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Configure provider' });
-  await dialog.getByLabel('Provider name').fill(scenario.provider);
-  await dialog.getByLabel('Provider kind').selectOption('openai_compatible');
-  await dialog.getByLabel('Execution base URL').fill(`${recorderBaseUrl}/v1`);
-  await dialog.getByLabel('Model').fill(scenario.model);
+  const editor = page.locator('form').filter({
+    has: page.getByRole('heading', { name: 'Configure provider', exact: true }),
+  });
+  await editor.getByLabel(/^(?:Provider name|Provider ID)$/).fill(scenario.provider);
+  const providerKind = editor.getByLabel('Provider kind');
+  if (await providerKind.count()) await providerKind.selectOption('openai_compatible');
+  await editor.getByLabel(/^(?:Execution base URL|Base URL)$/).fill(`${recorderBaseUrl}/v1`);
+  await editor.getByLabel(/^(?:Model|Models)$/).fill(scenario.model);
   const response = await expectResponseAfter(
     page,
     resolveRoute(seamMatrix.providerDescriptor, { provider: scenario.provider }),
-    () => dialog.getByRole('button', { name: 'Save provider' }).click(),
+    () => editor.getByRole('button', { name: 'Save provider' }).click(),
     'provider descriptor revision 1',
   );
   const responseBody = (await response.json()) as JsonObject;
   expect(responseBody.provider).toBe(scenario.provider);
   expect(Number(responseBody.revision)).toBe(1);
-  await expect(dialog).toBeHidden();
-  await expect(page.getByRole('article', { name: new RegExp(escapeRegex(scenario.provider)) })).toContainText(
-    scenario.model,
-  );
+  await expect(editor).toBeHidden();
+  await expect(resourceArticle(page, scenario.provider)).toContainText(scenario.model);
 }
 
 async function updateProviderDescriptor(page: Page, recorderBaseUrl: string, model: string): Promise<void> {
   await openProviders(page);
-  const provider = page.getByRole('article', { name: new RegExp(escapeRegex(scenario.provider)) });
+  const provider = resourceArticle(page, scenario.provider);
   await provider.getByRole('button', { name: 'Edit provider descriptor' }).click();
   const dialog = page.getByRole('dialog', { name: 'Edit provider descriptor' });
   await dialog.getByLabel('Execution base URL').fill(`${recorderBaseUrl}/v1`);
@@ -1350,6 +1434,40 @@ async function updateProviderDescriptor(page: Page, recorderBaseUrl: string, mod
   expect(Number(responseBody.revision)).toBe(2);
   await expect(dialog).toBeHidden();
   await expect(provider).toContainText(model);
+}
+
+async function updateProviderDescriptorThroughPublicApi(
+  page: Page,
+  recorderBaseUrl: string,
+  model: string,
+): Promise<void> {
+  const path = `/v1/providers/${encodeURIComponent(scenario.provider)}`;
+  const result = await page.evaluate(
+    async ({ requestPath, body }) => {
+      const response = await fetch(requestPath, {
+        method: 'PUT',
+        headers: {
+          accept: 'application/json',
+          'content-type': 'application/json',
+          'idempotency-key': `put-provider-${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify(body),
+      });
+      return { status: response.status, body: await response.json() as JsonObject };
+    },
+    {
+      requestPath: path,
+      body: {
+        kind: 'openai_compatible',
+        base_url: `${recorderBaseUrl}/v1`,
+        models: [model],
+        options: {},
+      },
+    },
+  );
+  expect(result.status, 'provider descriptor revision 2 status').toBe(200);
+  expect(result.body.provider).toBe(scenario.provider);
+  expect(Number(result.body.revision)).toBe(2);
 }
 
 type SessionCreateObservation = {
@@ -1467,13 +1585,29 @@ function assertFrozenSessionCreateRetry(
   expect(first.minimumAuthRevision, 'first minimum auth revision').toBe(1);
 }
 
-async function openSessionCreateDialog(page: Page, endpointLabel: string, profileLabel: string): Promise<Locator> {
-  await page.getByRole('link', { name: 'Sessions' }).click();
-  await page.getByRole('button', { name: 'Create session' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Create session' });
-  await dialog.getByRole('radio', { name: endpointLabel }).check();
-  if (profileLabel) await dialog.getByRole('radio', { name: profileLabel }).check();
-  return dialog;
+async function openSessionComposer(
+  page: Page,
+  endpointId: string,
+  profileLabel?: string,
+): Promise<Locator> {
+  await page.getByRole('navigation', { name: 'Primary' })
+    .getByRole('link', { name: 'New session' }).click();
+  const composer = page.locator('form#home-session-composer');
+  await expect(composer).toBeVisible();
+  await selectRadixValue(
+    page,
+    composer.getByRole('combobox', { name: 'Environment' }),
+    endpointId,
+  );
+  if (profileLabel) {
+    await selectExecutionProfile(
+      page,
+      composer.getByRole('button', { name: 'Choose model and reasoning' }),
+      scenario.model,
+      profileLabel,
+    );
+  }
+  return composer;
 }
 
 async function addApiKeyProfile(
@@ -1484,19 +1618,19 @@ async function addApiKeyProfile(
   makeDefault: boolean,
   proxy: EndpointProxy,
 ): Promise<ProfileResource> {
-  await page.getByRole('button', { name: 'Add API-key profile' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Add API-key profile' });
-  await dialog.getByLabel('Profile label').fill(label);
-  const secret = dialog.getByLabel('API key (write-only)');
+  await page.getByRole('button', { name: /^Add API[- ]key profile$/ }).click();
+  const editor = page.locator('form.nested-editor');
+  await editor.getByLabel('Profile label').fill(label);
+  const secret = editor.getByLabel(/^API key(?: \(write-only\))?$/);
   await expect(secret).toHaveAttribute('type', 'password');
   await secret.fill(apiKey);
   await expect(secret).toHaveAttribute('autocomplete', /off|new-password/);
-  if (makeDefault) await dialog.getByRole('checkbox', { name: 'Make this the default profile' }).check();
-  await dialog.getByRole('checkbox', { name: `Share with ${endpointLabel}` }).check();
+  if (makeDefault) await editor.getByRole('checkbox', { name: 'Make this the default profile' }).check();
+  await editor.getByRole('checkbox', { name: `Share with ${endpointLabel}` }).check();
   const response = await expectResponseAfter(
     page,
     resolveRoute(seamMatrix.profileCreate, { provider: scenario.provider }),
-    () => dialog.getByRole('button', { name: 'Create API-key profile' }).click(),
+    () => editor.getByRole('button', { name: /Create (?:API[- ]key )?profile/ }).click(),
     `create profile ${label}`,
   );
   const responseBody = (await response.json()) as JsonObject;
@@ -1511,7 +1645,7 @@ async function addApiKeyProfile(
     resolveRoute(seamMatrix.replicaInstall, { profile_id: profileId }),
     `install replica for ${label}`,
   );
-  await expect(dialog).toBeHidden();
+  await expect(editor).toBeHidden();
   return { card: profileCard(page, label), profileId, revision };
 }
 
@@ -1550,13 +1684,14 @@ async function addOAuthProfile(
   makeDefault: boolean,
   proxy: EndpointProxy,
   provider: OAuthProviderFixture,
-  managementOrigin: string,
+  managementEdgeOrigin: string,
 ): Promise<ProfileResource> {
   await page.getByRole('button', { name: /add\s+(an?\s+)?oauth|new\s+oauth|sign\s+in\s+with\s+provider/i }).click();
-  const dialog = page.getByRole('dialog').last();
-  await dialog.getByLabel('Profile label').fill(label);
-  if (makeDefault) await dialog.getByRole('checkbox', { name: 'Make this the default profile' }).check();
-  await dialog.getByRole('checkbox', { name: `Share with ${endpointLabel}` }).check();
+  const editor = page.locator('form.nested-editor').filter({ hasText: 'Add OAuth profile' });
+  await expect(editor).toBeVisible();
+  await editor.getByLabel('Profile label').fill(label);
+  if (makeDefault) await editor.getByRole('checkbox', { name: 'Make this the default profile' }).check();
+  await editor.getByRole('checkbox', { name: `Share with ${endpointLabel}` }).check();
 
   const attemptResponsePromise = page.waitForResponse((response) => {
     const path = new URL(response.url()).pathname;
@@ -1566,18 +1701,18 @@ async function addOAuthProfile(
     const path = new URL(response.url()).pathname;
     return response.request().method() === 'POST' && /^\/v1\/auth-attempts\/[^/]+\/authorize-tickets$/.test(path);
   });
-  await dialog
+  await editor
     .getByRole('button', { name: /start\s+oauth|begin\s+oauth|create\s+oauth|continue(?!\s+to\s+provider)/i })
     .click();
   const [attemptResponse, ticketResponse] = await Promise.all([attemptResponsePromise, ticketResponsePromise]);
   expect(attemptResponse.request().method()).toBe('POST');
   expect(new URL(attemptResponse.url()).pathname).toMatch(/^\/v1\/providers\/[^/]+\/auth-attempts$/);
-  expect(new URL(attemptResponse.url()).origin).toBe(managementOrigin);
+  expect(new URL(attemptResponse.url()).origin).toBe(managementEdgeOrigin);
   expect(attemptResponse.status()).toBeGreaterThanOrEqual(200);
   expect(attemptResponse.status()).toBeLessThan(300);
   expect(ticketResponse.request().method()).toBe('POST');
   expect(new URL(ticketResponse.url()).pathname).toMatch(/^\/v1\/auth-attempts\/[^/]+\/authorize-tickets$/);
-  expect(new URL(ticketResponse.url()).origin).toBe(managementOrigin);
+  expect(new URL(ticketResponse.url()).origin).toBe(managementEdgeOrigin);
   expect(ticketResponse.status()).toBeGreaterThanOrEqual(200);
   expect(ticketResponse.status()).toBeLessThan(300);
   const ticketBody = jsonObject(await ticketResponse.json(), 'OAuth authorize-ticket response');
@@ -1596,6 +1731,26 @@ async function addOAuthProfile(
   const providerUrl = new URL(page.url());
   expect(providerUrl.searchParams.has('ticket')).toBe(false);
   await expect(page.getByRole('heading', { name: /fixture provider authorization/i })).toBeVisible();
+  const callbackTarget = await page.locator('input[name="authorize_url"]').evaluate((node) => {
+    const authorizeUrl = new URL((node as HTMLInputElement).value);
+    const redirectUri = authorizeUrl.searchParams.get('redirect_uri');
+    if (!redirectUri) return { origin: '', pathname: '' };
+    const parsed = new URL(redirectUri);
+    return { origin: parsed.origin, pathname: parsed.pathname };
+  });
+  expect(callbackTarget).toEqual({ origin: MANAGEMENT_ORIGIN, pathname: '/v1/oauth/callback' });
+  await page.route(`${provider.origin}/oauth/authorize/decision`, async (route) => {
+    const response = await route.fetch({ maxRedirects: 0 });
+    const headers = response.headers();
+    const location = headers.location;
+    if (!location) throw new Error('MissingOAuthCallbackLocation');
+    const callback = new URL(location);
+    if (callback.origin !== MANAGEMENT_ORIGIN || callback.pathname !== '/v1/oauth/callback') {
+      throw new Error('UnexpectedOAuthCallbackLocation');
+    }
+    const forwarded = new URL(`${callback.pathname}${callback.search}`, managementEdgeOrigin);
+    await route.fulfill({ response, headers: { ...headers, location: forwarded.toString() } });
+  });
 
   const callbackResponsePromise = page.waitForResponse((response) => {
     const url = new URL(response.url());
@@ -1605,10 +1760,10 @@ async function addOAuthProfile(
   const callbackResponse = await callbackResponsePromise;
   expect(callbackResponse.request().method()).toBe('GET');
   expect(new URL(callbackResponse.url()).pathname).toBe('/v1/oauth/callback');
-  expect(new URL(callbackResponse.url()).origin).toBe(managementOrigin);
+  expect(new URL(callbackResponse.url()).origin).toBe(managementEdgeOrigin);
   expect(callbackResponse.status()).toBeGreaterThanOrEqual(200);
   expect(callbackResponse.status()).toBeLessThan(400);
-  await expect(page.getByRole('heading', { name: 'Providers' })).toBeVisible({ timeout: ACTION_TIMEOUT_MS });
+  await expect(page.getByRole('heading', { name: 'Providers', exact: true })).toBeVisible({ timeout: ACTION_TIMEOUT_MS });
 
   const profileListResponse = await expectResponseAfter(
     page,
@@ -1624,7 +1779,7 @@ async function addOAuthProfile(
   expect(JSON.stringify(profileListBody)).not.toContain(OAUTH_SECRET_MARKERS[1]);
   const replicaPath = resolveRoute(seamMatrix.replicaInstall, { profile_id: found.profileId });
   await expectEndpointRequest(proxy, replicaPath, `install OAuth replica for ${label}`);
-  await expect(dialog).toBeHidden().catch(() => undefined);
+  await expect(editor).toBeHidden();
   const storage = await page.evaluate(() => `${JSON.stringify(localStorage)}${JSON.stringify(sessionStorage)}`);
   expect(storage).not.toContain(ticket);
   expect((await page.locator('html').evaluate((root) => root.outerHTML))).not.toContain(ticket);
@@ -1642,7 +1797,7 @@ async function rotateApiKey(
   const before = endpointRequestCount(proxy, replicaPath);
   await profile.card.getByRole('button', { name: 'Rotate API key' }).click();
   const dialog = page.getByRole('dialog', { name: 'Rotate API key' });
-  const secret = dialog.getByLabel('New API key (write-only)');
+  const secret = dialog.getByLabel(/^New API key(?: \(write-only\))?$/);
   await expect(secret).toHaveAttribute('type', 'password');
   await secret.fill(nextApiKey);
   await dialog.getByRole('button', { name: 'Save new API key' }).click();
@@ -1694,18 +1849,21 @@ async function probeEndpointStatus(
   page: Page,
   proxy: EndpointProxy,
   endpointId: string,
+  endpointLabel: string,
   expectedPublicStatus: number,
   expectedUpstreamStatus: number,
   label: string,
 ): Promise<void> {
+  await openEndpoints(page);
   const identity = resolveRoute(seamMatrix.endpointCatalog.identity);
   const capabilities = resolveRoute(seamMatrix.endpointCatalog.capabilities);
   const identityBefore = endpointResponseCount(proxy, identity);
   const capabilitiesBefore = endpointResponseCount(proxy, capabilities);
+  const endpointCard = page.locator('article.resource-card').filter({ hasText: endpointLabel }).first();
   const response = await expectResponseAfter(
     page,
     resolvedProbeContract(endpointId, expectedPublicStatus),
-    () => page.getByRole('button', { name: 'Refresh Endpoint status' }).click(),
+    () => endpointCard.getByRole('button', { name: 'Refresh Endpoint status' }).click(),
     `${label} probe`,
   );
   if (expectedPublicStatus === seamMatrix.endpointCatalog.probe.offlineStatus) {
@@ -1713,12 +1871,15 @@ async function probeEndpointStatus(
     expect((body.error as JsonObject | undefined)?.code, `${label} public error`).toBe('endpoint_unavailable');
   }
   await expectEndpointResponse(proxy, { ...identity, status: expectedUpstreamStatus }, `${label} identity`, identityBefore);
-  await expectEndpointResponse(
-    proxy,
-    { ...capabilities, status: expectedUpstreamStatus },
-    `${label} capabilities`,
-    capabilitiesBefore,
-  );
+  if (expectedUpstreamStatus < 400) {
+    await expectEndpointResponse(
+      proxy,
+      { ...capabilities, status: expectedUpstreamStatus },
+      `${label} capabilities`,
+      capabilitiesBefore,
+    );
+  }
+  await openProviders(page);
 }
 
 async function assertDeleteWarningAndCancel(page: Page, card: Locator): Promise<void> {
@@ -1749,6 +1910,7 @@ test.describe('provider profile distribution', () => {
     const environment = await ProviderDistributionEnvironment.start(
       [apiKeyA, controllerA, controllerB],
       testInfo.title,
+      [controllerA, controllerB],
     );
     const guard = new SecretSurfaceGuard(page, context, [apiKeyA, controllerA, controllerB]);
     let actorB: ActorBrowserSession | undefined;
@@ -1769,7 +1931,6 @@ test.describe('provider profile distribution', () => {
         environment.endpointProxies[0],
       );
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'pending');
-      await expect(profileA.card.getByRole('button', { name: 'Refresh profile' })).toBeDisabled();
       await guard.assertClean();
 
       await environment.endpointProxies[0].releaseReplicaWrites();
@@ -1806,7 +1967,6 @@ test.describe('provider profile distribution', () => {
       await expect(distributionRow(profileA.card, scenario.profiles[1].endpointLabel)).toHaveCount(0);
       await expect(distributionRow(profileB.card, scenario.profiles[1].endpointLabel)).toContainText(/Endpoint B/);
       await expect(distributionRow(profileB.card, scenario.profiles[0].endpointLabel)).toHaveCount(0);
-      await expect(profileA.card.getByRole('button', { name: 'Refresh profile' })).toBeEnabled();
       await assertSharedMultiProfileView(page, [profileA, profileB]);
 
       actorB = await openActorBrowserSession(
@@ -1848,6 +2008,7 @@ test.describe('provider profile distribution', () => {
     const environment = await ProviderDistributionEnvironment.start(
       [apiKeyA, rotatedApiKeyA, controllerA, controllerB],
       testInfo.title,
+      [controllerA, controllerB],
     );
     const guard = new SecretSurfaceGuard(page, context, [apiKeyA, rotatedApiKeyA, controllerA, controllerB]);
     try {
@@ -1898,10 +2059,23 @@ test.describe('provider profile distribution', () => {
         'profile B replica install',
       );
 
+      const orphanSecretPath = join(
+        environment.root,
+        'server-secrets',
+        'providers',
+        createHash('sha256').update(`unreferenced-${randomUUID()}`).digest('hex'),
+      );
+      await writeFile(orphanSecretPath, 'test-owned-unreferenced-provider-secret', {
+        flag: 'wx',
+        mode: 0o600,
+      });
       environment.endpointProxies[0].holdReplicaWrites = true;
       await rotateApiKey(page, profileA, rotatedApiKeyA, environment.endpointProxies[0]);
+      await expect
+        .poll(async () => (await stat(orphanSecretPath).catch(() => undefined)) === undefined)
+        .toBe(true);
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'stale');
-      await expect(profileA.card.getByRole('button', { name: 'Refresh profile' })).toBeDisabled();
+      await expect(profileA.card.getByRole('button', { name: 'Rotate API key' })).toBeDisabled();
       await guard.assertClean();
 
       await environment.endpointProxies[0].releaseReplicaWrites();
@@ -1912,40 +2086,59 @@ test.describe('provider profile distribution', () => {
       );
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'ready');
 
+      const repeatedRotationPath = resolveRoute(seamMatrix.replicaInstall, { profile_id: profileA.profileId });
+      const repeatedRotationResponses = endpointResponseCount(environment.endpointProxies[0], repeatedRotationPath);
+      environment.endpointProxies[0].holdReplicaWrites = true;
+      await rotateApiKey(page, profileA, rotatedApiKeyA, environment.endpointProxies[0]);
+      await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'stale');
+      await environment.endpointProxies[0].releaseReplicaWrites();
+      await expectEndpointResponse(
+        environment.endpointProxies[0],
+        repeatedRotationPath,
+        'same-value profile A rotation remains installable',
+        repeatedRotationResponses,
+      );
+      await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'ready');
+
       environment.endpointProxies[0].online = false;
       await probeEndpointStatus(
         page,
         environment.endpointProxies[0],
         endpointAId,
+        scenario.profiles[0].endpointLabel,
         seamMatrix.endpointCatalog.probe.offlineStatus,
         502,
         'Endpoint A offline',
       );
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'unreachable');
-      await expect(profileA.card.getByRole('button', { name: 'Refresh profile' })).toBeDisabled();
+      await expect(profileA.card.getByRole('button', { name: 'Rotate API key' })).toBeDisabled();
+      await expect(profileA.card.getByRole('button', { name: 'Edit sharing' })).toBeEnabled();
       await guard.assertClean();
 
       await removeEndpointSharing(page, profileA, scenario.profiles[0].endpointLabel, environment.endpointProxies[0]);
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'unreachable');
       await expect(profileA.card).toContainText(/removal pending|unreachable/i);
 
+      const tombstonePath = resolveRoute(seamMatrix.replicaTombstone, { profile_id: profileA.profileId });
+      const tombstoneResponsesBeforeRestore = endpointResponseCount(environment.endpointProxies[0], tombstonePath);
       environment.endpointProxies[0].online = true;
       await probeEndpointStatus(
         page,
         environment.endpointProxies[0],
         endpointAId,
+        scenario.profiles[0].endpointLabel,
         seamMatrix.endpointCatalog.probe.onlineStatus,
         200,
         'Endpoint A restored',
       );
       await expectEndpointResponse(
         environment.endpointProxies[0],
-        resolveRoute(seamMatrix.replicaTombstone, { profile_id: profileA.profileId }),
+        tombstonePath,
         'profile A tombstone acknowledgement',
+        tombstoneResponsesBeforeRestore,
       );
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'removed');
       await expect(profileA.card).toContainText(/removed/i);
-      await expect(profileA.card.getByRole('button', { name: 'Refresh profile' })).toBeHidden();
       await expect(profileA.card.getByRole('button', { name: 'Use for session' })).toBeHidden();
       await assertDeleteWarningAndCancel(page, profileB.card);
       await guard.assertClean();
@@ -1963,13 +2156,16 @@ test.describe('provider profile distribution', () => {
     expect(testInfo.title).toBe(FIRST_FAILURE_OWNER);
     const cassette = loadFirstFailureCassette();
     const apiKeyA = `web-e2e-api-key-a-${randomUUID()}`;
+    const apiKeyB = `web-e2e-api-key-b-${randomUUID()}`;
+    const secondaryProfileLabel = 'Secondary API key';
     const controllerA = `web-e2e-controller-a-${randomUUID()}`;
     const controllerB = `web-e2e-controller-b-${randomUUID()}`;
     const environment = await ProviderDistributionEnvironment.start(
-      [apiKeyA, controllerA, controllerB],
+      [apiKeyA, apiKeyB, controllerA, controllerB],
       testInfo.title,
+      [controllerA, controllerB],
     );
-    const guard = new SecretSurfaceGuard(page, context, [apiKeyA, controllerA, controllerB]);
+    const guard = new SecretSurfaceGuard(page, context, [apiKeyA, apiKeyB, controllerA, controllerB]);
     let adminPage: Page | undefined;
     let actorB: ActorBrowserSession | undefined;
     let removeSessionRoute: (() => Promise<void>) | undefined;
@@ -2008,11 +2204,12 @@ test.describe('provider profile distribution', () => {
         environment.endpointProxies[0],
       );
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'pending');
-      const pendingSessionDialog = await openSessionCreateDialog(page, scenario.profiles[0].endpointLabel, '');
-      const pendingProfile = pendingSessionDialog.getByRole('radio', { name: scenario.profiles[0].label });
-      await expect(pendingProfile).toBeDisabled();
-      await expect(pendingSessionDialog.getByRole('button', { name: 'Create session' })).toBeDisabled();
-      await pendingSessionDialog.getByRole('button', { name: 'Cancel' }).click();
+      const pendingComposer = await openSessionComposer(page, endpointAId);
+      await expect(
+        pendingComposer.getByRole('button', { name: 'Choose model and reasoning' }),
+      ).toBeDisabled();
+      await expect(pendingComposer).toContainText(/pending|not ready/i);
+      await expect(pendingComposer.getByRole('button', { name: 'Start session' })).toBeDisabled();
 
       environment.endpointProxies[0].online = false;
       await openEndpoints(page);
@@ -2020,13 +2217,13 @@ test.describe('provider profile distribution', () => {
         page,
         environment.endpointProxies[0],
         endpointAId,
+        scenario.profiles[0].endpointLabel,
         seamMatrix.endpointCatalog.probe.offlineStatus,
         502,
         'Endpoint A offline',
       );
       await openProviders(page);
-      await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'unreachable');
-      await expect(profileA.card.getByRole('button', { name: 'Use for session' })).toBeDisabled();
+      await expect(profileA.card).toContainText(/pending|unreachable/i);
 
       environment.endpointProxies[0].online = true;
       await environment.endpointProxies[0].releaseReplicaWrites();
@@ -2036,16 +2233,14 @@ test.describe('provider profile distribution', () => {
         'profile A replica install',
       );
       await expectDistributionStatus(page, profileA, scenario.profiles[0].endpointLabel, 'ready');
-      await expect(profileA.card.getByRole('button', { name: 'Use for session' })).toBeEnabled();
 
-      const profileB = await addOAuthProfile(
+      const profileB = await addApiKeyProfile(
         page,
-        scenario.profiles[1].label,
+        secondaryProfileLabel,
+        apiKeyB,
         scenario.profiles[1].endpointLabel,
         false,
         environment.endpointProxies[1],
-        environment.oauthProvider,
-        environment.accessEdges[0].baseUrl,
       );
       await expectDistributionStatus(page, profileB, scenario.profiles[1].endpointLabel, 'ready');
       await expectEndpointResponse(
@@ -2056,38 +2251,43 @@ test.describe('provider profile distribution', () => {
 
       const observations: SessionCreateObservation[] = [];
       removeSessionRoute = await installFirstSessionCreateResponseDrop(page, observations);
-      const sessionDialog = await openSessionCreateDialog(
+      const sessionComposer = await openSessionComposer(
         page,
-        scenario.profiles[0].endpointLabel,
+        endpointAId,
         scenario.profiles[0].label,
       );
-      const createButton = sessionDialog.getByRole('button', { name: 'Create session' });
+      const createButton = sessionComposer.getByRole('button', { name: 'Start session' });
       await expect(createButton).toBeEnabled();
       await createButton.click();
       await expect
         .poll(() => observations.length, { timeout: ACTION_TIMEOUT_MS })
         .toBe(1);
-      await expect(page.getByRole('button', { name: 'Retry session creation' })).toBeVisible();
+      await expect(createButton).toBeEnabled();
 
       actorB = await openActorBrowserSession(
         browser,
         environment.accessEdges[1],
-        [apiKeyA, controllerA, controllerB],
+        [apiKeyA, apiKeyB, controllerA, controllerB],
       );
       adminPage = actorB.page;
       await gotoProvidersWithBootstrap(adminPage, environment.accessEdges[1].baseUrl, true);
-      await assertSharedMultiProfileView(adminPage, [
-        profileOnPage(adminPage, profileA, scenario.profiles[0].label),
-        profileOnPage(adminPage, profileB, scenario.profiles[1].label),
-      ]);
-      const adminProfileB = profileCard(adminPage, scenario.profiles[1].label);
+      await expect(profileCard(adminPage, scenario.profiles[0].label)).toHaveCount(1);
+      const adminProfileB = profileCard(adminPage, secondaryProfileLabel);
+      await expect(adminProfileB).toHaveCount(1);
+      await expectDistributionStatus(
+        adminPage,
+        profileOnPage(adminPage, profileB, secondaryProfileLabel),
+        scenario.profiles[1].endpointLabel,
+        'ready',
+      );
       await setDefaultProfile(adminPage, profileB.profileId, adminProfileB);
-      await updateProviderDescriptor(adminPage, environment.recorder.baseUrl, `${scenario.model}-changed`);
-      await expect(adminPage.getByRole('article', { name: new RegExp(escapeRegex(scenario.provider)) })).toContainText(
-        /revision\s*2/i,
+      await updateProviderDescriptorThroughPublicApi(
+        adminPage,
+        environment.recorder.baseUrl,
+        `${scenario.model}-changed`,
       );
 
-      await page.getByRole('button', { name: 'Retry session creation' }).click();
+      await createButton.click();
       await expect
         .poll(() => observations.length, { timeout: ACTION_TIMEOUT_MS })
         .toBe(2);
@@ -2109,13 +2309,76 @@ test.describe('provider profile distribution', () => {
     expect(environment.recorder.exchanges.length).toBe(scenario.llm.requestsExpected);
   });
 
+  test('e2e_browser_profile_create_remains_accepted_while_replica_distribution_is_pending', async ({
+    context,
+    page,
+  }, testInfo) => {
+    const apiKey = `web-e2e-pending-profile-${randomUUID()}`;
+    const controller = `web-e2e-pending-controller-${randomUUID()}`;
+    const environment = await ProviderDistributionEnvironment.start(
+      [apiKey, controller],
+      testInfo.title,
+      [controller],
+    );
+    const guard = new SecretSurfaceGuard(page, context, [apiKey, controller]);
+    try {
+      await gotoProvidersWithBootstrap(page, environment.accessEdges[0].baseUrl);
+      await addRemoteEndpoint(
+        page,
+        scenario.profiles[0].endpointLabel,
+        environment.endpointProxies[0].baseUrl,
+        controller,
+        environment.endpointProxies[0],
+      );
+      await configureProvider(page, environment.recorder.baseUrl);
+
+      environment.endpointProxies[0].holdReplicaWrites = true;
+      const profile = await addApiKeyProfile(
+        page,
+        scenario.profiles[0].label,
+        apiKey,
+        scenario.profiles[0].endpointLabel,
+        true,
+        environment.endpointProxies[0],
+      );
+      await expectDistributionStatus(
+        page,
+        profile,
+        scenario.profiles[0].endpointLabel,
+        'pending',
+      );
+      await guard.assertClean();
+
+      await environment.endpointProxies[0].releaseReplicaWrites();
+      await expectEndpointResponse(
+        environment.endpointProxies[0],
+        resolveRoute(seamMatrix.replicaInstall, { profile_id: profile.profileId }),
+        'pending profile replica install',
+      );
+      await expectDistributionStatus(
+        page,
+        profile,
+        scenario.profiles[0].endpointLabel,
+        'ready',
+      );
+      await guard.assertClean();
+    } finally {
+      await environment.stop();
+    }
+    expect(environment.recorder.exchanges.length).toBe(scenario.llm.requestsExpected);
+  });
+
   test('e2e_provider_profiles_secret_markers_never_enter_dom_accessibility_storage_url_console_or_download', async ({
     context,
     page,
   }, testInfo) => {
     const apiKey = `web-e2e-secret-${randomUUID()}`;
     const controllerSecret = `web-e2e-control-secret-${randomUUID()}`;
-    const environment = await ProviderDistributionEnvironment.start([apiKey, controllerSecret], testInfo.title);
+    const environment = await ProviderDistributionEnvironment.start(
+      [apiKey, controllerSecret],
+      testInfo.title,
+      [controllerSecret],
+    );
     const guard = new SecretSurfaceGuard(page, context, [apiKey, controllerSecret]);
     try {
       await gotoProvidersWithBootstrap(page, environment.accessEdges[0].baseUrl);

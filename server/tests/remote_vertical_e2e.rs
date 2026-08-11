@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env,
     fs::{self, OpenOptions},
     io::{Error, ErrorKind, Write},
@@ -459,7 +460,6 @@ fn write_endpoint_config(
         }],
         "runtime": {
             "tool_foreground_ms": 100,
-            "max_rounds_per_activation": 8,
             "model_step_max_attempts": 1,
             "model_retry_base_ms": 1,
             "model_retry_max_ms": 10,
@@ -911,19 +911,149 @@ async fn wait_for_replica_ready(
     })?
 }
 
-async fn open_session_events(
+async fn add_remote_endpoint(
+    client: &Client,
+    server_url: &str,
+    assertion: &str,
+    label: &str,
+    base_url: &str,
+    idempotency_key: &str,
+    markers: &[&str],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let request = authenticated(
+        client
+            .post(format!("{server_url}/v1/endpoints"))
+            .header("Idempotency-Key", idempotency_key),
+        assertion,
+    )
+    .json(&json!({
+        "label": label,
+        "base_url": base_url,
+        "control_auth": {"kind": "bearer", "secret": ENDPOINT_CONTROL_SECRET}
+    }));
+    let (status, _body, value) = public_json(request, markers, label).await?;
+    require_status(status, StatusCode::CREATED, label)?;
+    value["endpoint_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| Error::other(format!("{label} omitted Endpoint-owned identity")).into())
+}
+
+async fn wait_for_replica_states(
+    client: &Client,
+    server_url: &str,
+    assertion: &str,
+    profile_id: &str,
+    expected: &[(&str, &str, u64)],
+    markers: &[&str],
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let request = authenticated(
+                client.get(format!(
+                    "{server_url}/v1/auth-profiles/{profile_id}/replicas"
+                )),
+                assertion,
+            );
+            let (status, _body, value) =
+                public_json(request, markers, "replica state convergence").await?;
+            if status == StatusCode::OK {
+                let matches = expected
+                    .iter()
+                    .all(|(endpoint_id, expected_status, revision)| {
+                        value["items"].as_array().is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item["endpoint_id"] == *endpoint_id
+                                    && item["status"] == *expected_status
+                                    && item["revision"] == *revision
+                                    && item["auth_profile_id"] == profile_id
+                                    && item["authority_id"] == SERVER_AUTHORITY
+                                    && item["provider"] == PROVIDER_NAME
+                            })
+                        })
+                    });
+                if matches {
+                    return Ok::<Value, Box<dyn std::error::Error + Send + Sync>>(value);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| Error::new(ErrorKind::TimedOut, "replica states did not converge"))?
+}
+
+fn preserve_sharing_failure(
+    request_body: &Value,
+    status: StatusCode,
+    response_body: &str,
+    forbidden: &[&str],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if status == StatusCode::ACCEPTED {
+        return Ok(());
+    }
+    let quarantine = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
+        .join("target/test-recordings/quarantine");
+    fs::create_dir_all(&quarantine)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o700))?;
+    }
+    let observed_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::other("system time preceded UNIX epoch"))?
+        .as_millis();
+    let path = quarantine.join(format!(
+        "auth-profile-sharing-first-{observed_at}-{}.json",
+        std::process::id()
+    ));
+    let value = json!({
+        "schema": "zode.http-first-occurrence.v1",
+        "owner": "e2e_auth_profile_sharing_removal_survives_offline_endpoint_and_server_restart",
+        "boundary": "management_http",
+        "request": {
+            "method": "PUT",
+            "path": "/v1/auth-profiles/SLOT_PROFILE_ID/sharing",
+            "headers": {
+                "Cf-Access-Jwt-Assertion": "SLOT_ACCESS_ASSERTION",
+                "Idempotency-Key": "sharing-remove-offline-endpoint"
+            },
+            "body": request_body
+        },
+        "response": {"status": status.as_u16(), "body": response_body}
+    });
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    if forbidden.iter().any(|marker| scan_bytes(&bytes, marker)) {
+        return Err(Error::other("sharing first occurrence retained a forbidden marker").into());
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+async fn open_endpoint_events(
     client: &Client,
     server_url: &str,
     assertion: &str,
     endpoint_id: &str,
-    session_id: &str,
     last_event_id: Option<&str>,
     markers: &[&str],
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     let mut request = authenticated(
-        client.get(format!(
-            "{server_url}/v1/endpoints/{endpoint_id}/sessions/{session_id}/events"
-        )),
+        client.get(format!("{server_url}/v1/endpoints/{endpoint_id}/events")),
         assertion,
     );
     if let Some(last_event_id) = last_event_id {
@@ -937,7 +1067,7 @@ async fn open_session_events(
             }
         }
     }
-    require_status(response.status(), StatusCode::OK, "session SSE")?;
+    require_status(response.status(), StatusCode::OK, "Endpoint SSE")?;
     Ok(response)
 }
 
@@ -992,7 +1122,7 @@ async fn read_assistant_event(
         }
         Err(Error::new(
             ErrorKind::UnexpectedEof,
-            "session SSE ended before assistant commit",
+            "Endpoint SSE ended before assistant commit",
         )
         .into())
     })
@@ -1000,7 +1130,7 @@ async fn read_assistant_event(
     .map_err(|_| {
         Error::new(
             ErrorKind::TimedOut,
-            "session SSE assistant barrier timed out",
+            "Endpoint SSE assistant barrier timed out",
         )
     })?
 }
@@ -1017,9 +1147,8 @@ async fn scan_tree_for_markers(
                 }
             } else if path.is_file() {
                 let bytes = fs::read(path)?;
-                if let Some(marker_index) = markers
-                    .iter()
-                    .position(|marker| scan_bytes(&bytes, marker))
+                if let Some(marker_index) =
+                    markers.iter().position(|marker| scan_bytes(&bytes, marker))
                 {
                     return Err(Error::other(format!(
                         "server-owned file contained forbidden marker index {marker_index}: {}",
@@ -1211,6 +1340,12 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         "kind": "openai_compatible",
         "base_url": provider_base_url,
         "models": [MODEL_NAME],
+        "model_limits": {
+            (MODEL_NAME): {
+                "context_window_tokens": 1_000_000,
+                "max_output_tokens": 384_000
+            }
+        },
         "options": {}
     }));
     let (status, _body, descriptor_value) = public_json(
@@ -1224,6 +1359,8 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         || descriptor_value["kind"] != "openai_compatible"
         || descriptor_value["base_url"] != provider_base_url
         || descriptor_value["models"] != json!([MODEL_NAME])
+        || descriptor_value["model_limits"][MODEL_NAME]["context_window_tokens"] != 1_000_000
+        || descriptor_value["model_limits"][MODEL_NAME]["max_output_tokens"] != 384_000
     {
         return Err(Error::other("provider descriptor was not persisted exactly").into());
     }
@@ -1252,7 +1389,7 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
     require_status(status, StatusCode::CREATED, "provider profile")?;
     if profile_value["provider"] != PROVIDER_NAME
         || profile_value["revision"] != 1
-        || profile_value["status"] != "ready"
+        || profile_value["status"] != "pending"
     {
         return Err(Error::other("provider profile metadata was not exact").into());
     }
@@ -1287,6 +1424,10 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
             "kind": "openai_compatible",
             "base_url": provider_base_url,
             "options": {}
+        },
+        "limits": {
+            "context_window_tokens": 1_000_000,
+            "max_output_tokens": 384_000
         },
         "auth_profile_id": profile_id,
         "minimum_auth_revision": profile_revision
@@ -1367,10 +1508,7 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         "remote session model selection replay",
     )?;
     if replay_body != model_selection_body {
-        return Err(Error::other(
-            "remote session model selection replay changed its body",
-        )
-        .into());
+        return Err(Error::other("remote session model selection replay changed its body").into());
     }
 
     let (status, _body, selected_session) = public_json(
@@ -1390,6 +1528,8 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         || selected_session["model"]["model"] != MODEL_NAME
         || selected_session["model"]["provider_execution_revision"] != descriptor_revision
         || selected_session["model"]["auth_profile_id"] != profile_id
+        || selected_session["model"]["limits"]["context_window_tokens"] != 1_000_000
+        || selected_session["model"]["limits"]["max_output_tokens"] != 384_000
     {
         return Err(Error::other("remote session model selection was not durable").into());
     }
@@ -1404,12 +1544,11 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         &assertion,
     )
     .json(&json!({"content": "Reply with exactly REMOTE_OK"}));
-    let initial_sse = open_session_events(
+    let initial_sse = open_endpoint_events(
         &client,
         &server.base_url,
         &assertion,
         &endpoint_id,
-        &session_id,
         None,
         &marker_refs(&marker_values),
     )
@@ -1504,12 +1643,11 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
     if restarted_session["session_id"] != session_id {
         return Err(Error::other("restarted Server changed the Endpoint session ID").into());
     }
-    let follow_up_sse = open_session_events(
+    let follow_up_sse = open_endpoint_events(
         &client,
         &restarted_server.base_url,
         &assertion,
         &endpoint_id,
-        &session_id,
         Some(&first_event_id),
         &marker_refs(&marker_values),
     )
@@ -1700,5 +1838,576 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
     }) {
         return Err(Error::other("Server output contained a forbidden marker").into());
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_auth_profile_sharing_removal_survives_offline_endpoint_and_server_restart(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let endpoint_binary = env::var_os("ZODE_ENDPOINT_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
+                .join("target/debug/zode")
+        });
+    if !endpoint_binary.is_file() {
+        return Err(Error::other(format!(
+            "real zode Endpoint binary is missing: {}",
+            endpoint_binary.display()
+        ))
+        .into());
+    }
+    let server_binary = env::var_os("CARGO_BIN_EXE_zode-server")
+        .or_else(|| env::var_os("CARGO_BIN_EXE_zode_server"))
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::other("server test binary path was not provided by Cargo"))?;
+    let temp = TempDir::new()?;
+    let (mut provider, provider_state) = start_provider().await?;
+    let (mut jwks, _jwks_state) = start_jwks().await?;
+    let provider_origin = provider.base_url.clone();
+    let provider_base_url = provider.url("/v1");
+
+    let endpoint_a_root = temp.path().join("endpoint-a");
+    let endpoint_a_database = endpoint_a_root.join("endpoint.sqlite3");
+    let endpoint_a_config =
+        write_endpoint_config(&endpoint_a_root, &endpoint_a_database, &provider_origin)?;
+    let mut endpoint_a = ReadyProcess::spawn(
+        &endpoint_binary,
+        &[
+            "--config".to_owned(),
+            endpoint_a_config.to_string_lossy().into_owned(),
+            "--database".to_owned(),
+            endpoint_a_database.to_string_lossy().into_owned(),
+            "--listen".to_owned(),
+            "127.0.0.1:0".to_owned(),
+        ],
+        "ZODE_READY ",
+    )
+    .await?;
+    let endpoint_a_listen = endpoint_a
+        .base_url
+        .strip_prefix("http://")
+        .ok_or_else(|| Error::other("Endpoint A readiness URL was not loopback HTTP"))?
+        .to_owned();
+
+    let endpoint_b_root = temp.path().join("endpoint-b");
+    let endpoint_b_database = endpoint_b_root.join("endpoint.sqlite3");
+    let endpoint_b_config =
+        write_endpoint_config(&endpoint_b_root, &endpoint_b_database, &provider_origin)?;
+    let mut endpoint_b = ReadyProcess::spawn(
+        &endpoint_binary,
+        &[
+            "--config".to_owned(),
+            endpoint_b_config.to_string_lossy().into_owned(),
+            "--database".to_owned(),
+            endpoint_b_database.to_string_lossy().into_owned(),
+            "--listen".to_owned(),
+            "127.0.0.1:0".to_owned(),
+        ],
+        "ZODE_READY ",
+    )
+    .await?;
+
+    let issuer = format!("{}/", jwks.base_url);
+    let (server_config, server_database, server_secrets) =
+        write_server_config(temp.path(), &issuer, &jwks.url("/jwks"))?;
+    let mut server = ReadyProcess::spawn(
+        &server_binary,
+        &[
+            "--config".to_owned(),
+            server_config.to_string_lossy().into_owned(),
+        ],
+        "ZODE_SERVER_READY ",
+    )
+    .await?;
+    let assertion = access_assertion(&issuer)?;
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .build()?;
+    let marker_values = vec![
+        PROVIDER_KEY.to_owned(),
+        ENDPOINT_CONTROL_SECRET.to_owned(),
+        assertion.clone(),
+        TEST_SUBJECT.to_owned(),
+        "sharing-endpoint-a".to_owned(),
+        "sharing-endpoint-b".to_owned(),
+        "sharing-provider-descriptor".to_owned(),
+        "sharing-profile-create".to_owned(),
+        "sharing-all-current-session-create".to_owned(),
+        "sharing-all-current-session-model".to_owned(),
+        "sharing-remove-offline-endpoint".to_owned(),
+        "sharing-noop".to_owned(),
+        "sharing-session-b-create".to_owned(),
+        "sharing-session-b-model".to_owned(),
+        "sharing-session-b-message".to_owned(),
+        "sharing-session-a-create".to_owned(),
+        "sharing-session-a-model".to_owned(),
+    ];
+    let markers = marker_refs(&marker_values);
+
+    let endpoint_a_id = add_remote_endpoint(
+        &client,
+        &server.base_url,
+        &assertion,
+        "Sharing Endpoint A",
+        &endpoint_a.base_url,
+        "sharing-endpoint-a",
+        &markers,
+    )
+    .await?;
+    let endpoint_b_id = add_remote_endpoint(
+        &client,
+        &server.base_url,
+        &assertion,
+        "Sharing Endpoint B",
+        &endpoint_b.base_url,
+        "sharing-endpoint-b",
+        &markers,
+    )
+    .await?;
+
+    let descriptor = authenticated(
+        client
+            .put(format!("{}/v1/providers/{PROVIDER_NAME}", server.base_url))
+            .header("Idempotency-Key", "sharing-provider-descriptor"),
+        &assertion,
+    )
+    .json(&json!({
+        "kind": "openai_compatible",
+        "base_url": provider_base_url,
+        "models": [MODEL_NAME],
+        "options": {}
+    }));
+    let (status, _body, descriptor_value) =
+        public_json(descriptor, &markers, "sharing provider descriptor").await?;
+    require_status(status, StatusCode::OK, "sharing provider descriptor")?;
+    let descriptor_revision = descriptor_value["revision"]
+        .as_u64()
+        .ok_or_else(|| Error::other("sharing provider descriptor omitted revision"))?;
+
+    let profile = authenticated(
+        client
+            .post(format!(
+                "{}/v1/providers/{PROVIDER_NAME}/auth-profiles",
+                server.base_url
+            ))
+            .header("Idempotency-Key", "sharing-profile-create"),
+        &assertion,
+    )
+    .json(&json!({
+        "kind": "api_key",
+        "label": "sharing-profile",
+        "api_key": PROVIDER_KEY,
+        "make_default": false,
+        "sharing": {"mode": "all_current", "endpoint_ids": []}
+    }));
+    let (status, _body, profile_value) =
+        public_json(profile, &markers, "sharing profile create").await?;
+    require_status(status, StatusCode::CREATED, "sharing profile create")?;
+    let profile_id = profile_value["auth_profile_id"]
+        .as_str()
+        .ok_or_else(|| Error::other("sharing profile omitted identity"))?
+        .to_owned();
+    let shared_endpoint_ids = profile_value["sharing"]["endpoint_ids"]
+        .as_array()
+        .ok_or_else(|| Error::other("all-current profile omitted expanded Endpoint IDs"))?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    if profile_value["sharing"]["mode"] != "all_current"
+        || shared_endpoint_ids != BTreeSet::from([endpoint_a_id.as_str(), endpoint_b_id.as_str()])
+    {
+        return Err(
+            Error::other("all-current profile did not freeze the current Endpoints").into(),
+        );
+    }
+    wait_for_replica_ready(
+        &client,
+        &server.base_url,
+        &assertion,
+        ReplicaReadyExpectation {
+            profile_id: &profile_id,
+            endpoint_id: &endpoint_a_id,
+            provider: PROVIDER_NAME,
+            revision: 1,
+        },
+        &markers,
+    )
+    .await?;
+    wait_for_replica_ready(
+        &client,
+        &server.base_url,
+        &assertion,
+        ReplicaReadyExpectation {
+            profile_id: &profile_id,
+            endpoint_id: &endpoint_b_id,
+            provider: PROVIDER_NAME,
+            revision: 1,
+        },
+        &markers,
+    )
+    .await?;
+
+    let initial_model = json!({
+        "provider": PROVIDER_NAME,
+        "model": MODEL_NAME,
+        "provider_execution": {
+            "schema": "zode.provider-execution.v1",
+            "revision": descriptor_revision,
+            "kind": "openai_compatible",
+            "base_url": provider_base_url,
+            "options": {}
+        },
+        "auth_profile_id": profile_id,
+        "minimum_auth_revision": 1
+    });
+    let (status, _body, initial_session) = public_json(
+        authenticated(
+            client
+                .post(format!(
+                    "{}/v1/endpoints/{endpoint_a_id}/sessions",
+                    server.base_url
+                ))
+                .header("Idempotency-Key", "sharing-all-current-session-create"),
+            &assertion,
+        )
+        .json(&json!({})),
+        &markers,
+        "all-current Endpoint session create",
+    )
+    .await?;
+    require_status(
+        status,
+        StatusCode::CREATED,
+        "all-current Endpoint session create",
+    )?;
+    let initial_session_id = initial_session["session_id"]
+        .as_str()
+        .ok_or_else(|| Error::other("all-current Endpoint session omitted ID"))?;
+    let (status, _body, _value) = public_json(
+        authenticated(
+            client
+                .put(format!(
+                    "{}/v1/endpoints/{endpoint_a_id}/sessions/{initial_session_id}/model",
+                    server.base_url
+                ))
+                .header("Idempotency-Key", "sharing-all-current-session-model"),
+            &assertion,
+        )
+        .json(&initial_model),
+        &markers,
+        "all-current Endpoint model selection",
+    )
+    .await?;
+    require_status(
+        status,
+        StatusCode::ACCEPTED,
+        "all-current Endpoint model selection",
+    )?;
+
+    endpoint_a.stop().await?;
+    let sharing_body = json!({"mode": "selected", "endpoint_ids": [&endpoint_b_id]});
+    let response = authenticated(
+        client
+            .put(format!(
+                "{}/v1/auth-profiles/{profile_id}/sharing",
+                server.base_url
+            ))
+            .header("Idempotency-Key", "sharing-remove-offline-endpoint"),
+        &assertion,
+    )
+    .json(&sharing_body)
+    .send()
+    .await?;
+    let (sharing_status, sharing_response_body) = read_response(response, &markers).await?;
+    preserve_sharing_failure(
+        &sharing_body,
+        sharing_status,
+        &sharing_response_body,
+        &[&assertion, ENDPOINT_CONTROL_SECRET, PROVIDER_KEY],
+    )?;
+    require_status(
+        sharing_status,
+        StatusCode::ACCEPTED,
+        "offline sharing removal",
+    )?;
+    let sharing_value = parse_json(&sharing_response_body, "offline sharing removal")?;
+    let sharing_revision = sharing_value["revision"]
+        .as_u64()
+        .filter(|revision| *revision > 1)
+        .ok_or_else(|| Error::other("sharing removal did not advance profile sequence"))?;
+    if sharing_value["schema"] != "zode.auth-profile.v1"
+        || sharing_value["auth_profile_id"] != profile_id
+        || sharing_value["sharing"]["mode"] != "selected"
+        || sharing_value["sharing"]["endpoint_ids"] != json!([endpoint_b_id])
+    {
+        return Err(Error::other("sharing removal response was not the admitted profile").into());
+    }
+
+    server.stop().await?;
+    server = ReadyProcess::spawn(
+        &server_binary,
+        &[
+            "--config".to_owned(),
+            server_config.to_string_lossy().into_owned(),
+        ],
+        "ZODE_SERVER_READY ",
+    )
+    .await?;
+    wait_for_replica_states(
+        &client,
+        &server.base_url,
+        &assertion,
+        &profile_id,
+        &[
+            (&endpoint_a_id, "unreachable", sharing_revision),
+            (&endpoint_b_id, "ready", sharing_revision),
+        ],
+        &markers,
+    )
+    .await?;
+
+    endpoint_a = ReadyProcess::spawn(
+        &endpoint_binary,
+        &[
+            "--config".to_owned(),
+            endpoint_a_config.to_string_lossy().into_owned(),
+            "--database".to_owned(),
+            endpoint_a_database.to_string_lossy().into_owned(),
+            "--listen".to_owned(),
+            endpoint_a_listen,
+        ],
+        "ZODE_READY ",
+    )
+    .await?;
+    wait_for_replica_states(
+        &client,
+        &server.base_url,
+        &assertion,
+        &profile_id,
+        &[
+            (&endpoint_a_id, "removed", sharing_revision),
+            (&endpoint_b_id, "ready", sharing_revision),
+        ],
+        &markers,
+    )
+    .await?;
+
+    let replay = authenticated(
+        client
+            .put(format!(
+                "{}/v1/auth-profiles/{profile_id}/sharing",
+                server.base_url
+            ))
+            .header("Idempotency-Key", "sharing-remove-offline-endpoint"),
+        &assertion,
+    )
+    .json(&sharing_body);
+    let (replay_status, replay_body) =
+        read_response(timeout(HTTP_TIMEOUT, replay.send()).await??, &markers).await?;
+    require_status(replay_status, StatusCode::ACCEPTED, "sharing replay")?;
+    if replay_body != sharing_response_body {
+        return Err(Error::other("sharing replay changed the original response").into());
+    }
+
+    let conflict = authenticated(
+        client
+            .put(format!(
+                "{}/v1/auth-profiles/{profile_id}/sharing",
+                server.base_url
+            ))
+            .header("Idempotency-Key", "sharing-remove-offline-endpoint"),
+        &assertion,
+    )
+    .json(&json!({"mode": "none", "endpoint_ids": []}));
+    let (conflict_status, _body) =
+        read_response(timeout(HTTP_TIMEOUT, conflict.send()).await??, &markers).await?;
+    require_status(
+        conflict_status,
+        StatusCode::CONFLICT,
+        "sharing changed-body replay",
+    )?;
+
+    let noop = authenticated(
+        client
+            .put(format!(
+                "{}/v1/auth-profiles/{profile_id}/sharing",
+                server.base_url
+            ))
+            .header("Idempotency-Key", "sharing-noop"),
+        &assertion,
+    )
+    .json(&sharing_body);
+    let (noop_status, _body, noop_value) = public_json(noop, &markers, "sharing no-op").await?;
+    require_status(noop_status, StatusCode::ACCEPTED, "sharing no-op")?;
+    if noop_value["revision"] != sharing_revision {
+        return Err(Error::other("sharing no-op advanced the profile revision").into());
+    }
+
+    let model = json!({
+        "provider": PROVIDER_NAME,
+        "model": MODEL_NAME,
+        "provider_execution": {
+            "schema": "zode.provider-execution.v1",
+            "revision": descriptor_revision,
+            "kind": "openai_compatible",
+            "base_url": provider_base_url,
+            "options": {}
+        },
+        "auth_profile_id": profile_id,
+        "minimum_auth_revision": sharing_revision
+    });
+    let (status, _body, session_b) = public_json(
+        authenticated(
+            client
+                .post(format!(
+                    "{}/v1/endpoints/{endpoint_b_id}/sessions",
+                    server.base_url
+                ))
+                .header("Idempotency-Key", "sharing-session-b-create"),
+            &assertion,
+        )
+        .json(&json!({})),
+        &markers,
+        "shared Endpoint session create",
+    )
+    .await?;
+    require_status(
+        status,
+        StatusCode::CREATED,
+        "shared Endpoint session create",
+    )?;
+    let session_b_id = session_b["session_id"]
+        .as_str()
+        .ok_or_else(|| Error::other("shared Endpoint session omitted ID"))?
+        .to_owned();
+    let (status, _body, _value) = public_json(
+        authenticated(
+            client
+                .put(format!(
+                    "{}/v1/endpoints/{endpoint_b_id}/sessions/{session_b_id}/model",
+                    server.base_url
+                ))
+                .header("Idempotency-Key", "sharing-session-b-model"),
+            &assertion,
+        )
+        .json(&model),
+        &markers,
+        "shared Endpoint model selection",
+    )
+    .await?;
+    require_status(
+        status,
+        StatusCode::ACCEPTED,
+        "shared Endpoint model selection",
+    )?;
+    let events = open_endpoint_events(
+        &client,
+        &server.base_url,
+        &assertion,
+        &endpoint_b_id,
+        None,
+        &markers,
+    )
+    .await?;
+    let (status, _body, _value) = public_json(
+        authenticated(
+            client
+                .post(format!(
+                    "{}/v1/endpoints/{endpoint_b_id}/sessions/{session_b_id}/messages",
+                    server.base_url
+                ))
+                .header("Idempotency-Key", "sharing-session-b-message"),
+            &assertion,
+        )
+        .json(&json!({"content": "Reply with exactly REMOTE_OK"})),
+        &markers,
+        "shared Endpoint message",
+    )
+    .await?;
+    require_status(status, StatusCode::ACCEPTED, "shared Endpoint message")?;
+    wait_for_provider_requests(&provider_state, 1).await?;
+    read_assistant_event(events, &markers, ASSISTANT_TEXT).await?;
+
+    let (status, _body, session_a) = public_json(
+        authenticated(
+            client
+                .post(format!(
+                    "{}/v1/endpoints/{endpoint_a_id}/sessions",
+                    server.base_url
+                ))
+                .header("Idempotency-Key", "sharing-session-a-create"),
+            &assertion,
+        )
+        .json(&json!({})),
+        &markers,
+        "removed Endpoint session create",
+    )
+    .await?;
+    require_status(
+        status,
+        StatusCode::CREATED,
+        "removed Endpoint session create",
+    )?;
+    let session_a_id = session_a["session_id"]
+        .as_str()
+        .ok_or_else(|| Error::other("removed Endpoint session omitted ID"))?;
+    let rejected = authenticated(
+        client
+            .put(format!(
+                "{}/v1/endpoints/{endpoint_a_id}/sessions/{session_a_id}/model",
+                server.base_url
+            ))
+            .header("Idempotency-Key", "sharing-session-a-model"),
+        &assertion,
+    )
+    .json(&model);
+    let (rejected_status, rejected_body) =
+        read_response(timeout(HTTP_TIMEOUT, rejected.send()).await??, &markers).await?;
+    require_status(
+        rejected_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "removed Endpoint model selection",
+    )?;
+    let rejected_value = parse_json(&rejected_body, "removed Endpoint model selection")?;
+    if rejected_value["error"]["code"] != "auth_replica_unavailable"
+        || rejected_value["error"]["retryable"] != true
+    {
+        return Err(
+            Error::other("removed Endpoint did not expose typed replica unavailability").into(),
+        );
+    }
+    if provider_state
+        .requests
+        .lock()
+        .expect("provider fixture request mutex poisoned")
+        .len()
+        != 1
+    {
+        return Err(Error::other("removed Endpoint reached the provider").into());
+    }
+
+    server.stop().await?;
+    endpoint_a.stop().await?;
+    endpoint_b.stop().await?;
+    provider.stop().await?;
+    jwks.stop().await?;
+    let mut persisted_markers = marker_values;
+    persisted_markers.push(session_b_id);
+    persisted_markers.push(session_a_id.to_owned());
+    scan_tree_for_markers(server_database.clone(), persisted_markers.clone()).await?;
+    scan_tree_for_markers(
+        server_database.with_extension("sqlite3-wal"),
+        persisted_markers.clone(),
+    )
+    .await?;
+    scan_tree_for_markers(
+        server_database.with_extension("sqlite3-shm"),
+        persisted_markers.clone(),
+    )
+    .await?;
+    scan_tree_for_markers(server_secrets, persisted_markers).await?;
     Ok(())
 }

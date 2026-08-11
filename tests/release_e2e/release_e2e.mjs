@@ -570,7 +570,7 @@ function requiredSurface(repoRoot, commit, driverRelativePath) {
     "web/tsconfig.json",
     "web/index.html",
     "web/src",
-    "web/src/main.ts",
+    "web/src/main.tsx",
     "web/vite.config.ts",
   ];
   if (driverRelativePath) required.push(driverRelativePath);

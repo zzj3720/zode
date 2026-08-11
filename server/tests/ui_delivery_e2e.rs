@@ -53,7 +53,7 @@ const ACCESS_EMAIL: &str = "ui-delivery-human@example.invalid";
 const ACCESS_KID: &str = "ui-delivery-access-key";
 const SERVER_AUTHORITY: &str = "ui-delivery-server-authority";
 const HISTORY_PATH: &str = "/endpoints/endpoint-ui/sessions/01JUIDELIVERYHISTORY";
-const SSE_PATH: &str = "/v1/endpoints/endpoint-ui/sessions/01JUIDELIVERYSSE/events";
+const SSE_PATH: &str = "/v1/endpoints/endpoint-ui/events";
 const INCIDENT_OWNER: &str =
     "e2e_server_ui_delivery_serves_access_protected_management_assets_and_isolates_callback_origin";
 const INCIDENT_CASSETTE_PATH: &str = "tests/fixtures/ui_delivery/ui-delivery-first-404.v1.json";
@@ -1309,6 +1309,13 @@ fn callback_lifecycle_body() -> TestResult {
     let profile_revision = profile_value["revision"]
         .as_u64()
         .ok_or_else(|| io::Error::other("provider profile omitted revision"))?;
+    if profile_value["status"] != "pending" {
+        return Err(io::Error::other(
+            "provider profile create did not return its durable pending receipt",
+        )
+        .into());
+    }
+    wait_for_callback_profile_ready(&edge, &assertion, &profile_id, &endpoint_id)?;
 
     let session_create_path = format!("/v1/endpoints/{endpoint_id}/sessions");
     let session_create = origin_request_with_headers(
@@ -1361,6 +1368,47 @@ fn callback_lifecycle_body() -> TestResult {
     run_real_callback_exchange(&edge, &assertion, &endpoint_id, session_id, &boundary)
 }
 
+fn wait_for_callback_profile_ready(
+    edge: &AccessEdge,
+    assertion: &str,
+    profile_id: &str,
+    endpoint_id: &str,
+) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let replicas = origin_request_with_headers(
+            &edge.management_url(),
+            HttpRequestSpec {
+                method: "GET",
+                path: &format!("/v1/auth-profiles/{profile_id}/replicas"),
+                host: MANAGEMENT_AUTHORITY,
+                accept: "application/json",
+                assertion: Some(assertion),
+                extra_headers: &[],
+                body: &[],
+            },
+        )?;
+        if replicas.status == 200 {
+            let value: Value = serde_json::from_slice(&replicas.body)?;
+            if value["items"].as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item["endpoint_id"] == endpoint_id && item["status"] == "ready")
+            }) {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "provider replica did not become ready before session create",
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn run_real_callback_exchange(
     edge: &AccessEdge,
     assertion: &str,
@@ -1368,7 +1416,7 @@ fn run_real_callback_exchange(
     session_id: &str,
     boundary: &CallbackBoundaryFixture,
 ) -> TestResult {
-    let events_path = format!("/v1/endpoints/{endpoint_id}/sessions/{session_id}/events");
+    let events_path = format!("/v1/endpoints/{endpoint_id}/events");
     let sse = open_sse_connection(
         &edge.management_url(),
         &events_path,
@@ -2129,7 +2177,6 @@ fn write_callback_endpoint_config(
         }],
         "runtime": {
             "tool_foreground_ms": 100,
-            "max_rounds_per_activation": 8,
             "model_step_max_attempts": 1,
             "model_retry_base_ms": 1,
             "model_retry_max_ms": 10,

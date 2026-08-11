@@ -62,6 +62,13 @@ Recordings have three storage classes:
    `fixtures/incidents/` contain reviewed immutable secret-safe cassettes used
    by committed regression E2Es.
 
+A long agent run may store its reviewed LLM envelope as a Zstandard-compressed
+tracked fixture when repeated growing request contexts would make the plain
+JSON envelope needlessly large. Compression changes only storage: loading is
+bounded independently for compressed and expanded bytes, then validates the
+same complete envelope digest, exact ordered requests, chunks, outcomes, and
+secret-slot rules before replay. It cannot omit or summarize exchanges.
+
 Create a new capture path exclusively. Never overwrite an existing raw or
 tracked cassette. A different occurrence receives a different recording ID.
 Tracked fixture updates are explicit reviewed changes, not output written by
@@ -95,6 +102,24 @@ Each exchange contains:
 - each chunk's offset from response start in microseconds;
 - whether the response completed, disconnected, timed out, or ended with a
   safe classified transport error.
+
+Reasoning-capable providers may emit one small SSE frame per reasoning token.
+The recorder therefore bounds response bytes and frame count independently;
+the frame bound must accommodate the configured model output budget while the
+byte bound remains authoritative. Crossing either bound fails the live test
+and cannot silently combine a later model request with the incomplete
+exchange. The positive large-response path is frozen by
+`e2e_llm_recorder_accepts_bounded_reasoning_stream_needed_by_handoff_generation`;
+`e2e_llm_recorder_stream_capture_bound_fails_closed` retains the upper-bound
+failure.
+
+Captured timing is the ordered offset of each frame from response start. The
+bounded-delay rule applies to the initial response delay and to each adjacent
+frame gap, not to total stream duration. A healthy long reasoning stream may
+therefore last longer than one allowed idle gap while every individual gap
+remains bounded. `e2e_recorded_provider_replay_accepts_long_total_stream_with_bounded_inter_chunk_delays`
+freezes this distinction; `e2e_recorded_provider_replay_rejects_unbounded_captured_timing`
+retains the rejection path.
 
 Do not store the upstream credential-bearing URL, DNS result, Authorization
 value, cookie, raw Access assertion, OAuth token/code/state, callback bearer,
@@ -202,6 +227,48 @@ Replay always starts the owning real product process and uses its public entry
 plus the production adapter under test. Provider replay therefore starts the
 real Endpoint and traverses aimux to a network replay server. Server incidents
 start real Server and Endpoint processes where the original path did.
+
+DeepSWE replay is centered on the session's append-only event log. One reviewed,
+immutable event trace is the causal manifest for the run; there is no parallel
+shell transcript or environment snapshot that can become a second authority.
+The trace preserves each ordered semantic event's schema version, type, and
+payload. Test-only loading is byte-bounded, checks a whole-trace digest, and
+rejects missing, extra, reordered, or changed events.
+
+The replay harness classifies trace entries by their role without importing
+them into storage:
+
+- input events describe stimuli that the harness must deliver through the same
+  public command or external adapter boundary used in production;
+- output and lifecycle events describe facts that the new Endpoint execution
+  must commit and are compared as expected results.
+
+For example, a recorded user delivery is replayed as the corresponding public
+message command. `AsyncToolCallStarted` supplies the exact tool name and input
+that the real HTTP tool adapter must receive, while its matching
+`AsyncToolCallCompleted` supplies the recorded external result returned by the
+test-owned tool fixture. Endpoint must independently commit both lifecycle
+events in the same causal position. Even when an event represents an admitted
+input, the harness never appends that event directly.
+
+The provider HTTP cassette is the only supplemental long-run recording. It
+retains exact provider request/response bytes because those payloads are
+intentionally excluded from session events. Replay still starts the real
+Endpoint, sends the user input through public HTTP, traverses aimux, and uses
+the production HTTP tool-dispatch adapter. The resulting stopped database's
+event trace must match the reviewed manifest after deterministic normalization
+of run-local identities and clocks. An unexpected provider request, tool call,
+event, duplicate, or unconsumed expected fact fails the E2E.
+
+A separate Pier reconstruction mode may additionally start a fresh official
+benchmark environment. It derives each shell command and expected result from
+the same event trace, executes the command there for its filesystem side
+effects, and requires the recorded exit code while returning the recorded
+stdout/stderr so provider replay remains exact. The official verifier then
+checks the reconstructed working tree after all provider requests and expected
+events are exhausted. This reconstruction does not replace the deterministic
+Endpoint replay, and recorded tool output alone cannot produce a passing
+benchmark result.
 
 The replay server verifies exact exchange order, method, path, semantic
 headers, request body bytes or approved synthetic-slot substitution, and total

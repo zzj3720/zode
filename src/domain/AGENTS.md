@@ -13,8 +13,9 @@ events, and the deterministic session projection. It does not own effects.
   outside the reducer and carried by typed events.
 - Use semantic events and explicit versioning. Never persist generic JSON
   patches, aimux/provider Rust or wire types, SQLite rows, HTTP request types,
-  or secrets. Native model continuation may use one bounded, versioned,
-  model-neutral opaque envelope; the reducer never interprets its bytes.
+  provider-request snapshots, transcript/tool copies, request controls, or
+  secrets. A request already sent to a provider exists only in the live
+  process; restart reconstructs a new request from durable semantic facts.
 - The original model `tool_call_id` is the lifecycle identity. Do not add a
   parallel async-task identity.
 - `SessionCreated` fixes the Endpoint-generated session ID, immutable
@@ -32,13 +33,15 @@ events, and the deterministic session projection. It does not own effects.
   fact captures its concrete resolved replica revision. No fact carries secret
   bytes. Later session-selection affects later activations; a later replica
   install may affect only a provider request not yet sent.
-- A model-round fact captures the delivery position and prepared logical
+- A model-round fact captures the delivery position and transient logical
   request fingerprint used by that round. Deliveries may materialize at later
-  round boundaries in the same activation, but retries of one prepared model
-  step keep its fingerprint and do not consume newer deliveries.
-- A scheduled model retry owns a stable next attempt ID and number. Starting it
-  is first-wins; interruption with exhausted budget atomically ends the
-  activation with typed failure and preserves queued delivery runnability.
+  round boundaries in the same activation, but retries of one live in-memory
+  model step keep its fingerprint and do not consume newer deliveries. An
+  interrupted request is abandoned after restart rather than reconstructed.
+- A scheduled model retry owns a stable next attempt ID and number while its
+  process-local request remains available. Starting it is first-wins. A crash
+  abandons that request and builds a fresh round from the latest durable facts;
+  it does not turn an interrupted transport into attempt exhaustion.
 - Incremental model stream parts are not durable assistant/tool facts. Only a
   complete successful stream can commit its assistant outcome and validated
   tool-call batch.

@@ -9,8 +9,10 @@ The root `AGENTS.md`, `docs/ui.md`, and `docs/server-api.md` are authoritative.
   discover devices, attach provider authorization, or import Endpoint runtime
   code.
 - Keep the Endpoint-owned `(endpoint_id, session_id)` pair together in every
-  session URL and query key. Resume with Endpoint event cursors proxied by
-  Server; no Server-global session or session-event identity exists.
+  session URL and query key. The application graph owns one SSE connection and
+  one cursor per Endpoint, proxied by Server, and dispatches frames to canonical
+  sessions by `session_id`; a Session or component never owns a stream. No
+  Server-global session or session-event identity exists.
 - Use `/endpoints/{endpoint_id}/sessions/{session_id}` as the canonical browser
   route. Never implement an ID-only search/fallback across Endpoints.
 - Browser storage and client caches contain non-secret query state only. API

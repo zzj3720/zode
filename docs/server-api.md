@@ -10,7 +10,8 @@ with a failing real-process E2E.
 The browser and API clients call Server only through the Cloudflare Access-
 protected management origin. Server validates the Access application assertion,
 resolves Endpoint and auth-profile semantics, and proxies Endpoint session
-HTTP/SSE. Session data passes through Server but is never persisted there.
+HTTP plus Endpoint-wide SSE. Session data passes through Server but is never
+persisted there.
 `docs/access.md` is authoritative for ingress, actor derivation, origin
 separation, key rotation, and authentication E2Es.
 
@@ -257,6 +258,12 @@ deleted. It cannot be added as ordinary row deletion.
 health/capability observation. It does not cause Endpoint to register or open a
 reverse connection.
 
+A failed authenticated probe also marks that Endpoint's latest non-terminal
+auth-replica projections `unreachable`. A later successful probe wakes normal
+replica reconciliation; Server does not guess that a credential is ready.
+Already acknowledged tombstones remain `removed` and cannot regress merely
+because a later probe fails.
+
 ## 4. Provider types and auth profiles
 
 `GET /v1/providers` lists Server-managed provider types, their versioned
@@ -278,8 +285,15 @@ The response shape is exact and versioned:
         "kind": "openai_compatible",
         "base_url": "https://models.example.test/v1",
         "models": ["model-a"],
+        "model_limits": {
+          "model-a": {
+            "context_window_tokens": 1000000,
+            "max_output_tokens": 384000
+          }
+        },
         "options": {}
       },
+      "auth_methods": ["api_key", "oauth"],
       "default_profile_id": "01JPROFILEEXAMPLE0000000000",
       "auth_status": "ready",
       "auth_profile_count": 2
@@ -298,6 +312,48 @@ subjects, OAuth attempt/ticket state, replica credentials, or provider headers.
 An authority with no configured providers returns the same schema with an empty
 `providers` array; it does not return 404 or invent a built-in provider.
 
+Each provider projection additionally contains a sorted `auth_methods` array.
+`api_key` is always present. `oauth` is present only when Server startup loaded
+one valid OAuth adapter for that exact provider identity. The projection never
+contains authorization/token URLs, client identity, client-secret references,
+scopes, PKCE material, refresh tokens, or adapter-internal state. UI uses this
+field as the only authority for offering OAuth enrollment.
+
+Server's optional `provider_auth_adapters` deployment configuration is a list
+with at most one entry per provider:
+
+```json
+{
+  "provider": "models-example",
+  "kind": "oauth2_authorization_code_pkce",
+  "authorization_endpoint": "https://login.example.test/oauth/authorize",
+  "token_endpoint": "https://login.example.test/oauth/token",
+  "client_id": "zode-public-client",
+  "client_secret_file": null,
+  "scopes": ["models.execute"],
+  "refresh_recovery": "same_operation_id_idempotent"
+}
+```
+
+Endpoints are exact HTTPS URLs, except loopback HTTP is allowed for local test
+or development fixtures; credentials, fragments, and pre-existing query values
+are rejected. `client_secret_file`, when present, is resolved relative to the
+Server config and must be a private regular file outside SQLite. Scopes are
+bounded, sorted, and unique. For the generic
+`oauth2_authorization_code_pkce` adapter, `refresh_recovery` is exactly
+`same_operation_id_idempotent` or `none` and is frozen into each admitted
+refresh operation. `exact_result_reconcile` requires a provider-specific
+adapter with a separately validated exact-result readback contract; the generic
+adapter rejects that value before public bind instead of advertising an
+unimplemented recovery path. Duplicate provider entries or an unsupported
+adapter fail startup. Environment variables and browser input cannot install
+or override an adapter.
+
+This catalog is Server management configuration, not Endpoint execution
+configuration. It is never copied into `provider_execution.options` or an auth
+replica. Updating the catalog requires a normal Server config/restart and does
+not mutate an already admitted attempt or refresh operation.
+
 `PUT /v1/providers/{provider}` creates or updates that provider type's
 non-secret execution descriptor:
 
@@ -306,6 +362,12 @@ non-secret execution descriptor:
   "kind": "openai_compatible",
   "base_url": "https://models.example.test/v1",
   "models": ["model-a"],
+  "model_limits": {
+    "model-a": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 384000
+    }
+  },
   "options": {}
 }
 ```
@@ -316,6 +378,12 @@ session create/model selection carries one explicit revision and same-key retry
 keeps it. Server validates bounds and safe URL schemes, while the target
 Endpoint independently enforces adapter support and outbound policy. Secret
 headers are auth-profile material and are rejected from this descriptor.
+`model_limits` is keyed only by names present in `models`. Its context window
+and maximum output are provider capabilities, not per-request reservations.
+The client copies the selected immutable entry with the descriptor revision;
+Server accepts and forwards it only when it exactly matches that entry. A
+legacy descriptor without an entry remains usable but cannot enable Endpoint's
+automatic context handoff for that model.
 
 One provider type may have any number of OAuth and API-key profiles. Profile
 routes are:
@@ -329,6 +397,21 @@ routes are:
 - `POST /v1/auth-profiles/{profile_id}/refresh-operations`
 - `GET /v1/auth-refresh-operations/{operation_id}`
 - `GET /v1/auth-refresh-operations/{operation_id}/events`
+
+`POST /v1/providers/{provider}/auth-profiles` durably creates the Server-owned
+profile, its sharing plan, and the original non-secret response before it
+returns. Endpoint replica installation is asynchronous: an unavailable or
+slow Endpoint leaves the profile visibly `pending` or `unreachable` and does
+not turn an accepted profile create into a `5xx` response. Server rebuilds and
+retries unfinished distribution after restart with the original operation
+identity.
+
+The API-key profile-create response is an immutable receipt scoped to the
+Access actor, provider, idempotency key, and request body. A matching retry
+returns that original safe response even after distribution state changes. If
+an upgraded database contains a historical create operation without a receipt,
+Server fails closed with `409 idempotency_receipt_unavailable`; it never
+synthesizes an old response from the current projection.
 
 `PUT /v1/providers/{provider}/default-auth-profile` accepts
 `{"profile_id":"..."}` and returns the selected non-secret auth-profile
@@ -351,6 +434,28 @@ An API-key create body is:
 }
 ```
 
+The same route replaces the secret of an existing API-key profile when the
+body contains `replace_auth_profile_id` instead of create-only `label`,
+`make_default`, and `sharing` fields:
+
+```json
+{
+  "kind": "api_key",
+  "api_key": "new secret input",
+  "replace_auth_profile_id": "profile-opaque"
+}
+```
+
+A replacement preserves the profile ID, provider, label, default pointer, and
+sharing policy. It atomically advances the profile above every credential,
+reserved refresh, install, and tombstone revision, then creates install work
+for every currently authorized Endpoint. The accepted response may therefore
+show distribution as `pending`, `stale`, or `unreachable`; it never claims the
+new credential is ready before the exact revision is acknowledged. The
+replacement is idempotent for the Access actor, provider, key, and complete
+request body. It rejects a missing, deleted, non-API-key, or cross-provider
+profile and never returns either the old or new secret.
+
 The response contains profile ID, provider, kind, label, safe account hint,
 status, revision, expiry when known, default flag, sharing policy, and
 distribution summary. It never returns secret material.
@@ -363,6 +468,40 @@ Sharing policy is `none`, `selected`, or `all_current`. `all_current` does not
 silently authorize future Endpoints; adding a new Endpoint creates an explicit
 distribution plan visible to the user before secret transfer. A future
 `all_including_future` policy requires a separate user-approved design.
+
+`PUT /v1/auth-profiles/{profile_id}/sharing` accepts the sharing object itself:
+
+```json
+{
+  "mode": "selected",
+  "endpoint_ids": ["endpoint-local"]
+}
+```
+
+`none` requires an empty list, `selected` requires a non-empty list, and
+`all_current` requires an empty input list that Server expands atomically to
+the sorted IDs of all currently enabled Endpoints. The expanded explicit IDs
+are returned in the profile projection and remain the durable plan; Endpoints
+added later are not included automatically.
+
+The mutation requires `Idempotency-Key` and returns `202` with the complete
+`zode.auth-profile.v1` projection after durable admission. A matching replay
+returns that exact original status and body even if replica states later
+change; changed-body key reuse conflicts. A new-key semantic no-op records and
+returns the current projection without advancing a revision or dispatching
+replica work.
+
+When the sharing mode or explicit Endpoint set changes, one transaction
+appends the sharing revision, advances the profile sequence above every
+credential, reserved refresh revision, install, and tombstone revision,
+appends installs at that revision for every Endpoint still authorized, appends
+tombstones at the same revision for every removed Endpoint, and stores the
+original response receipt.
+The installs re-publish the same Server-authoritative credential at the new
+revision so re-sharing can never send an older credential across a newer
+tombstone. External delivery happens only after this commit and may leave the
+returned distribution projection `pending` or `unreachable` until the normal
+reconciler receives Endpoint acknowledgements.
 
 Deleting a profile or removing an Endpoint from sharing atomically appends the
 higher per-Endpoint tombstone operations defined in `docs/auth-replication.md`.
@@ -467,6 +606,10 @@ revision and removes the fence.
       "base_url": "https://models.example.test/v1",
       "options": {}
     },
+    "limits": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 384000
+    },
     "auth_profile_id": "profile-opaque",
     "minimum_auth_revision": 7
   },
@@ -481,8 +624,9 @@ key on every retry. Server never resolves a mutable default during admission.
 On a new admission, Server validates the Access assertion, Endpoint capability,
 model/profile compatibility, sharing policy, and that the full descriptor
 exactly matches its immutable revision before forwarding it with the concrete
-authority/profile/minimum replica revision. Operators still configure these
-resources once on Server rather than on each Endpoint. Server additionally
+authority/profile/minimum replica revision and the exact selected descriptor
+model-capability limits copied by the client. Operators still configure these resources once on Server
+rather than on each Endpoint. Server additionally
 injects its stable Endpoint-scoped `callback_base_url`; that configured value
 cannot vary across a same-key retry.
 
@@ -521,7 +665,7 @@ Endpoint-scoped route with the same key and Endpoint returns the original ULID.
 Server keeps no session receipt, mapping, or pending route.
 
 The Endpoint is always explicit in the URL; v0 never selects a device
-implicitly. `auth_profile_id`, `provider_execution`, and
+implicitly. `auth_profile_id`, `provider_execution`, `limits`, and
 `minimum_auth_revision` are required whenever `model` is present; omitting one
 returns `422` and never resolves a default. Omitting the entire model follows
 Endpoint's explicit non-runnable-session contract. The provider default is a UI
@@ -559,6 +703,10 @@ segment and does not persist or index it. It derives the same opaque subject for
 every request by that Access actor; Endpoint returns not-found for another
 subject's session.
 
+Tool projections preserve Endpoint's complete `allowed_actions` array. Server
+does not infer Cancel or retry eligibility from status and Web does not add an
+action that the proxied projection omitted.
+
 The common replay-aware ordering is applied before mutable provider, profile,
 model, or action gates. Thus a lost admitted message/model/tool-command
 response remains replayable after a policy change, while a new key is judged by
@@ -575,21 +723,32 @@ or `move` route. The Endpoint-scoped identity makes that ownership explicit.
 Disabling or losing an Endpoint does not silently run the session on the
 built-in Endpoint.
 
-## 7. Session events
+## 7. Endpoint events
 
-`GET /v1/endpoints/{endpoint_id}/sessions/{session_id}/events` proxies Endpoint
-SSE. Event IDs remain durable Endpoint event positions and support
+`GET /v1/endpoints/{endpoint_id}/events` proxies the Endpoint-wide SSE stream.
+Event IDs remain durable Endpoint-global event positions and support
 `Last-Event-ID`.
 
 Server forwards the Endpoint public event schema without allocating a second
-event identity. The route already supplies `endpoint_id`; each frame contains
-the Endpoint-generated `session_id`, session version, kind, and data.
+event identity. The route supplies `endpoint_id`; each session-owned frame
+contains the Endpoint-generated `session_id`, session version, kind, and data.
+The validated Access actor is translated to the same opaque Endpoint subject as
+session reads and commands, so one stream multiplexes only that actor's visible
+sessions.
 
-For each attached client, Server opens the matching Endpoint stream and forwards
-the client's `Last-Event-ID`. Endpoint owns replay/live handoff and
-deduplication. Server stores neither events nor cursors. If Endpoint is
-unreachable, the proxy returns or closes with a safe Endpoint-unavailable
-condition and cannot invent missing session facts.
+For each attached browser/client Endpoint stream, Server opens Endpoint
+`GET /v1/events` and forwards the client's `Last-Event-ID` unchanged. Endpoint
+owns subject filtering, replay/live handoff, ordering, and deduplication. Server
+stores neither events nor cursors and does not open one downstream stream per
+session. If Endpoint is unreachable, the proxy returns or closes with a safe
+Endpoint-unavailable condition and cannot invent missing session facts.
+
+The former
+`/v1/endpoints/{endpoint_id}/sessions/{session_id}/events` route is absent; the
+Server does not retain a compatibility proxy. The browser anchor
+`e2e_browser_endpoint_stream_multiplexes_sessions_across_navigation_and_reconnect`
+proves one management stream and one downstream Endpoint stream carry two
+sessions across navigation and reconnect while the Server remains stateless.
 
 Transient model token deltas may be proxied live. Final messages, activation
 outcomes, tool lifecycle, and waits are published as durable frames only after
@@ -665,7 +824,8 @@ provider/tool/OAuth fixtures.
 - restart Server after an unknown create response and retry without duplicating
   the Endpoint session;
 - rotate Endpoint control authentication, restart/probe, and continue the same
-  session GET/SSE/message and same-key create replay under unchanged authority;
+  session GET/message, Endpoint SSE, and same-key create replay under unchanged
+  authority;
 - after Endpoint commits create but Server loses the response, delete/unshare
   the profile and prove same-key retry replays the original ULID while a new key
   is rejected by current policy;
@@ -679,12 +839,16 @@ provider/tool/OAuth fixtures.
   the original result while a new key follows current policy;
 - a model selection missing profile/descriptor/minimum revision returns `422`
   and creates no Endpoint session; Server never fills a mutable default;
-- proxied SSE reconnect has no missing/duplicate durable Endpoint event and no
-  Server event cursor;
+- one proxied Endpoint-wide SSE carries two owned sessions, and reconnect has
+  no missing/duplicate durable Endpoint event and no Server event cursor;
 - Endpoint unreachable returns typed unavailability and never silently
   reroutes or serves invented stale session state;
 - OAuth/profile/default/distribution lifecycle with multiple profiles for one
   provider;
+- `e2e_browser_profile_create_remains_accepted_while_replica_distribution_is_pending`
+  holds the real Endpoint replica install, proves profile create returns its
+  durable `pending` receipt instead of `5xx`, then releases the Endpoint and
+  observes the same browser projection automatically converge to `ready`;
 - redeem one OAuth authorize ticket twice and concurrently; exactly one request
   produces one redirect/provider state, every replay is consumed, and an
   explicit new ticket is required for another redirect; the provider observes
@@ -694,6 +858,11 @@ provider/tool/OAuth fixtures.
   distribution; non-idempotent unknown refresh fences new-key explicit and
   scheduled refresh with no second provider call until successful relogin, and
   never blindly retries or reuses a revision;
+- `e2e_server_crash_with_committed_wal_and_missing_shm_recovers_same_control_facts`
+  kills the real Server after a committed provider descriptor, proves a
+  non-empty private WAL remains while SHM is absent, then restarts through the
+  same config and observes the exact durable descriptor without weakening the
+  database/lock/owner integrity checks;
 - Endpoint-scoped callback relay completes exactly once when reachable and
   returns retryable unavailability without a Server queue when offline; its
   bearer never appears in a URL, log, event, or database; the same callback URL

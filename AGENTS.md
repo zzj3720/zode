@@ -185,6 +185,16 @@ activation; if no round follows they wake a later activation. Detailed
 round-boundary, atomicity, wait, retry, and recovery rules are owned by
 `src/runtime/AGENTS.md`.
 
+The complete append-only transcript is the public history authority, but it is
+not sent unbounded to a provider. Before a provider context reaches its token
+threshold, the current agent writes a durable handoff document and Endpoint
+starts a fresh context generation for the same session and task. The fresh
+generation does not receive the old transcript or handoff body implicitly; it
+uses runtime-owned read-only tools to open the handoff and page or inspect
+history as needed. No numeric round count may terminate unfinished work, and a
+context-generation change must continue without another client command.
+Server and Web own neither transcript, handoff, nor context-generation state.
+
 ## Provider execution and authentication boundary
 
 All production LLM requests execute on Endpoint through aimux and go directly
@@ -233,9 +243,11 @@ protected management origin.
 
 ## Append-only storage
 
-The session event stream is the only source of truth. Current state is a
-deterministic projection of semantic events. Do not store a mutable session JSON
-record as an alternative authority.
+Each session's append-only durable event log is the only source of truth for
+that session. It is a storage/runtime concept, not a transport connection: the
+public SSE transport is the single Endpoint-wide stream defined below. Current
+session state is a deterministic projection of semantic events. Do not store a
+mutable session JSON record as an alternative authority.
 
 - Use typed semantic events such as `InputQueued`, `WaitSet`,
   `AsyncToolCallStarted`, and `AsyncToolCallCompleted`; do not use generic JSON
@@ -293,7 +305,8 @@ Snapshots optimize replay; they are never an alternative authority.
   time alone. Keep the threshold configurable and small in E2E tests.
 - Snapshots do not advance the public event cursor and are not emitted as
   normal SSE domain events.
-- Storage snapshots and model-context compaction are separate mechanisms.
+- Storage snapshots and model-context handoff generations are separate
+  mechanisms.
 
 Every reducer or event-schema change must preserve deterministic full replay
 and snapshot-plus-tail replay. Prefer versioned events and explicit upcasters;
@@ -323,7 +336,8 @@ Endpoint surface stays execution-focused:
 
 - identity, bounded health, and non-secret capabilities;
 - create/read a session, select an explicit provider/model/profile revision,
-  append messages, and stream session events;
+  append messages, and stream all subject-visible session events through one
+  Endpoint-wide SSE;
 - read/cancel/reconcile tool calls and accept opaque-ID callback completion;
 - install/read/tombstone controller-authenticated credential replicas.
 
@@ -332,11 +346,13 @@ registration, or UI route. Server owns those resources plus Endpoint inventory,
 stateless Endpoint-scoped session/callback proxying, and UI delivery as defined
 in `docs/server-api.md`.
 
-Endpoint SSE is a durable ordered view of committed runtime events. Server
-forwards the UI's `Last-Event-ID` without storing a cursor or allocating a
-second event identity. Reconnect may not miss committed events or duplicate
-terminal effects. Transient token deltas may be best-effort, but the final
-assistant message and all lifecycle transitions are durable.
+Endpoint SSE is one durable ordered Endpoint-wide view of committed runtime
+events for the authenticated authority/subject. Each frame carries its
+`session_id`; session lifecycle never owns a connection or cursor. Server
+forwards the UI's Endpoint `Last-Event-ID` without storing a cursor or
+allocating a second event identity. Reconnect may not miss committed events or
+duplicate terminal effects. Transient token deltas may be best-effort, but the
+final assistant message and all lifecycle transitions are durable.
 
 Do not expose raw storage records as an accidental permanent public API. Map
 domain events to an explicitly versioned public event schema.
@@ -454,6 +470,11 @@ behavioral finding discovered during development, construct a black-box E2E
 that fails through the owning real process/browser and public HTTP/SSE entry,
 then make it pass. If the required process or route does not exist,
 implementing that smallest real entry and the red E2E comes before the fix.
+Source inspection, a plausible race, stronger-test advice, or a reviewer risk
+argument is not an accepted behavioral finding by itself and cannot block an
+otherwise-ready delivery. If the claimed behavior cannot be made stably red
+through that public E2E, reject the finding and do not change production code
+for it.
 Compiler, formatter, lint, and architectural type-boundary failures remain
 mandatory static gates; they do not justify adding a non-E2E test.
 
@@ -550,9 +571,11 @@ fabricate or relabel a later capture as the historical first occurrence.
   reports concrete correctness, recovery, security, simplicity, or operability
   findings and does not silently patch the implementation it reviews.
 - Every behavioral review finding must state a constructible public red E2E.
-  Send it to the assigned E2E owner, who demonstrates that failure before the
-  task's implementation owner fixes production code. Production workers and
-  reviewers may not rewrite a frozen E2E to fit their preferred implementation.
+  The review finding is accepted only after that E2E stably demonstrates the
+  claimed failure against the running product. A finding without such a red is
+  rejected, does not block merge, and must not cause a production change.
+  Production workers and reviewers may not rewrite a frozen E2E to fit their
+  preferred implementation.
 - Send the fix back to the same reviewer until its findings converge, then use
   an independent final repository review to catch cross-module failures.
 - Do not resolve review comments by weakening E2Es, adding parallel fallback

@@ -106,7 +106,10 @@ The v0 configuration shape is conceptually:
   "runtime": {
     "tool_foreground_ms": 3000,
     "snapshot_every_events": 100,
-    "max_rounds_per_activation": 32,
+    "model_request_max_output_tokens": 128000,
+    "model_context_buffer_tokens": 32000,
+    "model_context_handoff_generation_tokens": 128000,
+    "model_context_handoff_document_tokens": 4096,
     "model_step_max_attempts": 3,
     "model_retry_base_ms": 500,
     "model_retry_max_ms": 5000,
@@ -151,6 +154,30 @@ step after aimux surfaces a retryable failure; it includes the first call and
 must be at least one. Retry delay uses bounded jitter between the configured
 base and maximum and honors a shorter valid provider hint.
 
+There is no model-round-count setting: an activation is not stopped after an
+arbitrary number of model/tool rounds. `model_request_max_output_tokens` is the
+actual ordinary-request output ceiling and is clamped by the selected model's
+advertised output capability. `model_context_buffer_tokens` is an independent
+safety reserve added after that output allowance. Usable input is the selected
+model context window minus both values; the model's full advertised output
+capability is not deducted unless an actual request asks for it. With the
+defaults, a 1,000,000-token model has an 840,000-token ordinary input budget,
+a 128,000-token requested output allowance, and a separate 32,000-token
+estimation and handoff-headroom reserve. Ordinary rounds cannot consume that
+reserve. A handoff request may consume it while still reserving its own output
+allowance and remaining inside the selected model's absolute context window.
+`model_context_handoff_generation_tokens` bounds the separate handoff request,
+while `model_context_handoff_document_tokens` bounds only its durable decoded
+document. The accountant anchors on provider-reported usage and estimates only
+the later tail; before a valid anchor it uses a four-UTF-8-bytes-per-token
+fallback plus explicit message/tool framing, without another hidden scale
+factor. The independent buffer above is the safety reserve. Raw serialized
+bytes are not counted as tokens. Invalid relationships fail startup. The next context
+generation starts without implicit old transcript or handoff-body injection
+and uses the built-in read-only handoff/history tools.
+These limits affect only provider context: public transcript history remains
+complete.
+
 Each controller credential maps to one immutable `authority_id`; a caller
 cannot select another authority in a header. Secret file contents are outside
 the JSON and never returned. Rotating transport authentication while retaining
@@ -192,6 +219,10 @@ an HTTP tool.
       "options": {}
     },
     "model": "fixture-model",
+    "limits": {
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 384000
+    },
     "auth_authority_id": "authority-opaque",
     "auth_profile_id": "profile-opaque",
     "minimum_auth_revision": 3
@@ -216,6 +247,10 @@ installed revision at admission. A controller that distributed credentials
 should send the revision it verified. Omitting `model` creates a durable session
 that accepts and exposes messages but is not runnable until model selection is
 set; it does not silently choose an ambient provider or profile.
+`limits` records model capability, not the request output budget. A legacy
+selection may omit it and remains runnable, but Endpoint cannot safely trigger
+automatic context handoff for that selection because it will not invent a
+context window.
 `callback_base_url` is optional unless a selected external-callback tool needs
 it. It is concrete execution configuration supplied by the controller, must
 match Endpoint callback-origin policy, and does not cause Endpoint to connect
@@ -313,13 +348,26 @@ rather than silently restarting pagination.
   "delivery": { "acknowledged_through": 0, "pending": [] },
   "wait": null,
   "tool_calls": [],
-  "active_activation": null
+  "active_activation": null,
+  "active_model_round": null,
+  "context_handoff": null
 }
 ```
 
-List, read, mutation, tool, and SSE routes return the same safe not-found result
-for a missing session and a session owned by another authority/subject. This
-prevents an Endpoint-shared user from probing another subject's session IDs.
+After a handoff, `context_handoff` exposes only its stable ID, parent ID,
+generation, covered transcript message ID, and token-accounting metadata. The
+handoff body is not injected as projection metadata; the successor agent reads
+it through the session-bound `read_context_handoff` runtime tool. A long plain
+document is a first-class bounded text field rather than a generic inline JSON
+payload, and is returned in bounded UTF-8 chunks using `content_offset` and
+`next_content_offset`; each result then becomes part of the ordinary append-only
+transcript like any other tool result.
+
+List, read, mutation, and tool routes return the same safe not-found result for
+a missing session and a session owned by another authority/subject. The
+Endpoint-wide SSE omits every event outside the authenticated owner scope and
+never reveals whether another subject's session exists. Together these rules
+prevent an Endpoint-shared user from probing another subject's session IDs.
 
 Secret tool inputs/results and provider continuation bytes are never exposed
 accidentally by this summary. Dedicated result routes return only explicitly
@@ -356,6 +404,10 @@ duplicate the message.
     "options": {}
   },
   "model": "fixture-model",
+  "limits": {
+    "context_window_tokens": 1000000,
+    "max_output_tokens": 384000
+  },
   "auth_authority_id": "authority-opaque",
   "auth_profile_id": "profile-opaque",
   "minimum_auth_revision": 3
@@ -380,11 +432,16 @@ alter that request; if the activation performs another model round, it is
 materialized before that next request. Otherwise it makes the session runnable
 for a later activation.
 
-## 4. Session events
+## 4. Endpoint events
 
-`GET /v1/sessions/{session_id}/events` returns `text/event-stream`.
-`Last-Event-ID` is an optional durable global position. Every durable public
-frame has:
+`GET /v1/events` returns the one Endpoint-wide `text/event-stream`. The route
+requires the same trusted controller authority and opaque `Zode-Subject` used
+for session reads and commands. It multiplexes public events for every session
+owned by that authority/subject; it is not opened for, filtered by, or owned by
+one session.
+
+`Last-Event-ID` is an optional Endpoint-scoped durable global position. Every
+durable public frame identifies its owning session:
 
 ```text
 id: 42
@@ -392,11 +449,44 @@ event: assistant_message_committed
 data: {"schema":"zode.event.v1","id":"42","session_id":"...","version":7,"kind":"assistant_message_committed","data":{...}}
 ```
 
-IDs for one session can skip positions used by other sessions or private
-storage facts, but every public event for that session after the cursor appears
-exactly once and in increasing global order. Subscribe/replay handoff and live
-publication cannot lose an event. Keepalive comments have no `id` and carry no
-state.
+IDs can skip positions used by private storage facts or sessions outside the
+authenticated subject. Every eligible public event after the cursor appears
+exactly once and in increasing Endpoint-global order. Subscribe/replay handoff
+and live publication cannot lose an event. Keepalive comments have no `id` and
+carry no state.
+
+Durable catch-up is streamed in bounded batches rather than accumulated in
+memory before the first frame. Opening a stream and recovering from receiver
+lag each establish one Endpoint-wide handoff fence: durable events through the
+fence are replayed in global order, and later durable frames join that same
+ordered catch-up. No-ID transient progress is outside the durable cursor order:
+it may overtake an older durable replay tail so current work remains visible.
+A durable retry boundary still fences transient text from the next attempt
+until that boundary has been delivered, and a pre-fence transient is never
+emitted after a retry, terminal, or committed-assistant boundary already
+covered by catch-up. Catch-up therefore cannot turn old provisional text into
+apparently new progress or delay all current progress until an unbounded
+history finishes loading.
+
+`context_handoff_created` and `context_handoff_failed` are durable public
+metadata events. The created event carries the same bounded metadata as the
+session projection, never the handoff document body or a provider request.
+
+The cursor and connection belong to the Endpoint stream, not to a session.
+Creating, opening, closing, or navigating among sessions does not create or
+reset an SSE stream. A client uses the frame's `session_id` to dispatch the
+event to its canonical session projection. A fresh stream without
+`Last-Event-ID` replays all eligible public events from the beginning; clients
+may reconcile current session snapshots through bounded HTTP reads while the
+single stream remains attached.
+
+The former session-scoped `/v1/sessions/{session_id}/events` route is absent;
+there is no compatibility stream or second cursor authority. The public
+real-process anchor
+`e2e_endpoint_event_stream_multiplexes_owned_sessions_and_reconnects_once`
+creates two owned sessions plus an unowned session, proves one stream emits only
+the two owned sequences in Endpoint-global order, reconnects once with the last
+consumed ID, and observes no missed or duplicated durable terminal event.
 
 While a model stream is attached to a live client, Endpoint may also emit
 best-effort transient text frames. They have no `id`, are never persisted, and
@@ -407,7 +497,8 @@ event: assistant_message_delta
 data: {"schema":"zode.transient-event.v1","session_id":"...","activation_id":"...","round_id":"...","text":"partial"}
 ```
 
-Transient text is provisional display state only. A durable
+Transient text is provisional display state only and is dispatched by its
+`session_id`. A durable
 `assistant_message_committed` event replaces it; a reconnect must rely on the
 durable stream and must not duplicate or promote a transient candidate. On a
 live stream, a durable `model_step_retrying` boundary precedes every transient
@@ -417,8 +508,8 @@ attempt text and retry text can never be presented as one candidate.
 Durable public kinds include session/message, activation final outcome,
 model-step retry/interruption, wait, and async tool lifecycle facts. A
 `model_step_retrying` payload exposes only round ID, failed/next/max zode
-attempt numbers, bounded delay, and a safe classified error code. Raw prepared
-model envelopes, credentials, raw tool result bodies, provider wire parts,
+attempt numbers, bounded delay, and a safe classified error code. Provider
+request content is never persisted or exposed. Credentials, raw tool result bodies, provider wire parts,
 aimux-internal HTTP attempts, internal ignored facts, snapshot operations, and
 mutable projection repair are not public event payloads. A transient text frame
 contains only bounded display text and the session/activation identity above;
@@ -426,15 +517,18 @@ provider metadata and raw wire parts remain private.
 
 The configured `model_step_max_attempts` includes the first zode call to aimux.
 Aimux may independently perform its bounded pre-stream transport retries inside
-one such call. A retry of the zode model step keeps the prepared request
-fingerprint and does not absorb deliveries that arrived after the round
-boundary. A stream that ends without a valid finish, contains invalid completed
+one such call. A retry of the zode model step may reuse the same in-memory
+request only while that process and round remain alive, and does not absorb
+deliveries that arrived after the round boundary. After a process restart the
+old request is abandoned and a new round is built from the latest durable
+facts. A stream that ends without a valid finish, contains invalid completed
 tool input, or emits an error has no assistant/tool side effect. If retry budget
 remains, the public retry event precedes the next attempt; otherwise the
 activation ends with safe typed `model_attempts_exhausted` and queued deliveries
 remain runnable. A retry event preallocates its stable next attempt ID/number.
-Starting that attempt is an expected-version claim; restart resumes an
-unclaimed schedule once and never appends a duplicate retry fact.
+Starting that attempt is an expected-version claim. A restart reconciles the
+failure boundary once, abandons the unavailable in-memory request, and never
+appends a duplicate retry fact.
 
 If durable catch-up fails after headers were sent, emit one neutral
 `event: error` with a stable public code, then close the stream.
@@ -453,6 +547,7 @@ If durable catch-up fails after headers were sent, emit one neutral
   "tool_name": "fixture_tool",
   "status": "running",
   "completion_mode": "response",
+  "allowed_actions": ["cancel"],
   "result": null,
   "error": null,
   "reconciliation": null
@@ -464,9 +559,14 @@ Terminal `result` is either a bounded public value or
 classified and redacted.
 
 Public status is `planned`, `running`, `unknown_outcome`, `completed`, `failed`,
-or `cancelled`. `unknown_outcome` is nonterminal: automatic dispatch is paused,
-an authenticated callback may still resolve it, and public reconciliation
-metadata explains only the safe reason and allowed actions.
+or `cancelled`. `allowed_actions` is the complete current public action set:
+`planned`/`running` may expose `cancel`; `unknown_outcome` may expose
+`retry_dispatch` only for a tool whose contract guarantees the original
+invocation identity is deduplicated or fenced; terminal and unsupported states
+expose an empty array. Clients never infer actions from status.
+`unknown_outcome` is nonterminal: automatic dispatch is paused, an
+authenticated callback may still resolve it, and `reconciliation` explains the
+safe reason without creating a second action authority.
 
 ### Cancel
 
@@ -655,8 +755,8 @@ older credential, and acknowledges only after revision 2 authenticates the
 same authority. Lower revisions are stale; same revision/different fingerprint
 conflicts. If the response is lost, the controller probes with the staged new
 secret first and otherwise retries the same operation with the old secret.
-Session list/read/SSE/mutation and same-key receipt replay remain accessible
-under the unchanged authority/subject after rotation and restart.
+Session list/read/mutation, Endpoint SSE, and same-key receipt replay remain
+accessible under the unchanged authority/subject after rotation and restart.
 
 The active authority manifest is the durable promotion fact. Its publication
 is also the authentication linearization point: a request admitted after that
@@ -778,8 +878,8 @@ ordering decision.
 
 A controller-auth rotation E2E creates a session, loses the rotation response,
 recovers with the staged new secret, restarts Endpoint, and proves the unchanged
-authority/subject can list/read/SSE/message and replay the original create key
-while the old secret is fenced.
+authority/subject can list/read/message, resume the Endpoint SSE, and replay the
+original create key while the old secret is fenced.
 
 The executable anchor is
 `e2e_controller_auth_rotation_lost_response_fences_old_secret_and_survives_restart`;

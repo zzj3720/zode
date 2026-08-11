@@ -1,7 +1,8 @@
 # Endpoint HTTP and SSE adapter rules
 
 `src/api` is the passive device Endpoint adapter. It admits controller
-commands, renders Endpoint projections, and exposes durable session events. It
+commands, renders Endpoint projections, and exposes the Endpoint-wide durable
+event stream. It
 is not the agent runtime, management Server, UI API, provider-auth authority, or
 a second domain service. `docs/http-api.md` is the authoritative Endpoint
 contract.
@@ -65,22 +66,32 @@ contract.
 
 ## SSE contract
 
-- SSE IDs are durable global event positions. Replay and live publication form
-  one strictly increasing, lossless sequence of that session's public events.
-  Numeric IDs may skip positions belonging to other sessions or private facts.
+- SSE IDs are durable Endpoint-global event positions. One authenticated
+  Endpoint stream multiplexes every public event belonging to sessions owned by
+  the trusted controller authority and subject. Replay and live publication
+  form one strictly increasing, lossless eligible sequence. Numeric IDs may
+  skip private facts or sessions owned by another subject.
 - Commit order, not handler completion order, controls publication. Recover a
   lagged receiver from storage without leaking debug errors into the stream.
-- Subscribe before replay, deduplicate by durable cursor, and support
-  `Last-Event-ID`. A disconnect never cancels runtime work.
+- Subscribe before replay, establish one Endpoint-wide handoff fence, stream
+  catch-up in bounded batches through that fence, and merge later durable frames
+  into the same ordered catch-up. No-ID transient progress may overtake an older
+  durable replay tail, but a durable retry boundary must be delivered before
+  transient text from its next attempt. Deduplicate by durable cursor and
+  support `Last-Event-ID`; never emit a pre-fence transient after a retry,
+  terminal, or committed-assistant boundary already delivered by catch-up. A
+  disconnect never cancels runtime work.
 - Token deltas may eventually be transient; lifecycle transitions and final
   messages remain durable and reconnectable.
 - Public model retry/interruption events expose only zode attempt counters,
-  bounded delay, round identity, and safe error classification. Prepared model
-  envelopes, partial stream content/tool input, aimux HTTP attempts, and raw
-  provider errors remain private.
-- A management Server may proxy session SSE, but Endpoint emits no
+  bounded delay, round identity, and safe error classification. Provider
+  request content is never persisted or exposed; partial stream content/tool
+  input, aimux HTTP attempts, and raw provider errors remain private.
+- A management Server may proxy Endpoint SSE, but Endpoint emits no
   Server-specific cursor or callback. The controller resumes with the same
   public `Last-Event-ID` contract as any standalone client.
+- Expose only `GET /v1/events` for runtime events. Do not retain a
+  session-scoped compatibility route or cursor.
 
 ## Acceptance
 

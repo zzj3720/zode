@@ -288,6 +288,15 @@ pub trait EventStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<EventRecord>, StoreError>;
 
+    fn read_owned_events(
+        &self,
+        owner: &SessionOwner,
+        after_position: GlobalPosition,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>, StoreError>;
+
+    fn latest_global_position(&self) -> Result<GlobalPosition, StoreError>;
+
     fn scan_owned_session_refs(
         &self,
         after_creation_position: GlobalPosition,
@@ -1980,6 +1989,79 @@ impl EventStore for SqliteEventStore {
         let events = event_records(stored);
         transaction.commit()?;
         Ok(events)
+    }
+
+    fn read_owned_events(
+        &self,
+        owner: &SessionOwner,
+        after_position: GlobalPosition,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>, StoreError> {
+        owner.validate()?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        require_clean_storage_metadata(&transaction)?;
+        if limit == 0 {
+            transaction.commit()?;
+            return Ok(Vec::new());
+        }
+        let stored = {
+            let mut statement = transaction.prepare(
+                "SELECT events.global_position, events.stream_id, events.stream_version,
+                        events.event_id, events.command_id, events.event_schema_version,
+                        events.event_type, events.payload, events.event_fingerprint_version,
+                        events.event_fingerprint
+                 FROM events
+                 JOIN session_index ON session_index.stream_id = events.stream_id
+                 WHERE session_index.authority_id = ?1 AND session_index.subject = ?2
+                   AND events.global_position > ?3
+                 ORDER BY events.global_position ASC LIMIT ?4",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    &owner.authority_id,
+                    &owner.subject,
+                    to_sqlite_integer("after_position", after_position)?,
+                    i64::try_from(limit)
+                        .map_err(|_| StoreError::IntegerRange { field: "limit" })?,
+                ],
+                decode_persisted_event_row,
+            )?;
+            collect_persisted_events(rows)?
+        };
+        let mut verified_heads = BTreeMap::new();
+        for event in &stored {
+            let head = match verified_heads.get(&event.record.stream_id) {
+                Some(head) => *head,
+                None => {
+                    let head = verified_owned_stream(&transaction, owner, &event.record.stream_id)?
+                        .head
+                        .version;
+                    verified_heads.insert(event.record.stream_id.clone(), head);
+                    head
+                }
+            };
+            if event.record.stream_version > head {
+                return Err(StoreError::InvalidSessionCreateReceipt);
+            }
+        }
+        let events = event_records(stored);
+        transaction.commit()?;
+        Ok(events)
+    }
+
+    fn latest_global_position(&self) -> Result<GlobalPosition, StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        require_clean_storage_metadata(&transaction)?;
+        let position = transaction.query_row(
+            "SELECT COALESCE(MAX(global_position), 0) FROM events",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let position = from_sqlite_integer("global_position", position)?;
+        transaction.commit()?;
+        Ok(position)
     }
 
     fn scan_owned_session_refs(

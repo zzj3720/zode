@@ -1,0 +1,50 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "000023-519b25cc-34db-49dc-ad44-24f54fce9334",
+  "e2e_name": "e2e_browser_endpoint_reconciles_canonical_sessions_without_duplicate_streams_or_rows",
+  "boundary": "management-access-edge",
+  "first_observed": "activating the already-selected canonical Endpoint/session route opened a second public event stream instead of retaining the existing Session observation",
+  "classification": "CANONICAL_SESSION_REOPENED_A_DUPLICATE_STREAM",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000023-519b25cc-34db-49dc-ad44-24f54fce9334",
+      "boundary": "management-access-edge",
+      "method": "GET",
+      "path": "/v1/endpoints/01KZK1ZJRJ73JF61Q373EYHH1P/sessions/01KZK1ZKSSPMT4FYBF9A3P5TGR",
+      "request_headers": {
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 4258.125,
+            "data_base64": "eyJhY3RpdmVfYWN0aXZhdGlvbiI6bnVsbCwiYWN0aXZlX21vZGVsX3JvdW5kIjpudWxsLCJkZWxpdmVyeSI6eyJhY2tub3dsZWRnZWRfdGhyb3VnaCI6MCwicGVuZGluZyI6W119LCJsYXN0X21vZGVsX2F0dGVtcHRzX2V4aGF1c3RlZCI6bnVsbCwibW9kZWwiOnsiYXV0aF9hdXRob3JpdHlfaWQiOiJ3ZWItZTJlLXVpLWxvZ2ljIiwiYXV0aF9wcm9maWxlX2lkIjoicHJvZmlsZS1jNTMzNzMzNjA0ZDljNmU5OGYxMjliZDM4MmFjMWI0YiIsImF1dGhfcmV2aXNpb24iOjEsIm1vZGVsIjoidWktbG9naWMtbW9kZWwiLCJwcm92aWRlciI6InVpLWxvZ2ljLWVuZHBvaW50IiwicHJvdmlkZXJfZXhlY3V0aW9uX2Jhc2VfdXJsIjoiaHR0cDovLzEyNy4wLjAuMTo2MTUzNC92MSIsInByb3ZpZGVyX2V4ZWN1dGlvbl9raW5kIjoib3BlbmFpX2NvbXBhdGlibGUiLCJwcm92aWRlcl9leGVjdXRpb25fb3B0aW9ucyI6e30sInByb3ZpZGVyX2V4ZWN1dGlvbl9yZXZpc2lvbiI6MSwicHJvdmlkZXJfZXhlY3V0aW9uX3NjaGVtYSI6InpvZGUucHJvdmlkZXItZXhlY3V0aW9uLnYxIn0sInNjaGVtYSI6InpvZGUuc2Vzc2lvbi52MSIsInNlc3Npb25faWQiOiIwMUtaSzFaS1NTUE1UNEZZQkY5QTNQNVRHUiIsInN0YXR1cyI6ImlkbGUiLCJ0b29sX2NhbGxzIjpbXSwidHJhbnNjcmlwdCI6W10sInZlcnNpb24iOjEsIndhaXQiOm51bGx9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>",
+    "<secret:access_assertion_11>"
+  ],
+  "integrity_sha256": "5a09bd15e20b2adea6367d6ca849af6e14a082864e625fc3b7f967890ae3d954"
+}

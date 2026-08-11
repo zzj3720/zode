@@ -552,10 +552,10 @@ struct ProfileSse {
 async fn open_profile_events(
     client: &reqwest::Client,
     base_url: &str,
-    session_id: &str,
+    _session_id: &str,
     forbidden: &[&str],
 ) -> TestResult<ProfileSse> {
-    let response = authenticated(client.get(format!("{base_url}/v1/sessions/{session_id}/events")))
+    let response = authenticated(client.get(format!("{base_url}/v1/events")))
         .send_with_timeout()
         .await?;
     assert_response_headers_secret_free(&response, forbidden);
@@ -618,7 +618,10 @@ async fn wait_profile_assistant(
     loop {
         let (event, data) = events.next().await?;
         if event == "assistant_message_committed" || data["kind"] == "assistant_message_committed" {
-            if data["session_id"] != session_id || !data.to_string().contains(marker) {
+            if data["session_id"] != session_id {
+                continue;
+            }
+            if !data.to_string().contains(marker) {
                 return Err(IoError::other("profile assistant event was invalid").into());
             }
             return Ok(());

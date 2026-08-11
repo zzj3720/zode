@@ -9,6 +9,7 @@ const {
   proxyHttp,
   startHttpServer,
 } = require("../support/harness.cjs");
+const { openManagement } = require("../support/radix.cjs");
 
 const E2E_NAME = "e2e_provider_profile_delete_offline_tombstone_reconciles_after_restart";
 const CLASSIFICATION = "AUTH_PROFILE_DELETE_TOMBSTONE_NOT_RECONCILED_AFTER_RESTART";
@@ -183,8 +184,10 @@ async function concurrentTombstoneProxy(harness) {
   let armed = false;
   let requests = 0;
   let resolveSecond;
+  let resolveSecondStarted;
   let resolveFirst;
   const firstFinished = new Promise((resolve) => { resolveFirst = resolve; });
+  const secondStarted = new Promise((resolve) => { resolveSecondStarted = resolve; });
   const twoDispatches = new Promise((resolve) => { resolveSecond = resolve; });
   const failure = await startHttpServer((_request, response) => {
     response.writeHead(502, { "content-type": "application/json" });
@@ -211,6 +214,13 @@ async function concurrentTombstoneProxy(harness) {
     requests += 1;
     if (requests === 1) {
       try {
+        await Promise.race([
+          secondStarted,
+          new Promise((_, reject) => setTimeout(
+            () => reject(new Error("second tombstone dispatch did not enter the held race")),
+            15_000,
+          )),
+        ]);
         return await proxyHttp({
           targetBaseUrl: target.baseUrl,
           request,
@@ -226,6 +236,7 @@ async function concurrentTombstoneProxy(harness) {
         resolveFirst();
       }
     }
+    resolveSecondStarted();
     await firstFinished;
     await new Promise((resolve) => setTimeout(resolve, 250));
     try {
@@ -261,11 +272,11 @@ async function concurrentTombstoneProxy(harness) {
 }
 
 async function configureProvider(page, harness) {
-  await page.getByRole("link", { name: "Providers", exact: true }).click();
+  await openManagement(page, "Providers");
   await page.getByRole("button", { name: "Configure provider", exact: true }).click();
   const form = page.locator("form.editor-panel").filter({ hasText: "Configure provider" });
   await form.getByLabel("Provider ID").fill(PROVIDER);
-  await form.getByLabel("Provider kind").selectOption("openai_compatible");
+  await expect(form.getByText("OpenAI compatible", { exact: true })).toBeVisible();
   await form.getByLabel("Base URL").fill(`${harness.providerProxy.baseUrl}/v1`);
   await form.getByLabel("Models").fill(MODEL);
   await Promise.all([
@@ -279,7 +290,7 @@ async function configureProvider(page, harness) {
 }
 
 async function addRemoteEndpoint(page, proxyUrl, harness) {
-  await page.getByRole("link", { name: "Endpoints", exact: true }).click();
+  await openManagement(page, "Endpoints");
   await page.getByRole("button", { name: "Add remote Endpoint", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Add remote Endpoint" });
   await dialog.getByLabel("Endpoint label").fill(ENDPOINT_LABEL);
@@ -295,7 +306,7 @@ async function addRemoteEndpoint(page, proxyUrl, harness) {
 }
 
 async function createSharedProfile(page, harness) {
-  await page.getByRole("link", { name: "Providers", exact: true }).click();
+  await openManagement(page, "Providers");
   const card = page.locator("article.resource-card").filter({ hasText: PROVIDER }).first();
   await card.getByRole("button", { name: "Add API key profile", exact: true }).click();
   const form = card.locator("form.nested-editor");
@@ -360,13 +371,15 @@ test(E2E_NAME, async ({ page }) => {
   try {
     captureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 96 });
     await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "What do you want to work on?", exact: true }),
+    ).toBeVisible();
     await addRemoteEndpoint(page, endpointProxy.proxy.baseUrl, harness);
     await configureProvider(page, harness);
     await createSharedProfile(page, harness);
 
     await harness.endpoint.stop();
-    await page.getByRole("link", { name: "Providers", exact: true }).click();
+    await openManagement(page, "Providers");
     const card = page.locator("article.resource-card").filter({ hasText: PROVIDER }).first();
     const profile = card.locator(".profile-row").filter({ hasText: "Offline delete profile" });
     const id = await profileId(page);
@@ -426,6 +439,7 @@ test(E2E_NAME, async ({ page }) => {
     primaryError = error;
   } finally {
     try {
+      if (!page.isClosed()) await page.close();
       await harness.journal.waitForIdle();
       if (postCheckCaptureSetId) {
         const postCheckRecords = recordsFor(harness, postCheckCaptureSetId);
@@ -509,11 +523,13 @@ test(CONCURRENT_E2E_NAME, async ({ page }) => {
   let primaryError;
   try {
     await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "What do you want to work on?", exact: true }),
+    ).toBeVisible();
     await addRemoteEndpoint(page, race.proxy.baseUrl, harness);
     await configureProvider(page, harness);
     await createSharedProfile(page, harness);
-    await page.getByRole("link", { name: "Providers", exact: true }).click();
+    await openManagement(page, "Providers");
     const card = page.locator("article.resource-card").filter({ hasText: PROVIDER }).first();
     const profile = card.locator(".profile-row").filter({ hasText: "Offline delete profile" });
     const id = await profileId(page);
@@ -580,6 +596,7 @@ test(CONCURRENT_E2E_NAME, async ({ page }) => {
     primaryError = error;
   } finally {
     try {
+      if (!page.isClosed()) await page.close();
       await harness.journal.waitForIdle();
       if (!captureSetId) {
         if (primaryError) throw primaryError;

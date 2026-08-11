@@ -1,0 +1,56 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "000016-0ab87fdf-5cb6-48e0-9075-ae22ba3080a2",
+  "e2e_name": "e2e_browser_provider_endpoint_and_settings_models_follow_server_authority_without_shadow_state",
+  "boundary": "management-access-edge",
+  "first_observed": "after public Server authority acquired the provider default and Endpoint, the provider model refreshed but the Endpoints surface retained its bootstrap inventory and could not expose the authoritative Endpoint",
+  "classification": "BROWSER_MODELS_DID_NOT_FOLLOW_SERVER_AUTHORITY",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000016-0ab87fdf-5cb6-48e0-9075-ae22ba3080a2",
+      "boundary": "management-access-edge",
+      "method": "PUT",
+      "path": "/v1/providers/ui-logic-authority/default-auth-profile",
+      "request_headers": {
+        "idempotency-key": "ui-logic-authority-default",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "content-type": "application/json",
+        "origin": "http://127.0.0.1:61617",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "eyJwcm9maWxlX2lkIjoicHJvZmlsZS0yYjk3ODI0ZDU5OTRmOWZkOTUwYWIzN2JhZDY5YTI2ZiJ9",
+        "canonical_json": {
+          "profile_id": "profile-2b97824d5994f9fd950ab37bad69a26f"
+        },
+        "sha256": "c3abe7b8d5a71f664ea8a8a804a579b5ea239afb3235ead412e64b2619c78fb8"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 4568.166,
+            "data_base64": "eyJhdXRoX3Byb2ZpbGVfaWQiOiJwcm9maWxlLTJiOTc4MjRkNTk5NGY5ZmQ5NTBhYjM3YmFkNjlhMjZmIiwiZGVzY3JpcHRvcl9yZXZpc2lvbiI6MSwiZGlzdHJpYnV0aW9uIjpbeyJhdXRoX3Byb2ZpbGVfaWQiOiJwcm9maWxlLTJiOTc4MjRkNTk5NGY5ZmQ5NTBhYjM3YmFkNjlhMjZmIiwiYXV0aG9yaXR5X2lkIjoid2ViLWUyZS11aS1sb2dpYyIsImVuZHBvaW50X2lkIjoiMDFLWksyMDE4MzJBMzlGMThCWEg1Q1BEUEgiLCJpbnN0YWxsZWRfcmV2aXNpb24iOjEsIm9ic2VydmVkX3JldmlzaW9uIjoxLCJwcm92aWRlciI6InVpLWxvZ2ljLWF1dGhvcml0eSIsInJldmlzaW9uIjoxLCJzdGF0dXMiOiJyZWFkeSJ9XSwiZXhwaXJlc19hdF9tcyI6bnVsbCwiaXNfZGVmYXVsdCI6dHJ1ZSwia2luZCI6ImFwaV9rZXkiLCJsYWJlbCI6IkFsdGVybmF0ZSBwcm9maWxlIGF1dGhvcml0eSIsInByb2ZpbGVfaWQiOiJwcm9maWxlLTJiOTc4MjRkNTk5NGY5ZmQ5NTBhYjM3YmFkNjlhMjZmIiwicHJvdmlkZXIiOiJ1aS1sb2dpYy1hdXRob3JpdHkiLCJyZXZpc2lvbiI6MSwic2NoZW1hIjoiem9kZS5hdXRoLXByb2ZpbGUudjEiLCJzaGFyaW5nIjp7ImVuZHBvaW50X2lkcyI6WyIwMUtaSzIwMTgzMkEzOUYxOEJYSDVDUERQSCJdLCJtb2RlIjoic2VsZWN0ZWQifSwic3RhdHVzIjoicmVhZHkifQ=="
+          }
+        ],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>",
+    "<secret:access_assertion_13>"
+  ],
+  "integrity_sha256": "7c3e9bb3bff313c8387cc4caa3ea404406dc8373e3dd73de43fc868689265ee4"
+}

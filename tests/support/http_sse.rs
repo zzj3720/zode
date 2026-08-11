@@ -318,24 +318,19 @@ pub(crate) async fn assert_session_replay_has_only_initial_event(
     session_id: &str,
     initial: &SseRecord,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let replay_response = authenticated_as(
-        client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
-        subject,
-    )
-    .header("Last-Event-ID", "0")
-    .send_with_timeout()
-    .await?;
+    assert_eq!(initial.data["session_id"], session_id);
+    let replay_response = authenticated_as(client.get(server.url("/v1/events")), subject)
+        .header("Last-Event-ID", "0")
+        .send_with_timeout()
+        .await?;
     assert_eq!(replay_response.status(), StatusCode::OK);
     let replay = read_sse_events(replay_response, 1).await?;
     assert_eq!(replay, vec![initial.clone()]);
 
-    let tail_response = authenticated_as(
-        client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
-        subject,
-    )
-    .header("Last-Event-ID", &initial.id)
-    .send_with_timeout()
-    .await?;
+    let tail_response = authenticated_as(client.get(server.url("/v1/events")), subject)
+        .header("Last-Event-ID", &initial.id)
+        .send_with_timeout()
+        .await?;
     assert_eq!(tail_response.status(), StatusCode::OK);
     match timeout(
         Duration::from_millis(750),
@@ -357,7 +352,6 @@ pub(crate) async fn assert_session_replay_has_only_initial_event(
 pub(crate) enum OwnershipResource {
     Read,
     Message,
-    Events,
 }
 
 pub(crate) async fn assert_subject_safe_not_found(
@@ -383,11 +377,6 @@ pub(crate) async fn assert_subject_safe_not_found(
             format!("round1-not-found-{subject}-{session_id}"),
         )
         .json(&json!({"content": "must not cross"})),
-        OwnershipResource::Events => authenticated_as(
-            client.get(server.url(&format!("/v1/sessions/{session_id}/events"))),
-            subject,
-        )
-        .header("Last-Event-ID", "0"),
     };
     let cross = request(cross_id).send_with_timeout().await?;
     let missing = request(missing_id).send_with_timeout().await?;
@@ -397,7 +386,6 @@ pub(crate) async fn assert_subject_safe_not_found(
         match resource {
             OwnershipResource::Read => "GET",
             OwnershipResource::Message => "message",
-            OwnershipResource::Events => "SSE",
         },
         cross,
         missing,

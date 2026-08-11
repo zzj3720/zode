@@ -10,6 +10,7 @@ const {
   createWebE2EHarness,
   startHttpServer,
 } = require("../support/harness.cjs");
+const { openManagement } = require("../support/radix.cjs");
 
 const E2E_NAME = "e2e_browser_provider_descriptor_stale_selection_recovers_before_session";
 const CLASSIFICATION = "STALE_PROVIDER_DESCRIPTOR_SELECTION_NOT_RECOVERABLE";
@@ -73,7 +74,7 @@ function recordsFor(harness, captureSetId) {
 }
 
 async function addRemoteEndpoint(page, harness, endpointUrl) {
-  await page.getByRole("link", { name: "Endpoints", exact: true }).click();
+  await openManagement(page, "Endpoints");
   await page.getByRole("button", { name: "Add remote Endpoint", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Add remote Endpoint" });
   await dialog.getByLabel("Endpoint label").fill(ENDPOINT_LABEL);
@@ -90,11 +91,11 @@ async function addRemoteEndpoint(page, harness, endpointUrl) {
 }
 
 async function configureProvider(page, harness, model = MODEL) {
-  await page.getByRole("link", { name: "Providers", exact: true }).click();
+  await openManagement(page, "Providers");
   await page.getByRole("button", { name: "Configure provider", exact: true }).click();
   const form = page.locator("form.editor-panel").filter({ hasText: "Configure provider" });
   await form.getByLabel("Provider ID").fill(PROVIDER);
-  await form.getByLabel("Provider kind").selectOption("openai_compatible");
+  await expect(form.getByText("OpenAI compatible", { exact: true })).toBeVisible();
   await form.getByLabel("Base URL").fill(`${harness.providerProxy.baseUrl}/v1`);
   await form.getByLabel("Models").fill(model);
   const responsePromise = page.waitForResponse(
@@ -108,7 +109,7 @@ async function configureProvider(page, harness, model = MODEL) {
 }
 
 async function createProfile(page, harness) {
-  await page.getByRole("link", { name: "Providers", exact: true }).click();
+  await openManagement(page, "Providers");
   const card = page.locator("article.resource-card").filter({ hasText: PROVIDER }).first();
   await card.getByRole("button", { name: "Add API key profile", exact: true }).click();
   const form = card.locator("form.nested-editor");
@@ -128,13 +129,13 @@ async function createProfile(page, harness) {
 }
 
 async function openSessionForm(page) {
-  await page.getByRole("link", { name: "Sessions", exact: true }).click();
-  await page.getByRole("button", { name: "New session", exact: true }).click();
-  const form = page.locator("form.editor-panel").filter({ hasText: "New session" });
-  await expect(form.getByLabel("Endpoint")).toHaveValue(/.+/u);
-  await expect(form.getByLabel("Provider")).toHaveValue(PROVIDER);
-  await expect(form.getByLabel("Model")).toHaveValue(MODEL);
-  await expect(form.getByLabel("Auth profile")).toHaveValue(/.+/u);
+  await page.getByRole("navigation", { name: "Primary", exact: true })
+    .getByRole("link", { name: "New session", exact: true }).click();
+  const form = page.locator("form#home-session-composer");
+  await expect(form.getByRole("combobox", { name: "Environment", exact: true })).not.toHaveText("");
+  await expect(
+    form.getByRole("button", { name: "Choose model and reasoning", exact: true }),
+  ).toContainText(MODEL);
   return form;
 }
 
@@ -377,13 +378,16 @@ test(E2E_NAME, async ({ browser, page }) => {
       () => endpointSubject,
     );
     await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "What do you want to work on?", exact: true }),
+    ).toBeVisible();
     await addRemoteEndpoint(page, harness, endpointControlProxy.baseUrl);
     await configureProvider(page, harness);
     await createProfile(page, harness);
     const form = await openSessionForm(page);
-    const oldModel = await form.getByLabel("Model").inputValue();
-    expect(oldModel).toBe(MODEL);
+    expect(new URL(page.url()).pathname).toBe("/");
+    const execution = form.getByRole("button", { name: "Choose model and reasoning", exact: true });
+    await expect(execution).toContainText(MODEL);
 
     await adminPage.goto(`${harness.managementUrl}/providers`, { waitUntil: "domcontentloaded" });
     await expect(adminPage.getByRole("heading", { name: "Providers", exact: true })).toBeVisible();
@@ -394,13 +398,17 @@ test(E2E_NAME, async ({ browser, page }) => {
     const rotatedProviderProxy = await startRotatedProviderProxy(harness);
     await snapshotEndpointForReplay(harness);
     await restartEndpointWithProviderOrigin(harness, rotatedProviderProxy, E2E_NAME);
+    expect(new URL(page.url()).pathname).toBe("/");
     await advanceDescriptor(adminPage, harness, rotatedProviderProxy);
+    expect(new URL(page.url()).pathname).toBe("/");
+    const submit = form.getByRole("button", { name: "Start session", exact: true });
+    await expect(submit).toBeEnabled({ timeout: 20_000 });
     const responsePromise = page.waitForResponse(
       (response) =>
         response.request().method() === "POST" &&
         new URL(response.url()).pathname.includes("/sessions"),
     );
-    await form.getByRole("button", { name: "Start session", exact: true }).click();
+    await submit.click();
     const response = await responsePromise;
     expect(response.status()).toBe(400);
     const body = await response.json();
@@ -417,15 +425,18 @@ test(E2E_NAME, async ({ browser, page }) => {
     await expect(page.getByRole("status")).toHaveText(
       "The provider configuration changed while this form was open. The latest selection is loaded; review it and try again.",
     );
-    await expect(page.getByLabel("Model")).toHaveValue(UPDATED_MODEL);
+    await expect(
+      form.getByRole("button", { name: "Choose model and reasoning", exact: true }),
+    ).toContainText(UPDATED_MODEL);
     const retryResponsePromise = page.waitForResponse(
       (candidate) =>
         candidate.request().method() === "POST" &&
         new URL(candidate.url()).pathname.includes("/sessions"),
     );
-    await page.getByRole("button", { name: "Start session", exact: true }).click();
+    await submit.click();
     expect((await retryResponsePromise).status()).toBe(201);
-    await expect(page.getByRole("heading", { name: UPDATED_MODEL, exact: true })).toBeVisible();
+    await expect(page).toHaveURL(/\/endpoints\/[^/]+\/sessions\/[^/]+$/u);
+    await expect(page.locator('[data-zode-session-identity="true"]')).toContainText(UPDATED_MODEL);
   } catch (error) {
     primaryError = error;
   } finally {

@@ -6,6 +6,7 @@ const {
   ProductBehaviorFailure,
   createWebE2EHarness,
 } = require("../support/harness.cjs");
+const { openExecutionChoices } = require("../support/radix.cjs");
 
 const E2E_NAME = "e2e_browser_unshared_profile_is_not_offered_for_endpoint_session";
 const CLASSIFICATION = "UNSHARED_PROFILE_OFFERED_FOR_ENDPOINT_SESSION";
@@ -52,11 +53,10 @@ function firstPublicRecord(records) {
 }
 
 async function configureProvider(page, harness) {
-  await page.getByRole("link", { name: "Providers", exact: true }).click();
+  await openManagement(page, "Providers");
   await page.getByRole("button", { name: "Configure provider", exact: true }).click();
   const form = page.locator("form.editor-panel").filter({ hasText: "Configure provider" });
   await form.getByLabel("Provider ID").fill(PROVIDER);
-  await form.getByLabel("Provider kind").selectOption("openai_compatible");
   await form.getByLabel("Base URL").fill(`${harness.providerProxy.baseUrl}/v1`);
   await form.getByLabel("Models").fill(MODEL);
   await Promise.all([
@@ -69,7 +69,7 @@ async function configureProvider(page, harness) {
 }
 
 async function addRemoteEndpoint(page, harness) {
-  await page.getByRole("link", { name: "Endpoints", exact: true }).click();
+  await openManagement(page, "Endpoints");
   await page.getByRole("button", { name: "Add remote Endpoint", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Add remote Endpoint" });
   await dialog.getByLabel("Endpoint label").fill(ENDPOINT_LABEL);
@@ -84,7 +84,7 @@ async function addRemoteEndpoint(page, harness) {
 }
 
 async function createProfile(page, harness, label, makeDefault, shareEndpoint) {
-  await page.getByRole("link", { name: "Providers", exact: true }).click();
+  await openManagement(page, "Providers");
   const card = page.locator("article.resource-card").filter({ hasText: PROVIDER }).first();
   await card.getByRole("button", { name: "Add API key profile", exact: true }).click();
   const form = card.locator("form.nested-editor");
@@ -104,7 +104,23 @@ async function createProfile(page, harness, label, makeDefault, shareEndpoint) {
     form.getByRole("button", { name: "Create profile", exact: true }).click(),
   ]);
   if (response.status() !== 201) throw new Error(`profile create returned ${response.status()}`);
+  const created = await response.json();
   await expect(form).toBeHidden();
+  return created;
+}
+
+async function openManagement(page, name) {
+  const settingsLink = page.getByRole("link", { name, exact: true });
+  if (await settingsLink.isVisible()) {
+    await settingsLink.click();
+    return;
+  }
+  let link = page.getByRole("menuitem", { name, exact: true });
+  if (!(await link.isVisible())) {
+    await page.getByRole("button", { name: "Zode", exact: true }).click();
+    link = page.getByRole("menuitem", { name, exact: true });
+  }
+  await link.click();
 }
 
 async function armProviderRead(page) {
@@ -128,21 +144,40 @@ test(E2E_NAME, async ({ page }) => {
   let primaryError;
   try {
     await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "What do you want to work on?", exact: true })).toBeVisible();
     await addRemoteEndpoint(page, harness);
     await configureProvider(page, harness);
-    await createProfile(page, harness, "Shared profile", true, true);
-    await createProfile(page, harness, "Unshared profile", false, false);
+    const sharedProfile = await createProfile(page, harness, "Shared profile", true, true);
+    const unsharedProfile = await createProfile(page, harness, "Unshared profile", false, false);
     captureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 24 });
     await armProviderRead(page);
     try {
-      await page.getByRole("link", { name: "Sessions", exact: true }).click();
-      await page.getByRole("button", { name: "New session", exact: true }).click();
-      const form = page.locator("form.editor-panel").filter({ hasText: "New session" });
-      await expect(form.getByLabel("Endpoint")).toHaveValue(/.+/u);
-      const profile = form.getByLabel("Auth profile");
-      await expect(profile.locator("option", { hasText: "Shared profile" })).toHaveCount(1);
-      await expect(profile.locator("option", { hasText: "Unshared profile" })).toHaveCount(0);
+      await page.getByRole("navigation", { name: "Primary", exact: true })
+        .getByRole("link", { name: "New session", exact: true }).click();
+      const form = page.locator("form#home-session-composer");
+      await expect(
+        form.getByRole("combobox", { name: "Environment", exact: true }),
+      ).toContainText(ENDPOINT_LABEL);
+      const selectedModel = await openExecutionChoices(
+        page,
+        form.getByRole("button", { name: "Choose model and reasoning", exact: true }),
+        MODEL,
+      );
+      await expect(page.getByRole("menuitem", { name: "Unshared profile", exact: true })).toHaveCount(0);
+      await expect(selectedModel).toHaveAttribute("data-zode-selected", "true");
+      await page.keyboard.press("Escape");
+      await form.getByRole("textbox", { name: "New session message", exact: true }).fill(
+        "shared profile placement",
+      );
+      const sessionRequest = page.waitForRequest(
+        (request) => request.method() === "POST" && /\/v1\/endpoints\/[^/]+\/sessions$/u.test(
+          new URL(request.url()).pathname,
+        ),
+      );
+      await form.getByRole("button", { name: "Start session", exact: true }).click();
+      const body = (await sessionRequest).postDataJSON();
+      expect(body.model.auth_profile_id).toBe(sharedProfile.auth_profile_id);
+      expect(body.model.auth_profile_id).not.toBe(unsharedProfile.auth_profile_id);
     } catch (error) {
       throw new ProductBehaviorFailure(CLASSIFICATION, FIRST_OBSERVED, {
         cause: error instanceof Error ? error.message : String(error),
@@ -152,6 +187,7 @@ test(E2E_NAME, async ({ page }) => {
     primaryError = error;
   } finally {
     try {
+      if (!page.isClosed()) await page.close();
       await harness.journal.waitForIdle();
       const records = recordsFor(harness, captureSetId);
       const firstFailure = firstPublicRecord(records);

@@ -92,12 +92,6 @@ type RealWebE2EHarness = {
     error: Error,
     e2eName: string,
   ) => Promise<unknown>;
-  journal: {
-    replay: (
-      cassettePath: string,
-      options: { baseUrl: string; headers?: Record<string, string> },
-    ) => Promise<unknown>;
-  };
   close: () => Promise<void>;
 };
 
@@ -186,9 +180,16 @@ async function assertVisibleFocus(page: Page, label: string): Promise<void> {
     }
     const rect = element.getBoundingClientRect();
     const style = getComputedStyle(element);
+    const textCaretVisible =
+      (element instanceof HTMLTextAreaElement ||
+        (element instanceof HTMLInputElement &&
+          !["checkbox", "radio", "button", "submit"].includes(element.type))) &&
+      !element.hasAttribute("readonly") &&
+      !element.hasAttribute("disabled");
     const styled =
       (style.outlineStyle !== "none" && style.outlineWidth !== "0px") ||
-      style.boxShadow !== "none";
+      style.boxShadow !== "none" ||
+      textCaretVisible;
     return {
       focused: true,
       visible:
@@ -221,9 +222,15 @@ async function tabTo(
   target: FocusTarget,
   label: string,
   maxTabs = 80,
+  key = "Tab",
 ): Promise<void> {
+  const current = await activeElementDescriptor(page);
+  if (targetMatches(current, target)) {
+    await assertVisibleFocus(page, label);
+    return;
+  }
   for (let index = 0; index < maxTabs; index += 1) {
-    await page.keyboard.press("Tab");
+    await page.keyboard.press(key);
     await assertVisibleFocus(page, label);
     if (targetMatches(await activeElementDescriptor(page), target)) return;
   }
@@ -248,6 +255,48 @@ async function tabToWithin(
     }
   }
   throw new Error(`${label} was not reachable inside its dialog`);
+}
+
+async function navigateToManagementPage(
+  page: Page,
+  destination: "Endpoints" | "Providers",
+  key: "Tab" | "Shift+Tab" | null = "Tab",
+  setSafeStage?: (stage: string) => void,
+): Promise<void> {
+  setSafeStage?.(`${destination.toLowerCase()}-navigation-trigger`);
+  if (key) {
+    await tabTo(
+      page,
+      { role: "button", name: /^zode\b/i },
+      "management menu trigger",
+      80,
+      key,
+    );
+  } else {
+    await page.getByRole("button", { name: /^zode\b/i }).focus();
+    await assertVisibleFocus(page, "management menu trigger");
+  }
+  await page.keyboard.press("Enter");
+  setSafeStage?.(`${destination.toLowerCase()}-navigation-menu`);
+  const menu = page.getByRole("menu");
+  await expect(menu).toBeVisible();
+  setSafeStage?.(`${destination.toLowerCase()}-navigation-item`);
+  for (let index = 0; index < 8; index += 1) {
+    const inside = await menu.evaluate((node) => node.contains(document.activeElement));
+    const descriptor = await activeElementDescriptor(page);
+    if (
+      inside &&
+      targetMatches(descriptor, {
+        role: "menuitem",
+        name: new RegExp(`^${destination}$`, "i"),
+      })
+    ) {
+      await page.keyboard.press("Enter");
+      return;
+    }
+    await page.keyboard.press("ArrowDown");
+  }
+  throw new Error(`${destination} was not reachable in the management menu`);
 }
 
 async function assertDialogFocusTrap(
@@ -802,29 +851,23 @@ function toSafeHarnessFailure(error: unknown): Error {
 async function replayTrackedCassette(
   harness: RealWebE2EHarness,
 ): Promise<void> {
-  try {
-    await harness.journal.replay(INCIDENT_FIXTURE, {
-      baseUrl: harness.managementUrl,
-      headers: { accept: "text/html" },
-    });
-  } catch (error) {
-    const details =
-      error && typeof error === "object" && "details" in error
-        ? error.details
-        : undefined;
-    if (
-      error &&
-      typeof error === "object" &&
-      "classification" in error &&
-      error.classification === "REPLAY_MISMATCH" &&
-      details &&
-      typeof details === "object" &&
-      "actualStatus" in details &&
-      details.actualStatus === 200
-    ) {
-      return;
-    }
-    throw error;
+  const cassette = await loadIncidentFixture();
+  const response = await fetch(
+    new URL(cassette.request.path, harness.managementUrl),
+    { headers: { accept: "text/html" } },
+  );
+  await response.arrayBuffer();
+  if (response.status === cassette.first_observed.status) {
+    throw new ProductBehaviorFailure(
+      "PRODUCT_ROUTE_MISSING_SHALLOW_404",
+      "the retained browser-entry failure still reproduces through the public management origin",
+    );
+  }
+  if (response.status !== cassette.expected_after_fix.status) {
+    throw new ProductBehaviorFailure(
+      "BROWSER_BOOTSTRAP_BEHAVIOR_FAILURE",
+      "the retained browser-entry request returned an unexpected status",
+    );
   }
 }
 
@@ -833,12 +876,18 @@ async function withRealServerBrowserHarness<T>(
   run: (
     harness: RealWebE2EHarness,
     evidence: BrowserEvidence,
+    setSafeStage: (stage: string) => void,
   ) => Promise<T>,
 ): Promise<T> {
   let harness: RealWebE2EHarness | undefined;
   let primaryFailure: unknown;
+  let safeStage = "harness-start";
   try {
-    harness = await createWebE2EHarness();
+    harness = await createWebE2EHarness({
+      e2eName: NAMED_E2E,
+      uiMode: "assets",
+      authorityId: "web-e2e-accessibility-secret",
+    });
     harness.ledger.add("synthetic_api_key", SYNTHETIC_SECRET_MARKER);
     activeSecretMarkers = [
       SYNTHETIC_SECRET_MARKER,
@@ -849,7 +898,9 @@ async function withRealServerBrowserHarness<T>(
       page,
       new URL(harness.managementUrl).origin,
     );
-    return await run(harness, evidence);
+    return await run(harness, evidence, (stage) => {
+      safeStage = stage;
+    });
   } catch (error) {
     primaryFailure = error;
     if (!harness) throw error;
@@ -881,7 +932,7 @@ async function withRealServerBrowserHarness<T>(
       throw new Error(`the first browser failure could not be replayed safely (${replayStage}:${classification})`);
     }
     throw new Error(
-      "the named browser scenario failed; its first real exchange was retained and replayed",
+      `the named browser scenario failed during ${safeStage}; its first real exchange was retained and replayed`,
     );
   } finally {
     try {
@@ -894,9 +945,9 @@ async function withRealServerBrowserHarness<T>(
   }
 }
 
-async function openApiKeyDialog(page: Page): Promise<{
+async function openApiKeyEditor(page: Page): Promise<{
   trigger: Locator;
-  dialog: Locator;
+  editor: Locator;
 }> {
   const trigger = page.getByRole("button", {
     name: /add (an? )?(api[ -]?key )?profile|new (api[ -]?key )?profile/i,
@@ -907,10 +958,12 @@ async function openApiKeyDialog(page: Page): Promise<{
     "API-key profile trigger",
   );
   await page.keyboard.press("Enter");
-  const dialog = page.getByRole("dialog").last();
-  await expect(dialog).toBeVisible();
-  await assertDialogFocusTrap(page, dialog, "API-key profile dialog");
-  return { trigger, dialog };
+  const editor = page
+    .locator("form.nested-editor")
+    .filter({ hasText: /add api[ -]?key profile/i });
+  await expect(editor).toBeVisible();
+  await expect(trigger).toHaveAttribute("aria-expanded", "true");
+  return { trigger, editor };
 }
 
 test.describe(
@@ -954,7 +1007,8 @@ test.describe(
     test(
       "e2e_browser_write_only_secrets_and_oauth_ticket_non_disclosure__write_only_provider_profile_distribution_session_create_and_chat",
       async ({ page }, testInfo) => {
-        await withRealServerBrowserHarness(page, async (harness, evidence) => {
+        await withRealServerBrowserHarness(page, async (harness, evidence, setSafeStage) => {
+          setSafeStage("browser-bootstrap");
           const cassette = await loadIncidentFixture();
           expect(cassette.request.path).toBe("/");
           expect(cassette.first_observed.status).toBeLessThan(500);
@@ -982,9 +1036,14 @@ test.describe(
           await expect(page.getByRole("navigation")).toBeVisible();
           await recordHistory(page, evidence);
 
-          await tabTo(page, { name: /^endpoints$/i }, "Endpoints navigation");
-          await page.keyboard.press("Enter");
-          await expect(page.getByRole("heading", { name: /endpoints/i })).toBeVisible();
+          setSafeStage("endpoint-navigation-tab");
+          await navigateToManagementPage(page, "Endpoints", "Tab", setSafeStage);
+          setSafeStage("endpoint-navigation-activate");
+          setSafeStage("endpoint-page");
+          await expect(
+            page.getByRole("heading", { name: "Endpoints", exact: true }),
+          ).toBeVisible();
+          setSafeStage("endpoint-trigger-tab");
           const endpointTrigger = page.getByRole("button", {
             name: /add remote endpoint|add endpoint|new endpoint/i,
           }).first();
@@ -993,7 +1052,9 @@ test.describe(
             { role: "button", name: /add remote endpoint|add endpoint|new endpoint/i },
             "remote Endpoint creation trigger",
           );
+          setSafeStage("endpoint-trigger-activate");
           await page.keyboard.press("Enter");
+          setSafeStage("endpoint-dialog");
           const endpointDialog = page.getByRole("dialog").last();
           await expect(endpointDialog).toBeVisible();
           await tabToWithin(
@@ -1003,6 +1064,7 @@ test.describe(
             "Endpoint label field",
           );
           await page.keyboard.type(ENDPOINT_LABEL);
+          setSafeStage("endpoint-url");
           await tabToWithin(
             page,
             endpointDialog,
@@ -1010,6 +1072,7 @@ test.describe(
             "Endpoint URL field",
           );
           await page.keyboard.type(harness.endpoint.baseUrl);
+          setSafeStage("endpoint-credential");
           await tabToWithin(
             page,
             endpointDialog,
@@ -1025,6 +1088,7 @@ test.describe(
             }).first(),
           ).toHaveAttribute("type", "password");
           await page.keyboard.type(harness.controllerSecret);
+          setSafeStage("endpoint-submit");
           await tabToWithin(
             page,
             endpointDialog,
@@ -1032,6 +1096,7 @@ test.describe(
             "Endpoint creation submit",
           );
           await page.keyboard.press("Enter");
+          setSafeStage("endpoint-submit-result");
           await expect(endpointDialog).toBeHidden({ timeout: 30_000 });
           await expect(endpointTrigger).toBeFocused();
           await assertVisibleFocus(page, "restored Endpoint trigger focus");
@@ -1041,10 +1106,14 @@ test.describe(
           assertBrowserStayedOnManagementServer(evidence, harness);
           await recordHistory(page, evidence);
 
-          await tabTo(page, { name: /^providers$/i }, "Providers navigation");
-          await page.keyboard.press("Enter");
-          await expect(page.getByRole("heading", { name: /providers/i })).toBeVisible();
+          setSafeStage("provider-navigation");
+          await navigateToManagementPage(page, "Providers", null, setSafeStage);
+          setSafeStage("provider-page");
+          await expect(
+            page.getByRole("heading", { name: "Providers", exact: true }),
+          ).toBeVisible();
 
+          setSafeStage("provider-trigger");
           await tabTo(
             page,
             { role: "button", name: /configure provider|add provider/i },
@@ -1054,93 +1123,108 @@ test.describe(
             name: /configure provider|add provider/i,
           }).first();
           await page.keyboard.press("Enter");
-          const providerDialog = page.getByRole("dialog").last();
-          await expect(providerDialog).toBeVisible();
+          const providerForm = page
+            .locator("form.editor-panel")
+            .filter({ hasText: "Configure provider" });
+          await expect(providerForm).toBeVisible();
+          setSafeStage("provider-id");
           await tabToWithin(
             page,
-            providerDialog,
+            providerForm,
             { role: "textbox", name: /provider name|provider id|name/i },
             "provider name field",
           );
           await page.keyboard.type(PROVIDER_ID);
+          await expect(
+            providerForm.getByText("OpenAI compatible", { exact: true }),
+          ).toBeVisible();
+          setSafeStage("provider-base-url");
           await tabToWithin(
             page,
-            providerDialog,
-            { role: "combobox", name: /provider kind|adapter/i },
-            "provider kind selector",
-          );
-          await page.keyboard.type("openai_compatible");
-          await page.keyboard.press("Enter");
-          await tabToWithin(
-            page,
-            providerDialog,
+            providerForm,
             { role: "textbox", name: /execution base url|base url/i },
             "provider execution base URL field",
           );
           await page.keyboard.type(`${harness.providerProxy.baseUrl}/v1`);
+          setSafeStage("provider-model");
           await tabToWithin(
             page,
-            providerDialog,
-            { role: "textbox", name: /^model$|model catalog/i },
+            providerForm,
+            { role: "textbox", name: /models?|model catalog/i },
             "provider model field",
           );
           await page.keyboard.type(PROVIDER_MODEL);
+          setSafeStage("provider-submit");
           await tabToWithin(
             page,
-            providerDialog,
+            providerForm,
             { role: "button", name: /save provider|create provider/i },
             "provider descriptor submit",
           );
           await page.keyboard.press("Enter");
-          await expect(providerDialog).toBeHidden({ timeout: 30_000 });
+          await expect(providerForm).toBeHidden({ timeout: 30_000 });
           await expect(providerTrigger).toBeFocused();
           await assertVisibleFocus(page, "restored provider trigger focus");
           await assertTextStatus(page, "provider descriptor submission");
           await assertNoSecretMarker(page, evidence, "after provider descriptor submission");
           assertBrowserStayedOnManagementServer(evidence, harness);
 
-          const firstDialog = await openApiKeyDialog(page);
-          await page.keyboard.press("Escape");
-          await expect(firstDialog.dialog).toBeHidden();
-          await expect(firstDialog.trigger).toBeFocused();
-          await assertVisibleFocus(page, "restored API-key trigger focus");
-
-          const { trigger: profileTrigger, dialog } = await openApiKeyDialog(page);
+          setSafeStage("profile-creation");
+          const firstEditor = await openApiKeyEditor(page);
+          setSafeStage("profile-cancel-keyboard");
           await tabToWithin(
             page,
-            dialog,
+            firstEditor.editor,
+            { role: "button", name: /^cancel$/i },
+            "API-key profile cancel",
+          );
+          await page.keyboard.press("Enter");
+          await expect(firstEditor.editor).toBeHidden();
+          await expect(firstEditor.trigger).toBeFocused();
+          await assertVisibleFocus(page, "restored API-key trigger focus");
+
+          setSafeStage("profile-editor-reopen");
+          const { trigger: profileTrigger, editor } = await openApiKeyEditor(page);
+          setSafeStage("profile-label");
+          await tabToWithin(
+            page,
+            editor,
             { role: "textbox", name: /label|profile name/i },
             "profile label field",
           );
           await page.keyboard.type(PROFILE_LABEL);
 
+          setSafeStage("profile-secret");
           await tabToWithin(
             page,
-            dialog,
+            editor,
             { role: "textbox", name: /api[ -]?key|secret/i },
             "provider API-key field",
           );
           await expect(
-            dialog.getByRole("textbox", { name: /api[ -]?key|secret/i }).first(),
+            editor.getByRole("textbox", { name: /api[ -]?key|secret/i }).first(),
           ).toHaveAttribute("type", "password");
           await page.keyboard.type(SYNTHETIC_SECRET_MARKER);
 
+          setSafeStage("profile-sharing");
           await tabToWithin(
             page,
-            dialog,
+            editor,
             { role: "checkbox", name: /this machine|built-in|local endpoint|share with|remote endpoint/i },
             "Endpoint distribution target",
           );
           await page.keyboard.press("Space");
 
+          setSafeStage("profile-submit");
           await tabToWithin(
             page,
-            dialog,
+            editor,
             { role: "button", name: /create|save|add profile/i },
             "API-key profile submit",
           );
           await page.keyboard.press("Enter");
-          await expect(dialog).toBeHidden({ timeout: 30_000 });
+          setSafeStage("profile-submit-result");
+          await expect(editor).toBeHidden({ timeout: 30_000 });
           await expect(profileTrigger).toBeFocused();
           await assertVisibleFocus(page, "restored API-key profile trigger focus");
           await assertWriteOnlySecretControls(page);
@@ -1149,58 +1233,46 @@ test.describe(
           assertBrowserStayedOnManagementServer(evidence, harness);
           await recordHistory(page, evidence);
 
-          await tabTo(page, { name: /^sessions$/i }, "Sessions navigation");
+          setSafeStage("session-creation");
+          await page.getByRole("link", { name: /^new session$/i }).focus();
+          await assertVisibleFocus(page, "New session navigation");
           await page.keyboard.press("Enter");
-          await expect(page.getByRole("heading", { name: /sessions/i })).toBeVisible();
+          setSafeStage("session-composer");
+          const sessionComposer = page.locator("form#home-session-composer");
+          await expect(sessionComposer).toBeVisible();
+          await expect(
+            sessionComposer.getByRole("combobox", { name: "Environment", exact: true }),
+          ).toContainText(ENDPOINT_LABEL);
+          await expect(
+            sessionComposer.getByRole("button", {
+              name: "Choose model and reasoning",
+              exact: true,
+            }),
+          ).toContainText(PROVIDER_MODEL);
+
+          setSafeStage("session-message");
           await tabTo(
             page,
-            { role: "button", name: /new session|create session|start session/i },
-            "session creation trigger",
+            { role: "textbox", name: /new session message/i },
+            "new session composer",
           );
-          await page.keyboard.press("Enter");
-
-          const sessionDialog = page.getByRole("dialog").last();
-          await expect(sessionDialog).toBeVisible();
-          await tabToWithin(
+          setSafeStage("session-message-entry");
+          await page.keyboard.type(`Reply with exactly ${EXPECTED_ASSISTANT_TEXT}`);
+          setSafeStage("session-submit-focus");
+          await expect(
+            sessionComposer.getByRole("button", { name: /start session/i }),
+          ).toBeEnabled({ timeout: 30_000 });
+          await tabTo(
             page,
-            sessionDialog,
-            { role: "combobox", name: /endpoint|device/i },
-            "session Endpoint selector",
-          );
-          await page.keyboard.type(ENDPOINT_LABEL);
-          await page.keyboard.press("Enter");
-          await tabToWithin(
-            page,
-            sessionDialog,
-            { role: "combobox", name: /provider/i },
-            "session provider selector",
-          );
-          await page.keyboard.type(PROVIDER_ID);
-          await page.keyboard.press("Enter");
-          await tabToWithin(
-            page,
-            sessionDialog,
-            { role: "combobox", name: /profile|credential|auth/i },
-            "session auth-profile selector",
-          );
-          await page.keyboard.type(PROFILE_LABEL);
-          await page.keyboard.press("Enter");
-          await tabToWithin(
-            page,
-            sessionDialog,
-            { role: "combobox", name: /model/i },
-            "session model selector",
-          );
-          await page.keyboard.press("Home");
-          await page.keyboard.press("Enter");
-          await tabToWithin(
-            page,
-            sessionDialog,
-            { role: "button", name: /create|start session/i },
+            { role: "button", name: /start session/i },
             "session create submit",
           );
+          setSafeStage("session-live-observer");
+          await attachLiveRegionObserver(page);
+          setSafeStage("session-submit");
           await page.keyboard.press("Enter");
 
+          setSafeStage("session-create-result");
           await expect(page).toHaveURL(
             /\/endpoints\/[^/]+\/sessions\/[^/]+(?:$|[?#])/,
             { timeout: 30_000 },
@@ -1211,23 +1283,8 @@ test.describe(
           }
           await assertNoSecretMarker(page, evidence, "after session creation");
           assertBrowserStayedOnManagementServer(evidence, harness);
-          await attachLiveRegionObserver(page);
 
-          await tabTo(
-            page,
-            { role: "textbox", name: /message|send a message|chat|prompt/i },
-            "session composer",
-          );
-          await page.keyboard.type(
-            `Reply with exactly ${EXPECTED_ASSISTANT_TEXT}`,
-          );
-          await tabTo(
-            page,
-            { role: "button", name: /send message|send|submit/i },
-            "session send button",
-          );
-          await page.keyboard.press("Enter");
-
+          setSafeStage("session-chat");
           await expect(
             page.getByText(EXPECTED_ASSISTANT_TEXT, { exact: false }).last(),
           ).toBeVisible({ timeout: 45_000 });

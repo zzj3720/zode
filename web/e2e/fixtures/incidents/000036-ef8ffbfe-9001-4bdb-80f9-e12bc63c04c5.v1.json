@@ -1,0 +1,59 @@
+{
+  "schema": "zode.http-incident-recording.v1",
+  "version": 1,
+  "recording_id": "000036-ef8ffbfe-9001-4bdb-80f9-e12bc63c04c5",
+  "e2e_name": "e2e_browser_session_logic_survives_shell_navigation_without_losing_draft_or_duplicating_effects",
+  "boundary": "management-access-edge",
+  "first_observed": "after the Server admitted a message but the browser lost its response, replacing the visual route discarded the command identity and a retry used a second idempotency key",
+  "classification": "SESSION_LOGIC_DID_NOT_SURVIVE_SHELL_NAVIGATION",
+  "exchanges": [
+    {
+      "sequence": "000001",
+      "recording_id": "000036-ef8ffbfe-9001-4bdb-80f9-e12bc63c04c5",
+      "boundary": "management-access-edge",
+      "method": "POST",
+      "path": "/v1/endpoints/01KZK1Z96PD7JKGFKMDDA756A0/sessions/01KZK1ZA8S3Q15W14HVJCFGRSD/messages",
+      "request_headers": {
+        "cache-control": "no-cache",
+        "idempotency-key": "a32a360a-9a48-4185-802f-554bc13d1be3",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+        "accept": "application/json",
+        "content-type": "application/json",
+        "origin": "http://127.0.0.1:61494",
+        "host": "127.0.0.1"
+      },
+      "request_body": {
+        "raw_base64": "eyJjb250ZW50IjoiZHJhZnQgc3Vydml2ZXMgc2hlbGwgbmF2aWdhdGlvbiJ9",
+        "canonical_json": {
+          "content": "draft survives shell navigation"
+        },
+        "sha256": "f700d44c5ac367cc554eba6ac8555f48509739afba2e1cdf196e2f88d1b2dc43"
+      },
+      "response": {
+        "status": 202,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "chunks": [
+          {
+            "offset_us": 3002.958,
+            "data_base64": "eyJhY2NlcHRlZCI6dHJ1ZSwic2NoZW1hIjoiem9kZS5jb21tYW5kLnYxIiwic2Vzc2lvbl9pZCI6IjAxS1pLMVpBOFMzUTE1VzE0SFZKQ0ZHUlNEIiwidmVyc2lvbiI6MTJ9"
+          }
+        ],
+        "outcome": "completed"
+      }
+    }
+  ],
+  "synthetic_secret_slots": [
+    "<secret:controller_secret>",
+    "<secret:provider_secret>",
+    "<secret:access_subject>",
+    "<secret:access_email>",
+    "<secret:service_client>",
+    "<secret:access_assertion_1>",
+    "<secret:access_assertion_7>",
+    "<secret:access_assertion_23>",
+    "<secret:access_assertion_34>"
+  ],
+  "integrity_sha256": "1da11c4505c661c08f6a2084af446e1274126bb2a57d3ba73f1f6b9fa1525730"
+}

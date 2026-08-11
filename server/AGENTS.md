@@ -60,8 +60,8 @@ replication is `docs/auth-replication.md`; ingress identity is
   Crash/retry obtains the original Endpoint result through that receipt.
 - Derive one stable opaque Endpoint subject from the validated Access actor and
   configured controller authority. Forward it in trusted controller
-  context on every session list/read/mutation/SSE request; browser input cannot
-  choose it, and Server stores no session ACL. Use a restart-stable keyed
+  context on every session list/read/mutation request and the Endpoint-wide SSE;
+  browser input cannot choose it, and Server stores no session ACL. Use a restart-stable keyed
   pseudonymous derivation, never raw email/name; key rotation needs explicit
   ownership migration.
 - Endpoint owns `endpoint_id`; Server uses that exact value as its catalog key
@@ -109,14 +109,18 @@ replication is `docs/auth-replication.md`; ingress identity is
 
 ## SSE proxy
 
-- Open Endpoint SSE only for an attached client, forward `Last-Event-ID`, and
-  preserve Endpoint event IDs and public frames.
+- Open one downstream Endpoint-wide SSE for each attached client Endpoint
+  stream, forward `Last-Event-ID`, and preserve Endpoint event IDs and public
+  frames. Never open or filter a downstream stream per session.
 - Close every management SSE no later than the validated Access assertion's
   expiry so reconnect must re-enter current Access policy.
 - Do not store session events, session projections, or resume cursors and do not
   allocate a Server session-event ID. Endpoint owns replay/live handoff and
   durable deduplication. Server-owned OAuth/control streams remain separate and
   may use resource-local cursors.
+- Expose only `/v1/endpoints/{endpoint_id}/events` for Endpoint runtime events.
+  The former session-scoped event proxy is absent; do not retain a compatibility
+  route or a second cursor path.
 - Transient token deltas may be proxied, but final messages and lifecycle facts
   are durable only after Endpoint commit.
 
@@ -138,6 +142,12 @@ replication is `docs/auth-replication.md`; ingress identity is
 - Keep profile/OAuth non-secret control facts append-only and secrets in a
   replaceable protected store. Default pointer, refresh, delete, sharing, and
   recovery serialize under the owning profile/provider locks and transactions.
+- Load OAuth capability only from the validated Server
+  `provider_auth_adapters` catalog. Bind one adapter to one provider identity;
+  keep authorization/token endpoints, client configuration, PKCE/state and
+  refresh recovery out of Endpoint execution descriptors, browser input and
+  test-only environment overrides. Public provider projections expose only the
+  sorted supported auth methods.
 - Distribute only to explicitly authorized Endpoint IDs. `all_current` expands
   to a durable explicit plan; it does not auto-authorize future Endpoints.
 - Allocate stable operation/profile/revision identity before secret staging.
@@ -157,6 +167,11 @@ replication is `docs/auth-replication.md`; ingress identity is
   revision clears it. Failed/cancelled relogin leaves it fenced.
 - Tombstones are monotonically versioned. UI must represent pending,
   unreachable, stale, ready, removing, and removed accurately.
+- Static API-key replacement preserves the same profile identity, default
+  pointer, label, and sharing policy. It allocates above every credential,
+  reserved, install, and tombstone revision and redistributes only to the
+  currently authorized Endpoints; neither request nor response may expose the
+  previous or replacement secret.
 - Profile deletion and sharing removal atomically allocate a revision above
   every credential/tombstone revision and append durable per-Endpoint tombstone
   operations. Retain and rebuild them across restart until acknowledged;
@@ -177,14 +192,20 @@ replication is `docs/auth-replication.md`; ingress identity is
   missing markers, symlink, inode/path replacement, or multiply-linked
   sidecars fail before READY rather than changing the owned store.
   Existing-store integrity is preflighted before a failed startup can create
-  new ownership sidecars.
+  new ownership sidecars. A missing SQLite SHM after a crash is recoverable
+  only when the canonical database, stable lock/anchor, both owner markers, and
+  a private single-link WAL remain valid. The next exclusive owner may rebuild
+  only that disposable SHM, must validate authority metadata through the WAL
+  before readiness, and must remove the rebuilt SHM again if validation fails.
+  Existing unsafe sidecars or any durable identity mismatch still fail closed.
   The readiness matrix covers database/lock/pair swaps, both-marker removal,
   URI-delimiter restart, corrupt-store cleanup, and WAL/SHM link rejection.
   Its anchors include
   `e2e_server_control_database_path_swap_cannot_cross_catalog_ownership`,
   `e2e_server_control_owner_markers_removal_and_lock_pair_replacement_cannot_allow_second_owner`,
-  `e2e_server_corrupt_existing_control_store_failure_removes_new_ownership_sidecars`,
-  and `e2e_initialized_server_wal_shm_hardlink_is_rejected_before_ready`.
+    `e2e_server_corrupt_existing_control_store_failure_removes_new_ownership_sidecars`,
+    `e2e_initialized_server_wal_shm_hardlink_is_rejected_before_ready`, and
+    `e2e_server_crash_with_committed_wal_and_missing_shm_recovers_same_control_facts`.
 - The combined Server starts one built-in local Endpoint on a private loopback
   listener as a supervised standalone `zode` child and treats it as a normal
   Endpoint record/client. Do not link or instantiate Endpoint runtime state in
@@ -218,8 +239,10 @@ replication is `docs/auth-replication.md`; ingress identity is
   the control-store owner, a normal shutdown checkpoints and truncates its WAL so
   a later startup does not mistake the Server's own missing SQLite SHM sidecar for
   external store damage; external sidecar/link mutations still fail closed during
-  preflight. Crash-surviving adoption/handoff remains an explicit later lifecycle
-  state, never an accidental orphan.
+  preflight. Arm process shutdown signal handling before publishing
+  `ZODE_SERVER_READY`, so an immediate signal after the readiness barrier cannot
+  bypass that checkpoint and cleanup path. Crash-surviving adoption/handoff
+  remains an explicit later lifecycle state, never an accidental orphan.
 - Endpoint holds an exclusive process-lifetime lock for its runtime/secret
   identity. On startup, all-in-one first probes the stable loopback address and
   adopts a healthy matching installation. An unresponsive/mismatched probe

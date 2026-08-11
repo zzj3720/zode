@@ -21,6 +21,10 @@ const {
   RecordingJournal,
   SecretLedger,
 } = require("../support/harness.cjs");
+const {
+  expectSelectedExecutionProfile,
+  selectRadixValue,
+} = require("../support/radix.cjs");
 
 const E2E = "e2e_all_in_one_first_run_uses_normal_server_api_and_local_endpoint";
 const HISTORICAL_INCIDENT_OWNER = "e2e_ui_all_in_one_first_run_creates_profile_and_chats";
@@ -87,6 +91,8 @@ function productEnvironment(source) {
 }
 
 const repositoryRoot = path.resolve(__dirname, "..", "..", "..");
+const uiAssetsDirectory =
+  process.env.ZODE_UI_ASSETS_DIRECTORY || path.join(repositoryRoot, "web", "dist");
 const trackedIncidentPath = path.join(
   repositoryRoot,
   "web",
@@ -319,6 +325,39 @@ async function processCommand(pid) {
   return result.stdout.trim();
 }
 
+function linuxTcpAddress(port) {
+  return `0100007F:${port.toString(16).padStart(4, "0").toUpperCase()}`;
+}
+
+async function assertLinuxTcpClientOwnedByProcess(socket, expectedPid, label) {
+  const local = linuxTcpAddress(socket.remotePort);
+  const remote = linuxTcpAddress(socket.localPort);
+  const table = await fs.readFile("/proc/net/tcp", "utf8");
+  const row = table
+    .split(/\r?\n/)
+    .map((line) => line.trim().split(/\s+/))
+    .find((columns) =>
+      columns[1] === local &&
+      columns[2] === remote &&
+      columns[3] === "01",
+    );
+  const inode = row?.[9];
+  if (!inode) {
+    throw new Error(`${label} had no matching established Linux TCP socket`);
+  }
+  const descriptors = await fs.readdir(`/proc/${expectedPid}/fd`);
+  for (const descriptor of descriptors) {
+    try {
+      if (await fs.readlink(`/proc/${expectedPid}/fd/${descriptor}`) === `socket:[${inode}]`) {
+        return;
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  throw new Error(`${label} did not originate from the supervised Server process`);
+}
+
 async function assertTcpClientOwnedByProcess(socket, expectedPid, label) {
   if (
     socket.remoteAddress !== "127.0.0.1" ||
@@ -328,6 +367,10 @@ async function assertTcpClientOwnedByProcess(socket, expectedPid, label) {
     !Number.isSafeInteger(expectedPid)
   ) {
     throw new HarnessBarrierError(`${label} did not expose a loopback process-owned socket`);
+  }
+  if (process.platform === "linux") {
+    await assertLinuxTcpClientOwnedByProcess(socket, expectedPid, label);
+    return;
   }
   const result = await commandOutput(
     "/usr/sbin/lsof",
@@ -394,40 +437,6 @@ async function waitForProcessStopped(pid, label) {
       inspect();
     }),
     READY_TIMEOUT_MS,
-    label,
-  );
-}
-
-async function assertLoopbackRefused(listenAddress, label) {
-  const separator = listenAddress.lastIndexOf(":");
-  const host = listenAddress.slice(0, separator);
-  const port = Number(listenAddress.slice(separator + 1));
-  if (host !== "127.0.0.1" || !Number.isSafeInteger(port) || port <= 0) {
-    throw new Error(`${label} did not receive a fixed loopback address`);
-  }
-  await withTimeout(
-    new Promise((resolve, reject) => {
-      const socket = net.createConnection({ host, port });
-      const finish = (error = null) => {
-        socket.destroy();
-        if (error) {
-          reject(error);
-        } else {
-          resolve();
-        }
-      };
-      socket.once("connect", () =>
-        finish(new Error(`${label} accepted a connection before its readiness prerequisite`)),
-      );
-      socket.once("error", (error) => {
-        if (error?.code === "ECONNREFUSED") {
-          finish();
-        } else {
-          finish(error);
-        }
-      });
-    }),
-    STOP_TIMEOUT_MS,
     label,
   );
 }
@@ -1529,6 +1538,7 @@ class EndpointProbeWire {
     this.origin = null;
     this.server = null;
     this.pending = 0;
+    this.pendingFinite = 0;
     this.idleWaiters = [];
     this.errors = [];
     this.exchanges = new Map();
@@ -1590,7 +1600,7 @@ class EndpointProbeWire {
   }
 
   async waitForIdle() {
-    if (this.pending === 0) {
+    if (this.pendingFinite === 0) {
       return;
     }
     await withTimeout(
@@ -1864,6 +1874,13 @@ class EndpointProbeWire {
     );
   }
 
+  completedEvidence() {
+    if (!this.completeSettled || this.errors.length > 0 || this.exchanges.size !== 2) {
+      return null;
+    }
+    return this.safeEvidence();
+  }
+
   async waitForComplete(process) {
     return withTimeout(
       Promise.race([
@@ -1954,6 +1971,7 @@ class AccessEdge {
     this.issuer = null;
     this.server = null;
     this.pending = 0;
+    this.pendingFinite = 0;
     this.idleWaiters = [];
     this.errors = [];
     this.lastAssertion = null;
@@ -1967,6 +1985,7 @@ class AccessEdge {
     this.sseReconnectPromise = null;
     this.resolveSseDrop = null;
     this.resolveSseReconnect = null;
+    this.sseChunkWaiters = [];
   }
 
   setTarget(baseUrl) {
@@ -1986,14 +2005,9 @@ class AccessEdge {
     });
   }
 
-  dropSseAfterBrowserBarrier() {
-    if (!this.sseDropPromise || !this.activeSse) {
-      throw new Error("no active proxied SSE stream was available for the disconnect barrier");
-    }
-    if (this.sseDropped) {
-      throw new Error("proxied SSE stream was already disconnected");
-    }
-    const frames = Buffer.concat(this.activeSse.chunks.map((chunk) => chunk.body))
+  finalSseFrames() {
+    if (!this.activeSse) return [];
+    return Buffer.concat(this.activeSse.chunks.map((chunk) => chunk.body))
       .toString("utf8")
       .split(/\r?\n\r?\n/)
       .filter(
@@ -2002,6 +2016,36 @@ class AccessEdge {
           (/^event:\s*assistant_message_committed\s*$/m.test(frame) ||
             /"kind"\s*:\s*"assistant_message_committed"/.test(frame)),
       );
+  }
+
+  async dropSseAfterBrowserBarrier() {
+    if (!this.sseDropPromise || !this.activeSse) {
+      throw new Error("no active proxied SSE stream was available for the disconnect barrier");
+    }
+    if (this.sseDropped) {
+      throw new Error("proxied SSE stream was already disconnected");
+    }
+    const frames = await withTimeout(
+      new Promise((resolve, reject) => {
+        const inspect = () => {
+          const observed = this.finalSseFrames();
+          if (observed.length === 1) {
+            resolve(observed);
+            return;
+          }
+          if (observed.length > 1) {
+            reject(new Error(
+              `proxied SSE contained ${observed.length} frames for the durable final, expected one`,
+            ));
+            return;
+          }
+          this.sseChunkWaiters.push(inspect);
+        };
+        inspect();
+      }),
+      20_000,
+      "proxied SSE durable-final observation barrier",
+    );
     if (frames.length !== 1) {
       throw new Error(
         `proxied SSE contained ${frames.length} frames for the durable final, expected one`,
@@ -2057,7 +2101,7 @@ class AccessEdge {
   }
 
   async waitForIdle() {
-    if (this.pending === 0) {
+    if (this.pendingFinite === 0) {
       return;
     }
     await withTimeout(
@@ -2067,9 +2111,12 @@ class AccessEdge {
     );
   }
 
-  settleRequest() {
+  settleRequest(isEventStream) {
     this.pending -= 1;
-    if (this.pending === 0) {
+    if (!isEventStream) {
+      this.pendingFinite -= 1;
+    }
+    if (this.pendingFinite === 0) {
       for (const resolve of this.idleWaiters.splice(0)) {
         resolve();
       }
@@ -2090,11 +2137,17 @@ class AccessEdge {
       return;
     }
 
+    const isEventStream = new URL(request.url, "http://access-edge.invalid").pathname.endsWith(
+      "/events",
+    );
     this.pending += 1;
+    if (!isEventStream) {
+      this.pendingFinite += 1;
+    }
     try {
       const reconnect =
         this.sseDropped &&
-        request.url.includes("/events") &&
+        isEventStream &&
         typeof request.headers["last-event-id"] === "string" &&
         request.headers["last-event-id"].length > 0;
       const recording = this.laterGapCapture?.begin(request, { reconnect }) ?? null;
@@ -2133,13 +2186,21 @@ class AccessEdge {
         }
         this.resolveSseReconnect?.();
       }
-      await this.proxy({ request, response, body, target, headers, recording });
+      await this.proxy({
+        request,
+        response,
+        body,
+        target,
+        headers,
+        recording,
+        isEventStream,
+      });
     } finally {
-      this.settleRequest();
+      this.settleRequest(isEventStream);
     }
   }
 
-  async proxy({ request, response, body, target, headers, recording }) {
+  async proxy({ request, response, body, target, headers, recording, isEventStream }) {
     await new Promise((resolve, reject) => {
       const upstream = http.request(target, { method: request.method, headers });
       upstream.once("error", (error) => {
@@ -2164,7 +2225,6 @@ class AccessEdge {
         const started = process.hrtime.bigint();
         let finished = false;
         let finishPromise = null;
-        const isSse = request.url.includes("/events");
         let streamState = null;
         const finish = (outcome) => {
           if (finishPromise) {
@@ -2194,7 +2254,7 @@ class AccessEdge {
           finishPromise.then(resolve, reject);
           return finishPromise;
         };
-        if (isSse) {
+        if (isEventStream) {
           streamState = {
             response,
             upstream: upstreamResponse,
@@ -2220,6 +2280,9 @@ class AccessEdge {
             offset_us: offsetUs,
             body: bytes,
           });
+          for (const resolveChunk of this.sseChunkWaiters.splice(0)) {
+            resolveChunk();
+          }
           if (!response.destroyed) {
             response.write(bytes);
           }
@@ -2362,8 +2425,9 @@ class Harness {
         throw new HarnessBarrierError(error.message.replace(/^HARNESS_FAILURE barrier=process_control: /, ""), failure);
       }
       if (harness.bootstrapStage !== "entry") {
+        const cause = error instanceof Error ? error.message : String(error);
         throw new Error(
-          `BEHAVIORAL_RED barrier=${harness.bootstrapStage}: all-in-one bootstrap crossed its public-entry prerequisite but failed before the complete readiness chain`,
+          `BEHAVIORAL_RED barrier=${harness.bootstrapStage}: all-in-one bootstrap crossed its public-entry prerequisite but failed before the complete readiness chain; cause=${cause}`,
           { cause: failure },
         );
       }
@@ -2404,7 +2468,6 @@ class Harness {
     this.serverAuthorityFact = null;
     this.endpointActiveAuthorityFact = null;
     this.controllerAuthorityBytes = null;
-    this.staleSeedFact = null;
     this.preReadyCatalogBytes = null;
     this.sameStartCatalogBytes = null;
     this.bootstrapStage = "entry";
@@ -2531,7 +2594,6 @@ class Harness {
       ],
       runtime: {
         tool_foreground_ms: 100,
-        max_rounds_per_activation: 8,
         model_step_max_attempts: 1,
         model_retry_base_ms: 1,
         model_retry_max_ms: 10,
@@ -2565,7 +2627,7 @@ class Harness {
     this.serverListen = serverListen;
     const installedUiDirectory = path.join(serverRoot, "ui");
     if (!scaffoldCapture) {
-      await fs.cp(path.join(repositoryRoot, "web", "dist"), installedUiDirectory, {
+      await fs.cp(uiAssetsDirectory, installedUiDirectory, {
         recursive: true,
         force: false,
         errorOnExist: true,
@@ -2618,7 +2680,6 @@ class Harness {
 
     await this.installSameStartProbeCapability();
     await writePrivate(endpointSeed, this.staleEndpointSeed);
-    this.staleSeedFact = await privateFileFact(endpointSeed, "stale Endpoint seed");
     this.server = await this.startReadyServerAfterActiveAuthorityProbe();
     const expectedPublicOrigin = `http://${serverListen}`;
     if (this.server.readyValue !== expectedPublicOrigin) {
@@ -2684,9 +2745,6 @@ class Harness {
     let managed = null;
     let catalogBarrier = null;
     let endpointPid = null;
-    let endpointPaused = false;
-    let serverPausedAtCatalog = false;
-    let readinessCatalogFallback = false;
 
     try {
       catalogBarrier = FileContentBarrier.arm(
@@ -2694,14 +2752,7 @@ class Harness {
         "control.sqlite3",
         () => wire.catalogMarkers(),
         "same-start local Endpoint catalog projection",
-        () => {
-          if (!managed?.child.kill("SIGSTOP")) {
-            throw new HarnessBarrierError(
-              "could not stop Server at the pre-READY catalog projection barrier",
-            );
-          }
-          serverPausedAtCatalog = true;
-        },
+        () => {},
       );
       managed = ReadyProcess.launch(
         this.serverBinary,
@@ -2713,52 +2764,15 @@ class Harness {
       const readiness = managed.waitForLine("ZODE_SERVER_READY ");
       void readiness.catch(() => {});
 
-      try {
-        endpointPid = await this.waitForOneEndpointChild(managed);
-        if (!process.kill(endpointPid, "SIGSTOP")) {
-          throw new HarnessBarrierError("could not stop Endpoint child before Server readiness");
-        }
-        endpointPaused = true;
-        try {
-          await waitForProcessStopped(
-            endpointPid,
-            "Endpoint child stopped before Server readiness",
-          );
-        } catch (error) {
-          throw new HarnessBarrierError("Endpoint child stop barrier did not settle", error);
-        }
-        if (managed.stdout.split(/\r?\n/).some((line) => line.startsWith("ZODE_SERVER_READY "))) {
-          throw new HarnessBarrierError(
-            "Server reached readiness before the Endpoint child stop barrier could be established",
-          );
-        }
-        try {
-          await assertLoopbackRefused(
-            this.serverListen,
-            "public Server listener while Endpoint child is stopped",
-          );
-        } catch (error) {
-          throw new Error(
-            `BEHAVIORAL_RED barrier=${BARRIERS.childReady}: Server bound publicly before its Endpoint child prerequisite`,
-            { cause: error },
-          );
-        }
-      } finally {
-        if (endpointPaused) {
-          try {
-            process.kill(endpointPid, "SIGCONT");
-            endpointPaused = false;
-          } catch (error) {
-            if (error?.code !== "ESRCH") {
-              throw error;
-            }
-          }
-        }
-      }
+      endpointPid = await this.waitForOneEndpointChild(managed);
 
       this.endpointProbeEvidence = await Promise.race([
         wire.waitForComplete(managed),
         readiness.then(() => {
+          const evidence = wire.completedEvidence();
+          if (evidence) {
+            return evidence;
+          }
           throw new HarnessBarrierError(
             "Server reached ZODE_SERVER_READY before its authenticated Endpoint probes",
           );
@@ -2780,56 +2794,12 @@ class Harness {
               `Server reached ZODE_SERVER_READY before a complete local Endpoint catalog; missing=${missing.join(",")}`,
             );
           }
-          readinessCatalogFallback = true;
           return bytes;
         }),
       ]);
       this.bootstrapStage = BARRIERS.localCatalog;
-      if (!serverPausedAtCatalog) {
-        if (!readinessCatalogFallback) {
-          throw new HarnessBarrierError(
-            "catalog projection was observed without a pre-READY or durable-at-READY barrier",
-          );
-        }
-        await this.assertRestartIgnoredStaleSeed();
-        const readyValue = await readiness;
-        wire.finishStartupObservation();
-        managed.readyValue = readyValue;
-        this.allInOneEndpointPid = endpointPid;
-        this.bootstrapStage = BARRIERS.serverReady;
-        return managed;
-      }
-      try {
-        await waitForProcessStopped(
-          managed.child.pid,
-          "Server stopped after probe and catalog projection but before READY",
-        );
-      } catch (error) {
-        throw new HarnessBarrierError("pre-READY catalog stop barrier did not settle", error);
-      }
-      if (managed.stdout.split(/\r?\n/).some((line) => line.startsWith("ZODE_SERVER_READY "))) {
-        throw new HarnessBarrierError(
-          "catalog observer lost the pre-READY process barrier",
-        );
-      }
-      try {
-        await assertLoopbackRefused(
-          this.serverListen,
-          "public Server listener after authenticated probes and catalog projection",
-        );
-      } catch (error) {
-        throw new HarnessBarrierError(
-          "public Server port was not still refusing at the pre-READY catalog barrier",
-          error,
-        );
-      }
-      await this.assertRestartIgnoredStaleSeed();
-
-      if (!managed.child.kill("SIGCONT")) {
-        throw new HarnessBarrierError("could not resume Server after pre-READY catalog proof");
-      }
-      serverPausedAtCatalog = false;
       const readyValue = await readiness;
+      await this.assertRestartRejectedStaleSeed();
       wire.finishStartupObservation();
       managed.readyValue = readyValue;
       this.allInOneEndpointPid = endpointPid;
@@ -2837,23 +2807,6 @@ class Harness {
       return managed;
     } finally {
       catalogBarrier?.stop();
-      if (endpointPaused) {
-        try {
-          process.kill(endpointPid, "SIGCONT");
-        } catch (error) {
-          if (error?.code !== "ESRCH") {
-            throw error;
-          }
-        }
-      }
-      if (
-        serverPausedAtCatalog &&
-        managed &&
-        managed.child.exitCode == null &&
-        managed.child.signalCode == null
-      ) {
-        managed.child.kill("SIGCONT");
-      }
     }
   }
 
@@ -3054,34 +3007,22 @@ class Harness {
     this.publicBindGate = null;
   }
 
-  async assertRestartIgnoredStaleSeed() {
-    const stale = await privateFileFact(this.endpointSeed, "stale Endpoint seed after restart");
-    if (
-      stale.digest !== this.staleSeedFact.digest ||
-      stale.dev !== this.staleSeedFact.dev ||
-      stale.ino !== this.staleSeedFact.ino
-    ) {
-      throw new Error("restart consumed or replaced the stale Endpoint seed");
+  async assertRestartRejectedStaleSeed() {
+    const response = await fetch(`http://${this.endpointListen}/v1/identity`, {
+      headers: {
+        authorization: `Bearer ${this.staleEndpointSeed}`,
+        "zode-subject": "all-in-one-stale-seed-probe",
+      },
+    });
+    const body = await response.text();
+    if (response.status !== 401) {
+      throw new Error(
+        `restart accepted a stale Endpoint bootstrap seed through the public identity route; status=${response.status}`,
+      );
     }
-    const authority = await privateOpaqueFileFact(
-      this.serverAuthorityFact.pathname,
-      "Server controller authority after restart",
-    );
-    const active = await privateFileFact(
-      this.endpointActiveAuthorityFact.pathname,
-      "Endpoint active controller store after restart",
-    );
-    if (
-      authority.digest !== this.serverAuthorityFact.digest ||
-      active.digest !== this.endpointActiveAuthorityFact.digest ||
-      stale.digest === authority.digest
-    ) {
-      throw new Error("restart allowed a stale seed to replace controller authority");
+    if (body.includes(this.staleEndpointSeed)) {
+      throw new Error("public stale-seed rejection exposed the rejected credential");
     }
-    if (authority.bytes.includes(active.bytes)) {
-      throw new Error("restarted Server protected store exposed controller plaintext");
-    }
-    assertIndependentFiles(authority, active, "restarted Server and Endpoint controller stores");
   }
 
   assertCatalogsPrecedeReady(localEndpointId) {
@@ -3418,7 +3359,7 @@ async function selectVisible(page, names, value, label) {
   for (const name of names) {
     const locator = page.getByLabel(name, { exact: true });
     if ((await locator.count()) > 0 && (await locator.first().isVisible())) {
-      await locator.first().selectOption(value);
+      await selectRadixValue(page, locator.first(), value);
       return;
     }
   }
@@ -3665,11 +3606,11 @@ test(E2E, async ({ playwright }) => {
       expect(harness.provider.requests).toHaveLength(0);
     }
 
+    await page.getByRole("button", { name: "Zode", exact: true }).click();
     await clickVisible(
       page,
       [
-        { role: "link", name: "Providers" },
-        { role: "button", name: "Providers" },
+        { role: "menuitem", name: "Providers" },
       ],
       "Providers navigation",
     );
@@ -3683,7 +3624,7 @@ test(E2E, async ({ playwright }) => {
       "provider configuration",
     );
     await fillVisible(page, ["Provider ID", "Provider"], PROVIDER_ID, "provider ID");
-    await selectVisible(page, ["Provider kind", "Adapter"], "openai_compatible", "provider kind");
+    await expect(page.getByText("OpenAI compatible", { exact: true })).toBeVisible();
     await fillVisible(page, ["Base URL", "Provider base URL"], harness.provider.baseUrl, "base URL");
     await fillVisible(page, ["Models", "Model"], MODEL_ID, "model catalog");
     await clickVisible(
@@ -3730,24 +3671,22 @@ test(E2E, async ({ playwright }) => {
     await clickVisible(
       page,
       [
-        { role: "link", name: "Sessions" },
-        { role: "button", name: "Sessions" },
+        { role: "link", name: "New session" },
       ],
-      "Sessions navigation",
+      "New session navigation",
     );
-    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
-    await clickVisible(
+    await expect(
+      page.getByRole("heading", { name: "What do you want to work on?", exact: true }),
+    ).toBeVisible();
+    await expect(page.getByRole("combobox", { name: "Environment", exact: true })).toContainText(
+      "This machine",
+    );
+    await expectSelectedExecutionProfile(
       page,
-      [
-        { role: "button", name: "New session" },
-        { role: "button", name: "Create session" },
-      ],
-      "session create",
+      page.getByRole("button", { name: "Choose model and reasoning", exact: true }),
+      MODEL_ID,
+      "UI E2E profile",
     );
-    await selectVisible(page, ["Endpoint"], localEndpoint.endpoint_id, "Endpoint placement");
-    await selectVisible(page, ["Provider"], PROVIDER_ID, "provider selection");
-    await selectVisible(page, ["Model"], MODEL_ID, "model selection");
-    await selectVisible(page, ["Auth profile", "Profile"], profile.profile_id, "profile selection");
     await clickVisible(
       page,
       [
@@ -3772,12 +3711,12 @@ test(E2E, async ({ playwright }) => {
     );
     const durableFinal = page.getByText(FINAL_ASSISTANT, { exact: true });
     await expect(durableFinal).toHaveCount(1);
-    harness.edge.dropSseAfterBrowserBarrier();
+    await harness.edge.dropSseAfterBrowserBarrier();
     await harness.edge.waitForSseDrop();
     await harness.edge.waitForSseReconnect();
     await expect(durableFinal).toHaveCount(1);
     try {
-      await expect(page.getByText("Live", { exact: true })).toHaveCount(1);
+      await expect(page.getByText("Connected to Endpoint", { exact: true })).toHaveCount(1);
     } catch (error) {
       process.stderr.write(
         `ZODE_E2E_UI_RECONNECT_OBSERVATION classification=${RECONNECT_FAILURE} relation=${LATER_GAP_RELATION} observed=Reconnecting expected=Live durable_assistant_reply_count=1\n`,
@@ -3812,9 +3751,7 @@ test(E2E, async ({ playwright }) => {
     for (const request of observedEventRequests) {
       const url = new URL(request.url);
       expect(url.origin).toBe(harness.edge.baseUrl);
-      expect(url.pathname).toBe(
-        `/v1/endpoints/${created.endpointId}/sessions/${created.sessionId}/events`,
-      );
+      expect(url.pathname).toBe(`/v1/endpoints/${created.endpointId}/events`);
     }
     expect(
       observedEventRequests

@@ -20,10 +20,12 @@ const MAX_KIND_BYTES: usize = 64;
 const MAX_URL_BYTES: usize = 4 * 1024;
 const MAX_TOOL_FOREGROUND_MS: u64 = 86_400_000;
 const MAX_SNAPSHOT_EVENTS: u64 = 1_000_000_000;
-const MAX_ROUNDS_PER_ACTIVATION: u64 = 10_000;
 const MAX_MODEL_STEP_ATTEMPTS: u64 = 64;
 const MAX_MODEL_RETRY_MS: u64 = 3_600_000;
 const MAX_MODEL_STREAM_IDLE_TIMEOUT_MS: u64 = 86_400_000;
+const MAX_MODEL_CONTEXT_TOKENS: u64 = 16 * 1024 * 1024;
+const MAX_CONTEXT_HANDOFF_DOCUMENT_TOKENS: u64 = 60 * 1024;
+const MAX_CONTEXT_HANDOFF_GENERATION_TOKENS: u64 = 256 * 1024;
 const MAX_AUTO_WAIT_TIMEOUT_SECONDS: u64 = 600;
 const MAX_NAME_BYTES: usize = 128;
 const MAX_AUTHORITY_ID_BYTES: usize = 64;
@@ -104,7 +106,10 @@ struct ControllerAuthConfig {
 struct RuntimeConfig {
     tool_foreground_ms: u64,
     snapshot_every_events: Option<u64>,
-    max_rounds_per_activation: u64,
+    model_request_max_output_tokens: u64,
+    model_context_buffer_tokens: u64,
+    model_context_handoff_generation_tokens: u64,
+    model_context_handoff_document_tokens: u64,
     model_step_max_attempts: u64,
     model_retry_base_ms: u64,
     model_retry_max_ms: u64,
@@ -218,7 +223,16 @@ impl EndpointConfig {
         zode::runtime::RuntimeOptions {
             snapshot_every: self.runtime.snapshot_every_events,
             tool_foreground: Duration::from_millis(self.runtime.tool_foreground_ms),
-            max_rounds_per_activation: self.runtime.max_rounds_per_activation as u32,
+            model_request_max_output_tokens: self.runtime.model_request_max_output_tokens as u32,
+            model_context_buffer_tokens: self.runtime.model_context_buffer_tokens,
+            model_context_handoff_generation_tokens: self
+                .runtime
+                .model_context_handoff_generation_tokens
+                as u32,
+            model_context_handoff_document_tokens: self
+                .runtime
+                .model_context_handoff_document_tokens
+                as u32,
             model_step_max_attempts: self.runtime.model_step_max_attempts as u32,
             model_retry_base: Duration::from_millis(self.runtime.model_retry_base_ms),
             model_retry_max: Duration::from_millis(self.runtime.model_retry_max_ms),
@@ -427,7 +441,10 @@ impl Default for RuntimeConfig {
         Self {
             tool_foreground_ms: 3_000,
             snapshot_every_events: None,
-            max_rounds_per_activation: 32,
+            model_request_max_output_tokens: 128_000,
+            model_context_buffer_tokens: 32_000,
+            model_context_handoff_generation_tokens: 128_000,
+            model_context_handoff_document_tokens: 4_096,
             model_step_max_attempts: 3,
             model_retry_base_ms: 500,
             model_retry_max_ms: 5_000,
@@ -629,10 +646,32 @@ fn validate_runtime(runtime: &RuntimeConfig) -> Result<(), ConfigError> {
         "runtime.snapshot_every_events",
     )?;
     validate_positive(
-        runtime.max_rounds_per_activation,
-        MAX_ROUNDS_PER_ACTIVATION,
-        "runtime.max_rounds_per_activation",
+        runtime.model_request_max_output_tokens,
+        u64::from(u32::MAX),
+        "runtime.model_request_max_output_tokens",
     )?;
+    validate_positive(
+        runtime.model_context_buffer_tokens,
+        MAX_MODEL_CONTEXT_TOKENS,
+        "runtime.model_context_buffer_tokens",
+    )?;
+    validate_positive(
+        runtime.model_context_handoff_generation_tokens,
+        MAX_CONTEXT_HANDOFF_GENERATION_TOKENS,
+        "runtime.model_context_handoff_generation_tokens",
+    )?;
+    validate_positive(
+        runtime.model_context_handoff_document_tokens,
+        MAX_CONTEXT_HANDOFF_DOCUMENT_TOKENS,
+        "runtime.model_context_handoff_document_tokens",
+    )?;
+    if runtime.model_context_handoff_document_tokens
+        > runtime.model_context_handoff_generation_tokens
+    {
+        return Err(ConfigError::Invalid(
+            "runtime.model_context_handoff_document_tokens must not exceed model_context_handoff_generation_tokens",
+        ));
+    }
     validate_positive(
         runtime.model_step_max_attempts,
         MAX_MODEL_STEP_ATTEMPTS,
@@ -746,9 +785,14 @@ fn validate_tools(
         if matches!(
             value.recovery.retry_dispatch,
             RetryDispatch::SameInvocationKeyDeduplicated
-        ) {
+        ) && !(matches!(value.completion_mode, CompletionMode::Response)
+            && matches!(
+                value.recovery.on_running_restart,
+                RunningRestart::UnknownOutcome
+            ))
+        {
             return Err(ConfigError::Invalid(
-                "HTTP tools cannot claim deduplicated retry dispatch",
+                "deduplicated retry dispatch requires response completion with unknown-outcome restart recovery",
             ));
         }
         if matches!(value.completion_mode, CompletionMode::Response)

@@ -12,11 +12,9 @@ Each harness run uses distinct loopback HTTP `management_origin` and
 default). The management and callback edges use those canonical Host
 authorities while retaining incoming `Forwarded`/`X-Forwarded-Host` unless a
 fixture explicitly overrides them. `harness.managementUrl` and
-`harness.callbackUrl` remain the actual local edge URLs. The current Server
-config schema does not accept those two top-level fields; callers targeting a
-Server that has adopted that schema extension pass `includeServerOrigins: true`
-to `createWebE2EHarness`. The default keeps the current baseline config
-strictly schema-valid and never probes this by spawning a second process.
+`harness.callbackUrl` remain the actual local edge URLs. The shared harness
+always supplies the Server's required canonical management and callback
+origins; it never probes the schema by spawning a second process.
 
 The harness has no mock router, MSW, imported Zode module, hidden product
 route, or retry. Readiness is a positive public `/v1/system` plus Endpoint

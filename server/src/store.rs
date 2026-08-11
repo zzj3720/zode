@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -111,18 +112,34 @@ CREATE TABLE IF NOT EXISTS auth_profile_create_operations (
     sharing_json TEXT NOT NULL CHECK (length(sharing_json) BETWEEN 2 AND 65536),
     make_default INTEGER NOT NULL CHECK (make_default IN (0, 1)),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    response_json TEXT,
     PRIMARY KEY (actor_key, provider, command_key),
     UNIQUE (profile_id)
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS auth_profile_rotation_operations (
+    actor_key BLOB NOT NULL CHECK (length(actor_key) = 32),
+    provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 128),
+    profile_id TEXT NOT NULL CHECK (length(profile_id) BETWEEN 1 AND 128),
+    command_key BLOB NOT NULL CHECK (length(command_key) = 32),
+    request_fingerprint BLOB NOT NULL CHECK (length(request_fingerprint) = 32),
+    revision INTEGER NOT NULL CHECK (revision > 1),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    response_json TEXT NOT NULL CHECK (length(response_json) BETWEEN 2 AND 1048576),
+    PRIMARY KEY (actor_key, provider, command_key),
+    FOREIGN KEY (profile_id) REFERENCES auth_profiles(profile_id)
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE IF NOT EXISTS auth_profiles (
     profile_id TEXT PRIMARY KEY CHECK (length(profile_id) BETWEEN 1 AND 128),
     provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 128),
-    kind TEXT NOT NULL CHECK (kind = 'api_key'),
+    kind TEXT NOT NULL CHECK (kind IN ('api_key', 'oauth')),
     label TEXT NOT NULL CHECK (length(label) BETWEEN 1 AND 256),
     revision INTEGER NOT NULL CHECK (revision > 0),
     descriptor_revision INTEGER NOT NULL CHECK (descriptor_revision > 0),
     secret_ref TEXT NOT NULL UNIQUE CHECK (length(secret_ref) = 64),
+    expires_at_ms INTEGER,
+    refresh_fenced INTEGER NOT NULL DEFAULT 0 CHECK (refresh_fenced IN (0, 1)),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
     deleted_at_ms INTEGER,
     FOREIGN KEY (provider, descriptor_revision)
@@ -136,6 +153,18 @@ CREATE TABLE IF NOT EXISTS auth_profile_sharing_revisions (
     endpoint_ids_json TEXT NOT NULL CHECK (length(endpoint_ids_json) BETWEEN 2 AND 65536),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
     PRIMARY KEY (profile_id, revision),
+    FOREIGN KEY (profile_id) REFERENCES auth_profiles(profile_id)
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS auth_profile_sharing_operations (
+    actor_key BLOB NOT NULL CHECK (length(actor_key) = 32),
+    profile_id TEXT NOT NULL CHECK (length(profile_id) BETWEEN 1 AND 128),
+    command_key BLOB NOT NULL CHECK (length(command_key) = 32),
+    request_fingerprint BLOB NOT NULL CHECK (length(request_fingerprint) = 32),
+    sequence_revision INTEGER NOT NULL CHECK (sequence_revision > 0),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    response_json TEXT NOT NULL CHECK (length(response_json) BETWEEN 2 AND 1048576),
+    PRIMARY KEY (actor_key, profile_id, command_key),
     FOREIGN KEY (profile_id) REFERENCES auth_profiles(profile_id)
 ) WITHOUT ROWID, STRICT;
 
@@ -178,6 +207,73 @@ CREATE TABLE IF NOT EXISTS auth_replica_operations (
     FOREIGN KEY (profile_id) REFERENCES auth_profiles(profile_id),
     FOREIGN KEY (endpoint_id) REFERENCES endpoints(endpoint_id)
 ) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS oauth_attempts (
+    attempt_id TEXT PRIMARY KEY CHECK (length(attempt_id) BETWEEN 1 AND 128),
+    actor_key BLOB NOT NULL CHECK (length(actor_key) = 32),
+    provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 128),
+    command_key BLOB NOT NULL CHECK (length(command_key) = 32),
+    request_fingerprint BLOB NOT NULL CHECK (length(request_fingerprint) = 32),
+    profile_id TEXT NOT NULL CHECK (length(profile_id) BETWEEN 1 AND 128),
+    replace_profile_id TEXT,
+    label TEXT NOT NULL CHECK (length(label) BETWEEN 1 AND 256),
+    sharing_json TEXT NOT NULL CHECK (length(sharing_json) BETWEEN 2 AND 65536),
+    make_default INTEGER NOT NULL CHECK (make_default IN (0, 1)),
+    status TEXT NOT NULL CHECK (status IN ('active', 'succeeded', 'failed', 'cancelled')),
+    safe_code TEXT,
+    pkce_secret_ref TEXT CHECK (pkce_secret_ref IS NULL OR length(pkce_secret_ref) = 64),
+    state_digest BLOB UNIQUE CHECK (state_digest IS NULL OR length(state_digest) = 32),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+    expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > created_at_ms),
+    CHECK (
+        (replace_profile_id IS NULL AND profile_id IS NOT NULL) OR
+        (replace_profile_id = profile_id)
+    ),
+    UNIQUE (actor_key, provider, command_key)
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS oauth_authorize_tickets (
+    ticket_digest BLOB PRIMARY KEY CHECK (length(ticket_digest) = 32),
+    attempt_id TEXT NOT NULL,
+    expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > 0),
+    consumed_at_ms INTEGER,
+    FOREIGN KEY (attempt_id) REFERENCES oauth_attempts(attempt_id)
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS auth_refresh_operations (
+    operation_id TEXT PRIMARY KEY CHECK (length(operation_id) BETWEEN 1 AND 128),
+    actor_key BLOB NOT NULL CHECK (length(actor_key) = 32),
+    profile_id TEXT NOT NULL,
+    command_key BLOB NOT NULL CHECK (length(command_key) = 32),
+    request_fingerprint BLOB NOT NULL CHECK (length(request_fingerprint) = 32),
+    source_revision INTEGER NOT NULL CHECK (source_revision > 0),
+    reserved_revision INTEGER NOT NULL CHECK (reserved_revision > source_revision),
+    source_secret_ref TEXT NOT NULL CHECK (length(source_secret_ref) = 64),
+    target_secret_ref TEXT NOT NULL CHECK (length(target_secret_ref) = 64),
+    recovery TEXT NOT NULL CHECK (
+        recovery IN ('same_operation_id_idempotent', 'none')
+    ),
+    status TEXT NOT NULL CHECK (
+        status IN ('prepared', 'dispatching', 'succeeded', 'refresh_unknown', 'failed')
+    ),
+    safe_code TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+    UNIQUE (actor_key, profile_id, command_key),
+    FOREIGN KEY (profile_id) REFERENCES auth_profiles(profile_id)
+) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS provider_control_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('oauth_attempt', 'auth_refresh')),
+    resource_id TEXT NOT NULL CHECK (length(resource_id) BETWEEN 1 AND 128),
+    event_json TEXT NOT NULL CHECK (length(event_json) BETWEEN 2 AND 65536),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS provider_control_events_resource
+ON provider_control_events(resource_kind, resource_id, sequence);
 "#;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -221,8 +317,12 @@ enum ControlDatabaseState {
 pub(crate) enum StoreError {
     #[error("management command conflicts with an existing receipt")]
     Conflict,
+    #[error("the original management response receipt is unavailable")]
+    ReceiptUnavailable,
     #[error("management resource was not found")]
     NotFound,
+    #[error("the auth profile requires relogin before another refresh")]
+    ReauthRequired,
     #[error("control store integrity check failed")]
     Integrity,
     #[error("control store operation failed")]
@@ -381,12 +481,32 @@ pub(crate) struct ProfileCreateWrite {
     pub(crate) created_at_ms: i64,
 }
 
+pub(crate) struct ProfileRotationWrite {
+    pub(crate) actor_key: [u8; DIGEST_BYTES],
+    pub(crate) provider: String,
+    pub(crate) profile_id: String,
+    pub(crate) command_key: [u8; DIGEST_BYTES],
+    pub(crate) request_fingerprint: [u8; DIGEST_BYTES],
+    pub(crate) secret_ref: String,
+    pub(crate) created_at_ms: i64,
+}
+
 pub(crate) struct ProviderDefaultProfileWrite {
     pub(crate) actor_key: [u8; DIGEST_BYTES],
     pub(crate) provider: String,
     pub(crate) command_key: [u8; DIGEST_BYTES],
     pub(crate) request_fingerprint: [u8; DIGEST_BYTES],
     pub(crate) profile_id: String,
+    pub(crate) created_at_ms: i64,
+}
+
+pub(crate) struct ProfileSharingWrite {
+    pub(crate) actor_key: [u8; DIGEST_BYTES],
+    pub(crate) profile_id: String,
+    pub(crate) command_key: [u8; DIGEST_BYTES],
+    pub(crate) request_fingerprint: [u8; DIGEST_BYTES],
+    pub(crate) mode: String,
+    pub(crate) endpoint_ids: Vec<String>,
     pub(crate) created_at_ms: i64,
 }
 
@@ -412,6 +532,104 @@ pub(crate) struct ProfileCreateOperation {
     pub(crate) created_at_ms: i64,
 }
 
+pub(crate) struct OAuthAttemptWrite {
+    pub(crate) attempt_id: String,
+    pub(crate) actor_key: [u8; DIGEST_BYTES],
+    pub(crate) provider: String,
+    pub(crate) command_key: [u8; DIGEST_BYTES],
+    pub(crate) request_fingerprint: [u8; DIGEST_BYTES],
+    pub(crate) profile_id: String,
+    pub(crate) replace_profile_id: Option<String>,
+    pub(crate) label: String,
+    pub(crate) sharing_json: String,
+    pub(crate) make_default: bool,
+    pub(crate) created_at_ms: i64,
+    pub(crate) expires_at_ms: i64,
+}
+
+#[derive(Clone)]
+pub(crate) struct OAuthAttemptRecord {
+    pub(crate) attempt_id: String,
+    pub(crate) provider: String,
+    pub(crate) profile_id: String,
+    pub(crate) replace_profile_id: Option<String>,
+    pub(crate) label: String,
+    pub(crate) sharing_json: String,
+    pub(crate) make_default: bool,
+    pub(crate) status: String,
+    pub(crate) safe_code: Option<String>,
+    pub(crate) pkce_secret_ref: Option<String>,
+    pub(crate) state_digest: Option<Vec<u8>>,
+    pub(crate) created_at_ms: i64,
+    pub(crate) updated_at_ms: i64,
+    pub(crate) expires_at_ms: i64,
+}
+
+pub(crate) struct OAuthAttemptSuccess {
+    pub(crate) actor_key: [u8; DIGEST_BYTES],
+    pub(crate) attempt_id: String,
+    pub(crate) credential_secret_ref: String,
+    pub(crate) expires_at_ms: Option<i64>,
+    pub(crate) completed_at_ms: i64,
+}
+
+pub(crate) struct OAuthTicketWrite {
+    pub(crate) actor_key: [u8; DIGEST_BYTES],
+    pub(crate) attempt_id: String,
+    pub(crate) ticket_digest: [u8; DIGEST_BYTES],
+    pub(crate) expires_at_ms: i64,
+    pub(crate) created_at_ms: i64,
+}
+
+pub(crate) struct OAuthTicketRedemption {
+    pub(crate) actor_key: [u8; DIGEST_BYTES],
+    pub(crate) attempt_id: String,
+    pub(crate) ticket_digest: [u8; DIGEST_BYTES],
+    pub(crate) state_digest: [u8; DIGEST_BYTES],
+    pub(crate) pkce_secret_ref: String,
+    pub(crate) redeemed_at_ms: i64,
+}
+
+pub(crate) struct AuthRefreshWrite {
+    pub(crate) operation_id: String,
+    pub(crate) actor_key: [u8; DIGEST_BYTES],
+    pub(crate) profile_id: String,
+    pub(crate) command_key: [u8; DIGEST_BYTES],
+    pub(crate) request_fingerprint: [u8; DIGEST_BYTES],
+    pub(crate) target_secret_ref: String,
+    pub(crate) recovery: String,
+    pub(crate) created_at_ms: i64,
+}
+
+#[derive(Clone)]
+pub(crate) struct AuthRefreshRecord {
+    pub(crate) operation_id: String,
+    pub(crate) actor_key: [u8; DIGEST_BYTES],
+    pub(crate) profile_id: String,
+    pub(crate) provider: String,
+    pub(crate) source_revision: u64,
+    pub(crate) reserved_revision: u64,
+    pub(crate) source_secret_ref: String,
+    pub(crate) target_secret_ref: String,
+    pub(crate) recovery: String,
+    pub(crate) status: String,
+    pub(crate) safe_code: Option<String>,
+    pub(crate) created_at_ms: i64,
+    pub(crate) updated_at_ms: i64,
+}
+
+pub(crate) struct AuthRefreshSuccess {
+    pub(crate) operation_id: String,
+    pub(crate) target_secret_ref: String,
+    pub(crate) expires_at_ms: Option<i64>,
+    pub(crate) completed_at_ms: i64,
+}
+
+pub(crate) struct ProviderControlEvent {
+    pub(crate) sequence: u64,
+    pub(crate) event_json: String,
+}
+
 #[derive(Clone)]
 pub(crate) struct AuthProfileRecord {
     pub(crate) profile_id: String,
@@ -421,6 +639,8 @@ pub(crate) struct AuthProfileRecord {
     pub(crate) revision: u64,
     pub(crate) descriptor_revision: u64,
     pub(crate) secret_ref: String,
+    pub(crate) expires_at_ms: Option<i64>,
+    pub(crate) refresh_fenced: bool,
     pub(crate) sharing_mode: String,
     pub(crate) endpoint_ids_json: String,
     pub(crate) is_default: bool,
@@ -853,6 +1073,72 @@ impl ControlStore {
         }
     }
 
+    pub(crate) fn cleanup_unreferenced_provider_secrets(&self) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT secret_ref FROM auth_profile_create_operations
+                    WHERE phase != 'complete'
+                 UNION SELECT secret_ref FROM auth_profiles
+                 UNION SELECT pkce_secret_ref FROM oauth_attempts
+                    WHERE status = 'active' AND pkce_secret_ref IS NOT NULL
+                 UNION SELECT source_secret_ref FROM auth_refresh_operations
+                    WHERE status IN ('prepared', 'dispatching')
+                 UNION SELECT target_secret_ref FROM auth_refresh_operations
+                    WHERE status IN ('prepared', 'dispatching')",
+            )
+            .map_err(|_| StoreError::Internal)?;
+        let referenced = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| StoreError::Internal)?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .map_err(|_| StoreError::Integrity)?;
+        drop(statement);
+        drop(connection);
+
+        let directory = self.secret_directory.join("providers");
+        ensure_private_secret_namespace(&directory)?;
+        let mut removed = false;
+        for entry in fs::read_dir(&directory).map_err(|_| StoreError::Internal)? {
+            let entry = entry.map_err(|_| StoreError::Internal)?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| StoreError::Integrity)?;
+            let reference = if valid_secret_reference(&name) {
+                name.as_str()
+            } else if let Some(reference) = name
+                .strip_prefix('.')
+                .and_then(|value| value.strip_suffix(".pending"))
+                .filter(|value| valid_secret_reference(value))
+            {
+                reference
+            } else {
+                return Err(StoreError::Integrity);
+            };
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|_| StoreError::Internal)?;
+            if !metadata.file_type().is_file() {
+                return Err(StoreError::Integrity);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    return Err(StoreError::Integrity);
+                }
+            }
+            if referenced.contains(reference) {
+                continue;
+            }
+            fs::remove_file(entry.path()).map_err(|_| StoreError::Internal)?;
+            removed = true;
+        }
+        if removed {
+            sync_directory(&directory).map_err(|_| StoreError::Internal)?;
+        }
+        Ok(())
+    }
+
     fn load_secret(&self, namespace: &str, reference: &str) -> Result<Option<Vec<u8>>, StoreError> {
         if reference.len() != 64 || !reference.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(StoreError::Integrity);
@@ -1257,24 +1543,858 @@ impl ControlStore {
         })
     }
 
-    pub(crate) fn commit_profile_create(
+    pub(crate) fn begin_oauth_attempt(
+        &self,
+        write: OAuthAttemptWrite,
+        initial_event_json: &str,
+    ) -> Result<OAuthAttemptRecord, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_fingerprint, attempt_id, actor_key, provider,
+                        profile_id, replace_profile_id, label, sharing_json,
+                        make_default, status, safe_code, pkce_secret_ref,
+                        state_digest,
+                        created_at_ms, updated_at_ms, expires_at_ms
+                 FROM oauth_attempts
+                 WHERE actor_key = ?1 AND provider = ?2 AND command_key = ?3",
+                params![
+                    &write.actor_key[..],
+                    &write.provider,
+                    &write.command_key[..]
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, oauth_attempt_from_row(row, 1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Internal)?;
+        if let Some((fingerprint, attempt)) = existing {
+            if !equal_digest(&fingerprint, &write.request_fingerprint) {
+                return Err(StoreError::Conflict);
+            }
+            return Ok(attempt);
+        }
+        let descriptor_exists = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM provider_descriptor_revisions WHERE provider = ?1
+                 )",
+                [&write.provider],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| StoreError::Internal)?
+            != 0;
+        if !descriptor_exists {
+            return Err(StoreError::NotFound);
+        }
+        if let Some(profile_id) = &write.replace_profile_id {
+            let profile = read_auth_profile_optional(&transaction, profile_id)?
+                .ok_or(StoreError::NotFound)?;
+            if profile.provider != write.provider
+                || profile.kind != "oauth"
+                || profile.deleted_at_ms.is_some()
+            {
+                return Err(StoreError::Conflict);
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO oauth_attempts (
+                    attempt_id, actor_key, provider, command_key, request_fingerprint,
+                    profile_id, replace_profile_id, label, sharing_json, make_default,
+                    status, safe_code, pkce_secret_ref, state_digest,
+                    created_at_ms, updated_at_ms, expires_at_ms
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    'active', NULL, NULL, NULL, ?11, ?11, ?12
+                 )",
+                params![
+                    &write.attempt_id,
+                    &write.actor_key[..],
+                    &write.provider,
+                    &write.command_key[..],
+                    &write.request_fingerprint[..],
+                    &write.profile_id,
+                    &write.replace_profile_id,
+                    &write.label,
+                    &write.sharing_json,
+                    if write.make_default { 1_i64 } else { 0_i64 },
+                    write.created_at_ms,
+                    write.expires_at_ms,
+                ],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        append_provider_control_event(
+            &transaction,
+            "oauth_attempt",
+            &write.attempt_id,
+            initial_event_json,
+            write.created_at_ms,
+        )?;
+        let attempt = read_oauth_attempt(&transaction, &write.actor_key, &write.attempt_id)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok(attempt)
+    }
+
+    pub(crate) fn get_oauth_attempt(
+        &self,
+        actor_key: &[u8; DIGEST_BYTES],
+        attempt_id: &str,
+    ) -> Result<Option<OAuthAttemptRecord>, StoreError> {
+        let connection = self.connection()?;
+        read_oauth_attempt_optional(&connection, actor_key, attempt_id)
+    }
+
+    pub(crate) fn mint_oauth_ticket(&self, write: OAuthTicketWrite) -> Result<(), StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let attempt = read_oauth_attempt(&transaction, &write.actor_key, &write.attempt_id)?;
+        if attempt.status != "active" || attempt.expires_at_ms <= write.created_at_ms {
+            return Err(StoreError::Conflict);
+        }
+        let existing = transaction
+            .query_row(
+                "SELECT attempt_id FROM oauth_authorize_tickets WHERE ticket_digest = ?1",
+                params![&write.ticket_digest[..]],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Internal)?;
+        if let Some(existing_attempt_id) = existing {
+            if existing_attempt_id != write.attempt_id {
+                return Err(StoreError::Conflict);
+            }
+            transaction.commit().map_err(|_| StoreError::Internal)?;
+            return Ok(());
+        }
+        transaction
+            .execute(
+                "INSERT INTO oauth_authorize_tickets (
+                    ticket_digest, attempt_id, expires_at_ms, consumed_at_ms
+                 ) VALUES (?1, ?2, ?3, NULL)",
+                params![
+                    &write.ticket_digest[..],
+                    &write.attempt_id,
+                    write.expires_at_ms,
+                ],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        transaction.commit().map_err(|_| StoreError::Internal)
+    }
+
+    pub(crate) fn redeem_oauth_ticket(
+        &self,
+        redemption: OAuthTicketRedemption,
+        event_json: &str,
+    ) -> Result<OAuthAttemptRecord, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let ticket = transaction
+            .query_row(
+                "SELECT ticket.expires_at_ms, ticket.consumed_at_ms
+                 FROM oauth_authorize_tickets AS ticket
+                 INNER JOIN oauth_attempts AS attempt
+                    ON attempt.attempt_id = ticket.attempt_id
+                 WHERE ticket.ticket_digest = ?1
+                   AND ticket.attempt_id = ?2
+                   AND attempt.actor_key = ?3",
+                params![
+                    &redemption.ticket_digest[..],
+                    &redemption.attempt_id,
+                    &redemption.actor_key[..],
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Internal)?
+            .ok_or(StoreError::NotFound)?;
+        let attempt =
+            read_oauth_attempt(&transaction, &redemption.actor_key, &redemption.attempt_id)?;
+        if ticket.1.is_some()
+            || ticket.0 <= redemption.redeemed_at_ms
+            || attempt.status != "active"
+            || attempt.expires_at_ms <= redemption.redeemed_at_ms
+            || attempt.state_digest.is_some()
+        {
+            return Err(StoreError::Conflict);
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE oauth_authorize_tickets SET consumed_at_ms = ?2
+                 WHERE ticket_digest = ?1 AND consumed_at_ms IS NULL",
+                params![&redemption.ticket_digest[..], redemption.redeemed_at_ms],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE oauth_attempts
+                 SET state_digest = ?3, pkce_secret_ref = ?4, updated_at_ms = ?5
+                 WHERE attempt_id = ?1 AND actor_key = ?2
+                   AND status = 'active' AND state_digest IS NULL",
+                params![
+                    &redemption.attempt_id,
+                    &redemption.actor_key[..],
+                    &redemption.state_digest[..],
+                    &redemption.pkce_secret_ref,
+                    redemption.redeemed_at_ms,
+                ],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        append_provider_control_event(
+            &transaction,
+            "oauth_attempt",
+            &redemption.attempt_id,
+            event_json,
+            redemption.redeemed_at_ms,
+        )?;
+        let attempt =
+            read_oauth_attempt(&transaction, &redemption.actor_key, &redemption.attempt_id)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok(attempt)
+    }
+
+    pub(crate) fn find_oauth_attempt_by_state(
+        &self,
+        actor_key: &[u8; DIGEST_BYTES],
+        state_digest: &[u8; DIGEST_BYTES],
+    ) -> Result<Option<OAuthAttemptRecord>, StoreError> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT attempt_id, actor_key, provider, profile_id,
+                        replace_profile_id, label, sharing_json, make_default,
+                        status, safe_code, pkce_secret_ref, state_digest,
+                        created_at_ms, updated_at_ms, expires_at_ms
+                 FROM oauth_attempts
+                 WHERE actor_key = ?1 AND state_digest = ?2",
+                params![&actor_key[..], &state_digest[..]],
+                |row| oauth_attempt_from_row(row, 0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Internal)
+    }
+
+    pub(crate) fn finish_oauth_attempt(
+        &self,
+        actor_key: &[u8; DIGEST_BYTES],
+        attempt_id: &str,
+        status: &str,
+        safe_code: &str,
+        finished_at_ms: i64,
+        event_json: &str,
+    ) -> Result<OAuthAttemptRecord, StoreError> {
+        if !matches!(status, "failed" | "cancelled") {
+            return Err(StoreError::Integrity);
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let attempt = read_oauth_attempt(&transaction, actor_key, attempt_id)?;
+        if attempt.status != "active" {
+            return Ok(attempt);
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE oauth_attempts
+                 SET status = ?3, safe_code = ?4, updated_at_ms = ?5
+                 WHERE attempt_id = ?1 AND actor_key = ?2 AND status = 'active'",
+                params![
+                    attempt_id,
+                    &actor_key[..],
+                    status,
+                    safe_code,
+                    finished_at_ms,
+                ],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        append_provider_control_event(
+            &transaction,
+            "oauth_attempt",
+            attempt_id,
+            event_json,
+            finished_at_ms,
+        )?;
+        let attempt = read_oauth_attempt(&transaction, actor_key, attempt_id)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok(attempt)
+    }
+
+    pub(crate) fn complete_oauth_attempt(
+        &self,
+        success: OAuthAttemptSuccess,
+        event_json: &str,
+    ) -> Result<(AuthProfileRecord, Vec<AuthReplicaRecord>, Option<String>), StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let attempt = read_oauth_attempt(&transaction, &success.actor_key, &success.attempt_id)?;
+        if attempt.status == "succeeded" {
+            let profile = read_auth_profile(&transaction, &attempt.profile_id)?;
+            let replicas = read_auth_replicas(&transaction, &attempt.profile_id)?;
+            transaction.commit().map_err(|_| StoreError::Internal)?;
+            return Ok((profile, replicas, None));
+        }
+        if attempt.status != "active" {
+            return Err(StoreError::Conflict);
+        }
+        let (profile, old_secret_ref) = if attempt.replace_profile_id.is_some() {
+            let profile = read_auth_profile(&transaction, &attempt.profile_id)?;
+            if profile.provider != attempt.provider
+                || profile.kind != "oauth"
+                || profile.deleted_at_ms.is_some()
+            {
+                return Err(StoreError::Conflict);
+            }
+            let highest_reserved = transaction
+                .query_row(
+                    "SELECT MAX(revision) FROM (
+                        SELECT revision FROM auth_replica_operations WHERE profile_id = ?1
+                        UNION ALL
+                        SELECT reserved_revision AS revision
+                        FROM auth_refresh_operations WHERE profile_id = ?1
+                     )",
+                    [&attempt.profile_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .map_err(|_| StoreError::Internal)?
+                .unwrap_or(i64::try_from(profile.revision).map_err(|_| StoreError::Integrity)?);
+            let current_revision =
+                i64::try_from(profile.revision).map_err(|_| StoreError::Integrity)?;
+            let revision = highest_reserved.max(current_revision) + 1;
+            let changed = transaction
+                .execute(
+                    "UPDATE auth_profiles
+                     SET revision = ?2, secret_ref = ?3, expires_at_ms = ?4,
+                         refresh_fenced = 0
+                     WHERE profile_id = ?1 AND deleted_at_ms IS NULL",
+                    params![
+                        &attempt.profile_id,
+                        revision,
+                        &success.credential_secret_ref,
+                        success.expires_at_ms,
+                    ],
+                )
+                .map_err(|_| StoreError::Internal)?;
+            if changed != 1 {
+                return Err(StoreError::Conflict);
+            }
+            let endpoint_ids = parse_endpoint_ids(&profile.endpoint_ids_json)?;
+            append_replica_installs(
+                &transaction,
+                &attempt.profile_id,
+                revision,
+                &endpoint_ids,
+                &format!("oauth-attempt:{}", attempt.attempt_id),
+            )?;
+            (
+                read_auth_profile(&transaction, &attempt.profile_id)?,
+                Some(profile.secret_ref),
+            )
+        } else {
+            let sharing: serde_json::Value =
+                serde_json::from_str(&attempt.sharing_json).map_err(|_| StoreError::Integrity)?;
+            let mode = sharing["mode"].as_str().ok_or(StoreError::Integrity)?;
+            let endpoint_ids = sharing["endpoint_ids"]
+                .as_array()
+                .ok_or(StoreError::Integrity)?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or(StoreError::Integrity)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let endpoint_ids = expand_sharing_endpoints(&transaction, mode, endpoint_ids)?;
+            validate_sharing_endpoints(&transaction, &endpoint_ids)?;
+            let descriptor_revision = transaction
+                .query_row(
+                    "SELECT MAX(revision) FROM provider_descriptor_revisions WHERE provider = ?1",
+                    [&attempt.provider],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|_| StoreError::Internal)?;
+            transaction
+                .execute(
+                    "INSERT INTO auth_profiles (
+                        profile_id, provider, kind, label, revision, descriptor_revision,
+                        secret_ref, expires_at_ms, refresh_fenced, created_at_ms, deleted_at_ms
+                     ) VALUES (?1, ?2, 'oauth', ?3, 1, ?4, ?5, ?6, 0, ?7, NULL)",
+                    params![
+                        &attempt.profile_id,
+                        &attempt.provider,
+                        &attempt.label,
+                        descriptor_revision,
+                        &success.credential_secret_ref,
+                        success.expires_at_ms,
+                        success.completed_at_ms,
+                    ],
+                )
+                .map_err(|_| StoreError::Internal)?;
+            transaction
+                .execute(
+                    "INSERT INTO auth_profile_sharing_revisions (
+                        profile_id, revision, mode, endpoint_ids_json, created_at_ms
+                     ) VALUES (?1, 1, ?2, ?3, ?4)",
+                    params![
+                        &attempt.profile_id,
+                        mode,
+                        serde_json::to_string(&endpoint_ids).map_err(|_| StoreError::Integrity)?,
+                        success.completed_at_ms,
+                    ],
+                )
+                .map_err(|_| StoreError::Internal)?;
+            if attempt.make_default {
+                let default_revision = transaction
+                    .query_row(
+                        "SELECT COALESCE(MAX(revision), 0) + 1
+                         FROM provider_default_profile_revisions WHERE provider = ?1",
+                        [&attempt.provider],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|_| StoreError::Internal)?;
+                transaction
+                    .execute(
+                        "INSERT INTO provider_default_profile_revisions (
+                            provider, revision, profile_id, created_at_ms
+                         ) VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            &attempt.provider,
+                            default_revision,
+                            &attempt.profile_id,
+                            success.completed_at_ms,
+                        ],
+                    )
+                    .map_err(|_| StoreError::Internal)?;
+            }
+            append_replica_installs(
+                &transaction,
+                &attempt.profile_id,
+                1,
+                &endpoint_ids,
+                &format!("oauth-attempt:{}", attempt.attempt_id),
+            )?;
+            (read_auth_profile(&transaction, &attempt.profile_id)?, None)
+        };
+        let changed = transaction
+            .execute(
+                "UPDATE oauth_attempts
+                 SET status = 'succeeded', safe_code = NULL, updated_at_ms = ?3
+                 WHERE attempt_id = ?1 AND actor_key = ?2 AND status = 'active'",
+                params![
+                    &attempt.attempt_id,
+                    &success.actor_key[..],
+                    success.completed_at_ms,
+                ],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        append_provider_control_event(
+            &transaction,
+            "oauth_attempt",
+            &attempt.attempt_id,
+            event_json,
+            success.completed_at_ms,
+        )?;
+        let replicas = read_auth_replicas(&transaction, &attempt.profile_id)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok((profile, replicas, old_secret_ref))
+    }
+
+    pub(crate) fn begin_auth_refresh(
+        &self,
+        write: AuthRefreshWrite,
+        event_json: &str,
+    ) -> Result<AuthRefreshRecord, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_fingerprint, operation_id
+                 FROM auth_refresh_operations
+                 WHERE actor_key = ?1 AND profile_id = ?2 AND command_key = ?3",
+                params![
+                    &write.actor_key[..],
+                    &write.profile_id,
+                    &write.command_key[..],
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Internal)?;
+        if let Some((fingerprint, operation_id)) = existing {
+            if !equal_digest(&fingerprint, &write.request_fingerprint) {
+                return Err(StoreError::Conflict);
+            }
+            let operation = read_auth_refresh(&transaction, &operation_id)?;
+            transaction.commit().map_err(|_| StoreError::Internal)?;
+            return Ok(operation);
+        }
+        let profile = read_auth_profile_optional(&transaction, &write.profile_id)?
+            .ok_or(StoreError::NotFound)?;
+        if profile.deleted_at_ms.is_some() || profile.kind != "oauth" {
+            return Err(StoreError::Conflict);
+        }
+        if profile.refresh_fenced {
+            return Err(StoreError::ReauthRequired);
+        }
+        let has_active = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM auth_refresh_operations
+                    WHERE profile_id = ?1 AND status IN ('prepared', 'dispatching')
+                 )",
+                [&write.profile_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| StoreError::Internal)?
+            != 0;
+        if has_active {
+            return Err(StoreError::Conflict);
+        }
+        let current_revision =
+            i64::try_from(profile.revision).map_err(|_| StoreError::Integrity)?;
+        let highest_reserved = transaction
+            .query_row(
+                "SELECT MAX(revision) FROM (
+                    SELECT revision FROM auth_replica_operations WHERE profile_id = ?1
+                    UNION ALL
+                    SELECT reserved_revision AS revision
+                    FROM auth_refresh_operations WHERE profile_id = ?1
+                 )",
+                [&write.profile_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|_| StoreError::Internal)?
+            .unwrap_or(current_revision);
+        let reserved_revision = highest_reserved
+            .max(current_revision)
+            .checked_add(1)
+            .ok_or(StoreError::Integrity)?;
+        transaction
+            .execute(
+                "INSERT INTO auth_refresh_operations (
+                    operation_id, actor_key, profile_id, command_key, request_fingerprint,
+                    source_revision, reserved_revision, source_secret_ref, target_secret_ref,
+                    recovery, status, safe_code, created_at_ms, updated_at_ms
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                    ?10, 'prepared', NULL, ?11, ?11
+                 )",
+                params![
+                    &write.operation_id,
+                    &write.actor_key[..],
+                    &write.profile_id,
+                    &write.command_key[..],
+                    &write.request_fingerprint[..],
+                    current_revision,
+                    reserved_revision,
+                    &profile.secret_ref,
+                    &write.target_secret_ref,
+                    &write.recovery,
+                    write.created_at_ms,
+                ],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        append_provider_control_event(
+            &transaction,
+            "auth_refresh",
+            &write.operation_id,
+            event_json,
+            write.created_at_ms,
+        )?;
+        let operation = read_auth_refresh(&transaction, &write.operation_id)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok(operation)
+    }
+
+    pub(crate) fn get_auth_refresh(
+        &self,
+        actor_key: &[u8; DIGEST_BYTES],
+        operation_id: &str,
+    ) -> Result<Option<AuthRefreshRecord>, StoreError> {
+        let connection = self.connection()?;
+        read_auth_refresh_optional(&connection, operation_id)?
+            .filter(|operation| equal_digest(&operation.actor_key, actor_key))
+            .map_or(Ok(None), |operation| Ok(Some(operation)))
+    }
+
+    pub(crate) fn list_pending_auth_refreshes(&self) -> Result<Vec<AuthRefreshRecord>, StoreError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT operation.operation_id, operation.actor_key, operation.profile_id,
+                        profile.provider, operation.source_revision,
+                        operation.reserved_revision, operation.source_secret_ref,
+                        operation.target_secret_ref, operation.recovery, operation.status,
+                        operation.safe_code, operation.created_at_ms, operation.updated_at_ms
+                 FROM auth_refresh_operations AS operation
+                 INNER JOIN auth_profiles AS profile ON profile.profile_id = operation.profile_id
+                 WHERE operation.status IN ('prepared', 'dispatching')
+                 ORDER BY operation.created_at_ms, operation.operation_id",
+            )
+            .map_err(|_| StoreError::Internal)?;
+        let records = statement
+            .query_map([], auth_refresh_from_row)
+            .map_err(|_| StoreError::Internal)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| StoreError::Integrity)?;
+        Ok(records)
+    }
+
+    pub(crate) fn mark_auth_refresh_dispatching(
+        &self,
+        operation_id: &str,
+        dispatched_at_ms: i64,
+        event_json: &str,
+    ) -> Result<AuthRefreshRecord, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let operation = read_auth_refresh(&transaction, operation_id)?;
+        if operation.status == "prepared" {
+            let changed = transaction
+                .execute(
+                    "UPDATE auth_refresh_operations
+                     SET status = 'dispatching', updated_at_ms = ?2
+                     WHERE operation_id = ?1 AND status = 'prepared'",
+                    params![operation_id, dispatched_at_ms],
+                )
+                .map_err(|_| StoreError::Internal)?;
+            if changed != 1 {
+                return Err(StoreError::Conflict);
+            }
+            append_provider_control_event(
+                &transaction,
+                "auth_refresh",
+                operation_id,
+                event_json,
+                dispatched_at_ms,
+            )?;
+        }
+        let operation = read_auth_refresh(&transaction, operation_id)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok(operation)
+    }
+
+    pub(crate) fn complete_auth_refresh(
+        &self,
+        success: AuthRefreshSuccess,
+        event_json: &str,
+    ) -> Result<(AuthRefreshRecord, AuthProfileRecord, String), StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let operation = read_auth_refresh(&transaction, &success.operation_id)?;
+        if operation.status == "succeeded" {
+            let profile = read_auth_profile(&transaction, &operation.profile_id)?;
+            transaction.commit().map_err(|_| StoreError::Internal)?;
+            return Ok((operation.clone(), profile, operation.source_secret_ref));
+        }
+        if operation.status != "dispatching"
+            || operation.target_secret_ref != success.target_secret_ref
+        {
+            return Err(StoreError::Conflict);
+        }
+        let profile = read_auth_profile(&transaction, &operation.profile_id)?;
+        if profile.deleted_at_ms.is_some()
+            || profile.revision != operation.source_revision
+            || profile.secret_ref != operation.source_secret_ref
+            || profile.refresh_fenced
+        {
+            return Err(StoreError::Conflict);
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE auth_profiles
+                 SET revision = ?2, secret_ref = ?3, expires_at_ms = ?4
+                 WHERE profile_id = ?1 AND revision = ?5 AND secret_ref = ?6
+                   AND deleted_at_ms IS NULL AND refresh_fenced = 0",
+                params![
+                    &operation.profile_id,
+                    i64::try_from(operation.reserved_revision)
+                        .map_err(|_| StoreError::Integrity)?,
+                    &success.target_secret_ref,
+                    success.expires_at_ms,
+                    i64::try_from(operation.source_revision).map_err(|_| StoreError::Integrity)?,
+                    &operation.source_secret_ref,
+                ],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        let endpoint_ids = parse_endpoint_ids(&profile.endpoint_ids_json)?;
+        append_replica_installs(
+            &transaction,
+            &operation.profile_id,
+            i64::try_from(operation.reserved_revision).map_err(|_| StoreError::Integrity)?,
+            &endpoint_ids,
+            &format!("auth-refresh:{}", operation.operation_id),
+        )?;
+        let changed = transaction
+            .execute(
+                "UPDATE auth_refresh_operations
+                 SET status = 'succeeded', safe_code = NULL, updated_at_ms = ?2
+                 WHERE operation_id = ?1 AND status = 'dispatching'",
+                params![&success.operation_id, success.completed_at_ms],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        append_provider_control_event(
+            &transaction,
+            "auth_refresh",
+            &success.operation_id,
+            event_json,
+            success.completed_at_ms,
+        )?;
+        let completed = read_auth_refresh(&transaction, &success.operation_id)?;
+        let profile = read_auth_profile(&transaction, &operation.profile_id)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok((completed, profile, operation.source_secret_ref))
+    }
+
+    pub(crate) fn finish_auth_refresh(
+        &self,
+        operation_id: &str,
+        status: &str,
+        safe_code: &str,
+        finished_at_ms: i64,
+        event_json: &str,
+    ) -> Result<AuthRefreshRecord, StoreError> {
+        if !matches!(status, "refresh_unknown" | "failed") {
+            return Err(StoreError::Integrity);
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let operation = read_auth_refresh(&transaction, operation_id)?;
+        if matches!(
+            operation.status.as_str(),
+            "succeeded" | "refresh_unknown" | "failed"
+        ) {
+            transaction.commit().map_err(|_| StoreError::Internal)?;
+            return Ok(operation);
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE auth_refresh_operations
+                 SET status = ?2, safe_code = ?3, updated_at_ms = ?4
+                 WHERE operation_id = ?1 AND status IN ('prepared', 'dispatching')",
+                params![operation_id, status, safe_code, finished_at_ms],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        if status == "refresh_unknown" {
+            let changed = transaction
+                .execute(
+                    "UPDATE auth_profiles SET refresh_fenced = 1
+                     WHERE profile_id = ?1 AND deleted_at_ms IS NULL",
+                    [&operation.profile_id],
+                )
+                .map_err(|_| StoreError::Internal)?;
+            if changed != 1 {
+                return Err(StoreError::Conflict);
+            }
+        }
+        append_provider_control_event(
+            &transaction,
+            "auth_refresh",
+            operation_id,
+            event_json,
+            finished_at_ms,
+        )?;
+        let operation = read_auth_refresh(&transaction, operation_id)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok(operation)
+    }
+
+    pub(crate) fn list_provider_control_events(
+        &self,
+        resource_kind: &str,
+        resource_id: &str,
+        after: u64,
+    ) -> Result<Vec<ProviderControlEvent>, StoreError> {
+        let after = i64::try_from(after).map_err(|_| StoreError::Integrity)?;
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, event_json FROM provider_control_events
+                 WHERE resource_kind = ?1 AND resource_id = ?2 AND sequence > ?3
+                 ORDER BY sequence ASC LIMIT 256",
+            )
+            .map_err(|_| StoreError::Internal)?;
+        let events = statement
+            .query_map(params![resource_kind, resource_id, after], |row| {
+                let sequence = positive_u64(row, 0)?;
+                Ok(ProviderControlEvent {
+                    sequence,
+                    event_json: row.get(1)?,
+                })
+            })
+            .map_err(|_| StoreError::Internal)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| StoreError::Integrity)?;
+        Ok(events)
+    }
+
+    pub(crate) fn commit_profile_create<F>(
         &self,
         operation: &ProfileCreateOperation,
-    ) -> Result<AuthProfileRecord, StoreError> {
+        response_for: F,
+    ) -> Result<String, StoreError>
+    where
+        F: FnOnce(&AuthProfileRecord, &[AuthReplicaRecord]) -> Result<String, StoreError>,
+    {
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| StoreError::Internal)?;
         let persisted = transaction
             .query_row(
-                "SELECT request_fingerprint, phase FROM auth_profile_create_operations
+                "SELECT request_fingerprint, phase, response_json
+                 FROM auth_profile_create_operations
                  WHERE actor_key = ?1 AND provider = ?2 AND command_key = ?3",
                 params![
                     &operation.actor_key[..],
                     &operation.provider,
                     &operation.command_key[..]
                 ],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|_| StoreError::Internal)?
@@ -1283,7 +2403,10 @@ impl ControlStore {
             return Err(StoreError::Conflict);
         }
         if persisted.1 != "pending" {
-            return read_auth_profile(&transaction, &operation.profile_id);
+            let response_json = persisted.2.ok_or(StoreError::ReceiptUnavailable)?;
+            read_auth_profile(&transaction, &operation.profile_id)?;
+            transaction.commit().map_err(|_| StoreError::Internal)?;
+            return Ok(response_json);
         }
         let sharing: serde_json::Value =
             serde_json::from_str(&operation.sharing_json).map_err(|_| StoreError::Integrity)?;
@@ -1299,6 +2422,7 @@ impl ControlStore {
                     .ok_or(StoreError::Integrity)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let endpoint_ids = expand_sharing_endpoints(&transaction, mode, endpoint_ids)?;
         for endpoint_id in &endpoint_ids {
             let exists = transaction
                 .query_row(
@@ -1385,20 +2509,147 @@ impl ControlStore {
                 )
                 .map_err(|_| StoreError::Internal)?;
         }
-        transaction
+        let record = read_auth_profile(&transaction, &operation.profile_id)?;
+        let replicas = read_auth_replicas(&transaction, &operation.profile_id)?;
+        let response_json = response_for(&record, &replicas)?;
+        let changed = transaction
             .execute(
-                "UPDATE auth_profile_create_operations SET phase = 'distributing'
+                "UPDATE auth_profile_create_operations
+                 SET phase = 'distributing', response_json = ?4
                  WHERE actor_key = ?1 AND provider = ?2 AND command_key = ?3 AND phase = 'pending'",
                 params![
                     &operation.actor_key[..],
                     &operation.provider,
-                    &operation.command_key[..]
+                    &operation.command_key[..],
+                    &response_json,
                 ],
             )
             .map_err(|_| StoreError::Internal)?;
-        let record = read_auth_profile(&transaction, &operation.profile_id)?;
+        if changed != 1 {
+            return Err(StoreError::Integrity);
+        }
         transaction.commit().map_err(|_| StoreError::Internal)?;
-        Ok(record)
+        Ok(response_json)
+    }
+
+    pub(crate) fn rotate_api_key_profile<F>(
+        &self,
+        write: ProfileRotationWrite,
+        response_for: F,
+    ) -> Result<(String, Option<String>), StoreError>
+    where
+        F: FnOnce(&AuthProfileRecord, &[AuthReplicaRecord]) -> Result<String, StoreError>,
+    {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_fingerprint, profile_id, response_json
+                 FROM auth_profile_rotation_operations
+                 WHERE actor_key = ?1 AND provider = ?2 AND command_key = ?3",
+                params![
+                    &write.actor_key[..],
+                    &write.provider,
+                    &write.command_key[..],
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| StoreError::Internal)?;
+        if let Some((fingerprint, profile_id, response_json)) = existing {
+            if !equal_digest(&fingerprint, &write.request_fingerprint)
+                || profile_id != write.profile_id
+            {
+                return Err(StoreError::Conflict);
+            }
+            read_auth_profile(&transaction, &profile_id)?;
+            transaction.commit().map_err(|_| StoreError::Internal)?;
+            return Ok((response_json, None));
+        }
+
+        let profile = read_auth_profile_optional(&transaction, &write.profile_id)?
+            .ok_or(StoreError::NotFound)?;
+        if profile.provider != write.provider
+            || profile.kind != "api_key"
+            || profile.deleted_at_ms.is_some()
+        {
+            return Err(StoreError::Conflict);
+        }
+        let current_revision =
+            i64::try_from(profile.revision).map_err(|_| StoreError::Integrity)?;
+        let highest_reserved = transaction
+            .query_row(
+                "SELECT MAX(revision) FROM (
+                    SELECT revision FROM auth_replica_operations WHERE profile_id = ?1
+                    UNION ALL
+                    SELECT reserved_revision AS revision
+                    FROM auth_refresh_operations WHERE profile_id = ?1
+                 )",
+                [&write.profile_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|_| StoreError::Internal)?
+            .unwrap_or(current_revision);
+        let revision = highest_reserved
+            .max(current_revision)
+            .checked_add(1)
+            .ok_or(StoreError::Integrity)?;
+        let changed = transaction
+            .execute(
+                "UPDATE auth_profiles
+                 SET revision = ?2, secret_ref = ?3
+                 WHERE profile_id = ?1 AND kind = 'api_key' AND deleted_at_ms IS NULL",
+                params![&write.profile_id, revision, &write.secret_ref],
+            )
+            .map_err(|error| {
+                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                    StoreError::Conflict
+                } else {
+                    StoreError::Internal
+                }
+            })?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        let endpoint_ids = parse_endpoint_ids(&profile.endpoint_ids_json)?;
+        append_replica_installs(
+            &transaction,
+            &write.profile_id,
+            revision,
+            &endpoint_ids,
+            &format!("api-key-rotation:{}", hex(&write.request_fingerprint)),
+        )?;
+        let record = read_auth_profile(&transaction, &write.profile_id)?;
+        let replicas = read_auth_replicas(&transaction, &write.profile_id)?;
+        let response_json = response_for(&record, &replicas)?;
+        transaction
+            .execute(
+                "INSERT INTO auth_profile_rotation_operations (
+                    actor_key, provider, profile_id, command_key, request_fingerprint,
+                    revision, created_at_ms, response_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    &write.actor_key[..],
+                    &write.provider,
+                    &write.profile_id,
+                    &write.command_key[..],
+                    &write.request_fingerprint[..],
+                    revision,
+                    write.created_at_ms,
+                    &response_json,
+                ],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok((response_json, Some(profile.secret_ref)))
     }
 
     pub(crate) fn mark_replica_ready(
@@ -1424,10 +2675,31 @@ impl ControlStore {
         Ok(())
     }
 
-    pub(crate) fn complete_profile_create(
+    pub(crate) fn mark_endpoint_replicas_unreachable(
         &self,
-        operation: &ProfileCreateOperation,
-    ) -> Result<AuthProfileRecord, StoreError> {
+        endpoint_id: &str,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "UPDATE auth_replica_operations AS replica
+                 SET status = 'unreachable'
+                 WHERE replica.endpoint_id = ?1
+                   AND replica.status != 'unreachable'
+                   AND NOT (replica.kind = 'tombstone' AND replica.status = 'ready')
+                   AND NOT EXISTS (
+                        SELECT 1 FROM auth_replica_operations AS newer
+                        WHERE newer.profile_id = replica.profile_id
+                          AND newer.endpoint_id = replica.endpoint_id
+                          AND newer.revision > replica.revision
+                   )",
+                [endpoint_id],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_profile_create(&self, profile_id: &str) -> Result<(), StoreError> {
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1437,7 +2709,7 @@ impl ControlStore {
                 "SELECT COUNT(*) FROM auth_replica_operations
                  WHERE profile_id = ?1 AND revision = 1 AND kind = 'install'
                    AND status != 'ready'",
-                [&operation.profile_id],
+                [profile_id],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|_| StoreError::Internal)?;
@@ -1447,18 +2719,12 @@ impl ControlStore {
         transaction
             .execute(
                 "UPDATE auth_profile_create_operations SET phase = 'complete'
-                 WHERE actor_key = ?1 AND provider = ?2 AND command_key = ?3
-                   AND phase IN ('distributing', 'complete')",
-                params![
-                    &operation.actor_key[..],
-                    &operation.provider,
-                    &operation.command_key[..]
-                ],
+                 WHERE profile_id = ?1 AND phase IN ('distributing', 'complete')",
+                [profile_id],
             )
             .map_err(|_| StoreError::Internal)?;
-        let record = read_auth_profile(&transaction, &operation.profile_id)?;
         transaction.commit().map_err(|_| StoreError::Internal)?;
-        Ok(record)
+        Ok(())
     }
 
     pub(crate) fn set_provider_default_profile(
@@ -1543,6 +2809,150 @@ impl ControlStore {
         let record = read_auth_profile(&transaction, &write.profile_id)?;
         transaction.commit().map_err(|_| StoreError::Internal)?;
         Ok((record, false))
+    }
+
+    pub(crate) fn update_profile_sharing<F>(
+        &self,
+        write: ProfileSharingWrite,
+        response_for: F,
+    ) -> Result<(String, bool), StoreError>
+    where
+        F: FnOnce(&AuthProfileRecord, &[AuthReplicaRecord]) -> Result<String, StoreError>,
+    {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| StoreError::Internal)?;
+        let existing = transaction
+            .query_row(
+                "SELECT request_fingerprint, response_json
+                 FROM auth_profile_sharing_operations
+                 WHERE actor_key = ?1 AND profile_id = ?2 AND command_key = ?3",
+                params![
+                    &write.actor_key[..],
+                    &write.profile_id,
+                    &write.command_key[..]
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Internal)?;
+        if let Some((fingerprint, response_json)) = existing {
+            if !equal_digest(&fingerprint, &write.request_fingerprint) {
+                return Err(StoreError::Conflict);
+            }
+            transaction.commit().map_err(|_| StoreError::Internal)?;
+            return Ok((response_json, false));
+        }
+
+        if !matches!(write.mode.as_str(), "none" | "selected" | "all_current") {
+            return Err(StoreError::Integrity);
+        }
+        let current = read_auth_profile_optional(&transaction, &write.profile_id)?
+            .filter(|profile| profile.deleted_at_ms.is_none())
+            .ok_or(StoreError::NotFound)?;
+        let endpoint_ids = expand_sharing_endpoints(&transaction, &write.mode, write.endpoint_ids)?;
+        validate_sharing_endpoints(&transaction, &endpoint_ids)?;
+        let current_endpoint_ids = parse_endpoint_ids(&current.endpoint_ids_json)?;
+        let changed = current.sharing_mode != write.mode || current_endpoint_ids != endpoint_ids;
+        let sequence_revision = if changed {
+            let sequence_revision = transaction
+                .query_row(
+                    "SELECT MAX(revision) FROM (
+                        SELECT revision FROM auth_profiles WHERE profile_id = ?1
+                        UNION ALL
+                        SELECT revision FROM auth_profile_sharing_revisions WHERE profile_id = ?1
+                        UNION ALL
+                        SELECT revision FROM auth_replica_operations WHERE profile_id = ?1
+                        UNION ALL
+                        SELECT reserved_revision AS revision
+                        FROM auth_refresh_operations WHERE profile_id = ?1
+                     )",
+                    [&write.profile_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|_| StoreError::Internal)?
+                .checked_add(1)
+                .ok_or(StoreError::Integrity)?;
+            transaction
+                .execute(
+                    "UPDATE auth_profiles SET revision = ?2
+                     WHERE profile_id = ?1 AND deleted_at_ms IS NULL",
+                    params![&write.profile_id, sequence_revision],
+                )
+                .map_err(|_| StoreError::Internal)?;
+            transaction
+                .execute(
+                    "INSERT INTO auth_profile_sharing_revisions (
+                        profile_id, revision, mode, endpoint_ids_json, created_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        &write.profile_id,
+                        sequence_revision,
+                        &write.mode,
+                        serde_json::to_string(&endpoint_ids).map_err(|_| StoreError::Integrity)?,
+                        write.created_at_ms,
+                    ],
+                )
+                .map_err(|_| StoreError::Internal)?;
+            append_replica_installs(
+                &transaction,
+                &write.profile_id,
+                sequence_revision,
+                &endpoint_ids,
+                &format!("profile:{}:sharing:{sequence_revision}", write.profile_id),
+            )?;
+            let desired = endpoint_ids.iter().collect::<BTreeSet<_>>();
+            for endpoint_id in current_endpoint_ids
+                .iter()
+                .filter(|endpoint_id| !desired.contains(endpoint_id))
+            {
+                let operation_id = format!(
+                    "profile:{}:endpoint:{endpoint_id}:tombstone:{sequence_revision}",
+                    write.profile_id
+                );
+                transaction
+                    .execute(
+                        "INSERT INTO auth_replica_operations (
+                            profile_id, endpoint_id, revision, operation_id,
+                            kind, status, observed_revision
+                         ) VALUES (?1, ?2, ?3, ?4, 'tombstone', 'pending', NULL)",
+                        params![
+                            &write.profile_id,
+                            endpoint_id,
+                            sequence_revision,
+                            operation_id,
+                        ],
+                    )
+                    .map_err(|_| StoreError::Internal)?;
+            }
+            sequence_revision
+        } else {
+            i64::try_from(current.revision).map_err(|_| StoreError::Integrity)?
+        };
+
+        let profile = read_auth_profile(&transaction, &write.profile_id)?;
+        let replicas = read_auth_replicas(&transaction, &write.profile_id)?;
+        let response_json = response_for(&profile, &replicas)?;
+        transaction
+            .execute(
+                "INSERT INTO auth_profile_sharing_operations (
+                    actor_key, profile_id, command_key, request_fingerprint,
+                    sequence_revision, created_at_ms, response_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    &write.actor_key[..],
+                    &write.profile_id,
+                    &write.command_key[..],
+                    &write.request_fingerprint[..],
+                    sequence_revision,
+                    write.created_at_ms,
+                    &response_json,
+                ],
+            )
+            .map_err(|_| StoreError::Internal)?;
+        transaction.commit().map_err(|_| StoreError::Internal)?;
+        Ok((response_json, changed))
     }
 
     pub(crate) fn begin_profile_delete(
@@ -1836,29 +3246,33 @@ impl ControlStore {
         profile_id: &str,
     ) -> Result<Vec<AuthReplicaRecord>, StoreError> {
         let connection = self.connection()?;
+        read_auth_replicas(&connection, profile_id)
+    }
+
+    pub(crate) fn list_pending_profile_distribution_ids(&self) -> Result<Vec<String>, StoreError> {
+        let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT replica.profile_id, replica.endpoint_id, profile.provider,
-                        replica.revision, replica.operation_id, replica.status,
-                        replica.observed_revision, replica.kind
+                "SELECT DISTINCT replica.profile_id
                  FROM auth_replica_operations AS replica
-                 INNER JOIN auth_profiles AS profile ON profile.profile_id = replica.profile_id
-                 INNER JOIN (
-                    SELECT profile_id, endpoint_id, MAX(revision) AS revision
-                    FROM auth_replica_operations GROUP BY profile_id, endpoint_id
-                 ) AS latest
-                    ON latest.profile_id = replica.profile_id
-                   AND latest.endpoint_id = replica.endpoint_id
-                   AND latest.revision = replica.revision
-                 WHERE replica.profile_id = ?1
-                 ORDER BY replica.endpoint_id ASC",
+                 INNER JOIN auth_profiles AS profile
+                    ON profile.profile_id = replica.profile_id
+                   AND profile.revision = replica.revision
+                 WHERE profile.deleted_at_ms IS NULL
+                   AND replica.kind = 'install'
+                   AND replica.status != 'ready'
+                 ORDER BY replica.profile_id ASC
+                 LIMIT 101",
             )
             .map_err(|_| StoreError::Internal)?;
         let records = statement
-            .query_map([profile_id], auth_replica_from_row)
+            .query_map([], |row| row.get::<_, String>(0))
             .map_err(|_| StoreError::Internal)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| StoreError::Integrity)?;
+        if records.len() > 100 {
+            return Err(StoreError::Internal);
+        }
         Ok(records)
     }
 
@@ -1880,18 +3294,25 @@ impl ControlStore {
 
     pub(crate) fn list_auth_tombstones_for_reconciliation(
         &self,
-    ) -> Result<Vec<(AuthReplicaRecord, String)>, StoreError> {
+    ) -> Result<Vec<(AuthReplicaRecord, Option<String>)>, StoreError> {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
                 "SELECT tomb.profile_id, tomb.endpoint_id, profile.provider,
                         tomb.revision, tomb.operation_id, tomb.status,
-                        tomb.observed_revision, tomb.kind, profile.secret_ref
+                        tomb.observed_revision, tomb.kind,
+                        CASE WHEN profile.deleted_at_ms IS NOT NULL
+                             THEN profile.secret_ref ELSE NULL END
                  FROM auth_replica_operations AS tomb
                  INNER JOIN auth_profiles AS profile
                     ON profile.profile_id = tomb.profile_id
                  WHERE tomb.kind = 'tombstone' AND tomb.status <> 'ready'
-                   AND profile.deleted_at_ms IS NOT NULL
+                   AND NOT EXISTS (
+                        SELECT 1 FROM auth_replica_operations AS newer
+                        WHERE newer.profile_id = tomb.profile_id
+                          AND newer.endpoint_id = tomb.endpoint_id
+                          AND newer.revision > tomb.revision
+                   )
                  ORDER BY tomb.profile_id ASC, tomb.endpoint_id ASC",
             )
             .map_err(|_| StoreError::Internal)?;
@@ -2014,6 +3435,10 @@ fn ensure_private_secret_namespace(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn valid_secret_reference(reference: &str) -> bool {
+    reference.len() == 64 && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn read_provider_descriptor(
     transaction: &rusqlite::Transaction<'_>,
     provider: &str,
@@ -2030,6 +3455,230 @@ fn read_provider_descriptor(
         .optional()
         .map_err(|_| StoreError::Internal)?
         .ok_or(StoreError::Integrity)
+}
+
+const OAUTH_ATTEMPT_SELECT: &str =
+    "SELECT attempt_id, actor_key, provider, profile_id, replace_profile_id,
+            label, sharing_json, make_default, status, safe_code,
+            pkce_secret_ref, state_digest, created_at_ms, updated_at_ms, expires_at_ms
+     FROM oauth_attempts";
+
+fn read_oauth_attempt(
+    connection: &Connection,
+    actor_key: &[u8; DIGEST_BYTES],
+    attempt_id: &str,
+) -> Result<OAuthAttemptRecord, StoreError> {
+    read_oauth_attempt_optional(connection, actor_key, attempt_id)?.ok_or(StoreError::NotFound)
+}
+
+fn read_oauth_attempt_optional(
+    connection: &Connection,
+    actor_key: &[u8; DIGEST_BYTES],
+    attempt_id: &str,
+) -> Result<Option<OAuthAttemptRecord>, StoreError> {
+    connection
+        .query_row(
+            &format!("{OAUTH_ATTEMPT_SELECT} WHERE actor_key = ?1 AND attempt_id = ?2"),
+            params![&actor_key[..], attempt_id],
+            |row| oauth_attempt_from_row(row, 0),
+        )
+        .optional()
+        .map_err(|_| StoreError::Internal)
+}
+
+fn oauth_attempt_from_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<OAuthAttemptRecord> {
+    let actor = row.get::<_, Vec<u8>>(offset + 1)?;
+    let _actor_key: [u8; DIGEST_BYTES] = actor.try_into().map_err(|value: Vec<u8>| {
+        rusqlite::Error::FromSqlConversionFailure(
+            offset + 1,
+            rusqlite::types::Type::Blob,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid actor key length {}", value.len()),
+            )
+            .into(),
+        )
+    })?;
+    Ok(OAuthAttemptRecord {
+        attempt_id: row.get(offset)?,
+        provider: row.get(offset + 2)?,
+        profile_id: row.get(offset + 3)?,
+        replace_profile_id: row.get(offset + 4)?,
+        label: row.get(offset + 5)?,
+        sharing_json: row.get(offset + 6)?,
+        make_default: row.get::<_, i64>(offset + 7)? != 0,
+        status: row.get(offset + 8)?,
+        safe_code: row.get(offset + 9)?,
+        pkce_secret_ref: row.get(offset + 10)?,
+        state_digest: row.get(offset + 11)?,
+        created_at_ms: row.get(offset + 12)?,
+        updated_at_ms: row.get(offset + 13)?,
+        expires_at_ms: row.get(offset + 14)?,
+    })
+}
+
+const AUTH_REFRESH_SELECT: &str =
+    "SELECT operation.operation_id, operation.actor_key, operation.profile_id,
+            profile.provider, operation.source_revision, operation.reserved_revision,
+            operation.source_secret_ref, operation.target_secret_ref,
+            operation.recovery, operation.status, operation.safe_code,
+            operation.created_at_ms, operation.updated_at_ms
+     FROM auth_refresh_operations AS operation
+     INNER JOIN auth_profiles AS profile ON profile.profile_id = operation.profile_id";
+
+fn read_auth_refresh(
+    connection: &Connection,
+    operation_id: &str,
+) -> Result<AuthRefreshRecord, StoreError> {
+    read_auth_refresh_optional(connection, operation_id)?.ok_or(StoreError::NotFound)
+}
+
+fn read_auth_refresh_optional(
+    connection: &Connection,
+    operation_id: &str,
+) -> Result<Option<AuthRefreshRecord>, StoreError> {
+    connection
+        .query_row(
+            &format!("{AUTH_REFRESH_SELECT} WHERE operation.operation_id = ?1"),
+            [operation_id],
+            auth_refresh_from_row,
+        )
+        .optional()
+        .map_err(|_| StoreError::Internal)
+}
+
+fn auth_refresh_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthRefreshRecord> {
+    let actor = row.get::<_, Vec<u8>>(1)?;
+    let actor_key: [u8; DIGEST_BYTES] = actor.try_into().map_err(|value: Vec<u8>| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Blob,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid actor key length {}", value.len()),
+            )
+            .into(),
+        )
+    })?;
+    Ok(AuthRefreshRecord {
+        operation_id: row.get(0)?,
+        actor_key,
+        profile_id: row.get(2)?,
+        provider: row.get(3)?,
+        source_revision: positive_u64(row, 4)?,
+        reserved_revision: positive_u64(row, 5)?,
+        source_secret_ref: row.get(6)?,
+        target_secret_ref: row.get(7)?,
+        recovery: row.get(8)?,
+        status: row.get(9)?,
+        safe_code: row.get(10)?,
+        created_at_ms: row.get(11)?,
+        updated_at_ms: row.get(12)?,
+    })
+}
+
+fn append_provider_control_event(
+    transaction: &rusqlite::Transaction<'_>,
+    resource_kind: &str,
+    resource_id: &str,
+    event_json: &str,
+    created_at_ms: i64,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO provider_control_events (
+                resource_kind, resource_id, event_json, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![resource_kind, resource_id, event_json, created_at_ms],
+        )
+        .map_err(|_| StoreError::Internal)?;
+    Ok(())
+}
+
+fn parse_endpoint_ids(value: &str) -> Result<Vec<String>, StoreError> {
+    serde_json::from_str(value).map_err(|_| StoreError::Integrity)
+}
+
+fn validate_sharing_endpoints(
+    transaction: &rusqlite::Transaction<'_>,
+    endpoint_ids: &[String],
+) -> Result<(), StoreError> {
+    for endpoint_id in endpoint_ids {
+        let exists = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM endpoints WHERE endpoint_id = ?1 AND disabled = 0
+                 )",
+                [endpoint_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| StoreError::Internal)?
+            != 0;
+        if !exists {
+            return Err(StoreError::NotFound);
+        }
+    }
+    Ok(())
+}
+
+fn expand_sharing_endpoints(
+    transaction: &rusqlite::Transaction<'_>,
+    mode: &str,
+    endpoint_ids: Vec<String>,
+) -> Result<Vec<String>, StoreError> {
+    if mode != "all_current" {
+        return Ok(endpoint_ids);
+    }
+    if !endpoint_ids.is_empty() {
+        return Err(StoreError::Integrity);
+    }
+    let mut statement = transaction
+        .prepare(
+            "SELECT endpoint_id FROM endpoints
+             WHERE disabled = 0 ORDER BY endpoint_id ASC LIMIT 101",
+        )
+        .map_err(|_| StoreError::Internal)?;
+    let endpoint_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| StoreError::Internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| StoreError::Integrity)?;
+    if endpoint_ids.len() > 100 {
+        return Err(StoreError::Internal);
+    }
+    Ok(endpoint_ids)
+}
+
+fn append_replica_installs(
+    transaction: &rusqlite::Transaction<'_>,
+    profile_id: &str,
+    revision: i64,
+    endpoint_ids: &[String],
+    operation_prefix: &str,
+) -> Result<(), StoreError> {
+    for endpoint_id in endpoint_ids {
+        let operation_id = format!("{operation_prefix}:endpoint:{endpoint_id}:revision:{revision}");
+        transaction
+            .execute(
+                "INSERT INTO auth_replica_operations (
+                    profile_id, endpoint_id, revision, operation_id,
+                    kind, status, observed_revision
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, 'install', 'pending',
+                    (
+                        SELECT MAX(observed_revision)
+                        FROM auth_replica_operations
+                        WHERE profile_id = ?1 AND endpoint_id = ?2
+                    )
+                 )",
+                params![profile_id, endpoint_id, revision, operation_id],
+            )
+            .map_err(|_| StoreError::Internal)?;
+    }
+    Ok(())
 }
 
 fn provider_descriptor_from_row(
@@ -2056,6 +3705,7 @@ fn provider_descriptor_from_row(
 const AUTH_PROFILE_SELECT: &str =
     "SELECT profile.profile_id, profile.provider, profile.kind, profile.label,
             profile.revision, profile.descriptor_revision, profile.secret_ref,
+            profile.expires_at_ms, profile.refresh_fenced,
             sharing.mode, sharing.endpoint_ids_json,
             CASE WHEN defaults.profile_id = profile.profile_id THEN 1 ELSE 0 END,
             profile.deleted_at_ms
@@ -2107,10 +3757,12 @@ fn auth_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthProfil
         revision,
         descriptor_revision,
         secret_ref: row.get(6)?,
-        sharing_mode: row.get(7)?,
-        endpoint_ids_json: row.get(8)?,
-        is_default: row.get::<_, i64>(9)? != 0,
-        deleted_at_ms: row.get(10)?,
+        expires_at_ms: row.get(7)?,
+        refresh_fenced: row.get::<_, i64>(8)? != 0,
+        sharing_mode: row.get(9)?,
+        endpoint_ids_json: row.get(10)?,
+        is_default: row.get::<_, i64>(11)? != 0,
+        deleted_at_ms: row.get(12)?,
     })
 }
 
@@ -2137,11 +3789,51 @@ fn read_tombstone_replicas(
     Ok(records)
 }
 
+fn read_auth_replicas(
+    connection: &Connection,
+    profile_id: &str,
+) -> Result<Vec<AuthReplicaRecord>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT replica.profile_id, replica.endpoint_id, profile.provider,
+                    replica.revision, replica.operation_id, replica.status,
+                    replica.observed_revision, replica.kind
+             FROM auth_replica_operations AS replica
+             INNER JOIN auth_profiles AS profile ON profile.profile_id = replica.profile_id
+             INNER JOIN (
+                SELECT profile_id, endpoint_id, MAX(revision) AS revision
+                FROM auth_replica_operations GROUP BY profile_id, endpoint_id
+             ) AS latest
+                ON latest.profile_id = replica.profile_id
+               AND latest.endpoint_id = replica.endpoint_id
+               AND latest.revision = replica.revision
+             WHERE replica.profile_id = ?1
+             ORDER BY replica.endpoint_id ASC",
+        )
+        .map_err(|_| StoreError::Internal)?;
+    let records = statement
+        .query_map([profile_id], auth_replica_from_row)
+        .map_err(|_| StoreError::Internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| StoreError::Integrity)?;
+    Ok(records)
+}
+
 fn auth_replica_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthReplicaRecord> {
     let revision = positive_u64(row, 3)?;
     let observed_revision = optional_u64(row, 6)?;
     let kind = row.get::<_, String>(7)?;
     let status = row.get::<_, String>(5)?;
+    let public_status = if kind == "tombstone" && status == "ready" {
+        "removed".to_owned()
+    } else if kind == "install"
+        && status == "pending"
+        && observed_revision.is_some_and(|observed| observed < revision)
+    {
+        "stale".to_owned()
+    } else {
+        status
+    };
     Ok(AuthReplicaRecord {
         profile_id: row.get(0)?,
         endpoint_id: row.get(1)?,
@@ -2149,11 +3841,7 @@ fn auth_replica_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthReplic
         revision,
         operation_id: row.get(4)?,
         kind: kind.clone(),
-        status: if kind == "tombstone" && status == "ready" {
-            "removed".to_owned()
-        } else {
-            status
-        },
+        status: public_status,
         observed_revision,
     })
 }
@@ -2255,7 +3943,77 @@ fn ensure_endpoint_capability_columns(connection: &Connection) -> Result<(), Sta
 }
 
 fn ensure_auth_profile_columns(connection: &Connection) -> Result<(), StartupError> {
+    let table_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'auth_profiles'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| StartupError::StoreUnavailable)?;
+    if table_sql.contains("kind = 'api_key'") {
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 BEGIN IMMEDIATE;
+                 CREATE TABLE auth_profiles_v2 (
+                     profile_id TEXT PRIMARY KEY
+                         CHECK (length(profile_id) BETWEEN 1 AND 128),
+                     provider TEXT NOT NULL
+                         CHECK (length(provider) BETWEEN 1 AND 128),
+                     kind TEXT NOT NULL CHECK (kind IN ('api_key', 'oauth')),
+                     label TEXT NOT NULL CHECK (length(label) BETWEEN 1 AND 256),
+                     revision INTEGER NOT NULL CHECK (revision > 0),
+                     descriptor_revision INTEGER NOT NULL CHECK (descriptor_revision > 0),
+                     secret_ref TEXT NOT NULL UNIQUE CHECK (length(secret_ref) = 64),
+                     expires_at_ms INTEGER,
+                     refresh_fenced INTEGER NOT NULL DEFAULT 0
+                         CHECK (refresh_fenced IN (0, 1)),
+                     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                     deleted_at_ms INTEGER,
+                     FOREIGN KEY (provider, descriptor_revision)
+                         REFERENCES provider_descriptor_revisions(provider, revision)
+                 ) STRICT;
+                 INSERT INTO auth_profiles_v2 (
+                     profile_id, provider, kind, label, revision,
+                     descriptor_revision, secret_ref, expires_at_ms,
+                     refresh_fenced, created_at_ms, deleted_at_ms
+                 )
+                 SELECT profile_id, provider, kind, label, revision,
+                        descriptor_revision, secret_ref, NULL, 0,
+                        created_at_ms, deleted_at_ms
+                 FROM auth_profiles;
+                 DROP TABLE auth_profiles;
+                 ALTER TABLE auth_profiles_v2 RENAME TO auth_profiles;
+                 COMMIT;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .map_err(|_| StartupError::StoreUnavailable)?;
+        let violations = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|_| StartupError::StoreUnavailable)?;
+        if violations != 0 {
+            return Err(StartupError::StoreIntegrity);
+        }
+    }
     let columns = table_columns(connection, "auth_profiles")?;
+    if !columns.iter().any(|value| value == "expires_at_ms") {
+        connection
+            .execute(
+                "ALTER TABLE auth_profiles ADD COLUMN expires_at_ms INTEGER",
+                [],
+            )
+            .map_err(|_| StartupError::StoreUnavailable)?;
+    }
+    if !columns.iter().any(|value| value == "refresh_fenced") {
+        connection
+            .execute(
+                "ALTER TABLE auth_profiles ADD COLUMN refresh_fenced INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|_| StartupError::StoreUnavailable)?;
+    }
     if !columns.iter().any(|value| value == "deleted_at_ms") {
         connection
             .execute(
@@ -2269,6 +4027,15 @@ fn ensure_auth_profile_columns(connection: &Connection) -> Result<(), StartupErr
         connection
             .execute(
                 "ALTER TABLE auth_profile_delete_operations ADD COLUMN response_json TEXT",
+                [],
+            )
+            .map_err(|_| StartupError::StoreUnavailable)?;
+    }
+    let columns = table_columns(connection, "auth_profile_create_operations")?;
+    if !columns.iter().any(|value| value == "response_json") {
+        connection
+            .execute(
+                "ALTER TABLE auth_profile_create_operations ADD COLUMN response_json TEXT",
                 [],
             )
             .map_err(|_| StartupError::StoreUnavailable)?;
@@ -2582,10 +4349,14 @@ fn validate_existing_database(
         .unwrap_or(false);
     if (wal_exists && !sqlite_sidecar_is_private(&wal_path))
         || (shm_exists && !sqlite_sidecar_is_private(&shm_path))
-        || (wal_nonempty && !shm_exists)
     {
         return Err(StartupError::StoreIntegrity);
     }
+    let recreated_shm = if wal_nonempty && !shm_exists {
+        Some(TemporarySqliteShm::create(&shm_path)?)
+    } else {
+        None
+    };
     let connection = if wal_nonempty {
         Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
     } else {
@@ -2651,7 +4422,61 @@ fn validate_existing_database(
             return Err(StartupError::AlreadyOwned);
         }
     }
+    if let Some(shm) = recreated_shm {
+        shm.preserve()?;
+    }
     Ok(())
+}
+
+struct TemporarySqliteShm {
+    path: PathBuf,
+    file: File,
+    remove_on_drop: bool,
+}
+
+impl TemporarySqliteShm {
+    fn create(path: &Path) -> Result<Self, StartupError> {
+        let file = private_create_new(path).map_err(|_| StartupError::StoreIntegrity)?;
+        sync_directory(path.parent().ok_or(StartupError::StoreIntegrity)?)
+            .map_err(|_| StartupError::StoreIntegrity)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            remove_on_drop: true,
+        })
+    }
+
+    fn preserve(mut self) -> Result<(), StartupError> {
+        if !self.path_matches_file() || !sqlite_sidecar_is_private(&self.path) {
+            return Err(StartupError::StoreIntegrity);
+        }
+        self.remove_on_drop = false;
+        Ok(())
+    }
+
+    fn path_matches_file(&self) -> bool {
+        self.file
+            .metadata()
+            .ok()
+            .zip(fs::symlink_metadata(&self.path).ok())
+            .map(|(open, path)| {
+                path.file_type().is_file() && lock_identity(&open) == lock_identity(&path)
+            })
+            .unwrap_or(false)
+    }
+}
+
+impl Drop for TemporarySqliteShm {
+    fn drop(&mut self) {
+        if !self.remove_on_drop || !self.path_matches_file() {
+            return;
+        }
+        if fs::remove_file(&self.path).is_ok() {
+            if let Some(parent) = self.path.parent() {
+                let _ = sync_directory(parent);
+            }
+        }
+    }
 }
 
 fn existing_lock_is_busy(path: &Path) -> Result<bool, StartupError> {

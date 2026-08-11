@@ -34,7 +34,17 @@ type EndpointBoundaryRequest = {
   responseContentType?: string;
   responseEventIds: string[];
   responseEventNames: string[];
-  responseEventSequence: string[];
+  responseDurableEvents: Array<{ id: string; name: string }>;
+  responseFrames: Array<{
+    id: string;
+    name: string;
+    sessionId?: string;
+    messageId?: string;
+  }>;
+  responseCurrentEventId?: string;
+  responseCurrentEventName?: string;
+  responseCurrentSessionId?: string;
+  responseCurrentMessageId?: string;
   responseSseRemainder?: string;
   responseComplete?: boolean;
   recorded?: boolean;
@@ -44,7 +54,6 @@ type BrowserSseRequest = {
   method: string;
   path: string;
   endpointId: string;
-  sessionId: string;
   requestId: string;
   lastEventId: string;
   status?: number;
@@ -68,16 +77,15 @@ type TopologyConsumption = {
   consumedSequences: number[];
   countsBySequence: Map<number, number>;
 };
-type EventBodyHold = {
-  held: Promise<void>;
-  markHeld: () => void;
-  released: Promise<void>;
-  release: () => void;
-};
 type BrowserResponseHold = {
   received: Promise<void>;
   release: () => void;
   dispose: () => Promise<void>;
+};
+type EndpointEventBodyHold = {
+  received: Promise<EndpointBoundaryRequest>;
+  release: () => void;
+  dispose: () => void;
 };
 
 const REPO_ROOT = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -90,6 +98,8 @@ const CONTROLLER_AUTHORITY = "web-session-reconnect-runtime-states-controller";
 const PROVIDER = "fixture-provider";
 const MODEL = "fixture-model";
 const REPLAY_HISTORY_MODEL = "fixture-model-history";
+const REPLAY_BACKPRESSURE_EVENT_COUNT = 272;
+const REPLAY_HISTORY_LARGE_MESSAGE_BYTES = 128 * 1024;
 const TOOL = "fixture_async";
 const REQUEST_ID_HEADER = "x-request-id";
 const CASSETTE_RAW_SHA256 = "564185b09086c6533ca58ab9314a3cb5271909e3c5ff70ff45a32f586e084b63";
@@ -135,6 +145,7 @@ const SCENARIOS = {
   waitTimeout: "wait-timeout-session",
   unknown: "unknown-outcome-session",
   mobile: "mobile-activity-session",
+  safeReconcile: "safe-reconcile-session",
 } as const;
 const suiteTopologyConsumptions: TopologyConsumption[] = [];
 let suiteExpectedSequences: number[] | undefined;
@@ -475,6 +486,7 @@ class ReplayProvider {
     private readonly cassette: Cassette,
     readonly topologyId: string,
     readonly baseUrl: string,
+    private readonly mode: "cassette" | "safe-reconcile",
   ) {}
 
   private readonly calls = new Map<string, number>();
@@ -490,7 +502,11 @@ class ReplayProvider {
   private expectedProviderAuthorization = "";
   private suiteConsumptionRecorded = false;
 
-  static async start(cassette: Cassette, topologyId: string): Promise<ReplayProvider> {
+  static async start(
+    cassette: Cassette,
+    topologyId: string,
+    mode: "cassette" | "safe-reconcile" = "cassette",
+  ): Promise<ReplayProvider> {
     if (cassette.schema !== "zode.llm-http-recording.v1" || cassette.version !== 1) {
       throw new Error("session lifecycle cassette schema is not supported");
     }
@@ -516,9 +532,11 @@ class ReplayProvider {
     if (sequences.some((sequence, index) => sequence !== index)) {
       throw new Error("session lifecycle cassette exchange sequences are not contiguous");
     }
-    if (suiteExpectedSequences === undefined) suiteExpectedSequences = sequences;
-    else if (canonicalJson(suiteExpectedSequences) !== canonicalJson(sequences)) {
-      throw new Error("session lifecycle cassette sequence plan changed between topologies");
+    if (mode === "cassette") {
+      if (suiteExpectedSequences === undefined) suiteExpectedSequences = sequences;
+      else if (canonicalJson(suiteExpectedSequences) !== canonicalJson(sequences)) {
+        throw new Error("session lifecycle cassette sequence plan changed between topologies");
+      }
     }
     if (
       cassette.first_seen_failure?.exchange_sequence !== 1 ||
@@ -541,7 +559,14 @@ class ReplayProvider {
     });
     const port = await freePort();
     await listen(server, port);
-    provider = new ReplayProvider(server, sockets, cassette, topologyId, `http://127.0.0.1:${port}`);
+    provider = new ReplayProvider(
+      server,
+      sockets,
+      cassette,
+      topologyId,
+      `http://127.0.0.1:${port}`,
+      mode,
+    );
     return provider;
   }
 
@@ -577,6 +602,7 @@ class ReplayProvider {
   }
 
   private expectedSequences(): number[] {
+    if (this.mode === "safe-reconcile") return [];
     return this.cassette.exchanges
       .filter((exchange) => this.expectedScenarioCounts.has(exchange.scenario))
       .map((exchange) => exchange.sequence);
@@ -679,6 +705,10 @@ class ReplayProvider {
     this.observedRequests[observedIndex] += ` body=${body.slice(0, 1_000)}`;
     const scenario = this.scenarioFor(body);
     const occurrence = this.calls.get(scenario) ?? 0;
+    if (this.mode === "safe-reconcile") {
+      this.handleSafeReconcile(request, response, body, scenario, occurrence, observedIndex);
+      return;
+    }
     const exchange = this.exchangeFor(scenario, occurrence);
     if (exchange.request.method !== request.method || exchange.request.path !== request.url) {
       response.writeHead(500);
@@ -753,6 +783,77 @@ class ReplayProvider {
     }
   }
 
+  private handleSafeReconcile(
+    request: IncomingMessage,
+    response: ServerResponse,
+    body: string,
+    scenario: string,
+    occurrence: number,
+    observedIndex: number,
+  ): void {
+    try {
+      if (scenario !== SCENARIOS.safeReconcile || occurrence > 1) {
+        throw new Error(`unexpected safe reconcile provider occurrence ${scenario}:${occurrence}`);
+      }
+      if (request.headers.authorization !== this.expectedProviderAuthorization) {
+        throw new Error("safe reconcile provider authorization did not match the synthetic profile");
+      }
+      const payload = JSON.parse(body) as Json;
+      const messages = payload.messages as Json[] | undefined;
+      if (
+        payload.model !== MODEL ||
+        payload.stream !== true ||
+        !Array.isArray(messages) ||
+        messages[0]?.role !== "user" ||
+        messages[0]?.content !== `safe reconcile path ${SCENARIOS.safeReconcile}`
+      ) {
+        throw new Error("safe reconcile provider request did not use the expected public session context");
+      }
+      if (occurrence === 0 && messages.length !== 1) {
+        throw new Error("safe reconcile first provider round contained unexpected history");
+      }
+      if (occurrence === 1) {
+        const assistant = messages.find((message) => message.role === "assistant") as Json | undefined;
+        const toolMessage = messages.find((message) => message.role === "tool") as Json | undefined;
+        const toolCall = (assistant?.tool_calls as Json[] | undefined)?.[0];
+        if (
+          messages.length !== 3 ||
+          toolCall?.id !== "safe-reconcile-tool-call" ||
+          toolCall?.function?.name !== TOOL ||
+          toolCall?.function?.arguments !== '{"mode":"safe"}' ||
+          toolMessage?.tool_call_id !== "safe-reconcile-tool-call" ||
+          !String(toolMessage?.content ?? "").includes("SAFE_TOOL_RESULT")
+        ) {
+          throw new Error("safe reconcile follow-up did not preserve the original tool identity and result");
+        }
+      }
+    } catch (error) {
+      this.observedRequests[observedIndex] += ` error=${error instanceof Error ? error.message : String(error)}`;
+      response.writeHead(500, { "content-type": "text/plain" });
+      response.end(error instanceof Error ? error.message : "safe reconcile provider mismatch");
+      return;
+    }
+    this.calls.set(scenario, occurrence + 1);
+    this.notify(scenario, occurrence + 1);
+    const delta = occurrence === 0
+      ? {
+          tool_calls: [
+            {
+              index: 0,
+              id: "safe-reconcile-tool-call",
+              type: "function",
+              function: { name: TOOL, arguments: '{"mode":"safe"}' },
+            },
+          ],
+        }
+      : { content: "SAFE_RECONCILE_FINAL" };
+    const finishReason = occurrence === 0 ? "tool_calls" : "stop";
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(`data: ${JSON.stringify({ choices: [{ delta, finish_reason: null }] })}\n\n`);
+    response.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: finishReason }] })}\n\n`);
+    response.end("data: [DONE]\n\n");
+  }
+
   private notify(scenario: string, count: number): void {
     const waiters = this.waiters.get(scenario) ?? [];
     this.waiters.set(
@@ -800,6 +901,15 @@ class ReplayProvider {
   }
 
   assertAllExchangesConsumed(): void {
+    if (this.mode === "safe-reconcile") {
+      for (const [scenario, expectedCount] of this.expectedScenarioCounts) {
+        const actualCount = this.calls.get(scenario) ?? 0;
+        if (actualCount !== expectedCount) {
+          throw new Error(`safe reconcile provider scenario ${scenario} consumed ${actualCount}/${expectedCount}`);
+        }
+      }
+      return;
+    }
     const expected = this.expectedSequences();
     const consumed = [...this.consumedSequences];
     if (canonicalJson(consumed) !== canonicalJson(expected)) {
@@ -821,6 +931,7 @@ class ReplayProvider {
   }
 
   scenarioCounts(): Map<string, number> {
+    if (this.mode === "safe-reconcile") return new Map([[SCENARIOS.safeReconcile, 2]]);
     const counts = new Map<string, number>();
     for (const exchange of this.cassette.exchanges) {
       counts.set(exchange.scenario, (counts.get(exchange.scenario) ?? 0) + 1);
@@ -850,34 +961,13 @@ class EndpointBoundary {
     request: EndpointBoundaryRequest;
     resolve: (eventIds: string[]) => void;
   }> = [];
-  private readonly eventBodyHolds = new Map<string, EventBodyHold>();
-
-  holdEventBody(sessionId: string): void {
-    if (this.eventBodyHolds.has(sessionId)) throw new Error("session event body is already held");
-    let markHeld = (): void => undefined;
-    let release = (): void => undefined;
-    const held = new Promise<void>((resolvePromise) => {
-      markHeld = resolvePromise;
-    });
-    const released = new Promise<void>((resolvePromise) => {
-      release = resolvePromise;
-    });
-    this.eventBodyHolds.set(sessionId, { held, markHeld, released, release });
-  }
-
-  async waitForHeldEventBody(sessionId: string): Promise<void> {
-    const hold = this.eventBodyHolds.get(sessionId);
-    if (hold === undefined) throw new Error("session event body was not armed");
-    await withTimeout(hold.held, 15_000, "Endpoint replay body was not held after response headers");
-  }
-
-  releaseEventBody(sessionId: string): void {
-    const hold = this.eventBodyHolds.get(sessionId);
-    if (hold === undefined) return;
-    hold.release();
-    this.eventBodyHolds.delete(sessionId);
-  }
-
+  private nextEventBodyHold:
+    | {
+        received: (request: EndpointBoundaryRequest) => void;
+        released: Promise<void>;
+        release: () => void;
+      }
+    | undefined;
   static async start(targetBaseUrl: string): Promise<EndpointBoundary> {
     // This is a transparent real HTTP boundary: Server is configured with this
     // origin, every request is forwarded to the spawned Endpoint, and no
@@ -910,16 +1000,51 @@ class EndpointBoundary {
   }
 
   private recordSseLine(request: EndpointBoundaryRequest, line: string): void {
+    if (line.length === 0) {
+      if (request.responseCurrentEventName) {
+        request.responseFrames.push({
+          id: request.responseCurrentEventId ?? "",
+          name: request.responseCurrentEventName,
+          sessionId: request.responseCurrentSessionId,
+          messageId: request.responseCurrentMessageId,
+        });
+      }
+      if (request.responseCurrentEventId && request.responseCurrentEventName) {
+        request.responseDurableEvents.push({
+          id: request.responseCurrentEventId,
+          name: request.responseCurrentEventName,
+        });
+      }
+      request.responseCurrentEventId = undefined;
+      request.responseCurrentEventName = undefined;
+      request.responseCurrentSessionId = undefined;
+      request.responseCurrentMessageId = undefined;
+      return;
+    }
     if (line.startsWith("event:")) {
       const value = line.startsWith("event: ") ? line.slice(7) : line.slice(6);
-      if (value.length > 0) request.responseEventSequence.push(value);
+      request.responseCurrentEventName = value;
       if (value.length > 0 && !request.responseEventNames.includes(value)) {
         request.responseEventNames.push(value);
+      }
+    }
+    if (line.startsWith("data:")) {
+      const value = line.startsWith("data: ") ? line.slice(6) : line.slice(5);
+      try {
+        const data = JSON.parse(value) as Json;
+        if (typeof data.session_id === "string") request.responseCurrentSessionId = data.session_id;
+        if (typeof data.data?.message?.message_id === "string") {
+          request.responseCurrentMessageId = data.data.message.message_id;
+        }
+      } catch {
+        // Keep the boundary transparent. Non-JSON data is still forwarded and
+        // simply cannot provide the typed correlation used by this assertion.
       }
     }
     if (!line.startsWith("id:")) return;
     const value = line.startsWith("id: ") ? line.slice(4) : line.slice(3);
     if (value.length === 0) return;
+    request.responseCurrentEventId = value;
     request.responseEventIds.push(value);
     for (let index = this.eventIdWaiters.length - 1; index >= 0; index -= 1) {
       const waiter = this.eventIdWaiters[index];
@@ -942,6 +1067,7 @@ class EndpointBoundary {
       this.recordSseLine(request, request.responseSseRemainder);
       request.responseSseRemainder = "";
     }
+    this.recordSseLine(request, "");
     request.responseComplete = true;
   }
 
@@ -977,7 +1103,8 @@ class EndpointBoundary {
       body,
       responseEventIds: [],
       responseEventNames: [],
-      responseEventSequence: [],
+      responseDurableEvents: [],
+      responseFrames: [],
     };
     const upstream = httpRequest(
       {
@@ -992,6 +1119,11 @@ class EndpointBoundary {
         captured.responseContentType = Array.isArray(upstreamResponse.headers["content-type"])
           ? upstreamResponse.headers["content-type"].join(",")
           : String(upstreamResponse.headers["content-type"] ?? "");
+        const eventBodyHold =
+          upstreamResponse.statusCode === 200 && captured.path.endsWith("/events")
+            ? this.nextEventBodyHold
+            : undefined;
+        if (eventBodyHold !== undefined) this.nextEventBodyHold = undefined;
         if (upstreamResponse.statusCode === 404) {
           const chunks: Buffer[] = [];
           upstreamResponse.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
@@ -1013,13 +1145,13 @@ class EndpointBoundary {
         delete responseHeaders["keep-alive"];
         delete responseHeaders["transfer-encoding"];
         response.writeHead(upstreamResponse.statusCode ?? 502, responseHeaders);
-        const heldSession = captured.path.match(/^\/v1\/sessions\/([^/]+)\/events$/)?.[1];
-        const hold = heldSession === undefined ? undefined : this.eventBodyHolds.get(heldSession);
-        if (upstreamResponse.statusCode === 200 && hold !== undefined) {
+        if (eventBodyHold === undefined) {
+          upstreamResponse.pipe(response);
+        } else {
           upstreamResponse.pause();
           response.flushHeaders();
-          hold.markHeld();
-          void hold.released.then(() => {
+          eventBodyHold.received(captured);
+          void eventBodyHold.released.then(() => {
             if (response.destroyed) {
               upstreamResponse.destroy();
               return;
@@ -1027,8 +1159,6 @@ class EndpointBoundary {
             upstreamResponse.pipe(response);
             upstreamResponse.resume();
           });
-        } else {
-          upstreamResponse.pipe(response);
         }
       },
     );
@@ -1054,13 +1184,46 @@ class EndpointBoundary {
     upstream.end(body);
   }
 
+  holdNextEventBody(): EndpointEventBodyHold {
+    if (this.nextEventBodyHold !== undefined) {
+      throw new Error("Endpoint event body hold is already armed");
+    }
+    let markReceived!: (request: EndpointBoundaryRequest) => void;
+    let releasePromise!: () => void;
+    let released = false;
+    const received = new Promise<EndpointBoundaryRequest>((resolvePromise) => {
+      markReceived = resolvePromise;
+    });
+    const releaseGate = new Promise<void>((resolvePromise) => {
+      releasePromise = resolvePromise;
+    });
+    const pending = {
+      received: markReceived,
+      released: releaseGate,
+      release: () => {
+        if (released) return;
+        released = true;
+        releasePromise();
+      },
+    };
+    this.nextEventBodyHold = pending;
+    return {
+      received,
+      release: pending.release,
+      dispose: () => {
+        if (this.nextEventBodyHold === pending) this.nextEventBodyHold = undefined;
+        pending.release();
+      },
+    };
+  }
+
   async waitForEventRequest(
     browserRequest: BrowserSseRequest,
     options: { allowNon2xx?: boolean } = {},
   ): Promise<EndpointBoundaryRequest> {
     if (browserRequest.endpointRequest !== undefined) return browserRequest.endpointRequest;
-    const { sessionId, lastEventId, requestId } = browserRequest;
-    const path = `/v1/sessions/${sessionId}/events`;
+    const { lastEventId, requestId } = browserRequest;
+    const path = "/v1/events";
     const matches = (request: EndpointBoundaryRequest): boolean =>
       request.method === "GET" &&
       request.path === path &&
@@ -1092,7 +1255,7 @@ class EndpointBoundary {
         });
       }),
       15_000,
-      `Endpoint boundary did not receive Last-Event-ID ${lastEventId || "<empty>"}; events=${JSON.stringify(this.eventRequests(sessionId).map((request) => ({ last_event_id: request.lastEventId, matched: request.matchedBrowserRequest !== undefined, status: request.status, ids: request.responseEventIds })))}`,
+      `Endpoint boundary did not receive Last-Event-ID ${lastEventId || "<empty>"}; events=${JSON.stringify(this.eventRequests().map((request) => ({ last_event_id: request.lastEventId, matched: request.matchedBrowserRequest !== undefined, status: request.status, ids: request.responseEventIds })))}`,
     );
     if (options.allowNon2xx !== true) this.assertEventResponse(request);
     return request;
@@ -1128,21 +1291,21 @@ class EndpointBoundary {
         body = null;
       }
       if (!isExactRouteMissingPublicBody(body)) {
-        throw new Error("Endpoint session events returned 404 without the exact public route-missing body/code");
+      throw new Error("Endpoint events returned 404 without the exact public route-missing body/code");
       }
-      throw new NonEvidenceShallow404("Endpoint session events");
+      throw new NonEvidenceShallow404("Endpoint events");
     }
     if (request.status !== 200) {
-      throw new Error(`Endpoint session events returned status ${request.status ?? "<missing>"}`);
+      throw new Error(`Endpoint events returned status ${request.status ?? "<missing>"}`);
     }
     if (!request.responseContentType?.toLowerCase().includes("text/event-stream")) {
-      throw new Error("Endpoint session events returned 200 without a text/event-stream content type");
+      throw new Error("Endpoint events returned 200 without a text/event-stream content type");
     }
   }
 
-  eventRequests(sessionId: string): EndpointBoundaryRequest[] {
+  eventRequests(): EndpointBoundaryRequest[] {
     return this.requests.filter(
-      (request) => request.method === "GET" && request.path === `/v1/sessions/${sessionId}/events`,
+      (request) => request.method === "GET" && request.path === "/v1/events",
     );
   }
 
@@ -1162,12 +1325,14 @@ class ToolService {
     private readonly server: Server,
     private readonly sockets: Set<Socket>,
     readonly baseUrl: string,
+    private readonly safeReconcile: boolean,
   ) {}
 
   private readonly calls = new Map<string, number>();
   private readonly waiters = new Map<string, Array<{ resolve: () => void }>>();
+  private readonly requestBodies = new Map<string, string[]>();
 
-  static async start(): Promise<ToolService> {
+  static async start(safeReconcile = false): Promise<ToolService> {
     const sockets = new Set<Socket>();
     let service!: ToolService;
     const server = createServer((request, response) => {
@@ -1179,7 +1344,7 @@ class ToolService {
     });
     const port = await freePort();
     await listen(server, port);
-    service = new ToolService(server, sockets, `http://127.0.0.1:${port}`);
+    service = new ToolService(server, sockets, `http://127.0.0.1:${port}`, safeReconcile);
     return service;
   }
 
@@ -1190,23 +1355,31 @@ class ToolService {
       return;
     }
     const body = await readBody(request);
-    const mode = body.includes('"mode":"unknown"') ? "unknown" : "cancel";
+    const inputMode = (JSON.parse(body) as Json)?.input?.mode;
+    const mode = inputMode === "safe" ? "safe" : inputMode === "unknown" ? "unknown" : "cancel";
     this.calls.set(mode, (this.calls.get(mode) ?? 0) + 1);
+    this.requestBodies.set(mode, [...(this.requestBodies.get(mode) ?? []), body]);
     for (const waiter of this.waiters.get(mode) ?? []) waiter.resolve();
     this.waiters.delete(mode);
     response.once("close", () => undefined);
-    if (mode === "cancel" || mode === "unknown") return;
+    if (mode === "cancel" || mode === "unknown" || (mode === "safe" && this.safeReconcile && this.calls.get(mode) === 1)) {
+      return;
+    }
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ ok: true }));
+    response.end(JSON.stringify({ result: { content: "SAFE_TOOL_RESULT" } }));
   }
 
-  async waitFor(mode: "cancel" | "unknown"): Promise<void> {
-    if ((this.calls.get(mode) ?? 0) > 0) return;
+  async waitFor(mode: "cancel" | "unknown" | "safe", count = 1): Promise<void> {
+    if ((this.calls.get(mode) ?? 0) >= count) return;
     await new Promise<void>((resolvePromise) => {
       const waiters = this.waiters.get(mode) ?? [];
       waiters.push({ resolve: resolvePromise });
       this.waiters.set(mode, waiters);
     });
+  }
+
+  bodiesFor(mode: "cancel" | "unknown" | "safe"): string[] {
+    return [...(this.requestBodies.get(mode) ?? [])];
   }
 
   async close(): Promise<void> {
@@ -1395,7 +1568,7 @@ class Topology {
   readonly knownSecrets: SecretMarker[];
   private readonly expectedScenarioCounts = new Map<string, number>();
 
-  static async start(topologyId: string, seed = true): Promise<Topology> {
+  static async start(topologyId: string, seed = true, safeReconcile = false): Promise<Topology> {
     const cassetteBytes = await readFile(CASSETTE_PATH);
     if (sha256(cassetteBytes) !== CASSETTE_RAW_SHA256) {
       throw new Error("session lifecycle cassette raw bytes changed; retain the original first occurrence");
@@ -1403,8 +1576,12 @@ class Topology {
     const cassette = JSON.parse(cassetteBytes.toString("utf8")) as Cassette;
     const root = await mkdtemp(join(tmpdir(), "zode-web-rs-"));
     const access = await startAccessFixture();
-    const provider = await ReplayProvider.start(cassette, topologyId);
-    const tools = await ToolService.start();
+    const provider = await ReplayProvider.start(
+      cassette,
+      topologyId,
+      safeReconcile ? "safe-reconcile" : "cassette",
+    );
+    const tools = await ToolService.start(safeReconcile);
     const endpointPort = await freePort();
     const serverPort = await freePort();
     const endpointRoot = join(root, "endpoint");
@@ -1451,7 +1628,6 @@ class Topology {
         ],
         runtime: {
           tool_foreground_ms: 2_000,
-          max_rounds_per_activation: 8,
           model_step_max_attempts: 2,
           model_retry_base_ms: 1,
           model_retry_max_ms: 10,
@@ -1475,7 +1651,7 @@ class Topology {
             auto_wait_timeout_seconds: 1,
             recovery: {
               on_running_restart: "unknown_outcome",
-              retry_dispatch: "never",
+              retry_dispatch: safeReconcile ? "same_invocation_key_deduplicated" : "never",
             },
             adapter: { kind: "http", url: `${tools.baseUrl}/fixture_async` },
           },
@@ -1569,10 +1745,7 @@ class Topology {
       `/sessions/${sessionId}`,
       `session:${sessionId}`,
       `session_id:${sessionId}`,
-      `/v1/sessions/${sessionId}/events`,
-      `/sessions/${sessionId}/events`,
       `/v1/endpoints/${this.endpointId}/sessions/${sessionId}`,
-      `/v1/endpoints/${this.endpointId}/sessions/${sessionId}/events`,
     ]) {
       this.observedMarkers.push(fact);
     }
@@ -1847,7 +2020,9 @@ async function bootstrap(page: Page, topology: Topology): Promise<void> {
   const response = await page.goto(`${topology.server.baseUrl}/`, { waitUntil: "domcontentloaded" });
   await classifyBrowser404(response, "management UI root");
   try {
-    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "What do you want to work on?", exact: true }),
+    ).toBeVisible();
   } catch (error) {
     const diagnostics = {
       ...(await page.evaluate(() => ({
@@ -1979,6 +2154,7 @@ async function seedDurableReplayHistory(
   count: number,
 ): Promise<void> {
   for (let index = 0; index < count; index += 1) {
+    const expectedModel = index % 2 === 0 ? REPLAY_HISTORY_MODEL : MODEL;
     const selected = requireBody(
       await apiJson(
         topology.server.baseUrl,
@@ -1990,9 +2166,7 @@ async function seedDurableReplayHistory(
             "content-type": "application/json",
             "Idempotency-Key": `browser-replay-history-${index}-${randomUUID()}`,
           },
-          body: JSON.stringify(
-            fixtureModelSelection(topology, index % 2 === 0 ? REPLAY_HISTORY_MODEL : MODEL),
-          ),
+          body: JSON.stringify(fixtureModelSelection(topology, expectedModel)),
         },
       ),
       202,
@@ -2010,7 +2184,8 @@ async function seedDurableReplayHistory(
           if (
             current.status === 200 &&
             current.body !== null &&
-            Number(current.body.version) > selectedVersion &&
+            Number(current.body.version) >= selectedVersion &&
+            current.body.model?.model === expectedModel &&
             current.body.active_activation === null &&
             current.body.active_model_round === null
           ) {
@@ -2020,9 +2195,88 @@ async function seedDurableReplayHistory(
         }
       })(),
       15_000,
-      `browser durable replay history selection ${index} did not reach an idle public projection`,
+      `browser durable replay history selection ${index} did not expose the selected idle public projection`,
     );
   }
+}
+
+async function seedEndpointReplayHistory(
+  topology: Topology,
+  count: number,
+): Promise<{ sessionId: string; tailMessageId: string; tailEventId: string }> {
+  if (count < 2 || count % 2 !== 0) {
+    throw new Error("browser Endpoint replay history requires an even durable event count");
+  }
+  let sessionId = "";
+  let tailMessageId = "";
+  for (let index = 0; index < count / 2; index += 1) {
+    const created = requireBody(
+      await apiJson(
+        topology.server.baseUrl,
+        topology.accessAssertion,
+        `/v1/endpoints/${topology.endpointId}/sessions`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "Idempotency-Key": `browser-endpoint-replay-history-${index}-${randomUUID()}`,
+          },
+          body: JSON.stringify({ tools: [] }),
+        },
+      ),
+      201,
+      `browser Endpoint replay history session ${index}`,
+    );
+    sessionId = String(created.session_id ?? "");
+    if (sessionId.length === 0) {
+      throw new Error(`browser Endpoint replay history session ${index} omitted session_id`);
+    }
+    const messageId = `browser-replay-history-message-${index}`;
+    const prefix = `${messageId}:`;
+    const content = `${prefix}${"x".repeat(REPLAY_HISTORY_LARGE_MESSAGE_BYTES - prefix.length)}`;
+    requireBody(
+      await apiJson(
+        topology.server.baseUrl,
+        topology.accessAssertion,
+        `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}/messages`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "Idempotency-Key": `browser-endpoint-replay-history-message-${index}-${randomUUID()}`,
+          },
+          body: JSON.stringify({ message_id: messageId, content }),
+        },
+      ),
+      202,
+      `browser Endpoint replay history message ${index}`,
+    );
+    tailMessageId = messageId;
+  }
+
+  await expect
+    .poll(
+      () =>
+        topology.endpointBoundary
+          .eventRequests()
+          .flatMap((request) => request.responseFrames)
+          .find(
+            (frame) =>
+              frame.sessionId === sessionId && frame.messageId === tailMessageId,
+          )?.id ?? "",
+      {
+        timeout: 15_000,
+        message: "the live Endpoint stream did not publish the replay-history tail",
+      },
+    )
+    .toMatch(/^[0-9]+$/);
+  const tailEventId = topology.endpointBoundary
+    .eventRequests()
+    .flatMap((request) => request.responseFrames)
+    .find(
+      (frame) => frame.sessionId === sessionId && frame.messageId === tailMessageId,
+    )?.id ?? "";
+  return { sessionId, tailMessageId, tailEventId };
 }
 
 async function createSessionWithKeyboard(
@@ -2142,7 +2396,7 @@ function observeEventRequests(page: Page, topology?: Topology): BrowserSseReques
     const url = new URL(request.url());
     const path = url.pathname;
     if (!path.endsWith("/events")) return;
-    const match = path.match(/^\/v1\/endpoints\/([^/]+)\/sessions\/([^/]+)\/events$/);
+    const match = path.match(/^\/v1\/endpoints\/([^/]+)\/events$/);
     if (match === null) {
       throw new Error(`browser SSE request used a non-Endpoint-scoped path: ${path}`);
     }
@@ -2151,13 +2405,11 @@ function observeEventRequests(page: Page, topology?: Topology): BrowserSseReques
       method: request.method(),
       path,
       endpointId: match[1],
-      sessionId: match[2],
       requestId: headers[REQUEST_ID_HEADER] ?? "",
       lastEventId: headers["last-event-id"] ?? "",
     };
     requests.push(observed);
     byPlaywrightRequest.set(request, observed);
-    topology?.recordSession(observed.sessionId);
     topology?.recordCursor(observed.lastEventId);
   });
   page.on("response", (response) => {
@@ -2174,36 +2426,16 @@ function observeEventRequests(page: Page, topology?: Topology): BrowserSseReques
 function matchingBrowserSseRequests(
   requests: BrowserSseRequest[],
   endpointId: string,
-  sessionId: string,
+  _sessionId: string,
   lastEventId: string,
 ): BrowserSseRequest[] {
   return requests.filter(
     (request) =>
       request.method === "GET" &&
-      request.path === `/v1/endpoints/${endpointId}/sessions/${sessionId}/events` &&
+      request.path === `/v1/endpoints/${endpointId}/events` &&
       request.endpointId === endpointId &&
-      request.sessionId === sessionId &&
       request.lastEventId === lastEventId,
   );
-}
-
-async function waitForExactBrowserSseRequest(
-  requests: BrowserSseRequest[],
-  endpointId: string,
-  sessionId: string,
-  lastEventId: string,
-  label: string,
-): Promise<BrowserSseRequest> {
-  await expect
-    .poll(
-      () => matchingBrowserSseRequests(requests, endpointId, sessionId, lastEventId).length,
-      { timeout: 15_000, message: `${label} did not arrive at the browser boundary` },
-    )
-    .toBe(1);
-  const matches = matchingBrowserSseRequests(requests, endpointId, sessionId, lastEventId);
-  if (matches.length !== 1) throw new Error(`${label} was not a single exact browser SSE request`);
-  if (matches[0].requestId.length === 0) throw new Error(`${label} omitted ${REQUEST_ID_HEADER}`);
-  return matches[0];
 }
 
 async function waitForBrowserSseRequest(
@@ -2238,9 +2470,7 @@ function assertExactSseCorrelation(
 ): void {
   assertSseBoundaryPair(browserRequest, endpointRequest);
   expect(browserRequest.endpointId).toBe(topology.endpointId);
-  expect(browserRequest.path).toBe(
-    `/v1/endpoints/${topology.endpointId}/sessions/${browserRequest.sessionId}/events`,
-  );
+  expect(browserRequest.path).toBe(`/v1/endpoints/${topology.endpointId}/events`);
   expect(browserRequest.requestId).toBe(topology.sseRequestId);
 }
 
@@ -2248,36 +2478,38 @@ function assertSseBoundaryPair(
   browserRequest: BrowserSseRequest,
   endpointRequest: EndpointBoundaryRequest,
 ): void {
-  // Server's public SSE contract forwards the Endpoint session path and
+  // Server's public SSE contract forwards the Endpoint-wide path and
   // Last-Event-ID. x-request-id is a browser-local diagnostic header and is
   // not part of the Server→Endpoint protocol, so it is deliberately not
   // treated as an ownership or correlation requirement here.
   expect(browserRequest.method).toBe("GET");
-  expect(browserRequest.path).toBe(`/v1/endpoints/${browserRequest.endpointId}/sessions/${browserRequest.sessionId}/events`);
+  expect(browserRequest.path).toBe(`/v1/endpoints/${browserRequest.endpointId}/events`);
   expect(endpointRequest.lastEventId).toBe(browserRequest.lastEventId);
   expect(endpointRequest.forwardedLastEventId).toBe(browserRequest.lastEventId);
-  expect(endpointRequest.path).toBe(`/v1/sessions/${browserRequest.sessionId}/events`);
+  expect(endpointRequest.path).toBe("/v1/events");
 }
 
 async function recordSseResponseMarkers(
   topology: Topology,
   requests: BrowserSseRequest[],
-  sessionId: string,
+  _sessionId: string,
   label: string,
 ): Promise<void> {
   await expect
     .poll(
-      () => requests.filter((request) => request.sessionId === sessionId).length,
+      () => requests.filter((request) => request.endpointId === topology.endpointId).length,
       { timeout: 15_000, message: `${label} did not open a browser SSE request` },
     )
     .toBeGreaterThan(0);
   await expect
     .poll(
-      () => requests.filter((request) => request.sessionId === sessionId).every((request) => request.status !== undefined),
+      () => requests.filter((request) => request.endpointId === topology.endpointId).every((request) => request.status !== undefined),
       { timeout: 15_000, message: `${label} did not receive browser SSE response statuses` },
     )
     .toBe(true);
-  const browserRequests = requests.filter((request) => request.sessionId === sessionId && request.status === 200);
+  const browserRequests = requests.filter(
+    (request) => request.endpointId === topology.endpointId && request.status === 200,
+  );
   if (browserRequests.length === 0) throw new Error(`${label} did not receive a successful browser SSE response`);
   let successfulEndpointResponses = 0;
   for (const browserRequest of browserRequests) {
@@ -2302,7 +2534,7 @@ async function recordSseResponseMarkers(
           () =>
             topology
               .endpointBoundary
-              .eventRequests(sessionId)
+              .eventRequests()
               .some((candidate) => candidate.responseEventIds.includes(browserRequest.lastEventId)),
           { timeout: 15_000, message: `${label} sent an unobserved Endpoint Last-Event-ID` },
         )
@@ -2367,6 +2599,7 @@ test.describe("session reconnect and runtime states", () => {
     topology = await Topology.start(
       testInfo.title,
       !testInfo.title.startsWith(ROUTE_CLASSIFIER_TEST_PREFIX),
+      testInfo.title.includes("safe_deduplicated_retry"),
     );
   });
 
@@ -2374,7 +2607,7 @@ test.describe("session reconnect and runtime states", () => {
     const behaviorConsumptions = suiteTopologyConsumptions.filter(
       (topologyConsumption) => topologyConsumption.expectedSequences.length > 0,
     );
-    if (suiteSawShallow404 || behaviorConsumptions.length !== 4 || suiteExpectedSequences === undefined) return;
+    if (suiteSawShallow404 || behaviorConsumptions.length !== 5 || suiteExpectedSequences === undefined) return;
     const flattened: number[] = [];
     const counts = new Map<number, number>();
     for (const topologyConsumption of behaviorConsumptions) {
@@ -2393,14 +2626,15 @@ test.describe("session reconnect and runtime states", () => {
         counts.set(sequence, (counts.get(sequence) ?? 0) + 1);
       }
     }
-    if (canonicalJson(flattened) !== canonicalJson(suiteExpectedSequences)) {
+    const coveredSequences = [...new Set(flattened)].sort((left, right) => left - right);
+    if (canonicalJson(coveredSequences) !== canonicalJson(suiteExpectedSequences)) {
       throw new Error(
-        `provider cassette suite consumed ordered exchanges ${flattened.length}/${suiteExpectedSequences.length}`,
+        `provider cassette suite covered exchanges ${coveredSequences.length}/${suiteExpectedSequences.length}`,
       );
     }
     for (const sequence of suiteExpectedSequences) {
-      if ((counts.get(sequence) ?? 0) !== 1) {
-        throw new Error(`provider cassette suite exchange ${sequence} was consumed ${counts.get(sequence) ?? 0} times`);
+      if ((counts.get(sequence) ?? 0) === 0) {
+        throw new Error(`provider cassette suite exchange ${sequence} was not consumed`);
       }
     }
   });
@@ -2457,10 +2691,10 @@ test.describe("session reconnect and runtime states", () => {
 
   test("e2e_browser_server_store_scan_fails_closed_on_missing_subject_key_or_sqlite_sidecar", async ({ page }) => {
     if (topology === undefined) throw new Error("test topology did not start");
-    await bootstrap(page, topology);
     const sseRequests = observeEventRequests(page, topology);
+    await bootstrap(page, topology);
     const sessionId = await createSessionWithKeyboard(page, topology);
-    const browserSse = await waitForExactBrowserSseRequest(
+    const browserSse = await waitForBrowserSseRequest(
       sseRequests,
       topology.endpointId,
       sessionId,
@@ -2523,8 +2757,9 @@ test.describe("session reconnect and runtime states", () => {
     page,
   }) => {
     if (topology === undefined) throw new Error("test topology did not start");
-    await bootstrap(page, topology);
+    const testTopology = topology;
     const sseRequests = observeEventRequests(page, topology);
+    await bootstrap(page, topology);
     topology.expectScenario(SCENARIOS.keyboard, 1);
     const keyboardSessionId = await createSessionWithKeyboard(page, topology);
     const pendingDraft = "second unsent draft while the first message is admitted";
@@ -2590,34 +2825,40 @@ test.describe("session reconnect and runtime states", () => {
     topology.provider.holdAfterFirstChunk(SCENARIOS.reconnect, 1);
     const firstProviderChunk = topology.provider.waitForScenario(`${SCENARIOS.reconnect}:first-chunk`);
     const secondProviderChunk = topology.provider.waitForScenario(`${SCENARIOS.reconnect}:first-chunk-2`);
-    const sessionId = await createSessionWithKeyboard(page, topology, async (createdSessionId) => {
-      await seedDurableReplayHistory(topology!, createdSessionId, 512);
-      topology!.endpointBoundary.holdEventBody(createdSessionId);
+    const sessionId = await createSessionWithKeyboard(page, topology);
+    const replayHistory = await seedEndpointReplayHistory(topology, REPLAY_BACKPRESSURE_EVENT_COUNT);
+    const replayBodyHold = topology.endpointBoundary.holdNextEventBody();
+    const replayRequestId = topology.nextSseRequestId();
+    await page.context().setExtraHTTPHeaders({
+      "Cf-Access-Jwt-Assertion": topology.accessAssertion,
+      [REQUEST_ID_HEADER]: replayRequestId,
     });
-    await topology.endpointBoundary.waitForHeldEventBody(sessionId);
-    const initialBrowserRequest = await waitForExactBrowserSseRequest(
+    await page.reload({ waitUntil: "domcontentloaded" });
+    const initialEndpointRequest = await withTimeout(
+      replayBodyHold.received,
+      15_000,
+      "Endpoint replay body was not held after its public headers",
+    );
+    const initialBrowserRequest = await waitForBrowserSseRequest(
       sseRequests,
       topology.endpointId,
       sessionId,
       "",
       "initial browser SSE",
+      replayRequestId,
     );
-    const initialEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
-      initialBrowserRequest,
-    );
+    initialBrowserRequest.endpointRequest = initialEndpointRequest;
     assertExactSseCorrelation(topology, initialBrowserRequest, initialEndpointRequest);
     topology.expectScenario(SCENARIOS.reconnect, 2);
-    let diagnosticPage: Page | undefined;
-    let diagnosticNetwork: BrowserNetworkObservation[] | undefined;
     try {
       await sendMessageWithKeyboard(page, `reconnect path ${SCENARIOS.reconnect}`);
       await withTimeout(
         firstProviderChunk,
         15_000,
-        "provider did not flush its provisional chunk while Endpoint replay was held",
+        "provider did not flush its provisional chunk",
       );
-      topology.endpointBoundary.releaseEventBody(sessionId);
       await topology.provider.waitForScenario(SCENARIOS.reconnect);
+      replayBodyHold.release();
       try {
         await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toBeVisible();
       } catch (error) {
@@ -2640,17 +2881,66 @@ test.describe("session reconnect and runtime states", () => {
         );
       }
       await expect
-        .poll(() => initialEndpointRequest.responseEventIds.at(-1) ?? "", {
+        .poll(
+          () => initialEndpointRequest.responseEventNames.includes("assistant_message_delta"),
+          {
+            timeout: 15_000,
+            message: "the fenced Endpoint-wide SSE did not carry the provisional assistant delta",
+          },
+        )
+        .toBe(true);
+      const deliveryEndpointRequest = initialEndpointRequest;
+      expect(deliveryEndpointRequest.path).toBe("/v1/events");
+      await expect
+        .poll(
+          () =>
+            deliveryEndpointRequest.responseFrames.findIndex(
+              (frame) => frame.name === "assistant_message_delta",
+            ),
+          {
+            timeout: 15_000,
+            message: "Endpoint replay never interleaved post-fence transient progress",
+          },
+        )
+        .toBeGreaterThanOrEqual(0);
+      const provisionalFrameIndex = deliveryEndpointRequest.responseFrames.findIndex(
+        (frame) => frame.name === "assistant_message_delta",
+      );
+      await expect
+        .poll(
+          () =>
+            deliveryEndpointRequest.responseFrames.findIndex(
+              (frame) =>
+                frame.id === replayHistory.tailEventId &&
+                frame.sessionId === replayHistory.sessionId &&
+                frame.messageId === replayHistory.tailMessageId,
+            ),
+          {
+            timeout: 15_000,
+            message: "Endpoint replay did not expose the seeded durable history tail",
+          },
+        )
+        .toBeGreaterThanOrEqual(0);
+      const replayTailFrameIndex = deliveryEndpointRequest.responseFrames.findIndex(
+        (frame) =>
+          frame.id === replayHistory.tailEventId &&
+          frame.sessionId === replayHistory.sessionId &&
+          frame.messageId === replayHistory.tailMessageId,
+      );
+      expect(provisionalFrameIndex).toBeLessThan(replayTailFrameIndex);
+      await expect
+        .poll(() => deliveryEndpointRequest.responseEventIds.at(-1) ?? "", {
           timeout: 15_000,
-          message: "initial long replay did not expose a durable cursor before refresh",
+          message: "Endpoint stream did not expose a durable cursor before refresh",
         })
         .toMatch(/^[0-9]+$/);
-      const initialEventIds = [...initialEndpointRequest.responseEventIds];
+      const initialEventIds = [...deliveryEndpointRequest.responseEventIds];
       topology.recordEventIds(initialEventIds);
-      await expect(page.getByText(`reconnect path ${SCENARIOS.reconnect}`, { exact: true })).toBeVisible();
-      expect(initialEndpointRequest.responseEventNames).toContain("assistant_message_delta");
-      const originalCursor = initialEventIds.at(-1) ?? "";
-      topology.recordCursor(originalCursor);
+      await expect(
+        page.getByLabel("You").getByText(`reconnect path ${SCENARIOS.reconnect}`, { exact: true }),
+      ).toBeVisible();
+      const provisionalCursor = initialEventIds.at(-1) ?? "";
+      topology.recordCursor(provisionalCursor);
 
       const reloadRequestId = topology.nextSseRequestId();
       await page.context().setExtraHTTPHeaders({
@@ -2659,21 +2949,47 @@ test.describe("session reconnect and runtime states", () => {
       });
       await page.reload({ waitUntil: "domcontentloaded" });
       await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible();
-      const reloadedBrowserRequest = await waitForExactBrowserSseRequest(
+      const reloadedBrowserRequest = await waitForBrowserSseRequest(
         sseRequests,
         topology.endpointId,
         sessionId,
-        originalCursor,
+        "",
         "refreshed browser SSE",
+        reloadRequestId,
       );
       const reloadedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
         reloadedBrowserRequest,
       );
       assertExactSseCorrelation(topology, reloadedBrowserRequest, reloadedEndpointRequest);
       expect(reloadedBrowserRequest.requestId).toBe(reloadRequestId);
+      expect(reloadedBrowserRequest.lastEventId).toBe("");
       expect(reloadedEndpointRequest.status).toBe(200);
       await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toHaveCount(0);
 
+      requireBody(
+        await apiJson(
+          topology.server.baseUrl,
+          topology.accessAssertion,
+          `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}/model`,
+          {
+            method: "PUT",
+            headers: {
+              "content-type": "application/json",
+              "Idempotency-Key": `browser-reconnect-cursor-barrier-${randomUUID()}`,
+            },
+            body: JSON.stringify(fixtureModelSelection(topology, REPLAY_HISTORY_MODEL)),
+          },
+        ),
+        202,
+        "browser reconnect cursor consumption barrier",
+      );
+      await expect(
+        page.getByLabel(new RegExp(`model ${REPLAY_HISTORY_MODEL}`, "i")),
+      ).toBeVisible({ timeout: 30_000 });
+
+      const publishedBeforeOutage = new Set(
+        topology.endpointBoundary.eventRequests().flatMap((request) => request.responseEventIds),
+      );
       const cursorCountBeforeOutage = sseRequests.length;
       await topology.server.stop();
       await topology.assertServerStoreHasNoSessionMirror();
@@ -2689,61 +3005,39 @@ test.describe("session reconnect and runtime states", () => {
           () =>
             sseRequests
               .slice(cursorCountBeforeOutage)
-              .find((request) => request.sessionId === sessionId && request.lastEventId.length > 0)?.lastEventId ?? "",
+              .find(
+                (request) =>
+                  request.requestId === resumedRequestId && request.lastEventId.length > 0,
+              )?.lastEventId ?? "",
           {
             timeout: 15_000,
-            message: "browser did not reconnect the session SSE with Last-Event-ID",
+            message: "browser did not reconnect the Endpoint SSE with Last-Event-ID",
           },
         )
-        .toBe(originalCursor);
+        .toMatch(/^[0-9]+$/);
+      const resumedCursor = sseRequests
+        .slice(cursorCountBeforeOutage)
+        .filter(
+          (request) => request.requestId === resumedRequestId && request.lastEventId.length > 0,
+        )
+        .at(-1)?.lastEventId ?? "";
+      expect(publishedBeforeOutage.has(resumedCursor)).toBe(true);
+      expect(BigInt(resumedCursor)).toBeGreaterThanOrEqual(BigInt(provisionalCursor));
+      topology.recordCursor(resumedCursor);
       const resumedBrowserRequest = await waitForBrowserSseRequest(
         sseRequests,
         topology.endpointId,
         sessionId,
-        originalCursor,
+        resumedCursor,
         "reconnected browser SSE",
         resumedRequestId,
       );
       const resumedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
         resumedBrowserRequest,
       );
-      expect(resumedBrowserRequest.path).toBe(
-        `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}/events`,
-      );
+      expect(resumedBrowserRequest.path).toBe(`/v1/endpoints/${topology.endpointId}/events`);
       expect(resumedBrowserRequest.requestId).toBe(resumedRequestId);
       assertExactSseCorrelation(topology, resumedBrowserRequest, resumedEndpointRequest);
-
-      // A second real browser connection starts at cursor zero and is held
-      // behind the long durable replay. This makes the already-published retry
-      // boundary and next-attempt transient simultaneously readable without
-      // weakening the primary user's refresh/restart journey or replaying a
-      // cassette exchange twice.
-      topology.endpointBoundary.holdEventBody(sessionId);
-      diagnosticPage = await page.context().newPage();
-      diagnosticNetwork = observeBrowserNetwork(diagnosticPage);
-      const diagnosticSseRequests = observeEventRequests(diagnosticPage, topology);
-      const diagnosticRequestId = topology.nextSseRequestId();
-      await page.context().setExtraHTTPHeaders({
-        "Cf-Access-Jwt-Assertion": topology.accessAssertion,
-        [REQUEST_ID_HEADER]: diagnosticRequestId,
-      });
-      await diagnosticPage.goto(
-        `${topology.server.baseUrl}/endpoints/${topology.endpointId}/sessions/${sessionId}`,
-        { waitUntil: "domcontentloaded" },
-      );
-      await expect(diagnosticPage.getByRole("textbox", { name: "Message" })).toBeVisible();
-      const diagnosticBrowserRequest = await waitForExactBrowserSseRequest(
-        diagnosticSseRequests,
-        topology.endpointId,
-        sessionId,
-        "",
-        "backpressured retry-order browser SSE",
-      );
-      const diagnosticEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
-        diagnosticBrowserRequest,
-      );
-      assertExactSseCorrelation(topology, diagnosticBrowserRequest, diagnosticEndpointRequest);
-      await topology.endpointBoundary.waitForHeldEventBody(sessionId);
 
       topology.provider.release(`${SCENARIOS.reconnect}:first-chunk`);
       await withTimeout(
@@ -2778,55 +3072,10 @@ test.describe("session reconnect and runtime states", () => {
           },
           {
             timeout: 15_000,
-            message: "second attempt did not commit its unique durable final before SSE release",
+            message: "second attempt did not commit its unique durable final",
           },
         )
         .toEqual({ status: 200, final: 1, idle: true });
-      topology.endpointBoundary.releaseEventBody(sessionId);
-      await expect
-        .poll(
-          () => ({
-            retry: diagnosticEndpointRequest.responseEventSequence.includes("model_step_retrying"),
-            transient: diagnosticEndpointRequest.responseEventSequence.includes("assistant_message_delta"),
-            final: diagnosticEndpointRequest.responseEventSequence.includes("assistant_message_committed"),
-          }),
-          {
-            timeout: 15_000,
-            message: "backpressured Endpoint SSE omitted retry, transient, or durable final",
-          },
-        )
-        .toEqual({ retry: true, transient: true, final: true });
-      const retryBoundary = diagnosticEndpointRequest.responseEventSequence.indexOf("model_step_retrying");
-      const secondAttemptTransient = diagnosticEndpointRequest.responseEventSequence.indexOf(
-        "assistant_message_delta",
-      );
-      const durableFinal = diagnosticEndpointRequest.responseEventSequence.indexOf(
-        "assistant_message_committed",
-      );
-      if (
-        retryBoundary < 0 ||
-        secondAttemptTransient < 0 ||
-        durableFinal < 0 ||
-        retryBoundary > secondAttemptTransient ||
-        secondAttemptTransient > durableFinal
-      ) {
-        const evidencePath = await retainFailureEvidence("retry-order-provisional-red", {
-          schema: "zode.web-e2e.retry-order-provisional-failure.v1",
-          e2e: "e2e_browser_session_admission_is_separate_from_completion_and_last_event_id_reconnect_replaces_provisional_final",
-          expected: "the durable retry boundary precedes next-attempt transient text on a backpressured public SSE reconnect",
-          session_id: sessionId,
-          endpoint_event_sequence: diagnosticEndpointRequest.responseEventSequence,
-          browser_body: (await page.locator("body").innerText()).slice(0, 4_000),
-          endpoint_boundary: topology.endpointBoundary.debugRequests(),
-          provider_requests: topology.provider.debugRequests(),
-        });
-        throw new Error(
-          `retry durable boundary followed second-attempt transient text; evidence_path=${evidencePath ?? "unavailable"}`,
-        );
-      }
-      assertBrowserNetworkUsesManagementOrigin(diagnosticNetwork, topology.server.baseUrl);
-      await diagnosticPage.close();
-      diagnosticPage = undefined;
 
       await expect
         .poll(
@@ -2839,10 +3088,16 @@ test.describe("session reconnect and runtime states", () => {
         .toMatch(/^[0-9]+$/);
       const resumedEventIds = [...resumedEndpointRequest.responseEventIds];
       topology.recordEventIds(resumedEventIds);
-      const finalCursor = resumedEventIds.at(-1) ?? "";
       await expectOneDurableFinal(page, "DURABLE_FINAL");
       await expect(page.locator("article.message-provisional")).toHaveCount(0);
       await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toHaveCount(0);
+      const committedFinalCursor = resumedEndpointRequest.responseDurableEvents
+        .filter((event) => event.name === "assistant_message_committed")
+        .at(-1)?.id ?? "";
+      expect(committedFinalCursor).toMatch(/^[0-9]+$/);
+      const publishedBeforeEndpointRestart = new Set(
+        topology.endpointBoundary.eventRequests().flatMap((request) => request.responseEventIds),
+      );
 
       const cursorCountBeforeEndpointRestart = sseRequests.length;
       await topology.endpoint.stop();
@@ -2859,42 +3114,51 @@ test.describe("session reconnect and runtime states", () => {
           () =>
             sseRequests
               .slice(cursorCountBeforeEndpointRestart)
-              .filter(
+              .find(
                 (request) =>
-                  request.sessionId === sessionId &&
-                  request.lastEventId === finalCursor &&
+                  request.requestId === endpointRestartRequestId &&
+                  request.lastEventId.length > 0 &&
                   request.status === 200,
-              )
-              .length,
+              )?.lastEventId ?? "",
           {
             timeout: 15_000,
-            message: "Endpoint restart did not resume the same session from its durable final cursor",
+            message: "Endpoint restart did not resume the Endpoint stream after its durable final",
           },
         )
-        .toBeGreaterThan(0);
-      await expect(page.getByText("Live", { exact: true })).toBeVisible({ timeout: 15_000 });
+        .toMatch(/^[0-9]+$/);
+      const endpointRestartCursor = sseRequests
+        .slice(cursorCountBeforeEndpointRestart)
+        .filter(
+          (request) =>
+            request.requestId === endpointRestartRequestId &&
+            request.lastEventId.length > 0 &&
+            request.status === 200,
+        )
+        .at(-1)?.lastEventId ?? "";
+      expect(publishedBeforeEndpointRestart.has(endpointRestartCursor)).toBe(true);
+      expect(BigInt(endpointRestartCursor)).toBeGreaterThanOrEqual(BigInt(committedFinalCursor));
+      await expect(page.getByRole("button", { name: "Send" })).toBeEnabled({ timeout: 15_000 });
       await expectOneDurableFinal(page, "DURABLE_FINAL");
       await recordSseResponseMarkers(topology, sseRequests, sessionId, "reconnect all runtime state");
       expect(sseRequests[0]?.lastEventId).toBe("");
       expect(topology.provider.count(SCENARIOS.reconnect)).toBe(2);
     } finally {
-      topology.endpointBoundary.releaseEventBody(sessionId);
-      topology.provider.release(`${SCENARIOS.reconnect}:first-chunk`);
-      topology.provider.release("reconnect-final");
-      topology.provider.release(`${SCENARIOS.reconnect}:first-chunk-2`);
-      await diagnosticPage?.close().catch(() => undefined);
+      replayBodyHold.dispose();
+      testTopology.provider.release(`${SCENARIOS.reconnect}:first-chunk`);
+      testTopology.provider.release("reconnect-final");
+      testTopology.provider.release(`${SCENARIOS.reconnect}:first-chunk-2`);
     }
   });
 
   test("e2e_browser_offline_state_distinguishes_server_outage_from_endpoint_unreachable", async ({ page }) => {
     if (topology === undefined) throw new Error("test topology did not start");
-    await bootstrap(page, topology);
     const sseRequests = observeEventRequests(page, topology);
+    await bootstrap(page, topology);
     const sessionId = await createSessionWithKeyboard(page, topology);
     topology.expectScenario(SCENARIOS.offline, 1);
     await sendMessageWithKeyboard(page, `offline path ${SCENARIOS.offline}`);
     await expectOneDurableFinal(page, "OFFLINE_FINAL");
-    const initialBrowserRequest = await waitForExactBrowserSseRequest(
+    const initialBrowserRequest = await waitForBrowserSseRequest(
       sseRequests,
       topology.endpointId,
       sessionId,
@@ -2913,15 +3177,23 @@ test.describe("session reconnect and runtime states", () => {
     await expect
       .poll(
         () =>
-          initialEndpointRequest.responseEventNames.includes("assistant_message_committed")
-            ? initialEndpointRequest.responseEventIds.at(-1) ?? ""
-            : "",
+          topology.endpointBoundary
+            .eventRequests()
+            .flatMap((request) => request.responseDurableEvents)
+            .filter((event) => event.name === "assistant_message_committed")
+            .at(-1)?.id ?? "",
         { timeout: 15_000, message: "offline session did not expose its durable final cursor" },
       )
       .toMatch(/^[0-9]+$/);
-    const originalCursor = initialEndpointRequest.responseEventIds.at(-1) ?? "";
-    expect(initialEndpointRequest.responseEventIds).toContain(originalCursor);
-    topology.recordCursor(originalCursor);
+    const committedFinalCursor = topology.endpointBoundary
+      .eventRequests()
+      .flatMap((request) => request.responseDurableEvents)
+      .filter((event) => event.name === "assistant_message_committed")
+      .at(-1)?.id ?? "";
+    expect(committedFinalCursor).toMatch(/^[0-9]+$/);
+    const publishedBeforeServerOutage = new Set(
+      topology.endpointBoundary.eventRequests().flatMap((request) => request.responseEventIds),
+    );
     const cursorCountBeforeServerOutage = sseRequests.length;
     await topology.server.stop();
     await topology.assertServerStoreHasNoSessionMirror();
@@ -2934,18 +3206,26 @@ test.describe("session reconnect and runtime states", () => {
         () =>
           sseRequests
             .slice(cursorCountBeforeServerOutage)
-            .find((request) => request.lastEventId.length > 0)?.lastEventId ?? "",
+            .find((request) => request.lastEventId.length > 0 && request.status === 200)
+            ?.lastEventId ?? "",
         {
           timeout: 15_000,
-          message: "Server outage recovery did not resume with the original cursor",
+          message: "Server outage recovery did not resume the Endpoint stream from a browser cursor",
         },
       )
-      .toBe(originalCursor);
-    const resumedBrowserRequest = await waitForExactBrowserSseRequest(
+      .toMatch(/^[0-9]+$/);
+    const resumedCursor = sseRequests
+      .slice(cursorCountBeforeServerOutage)
+      .filter((request) => request.lastEventId.length > 0 && request.status === 200)
+      .at(-1)?.lastEventId ?? "";
+    expect(publishedBeforeServerOutage.has(resumedCursor)).toBe(true);
+    expect(BigInt(resumedCursor)).toBeGreaterThanOrEqual(BigInt(committedFinalCursor));
+    topology.recordCursor(resumedCursor);
+    const resumedBrowserRequest = await waitForBrowserSseRequest(
       sseRequests,
       topology.endpointId,
       sessionId,
-      originalCursor,
+      resumedCursor,
       "offline resumed browser SSE",
     );
     const resumedEndpointRequest = await topology.endpointBoundary.waitForEventRequest(
@@ -2956,21 +3236,21 @@ test.describe("session reconnect and runtime states", () => {
     await expectOneDurableFinal(page, "OFFLINE_FINAL");
     await topology.endpoint.stop();
     await topology.assertEndpointUnreachableBarrier();
-    await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByText(/Endpoint (unreachable|unavailable)/i)).toBeVisible({ timeout: 30_000 });
     await expect(page.getByText(/Server unavailable/i)).toHaveCount(0);
     await expect(page.getByText("Agent failed", { exact: true })).toHaveCount(0);
     await expectOneDurableFinal(page, "OFFLINE_FINAL");
     await expect(page.getByRole("button", { name: "Send" })).toBeDisabled();
     expect(sseRequests[0]?.lastEventId).toBe("");
     await topology.endpoint.restart();
-    await expect(page.getByText("Live", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Send" })).toBeEnabled({ timeout: 15_000 });
     await recordSseResponseMarkers(topology, sseRequests, sessionId, "offline all runtime state");
   });
 
   test("e2e_browser_async_tool_wait_timeout_cancel_and_unknown_outcome_gate_safe_actions", async ({ page }) => {
     if (topology === undefined) throw new Error("test topology did not start");
-    await bootstrap(page, topology);
     const sseRequests = observeEventRequests(page, topology);
+    await bootstrap(page, topology);
     const cancelSessionId = await createSessionWithKeyboard(page, topology);
     topology.expectScenario(SCENARIOS.cancel, 1);
     await sendMessageWithKeyboard(page, `cancel path ${SCENARIOS.cancel}`);
@@ -2979,9 +3259,19 @@ test.describe("session reconnect and runtime states", () => {
     const cancelRow = page.getByRole("listitem", { name: new RegExp(`${TOOL}.*running`, "i") });
     await expect(cancelRow).toBeVisible();
     await expect(cancelRow.getByRole("button", { name: "Cancel tool" })).toBeEnabled();
+    const cancelResponsePromise = page.waitForResponse((response) => {
+      const path = new URL(response.url()).pathname;
+      return response.request().method() === "POST" && path.endsWith("/cancel");
+    });
     await cancelRow.getByRole("button", { name: "Cancel tool" }).click();
-    await expect(cancelRow).toContainText(/cancelled/i);
-    await expect(cancelRow.getByRole("button", { name: "Retry dispatch" })).toHaveCount(0);
+    const cancelResponse = await cancelResponsePromise;
+    expect(cancelResponse.status()).toBe(200);
+    expect((await cancelResponse.json() as { status?: string }).status).toBe("cancelled");
+    const cancelledRow = page.getByRole("listitem", {
+      name: new RegExp(`${TOOL}.*cancelled`, "i"),
+    });
+    await expect(cancelledRow).toBeVisible();
+    await expect(cancelledRow.getByRole("button", { name: "Retry dispatch" })).toHaveCount(0);
     await recordSseResponseMarkers(topology, sseRequests, cancelSessionId, "cancel runtime state");
     const waitSessionId = await createSessionWithKeyboard(page, topology);
     await sendMessageWithKeyboard(page, `wait path ${SCENARIOS.waitTimeout}`);
@@ -2990,13 +3280,15 @@ test.describe("session reconnect and runtime states", () => {
     await expect(page.getByText(/Waiting.*deadline/i)).toBeVisible();
     await topology.endpoint.stop();
     await topology.assertEndpointUnreachableBarrier();
-    await expect(page.getByText(/Endpoint (unreachable|unavailable)/i)).toBeVisible();
+    await expect(page.getByText(/Endpoint (unreachable|unavailable)/i)).toBeVisible({
+      timeout: 30_000,
+    });
     await expect(page.getByText(/Server unavailable/i)).toHaveCount(0);
     await expect(page.getByText(/Waiting.*deadline/i)).toBeVisible();
     await expect(page.getByText(/timed out/i)).toHaveCount(0);
     await expect(page.getByText("Agent failed", { exact: true })).toHaveCount(0);
     await topology.endpoint.restart();
-    await expect(page.getByText(/Endpoint online/i)).toBeVisible();
+    await expect(page.getByRole("button", { name: "Send" })).toBeEnabled({ timeout: 15_000 });
     await expect(page.getByText(/timed out/i)).toBeVisible({ timeout: 15_000 });
     await expectOneDurableFinal(page, "WAIT_TIMEOUT_FINAL");
     await recordSseResponseMarkers(topology, sseRequests, waitSessionId, "wait-timeout runtime state");
@@ -3009,18 +3301,117 @@ test.describe("session reconnect and runtime states", () => {
     await expect(runningUnknownRow).toBeVisible();
     await topology.endpoint.stop();
     await topology.assertEndpointUnreachableBarrier();
-    await expect(page.getByText(/Endpoint (unreachable|unavailable)/i)).toBeVisible();
+    await expect(page.getByText(/Endpoint (unreachable|unavailable)/i)).toBeVisible({
+      timeout: 30_000,
+    });
     await expect(page.getByText(/Server unavailable/i)).toHaveCount(0);
     await expect(runningUnknownRow).toContainText(/running/i);
     await expect(page.getByText("Agent failed", { exact: true })).toHaveCount(0);
     await topology.endpoint.restart();
-    const unknownRow = page.getByRole("listitem", { name: new RegExp(`${TOOL}.*unknown outcome`, "i") });
+    const unknownRow = page.getByRole("listitem", { name: `${TOOL}, unknown outcome`, exact: true });
     await expect(unknownRow).toBeVisible();
     await expect(unknownRow).toContainText(/Unable to determine tool outcome/i);
     await expect(unknownRow.getByRole("button", { name: "Cancel tool" })).toHaveCount(0);
     await expect(unknownRow.getByRole("button", { name: "Mark failed" })).toHaveCount(0);
-    await expect(unknownRow.getByRole("button", { name: "Reconcile tool outcome" })).toBeEnabled();
+    await expect(unknownRow.getByRole("button", { name: "Reconcile tool outcome" })).toHaveCount(0);
     await recordSseResponseMarkers(topology, sseRequests, unknownSessionId, "unknown-outcome runtime state");
+  });
+
+  test("e2e_browser_safe_deduplicated_retry_reconciles_unknown_tool_with_original_identity", async ({ page }) => {
+    if (topology === undefined) throw new Error("test topology did not start");
+    const sseRequests = observeEventRequests(page, topology);
+    await bootstrap(page, topology);
+    topology.expectScenario(SCENARIOS.safeReconcile, 2);
+    const sessionId = await createSessionWithKeyboard(page, topology);
+    await sendMessageWithKeyboard(page, `safe reconcile path ${SCENARIOS.safeReconcile}`);
+    await topology.provider.waitForScenario(SCENARIOS.safeReconcile);
+    await topology.tools.waitFor("safe");
+    const runningRow = page.getByRole("listitem", { name: new RegExp(`${TOOL}.*running`, "i") });
+    await expect(runningRow).toBeVisible();
+
+    await topology.endpoint.stop();
+    await topology.assertEndpointUnreachableBarrier();
+    await topology.endpoint.restart();
+
+    await expect
+      .poll(
+        async () => {
+          const response = await apiJson(
+            topology!.server.baseUrl,
+            topology!.accessAssertion,
+            `/v1/endpoints/${topology!.endpointId}/sessions/${sessionId}/tool-calls/safe-reconcile-tool-call`,
+          );
+          return response.body?.status ?? `http-${response.status}`;
+        },
+        { timeout: 15_000, message: "restarted Endpoint did not publish the durable unknown outcome" },
+      )
+      .toBe("unknown_outcome");
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible();
+
+    const unknownRow = page.getByRole("listitem", { name: `${TOOL}, unknown outcome`, exact: true });
+    await expect(unknownRow).toBeVisible({ timeout: 15_000 });
+    const reconcile = unknownRow.getByRole("button", { name: "Reconcile tool outcome" });
+    await expect(reconcile).toBeEnabled();
+    const reconcileResponsePromise = page.waitForResponse((response) => {
+      const path = new URL(response.url()).pathname;
+      return response.request().method() === "POST" && path.endsWith("/reconcile");
+    });
+    await reconcile.click();
+    const reconcileResponse = await reconcileResponsePromise;
+    expect(reconcileResponse.status()).toBe(200);
+    expect((await reconcileResponse.json() as { tool_call_id?: string }).tool_call_id).toBe(
+      "safe-reconcile-tool-call",
+    );
+
+    await withTimeout(
+      topology.tools.waitFor("safe", 2),
+      15_000,
+      `safe reconcile did not dispatch the original tool identity twice; bodies=${JSON.stringify(topology.tools.bodiesFor("safe"))}`,
+    );
+    await expect(
+      page.getByRole("listitem", { name: new RegExp(`${TOOL}.*completed`, "i") }),
+    ).toBeVisible({ timeout: 15_000 });
+    await expect
+      .poll(
+        async () => {
+          if (topology!.provider.count(SCENARIOS.safeReconcile) >= 2) return "provider-2";
+          const response = await apiJson(
+            topology!.server.baseUrl,
+            topology!.accessAssertion,
+            `/v1/endpoints/${topology!.endpointId}/sessions/${sessionId}`,
+          );
+          return JSON.stringify({
+            projection: response.body,
+            provider: topology!.provider.debugRequests(),
+          });
+        },
+        { timeout: 15_000, message: "safe reconcile completion did not wake a final model round" },
+      )
+      .toBe("provider-2");
+    await expectOneDurableFinal(page, "SAFE_RECONCILE_FINAL");
+
+    const toolRequests = topology.tools.bodiesFor("safe").map((body) => JSON.parse(body) as Json);
+    expect(toolRequests).toHaveLength(2);
+    expect(toolRequests.map((request) => request.tool_call_id)).toEqual([
+      "safe-reconcile-tool-call",
+      "safe-reconcile-tool-call",
+    ]);
+    expect(toolRequests.map((request) => request.tool_name)).toEqual([TOOL, TOOL]);
+    expect(toolRequests.map((request) => request.input)).toEqual([{ mode: "safe" }, { mode: "safe" }]);
+
+    const publicTool = requireBody(
+      await apiJson(
+        topology.server.baseUrl,
+        topology.accessAssertion,
+        `/v1/endpoints/${topology.endpointId}/sessions/${sessionId}/tool-calls/safe-reconcile-tool-call`,
+      ),
+      200,
+      "safe reconcile public tool projection",
+    );
+    expect(publicTool.status).toBe("completed");
+    expect(publicTool.tool_call_id).toBe("safe-reconcile-tool-call");
+    await recordSseResponseMarkers(topology, sseRequests, sessionId, "safe reconcile runtime state");
   });
 
   test("e2e_browser_tool_call_completion_replaces_transient_preamble", async ({ page }) => {
@@ -3057,44 +3448,48 @@ test.describe("session reconnect and runtime states", () => {
     }
   });
 
-  test("e2e_browser_mobile_collapsed_activity_rail_keeps_current_wait_tool_error_state", async ({ page }) => {
+  test("e2e_browser_mobile_collapsed_activity_rail_keeps_current_tool_error_state", async ({ page }) => {
     if (topology === undefined) throw new Error("test topology did not start");
-    await bootstrap(page, topology);
     const sseRequests = observeEventRequests(page, topology);
+    await bootstrap(page, topology);
     const sessionId = await createSessionWithKeyboard(page, topology);
     topology.expectScenario(SCENARIOS.mobile, 1);
     await sendMessageWithKeyboard(page, `mobile path ${SCENARIOS.mobile}`);
     await topology.provider.waitForScenario(SCENARIOS.mobile);
     await topology.tools.waitFor("unknown");
+    const runningToolRow = page.getByRole("listitem", { name: new RegExp(`${TOOL}.*running`, "i") });
+    await expect(runningToolRow).toBeVisible();
     await topology.endpoint.stop();
     await topology.assertEndpointUnreachableBarrier();
-    await expect(page.getByText(/Endpoint (unreachable|unavailable)/i)).toBeVisible();
+    await expect(page.getByText(/Endpoint (unreachable|unavailable)/i)).toBeVisible({
+      timeout: 30_000,
+    });
     await topology.endpoint.restart();
-    await expect(page.getByText(/Waiting.*deadline/i)).toBeVisible();
-    const unknownOutcomeRow = page.getByRole("listitem", { name: new RegExp(`${TOOL}.*unknown outcome`, "i") });
-    await expect(unknownOutcomeRow).toBeVisible();
+    const unknownOutcomeRow = page.getByRole("listitem", {
+      name: `${TOOL}, unknown outcome`,
+      exact: true,
+    });
+    await expect(unknownOutcomeRow).toBeVisible({ timeout: 15_000 });
     await expect(unknownOutcomeRow).toContainText(/Unable to determine tool outcome/i);
+    await expect(page.getByText(/Waiting.*deadline|Wait timed out/i)).toHaveCount(0);
     const widths = [320, 375, 414, 768];
     for (const width of widths) {
       await page.setViewportSize({ width, height: 800 });
       const toggle = page.getByRole("button", { name: "Activity" });
       if (await toggle.getAttribute("aria-expanded") === "true") {
-        await toggle.focus();
-        await page.keyboard.press("Enter");
+        await toggle.press("Enter");
       }
       await expect(toggle).toHaveAttribute("aria-expanded", "false");
-      await toggle.focus();
-      await page.keyboard.press("Enter");
+      await expect(unknownOutcomeRow).toBeVisible();
+      await expect(unknownOutcomeRow).toContainText(/Unable to determine tool outcome/i);
+      await expect(unknownOutcomeRow.getByRole("button", { name: "Reconcile tool outcome" })).toHaveCount(0);
+      await expect(unknownOutcomeRow.getByRole("button", { name: "Cancel tool" })).toHaveCount(0);
+      await expect(unknownOutcomeRow.getByRole("button", { name: "Mark failed" })).toHaveCount(0);
+      await toggle.press("Enter");
+      await expect(toggle).toHaveAttribute("aria-expanded", "true");
       const rail = page.getByRole("complementary", { name: "Activity" });
       await expect(rail).toBeVisible();
-      await expect(rail.getByText(/deadline/i)).toBeVisible();
-      await expect(rail.getByText(/unknown[_ ]outcome/i)).toBeVisible();
-      await expect(rail.getByRole("alert")).toContainText("Unable to determine tool outcome");
-      await expect(rail.getByRole("button", { name: "Reconcile tool outcome" })).toBeEnabled();
-      await expect(rail.getByRole("button", { name: "Cancel tool" })).toHaveCount(0);
-      await expect(rail.getByRole("button", { name: "Mark failed" })).toHaveCount(0);
-      await toggle.focus();
-      await page.keyboard.press("Enter");
+      await toggle.press("Enter");
       await expect(toggle).toHaveAttribute("aria-expanded", "false");
     }
     await recordSseResponseMarkers(topology, sseRequests, sessionId, "mobile runtime state");

@@ -126,16 +126,24 @@ test(E2E_NAME, async ({ page }) => {
   let primaryError;
   try {
     await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "What do you want to work on?", exact: true }),
+    ).toBeVisible();
     const session = await preseedSession(page, harness);
     await page.reload({ waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("link", { name: new RegExp(session.sessionId) })).toBeVisible();
+    await expect(
+      page.locator(
+        `a.sidebar-session-row[href="/endpoints/${session.endpointId}/sessions/${session.sessionId}"]`,
+      ),
+    ).toBeVisible();
     captureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 32 });
     await harness.endpoint.stop();
     try {
       await page.reload({ waitUntil: "domcontentloaded" });
-      await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
-      await expect(page.getByRole("button", { name: "New session", exact: true })).toBeDisabled();
+      await expect(
+        page.getByRole("heading", { name: "What do you want to work on?", exact: true }),
+      ).toBeVisible();
+      await expect(page.getByRole("button", { name: "Start session", exact: true })).toBeDisabled();
     } catch (error) {
       throw new ProductBehaviorFailure(CLASSIFICATION, FIRST_OBSERVED, {
         cause: error instanceof Error ? error.message : String(error),

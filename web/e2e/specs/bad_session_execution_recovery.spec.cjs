@@ -10,6 +10,10 @@ const {
   proxyHttp,
   startHttpServer,
 } = require("../support/harness.cjs");
+const {
+  expectSelectedExecutionProfile,
+  selectExecutionProfile,
+} = require("../support/radix.cjs");
 
 const E2E_NAME = "e2e_browser_bad_session_retains_history_and_offers_same_session_execution_recovery";
 const CLASSIFICATION = "BAD_SESSION_SAME_SESSION_RECOVERY_MISSING";
@@ -139,6 +143,30 @@ async function managementJson(page, method, requestPath, body) {
   }, { method, requestPath, body });
 }
 
+async function waitForProfileReady(page, provider, profileId, endpointId) {
+  await expect.poll(async () => {
+    const profiles = await managementJson(
+      page,
+      "GET",
+      `/v1/providers/${encodeURIComponent(provider)}/auth-profiles`,
+    );
+    if (profiles.status !== 200) return false;
+    const profile = profiles.body.items?.find(
+      (candidate) =>
+        candidate.auth_profile_id === profileId || candidate.profile_id === profileId,
+    );
+    const replica = profile?.distribution?.find(
+      (candidate) => candidate.endpoint_id === endpointId,
+    );
+    return (
+      profile?.status === "ready" &&
+      replica?.status === "ready" &&
+      replica.installed_revision !== null &&
+      replica.installed_revision >= profile.revision
+    );
+  }, { timeout: 20_000 }).toBe(true);
+}
+
 async function mutableEndpointProxy(harness) {
   let target = harness.endpoint;
   let subject;
@@ -193,19 +221,22 @@ async function restartEndpoint(harness) {
   });
 }
 
-async function assertRecoverySelection(recovery, expected) {
-  const actual = {
-    provider: await recovery.getByLabel("Provider").inputValue(),
-    model: await recovery.getByLabel("Model").inputValue(),
-    profileId: await recovery.getByLabel("Auth profile").inputValue(),
-  };
-  if (actual.provider !== expected.provider ||
-      actual.model !== expected.model ||
-      actual.profileId !== expected.profileId) {
+async function assertRecoverySelection(page, trigger, expected) {
+  try {
+    await expectSelectedExecutionProfile(
+      page,
+      trigger,
+      expected.model,
+      expected.profileLabel,
+    );
+  } catch (error) {
     throw new ProductBehaviorFailure(
       SELECTION_CLASSIFICATION,
       SELECTION_FIRST_OBSERVED,
-      { expected, actual },
+      {
+        expected,
+        cause: error instanceof Error ? error.message : String(error),
+      },
     );
   }
 }
@@ -268,6 +299,17 @@ async function preseedSession(page, harness, endpointBaseUrl) {
   expect(second.status).toBe(201);
   harness.ledger.add("recovery_profile", `${harness.providerSecret}-recovery`);
 
+  await Promise.all([
+    waitForProfileReady(
+      page,
+      DECOY_PROVIDER,
+      decoyProfile.body.auth_profile_id,
+      endpointId,
+    ),
+    waitForProfileReady(page, PROVIDER, first.body.auth_profile_id, endpointId),
+    waitForProfileReady(page, PROVIDER, second.body.auth_profile_id, endpointId),
+  ]);
+
   const session = await managementJson(page, "POST", `/v1/endpoints/${endpointId}/sessions`, {
     model: {
       provider: PROVIDER,
@@ -304,42 +346,18 @@ test(E2E_NAME, async ({ page }) => {
     authorityId: "web-e2e-bad-session-recovery",
   });
   const endpointProxy = await mutableEndpointProxy(harness);
-  await page.addInitScript(() => {
-    const NativeEventSource = window.__zodeNativeEventSource || window.EventSource;
-    window.__zodeNativeEventSource = NativeEventSource;
-    const sources = [];
-    window.__zodeBadSessionEventSources = sources;
-    if (window.localStorage.getItem("zode-bad-session-disable-event-source") === "1") {
-      window.EventSource = class extends EventTarget {
-        constructor() {
-          super();
-          this.readyState = 2;
-          this.url = "";
-          this.withCredentials = false;
-        }
-        close() {}
-      };
-    } else {
-      window.EventSource = class extends NativeEventSource {
-        constructor(...args) {
-          super(...args);
-          sources.push(this);
-        }
-      };
-    }
-  });
   let captureSetId;
   let controlCaptureSetId;
   let primaryError;
   try {
     await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "What do you want to work on?", exact: true })).toBeVisible();
     const session = await preseedSession(page, harness, endpointProxy.proxy.baseUrl);
     await page.goto(
       `${harness.managementUrl}/endpoints/${encodeURIComponent(session.endpointId)}/sessions/${encodeURIComponent(session.sessionId)}`,
       { waitUntil: "domcontentloaded" },
     );
-    await expect(page.getByRole("heading", { name: MODEL, exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Choose model", exact: true })).toBeVisible();
     const messagePath = `/v1/endpoints/${encodeURIComponent(session.endpointId)}/sessions/${encodeURIComponent(session.sessionId)}/messages`;
     const message = await managementJson(page, "POST", messagePath, {
       content: "history before execution recovery",
@@ -347,17 +365,21 @@ test(E2E_NAME, async ({ page }) => {
     expect(message.status).toBe(202);
     await expect.poll(async () => page.evaluate(async (requestPath) => {
       const response = await fetch(requestPath, { headers: { accept: "application/json" } });
-      if (!response.ok) return false;
+      if (!response.ok) return { user: 0, assistant: 0 };
       const body = await response.json();
-      return body.transcript?.some((item) => item.content === "history before execution recovery") === true;
+      const transcript = Array.isArray(body.transcript) ? body.transcript : [];
+      return {
+        user: transcript.filter(
+          (item) => item.role === "user" && item.content === "history before execution recovery",
+        ).length,
+        assistant: transcript.filter(
+          (item) => item.role === "assistant" && item.content === "E2E_OK",
+        ).length,
+      };
     }, `/v1/endpoints/${encodeURIComponent(session.endpointId)}/sessions/${encodeURIComponent(session.sessionId)}`), {
       timeout: 20_000,
-    }).toBe(true);
-    await page.evaluate(() => {
-      window.localStorage.setItem("zode-bad-session-disable-event-source", "1");
-      for (const source of window.__zodeBadSessionEventSources || []) source.close();
-    });
-    captureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 64 });
+    }).toEqual({ user: 1, assistant: 1 });
+    captureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 128 });
     const deleted = await page.evaluate(async ({ provider, profileId }) => {
       const response = await fetch(
         `/v1/providers/${encodeURIComponent(provider)}/auth-profiles/${encodeURIComponent(profileId)}`,
@@ -372,22 +394,17 @@ test(E2E_NAME, async ({ page }) => {
 
     try {
       await page.reload({ waitUntil: "domcontentloaded" });
-      await expect(page.getByRole("heading", { name: MODEL, exact: true })).toBeVisible();
-      await expect(page.getByText("history before execution recovery", { exact: true })).toBeVisible();
-      const recovery = page.locator("form.session-execution-recovery");
-      await expect(recovery.getByRole("heading", { name: "Recover session execution", exact: true })).toBeVisible();
-      await recovery.getByLabel("Provider").selectOption(PROVIDER);
-      await recovery.getByLabel("Model").selectOption(MODEL);
-      await recovery.getByLabel("Auth profile").selectOption({ label: "Recovery session profile" });
+      await expect(page.getByLabel("You").getByText("history before execution recovery", { exact: true })).toBeVisible();
+      const trigger = page.getByRole("button", { name: "Choose execution", exact: true });
+      await expect(trigger).toHaveAttribute("data-zode-execution-state", "needs-recovery");
       const modelResponse = page.waitForResponse((response) =>
         response.request().method() === "PUT" &&
         new URL(response.url()).pathname ===
           `/v1/endpoints/${session.endpointId}/sessions/${session.sessionId}/model`,
       );
-      await recovery.getByRole("button", { name: "Apply execution", exact: true }).click();
+      await selectExecutionProfile(page, trigger, MODEL, "Recovery session profile");
       expect((await modelResponse).status()).toBe(202);
-      await expect(page.getByText("Session execution updated. Existing history was preserved.", { exact: true })).toBeVisible();
-      await page.evaluate(() => window.localStorage.removeItem("zode-bad-session-disable-event-source"));
+      await expect(page.getByText("Execution updated. This session and its history were preserved.", { exact: true })).toBeVisible();
       const advancedDescriptor = await managementJson(page, "PUT", `/v1/providers/${PROVIDER}`, {
         kind: "openai_compatible",
         base_url: `${harness.providerProxy.baseUrl}/v1`,
@@ -396,38 +413,71 @@ test(E2E_NAME, async ({ page }) => {
       });
       expect(advancedDescriptor.status).toBe(200);
       await page.reload({ waitUntil: "domcontentloaded" });
-      await expect(page.getByRole("heading", { name: MODEL, exact: true })).toBeVisible();
-      await expect(page.getByText(`${PROVIDER} · ${MODEL}`, { exact: true })).toBeVisible();
-      const recoveredForm = page.locator("form.session-execution-recovery");
+      await expect(page.getByLabel("You").getByText("history before execution recovery", { exact: true })).toBeVisible();
+      const currentTrigger = page.getByRole("button", { name: "Choose execution", exact: true });
       const sessionPath =
         `/v1/endpoints/${encodeURIComponent(session.endpointId)}/sessions/${encodeURIComponent(session.sessionId)}`;
-      await page.evaluate(() => {
-        for (const source of window.__zodeBadSessionEventSources || []) source.close();
+      const sessionUrl =
+        `${harness.managementUrl}/endpoints/${encodeURIComponent(session.endpointId)}/sessions/${encodeURIComponent(session.sessionId)}`;
+      await assertRecoverySelection(page, currentTrigger, {
+        provider: PROVIDER,
+        model: MODEL,
+        profileLabel: "Recovery session profile",
       });
+      await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
+      await expect(page.getByRole("heading", { name: "What do you want to work on?", exact: true })).toBeVisible();
+      await page.goto("about:blank");
       await harness.journal.waitForIdle(15_000);
       harness.journal.flushCaptureSet(captureSetId);
-      captureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 8 });
+      captureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 128 });
+      await page.goto(`${harness.managementUrl}${sessionPath}`, { waitUntil: "domcontentloaded" });
+      await expect.poll(async () => page.evaluate(async (requestPath) => {
+        const response = await fetch(requestPath, { headers: { accept: "application/json" } });
+        if (!response.ok) return { status: response.status };
+        const body = await response.json();
+        const transcript = Array.isArray(body.transcript) ? body.transcript : [];
+        return {
+          status: response.status,
+          sessionStatus: body.status,
+          activeActivation: body.active_activation ?? null,
+          activeModelRound: body.active_model_round ?? null,
+          user: transcript.filter(
+            (item) => item.role === "user" && item.content === "history before execution recovery",
+          ).length,
+          assistant: transcript.filter(
+            (item) => item.role === "assistant" && item.content === "E2E_OK",
+          ).length,
+        };
+      }, sessionPath), { timeout: 20_000 }).toEqual({
+        status: 200,
+        sessionStatus: "idle",
+        activeActivation: null,
+        activeModelRound: null,
+        user: 1,
+        assistant: 1,
+      });
       const beforeNoop = await managementJson(page, "GET", sessionPath);
-      expect(beforeNoop.status).toBe(200);
+      expect(beforeNoop.status, "beforeNoop session read").toBe(200);
       expect(beforeNoop.body.session_id).toBe(session.sessionId);
       expect(advancedDescriptor.body.revision)
         .toBeGreaterThan(beforeNoop.body.model.provider_execution_revision);
-      await assertRecoverySelection(recoveredForm, {
-        provider: PROVIDER,
-        model: MODEL,
-        profileId: session.recoveryProfileId,
-      });
       harness.journal.flushCaptureSet(captureSetId);
       controlCaptureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 16 });
-      captureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 64 });
+      captureSetId = harness.beginCaptureSet({ e2eName: E2E_NAME, maxMembers: 128 });
       endpointProxy.setCaptureSetId(controlCaptureSetId);
-      await expect(recoveredForm.getByLabel("Auth profile").locator("option:checked"))
-        .toHaveText("Recovery session profile");
-      await recoveredForm.getByRole("button", { name: "Apply execution", exact: true }).click();
-      await expect(page.getByRole("status")).toContainText("Existing history was preserved.");
+      await page.goto(sessionUrl, { waitUntil: "domcontentloaded" });
+      await expect(page.getByLabel("You").getByText("history before execution recovery", { exact: true })).toBeVisible();
+      const recoveredTrigger = page.getByRole("button", { name: "Choose execution", exact: true });
+      await selectExecutionProfile(page, recoveredTrigger, MODEL, "Recovery session profile");
+      await expect(
+        page.getByText("Session execution is already current. Existing history was preserved.", { exact: true }),
+      ).toBeVisible();
       const afterNoop = await managementJson(page, "GET", sessionPath);
-      expect(afterNoop.status).toBe(200);
+      expect(afterNoop.status, "afterNoop session read").toBe(200);
       expect(afterNoop.body.session_id).toBe(session.sessionId);
+      await page.goto(`${harness.managementUrl}/`, { waitUntil: "domcontentloaded" });
+      await expect(page.getByRole("heading", { name: "What do you want to work on?", exact: true })).toBeVisible();
+      await page.goto("about:blank");
       await harness.journal.waitForIdle(15_000);
       endpointProxy.setCaptureSetId(undefined);
       harness.journal.flushCaptureSet(controlCaptureSetId);
@@ -446,22 +496,48 @@ test(E2E_NAME, async ({ page }) => {
         );
       }
       expect(afterNoop.body.transcript).toEqual(beforeNoop.body.transcript);
+      await page.goto(sessionUrl, { waitUntil: "domcontentloaded" });
+      await expect(page.getByLabel("You").getByText("history before execution recovery", { exact: true })).toBeVisible();
       await page.reload({ waitUntil: "domcontentloaded" });
-      await expect(page.getByRole("heading", { name: MODEL, exact: true })).toBeVisible();
+      await expect(page.getByLabel("You").getByText("history before execution recovery", { exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Send", exact: true })).toBeEnabled({
+        timeout: 30_000,
+      });
       const messageInput = page.getByRole("textbox", { name: "Message", exact: true });
       await messageInput.fill("continue after execution recovery");
       await messageInput.press("Enter");
-      await expect(page.getByText("E2E_OK", { exact: true })).toBeVisible({ timeout: 30_000 });
+      await expect(page.getByText("E2E_OK", { exact: true })).toHaveCount(2, {
+        timeout: 30_000,
+      });
       await expect.poll(async () => page.evaluate(async (requestPath) => {
         const response = await fetch(requestPath, { headers: { accept: "application/json" } });
-        if (!response.ok) return false;
+        if (!response.ok) return { status: response.status };
         const body = await response.json();
-        return body.transcript?.some((item) => item.role === "assistant" && item.content === "E2E_OK") === true;
+        const transcript = Array.isArray(body.transcript) ? body.transcript : [];
+        return {
+          status: response.status,
+          sessionStatus: body.status,
+          activeActivation: body.active_activation ?? null,
+          activeModelRound: body.active_model_round ?? null,
+          continuedUser: transcript.filter(
+            (item) => item.role === "user" && item.content === "continue after execution recovery",
+          ).length,
+          assistant: transcript.filter(
+            (item) => item.role === "assistant" && item.content === "E2E_OK",
+          ).length,
+        };
       }, `/v1/endpoints/${encodeURIComponent(session.endpointId)}/sessions/${encodeURIComponent(session.sessionId)}`), {
         timeout: 20_000,
-      }).toBe(true);
+      }).toEqual({
+        status: 200,
+        sessionStatus: "idle",
+        activeActivation: null,
+        activeModelRound: null,
+        continuedUser: 1,
+        assistant: 2,
+      });
       const beforeRestart = await managementJson(page, "GET", sessionPath);
-      expect(beforeRestart.status).toBe(200);
+      expect(beforeRestart.status, "beforeRestart session read").toBe(200);
       expect(beforeRestart.body.session_id).toBe(session.sessionId);
       await harness.restartServer();
       const restartedEndpoint = await restartEndpoint(harness);
@@ -474,21 +550,24 @@ test(E2E_NAME, async ({ page }) => {
       );
       await expect(page.getByText("continue after execution recovery", { exact: true })).toBeVisible();
       await expect(page.getByText("E2E_OK", { exact: true })).toHaveCount(2, { timeout: 20_000 });
-      await expect(page.getByText(`${PROVIDER} · ${MODEL}`, { exact: true })).toBeVisible();
-      await assertRecoverySelection(page.locator("form.session-execution-recovery"), {
+      const restartedTrigger = page.getByRole("button", { name: "Choose execution", exact: true });
+      await expect(restartedTrigger).toHaveAttribute("data-zode-execution-state", "needs-recovery");
+      await assertRecoverySelection(page, restartedTrigger, {
         provider: PROVIDER,
         model: MODEL,
-        profileId: session.recoveryProfileId,
+        profileLabel: "Recovery session profile",
       });
       const afterRestart = await managementJson(page, "GET", sessionPath);
-      expect(afterRestart.status).toBe(200);
+      expect(afterRestart.status, "afterRestart session read").toBe(200);
       expect(afterRestart.body.session_id).toBe(session.sessionId);
       expect(afterRestart.body.model).toEqual(beforeRestart.body.model);
       expect(afterRestart.body.transcript).toEqual(beforeRestart.body.transcript);
+      await harness.journal.waitForQuiescent(15_000);
     } catch (error) {
       if (error instanceof ProductBehaviorFailure) throw error;
       const cause = error instanceof Error ? error.message : String(error);
-      throw new ProductBehaviorFailure(CLASSIFICATION, FIRST_OBSERVED, {
+      const safeCause = harness.ledger.redact(cause);
+      throw new ProductBehaviorFailure(CLASSIFICATION, `${FIRST_OBSERVED}; cause=${safeCause}`, {
         cause,
         sessionId: session.sessionId,
         endpointId: session.endpointId,
@@ -498,13 +577,17 @@ test(E2E_NAME, async ({ page }) => {
     primaryError = error;
   } finally {
     try {
-      await page.evaluate(() => {
-        for (const source of window.__zodeBadSessionEventSources || []) source.close();
-      });
+      await page.close();
+      await endpointProxy.close();
+      await harness.server.stop();
+      await harness.edge.close();
       await harness.journal.waitForIdle(15_000);
       endpointProxy.setCaptureSetId(undefined);
       if (controlCaptureSetId) harness.journal.flushCaptureSet(controlCaptureSetId);
-      if (!captureSetId) throw new Error("bad-session recovery capture was not armed");
+      if (!captureSetId) {
+        if (!primaryError) throw new Error("bad-session recovery capture was not armed");
+        throw primaryError;
+      }
       const records = recordsFor(harness, captureSetId);
       const firstFailure = primaryError?.classification === NOOP_DESCRIPTOR_CLASSIFICATION
         ? records.find((record) =>
@@ -565,11 +648,6 @@ test(E2E_NAME, async ({ page }) => {
       }
     } catch (captureError) {
       primaryError = captureError;
-    }
-    try {
-      await page.close();
-    } catch (pageError) {
-      primaryError ||= pageError;
     }
     for (const resource of [harness.endpoint, harness.server, harness.edge, harness.callbackEdge]) {
       try {
