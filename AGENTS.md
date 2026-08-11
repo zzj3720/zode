@@ -465,18 +465,19 @@ work. Do not delay an absent public capability to broaden an adversarial matrix
 unless current evidence shows ordinary use would lose, misroute, or disclose
 state.
 
-Review findings are regressions, not prose-only cleanup. Before fixing any
-behavioral finding discovered during development, construct a black-box E2E
-that fails through the owning real process/browser and public HTTP/SSE entry,
-then make it pass. If the required process or route does not exist,
-implementing that smallest real entry and the red E2E comes before the fix.
-Source inspection, a plausible race, stronger-test advice, or a reviewer risk
-argument is not an accepted behavioral finding by itself and cannot block an
-otherwise-ready delivery. If the claimed behavior cannot be made stably red
-through that public E2E, reject the finding and do not change production code
-for it.
-Compiler, formatter, lint, and architectural type-boundary failures remain
-mandatory static gates; they do not justify adding a non-E2E test.
+Review findings are regressions, not prose-only cleanup. Every review finding
+must be demonstrated first by a named black-box E2E that fails through the
+owning real process/browser and public HTTP/SSE entry. The reviewer may inspect
+source to design that E2E, but may not report the finding, block delivery, or
+cause a production change until the stable red exists. If the required process
+or route does not exist, implementing that smallest real entry and the red E2E
+comes before the review finding. Source inspection, a plausible race,
+stronger-test advice, or a reviewer risk argument is not a finding. If the
+claimed failure cannot be made stably red through that public E2E, the review
+returns no finding for it and production code remains unchanged. Compiler,
+formatter, lint, and architectural type-boundary failures remain mandatory
+static gate results rather than review findings; they do not justify adding a
+non-E2E test.
 
 ### First-occurrence replay evidence
 
@@ -570,10 +571,10 @@ fabricate or relabel a later capture as the historical first occurrence.
 - Use a separate adversarial reviewer for each substantial task or PR. A reviewer
   reports concrete correctness, recovery, security, simplicity, or operability
   findings and does not silently patch the implementation it reviews.
-- Every behavioral review finding must state a constructible public red E2E.
-  The review finding is accepted only after that E2E stably demonstrates the
-  claimed failure against the running product. A finding without such a red is
-  rejected, does not block merge, and must not cause a production change.
+- Every review finding must attach a named public red E2E and stable failure
+  evidence before it is reported. A review that cannot produce that red returns
+  no finding for the claim; it does not block merge and must not cause a
+  production change.
   Production workers and reviewers may not rewrite a frozen E2E to fit their
   preferred implementation.
 - Send the fix back to the same reviewer until its findings converge, then use

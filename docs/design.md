@@ -897,15 +897,16 @@ Development order is strict:
 3. the assigned implementation worker changes only the authoritative
    production path until it passes;
 4. the same independent adversarial reviewer re-reviews the module;
-5. every new behavioral finding returns to step 2 before any fix;
+5. every proposed review finding returns to step 2 and is not a finding until
+   its named public E2E is stably red;
 6. the main agent performs the final cross-module architecture, full E2E,
    static-gate, diff, and code-size review.
 
 An implementation worker or reviewer may not weaken, skip, internally bypass,
-or rewrite a red E2E to fit a fix. Build failures and purely static dependency
-violations use compiler/lint/architecture gates; any issue observable through a
-running product requires its own red E2E first. Reviewer prose, source-level
-risk, or a request for stronger coverage is not a behavioral finding and cannot
-block delivery until the claimed behavior is stably red through that real
-public path. If no such red can be constructed, reject the finding and do not
-change production behavior for it.
+or rewrite a red E2E to fit a fix. Every review finding must first be stably red
+through its named real public E2E; without that red there is no finding, no
+merge block, and no production change. Reviewer prose, source-level risk, a
+plausible race, or a request for stronger coverage may guide construction of an
+E2E but cannot itself enter the product defect ledger. Build failures and purely
+static dependency violations remain compiler/lint/architecture gate results,
+not review findings.
