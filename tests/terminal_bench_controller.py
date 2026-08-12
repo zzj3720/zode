@@ -381,6 +381,7 @@ class Controller:
         self.tasks_root = Path(self.config["tasks_root"])
         self.zode_root = Path(self.config["zode_root"])
         self.auth_file = Path(self.config["auth_file"])
+        self.pi_runtime_root = Path(self.config["pi_runtime_root"])
         self.harbor = Path(self.config["harbor"])
         self.jobs_root = self.run_root / "jobs"
         self.logs_root = self.run_root / "logs"
@@ -413,6 +414,18 @@ class Controller:
             raise RuntimeError("benchmark auth file is missing or not 0600")
         if not self.harbor.is_file():
             raise RuntimeError("Harbor executable is unavailable")
+        if (
+            not (self.pi_runtime_root / "bin" / "node").is_file()
+            or not (self.pi_runtime_root / "bin" / "pi").exists()
+        ):
+            raise RuntimeError("pinned Pi runtime is unavailable")
+        if (
+            sha256(self.pi_runtime_root / "bin" / "node")
+            != self.config["pi_runtime_node_sha256"]
+            or sha256(self.pi_runtime_root / "bin" / "pi")
+            != self.config["pi_runtime_cli_sha256"]
+        ):
+            raise RuntimeError("pinned Pi runtime changed")
         if (self.zode_root / ".git").exists():
             revision = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
@@ -501,7 +514,13 @@ class Controller:
     def update_control(self, value: Any) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise TypeError("control body must be an object")
-        allowed = {"paused", "max_groups", "capacity_cpus", "capacity_memory_mb"}
+        allowed = {
+            "paused",
+            "max_groups",
+            "capacity_cpus",
+            "capacity_memory_mb",
+            "retry_lanes",
+        }
         unknown = set(value) - allowed
         if unknown:
             raise ValueError(f"unknown control fields: {sorted(unknown)}")
@@ -520,11 +539,30 @@ class Controller:
                 or value[field] < 1
             ):
                 raise ValueError(f"{field} must be a positive integer")
+        retry_lanes = value.get("retry_lanes", [])
+        if (
+            not isinstance(retry_lanes, list)
+            or any(
+                isinstance(lane, bool)
+                or not isinstance(lane, int)
+                or not 1 <= lane <= MAX_WORKERS
+                for lane in retry_lanes
+            )
+            or len(set(retry_lanes)) != len(retry_lanes)
+        ):
+            raise ValueError("retry_lanes must contain unique lane numbers 1 through 3")
 
         def mutation(queue: dict[str, Any]) -> dict[str, Any]:
-            for field in allowed:
+            for field in allowed - {"retry_lanes"}:
                 if field in value:
                     queue["control"][field] = value[field]
+            for lane in retry_lanes:
+                lease = queue["leases"].get(str(lane))
+                if lease is None or lease.get("attention") is None:
+                    raise ValueError(f"lane {lane} has no failed pair to retry")
+                if lease.get("active_pair") is not None:
+                    raise ValueError(f"lane {lane} still has an active pair")
+                lease["attention"] = None
             queue["control"]["changed_at"] = now()
             return dict(queue["control"])
 
@@ -827,7 +865,13 @@ class Controller:
                         "source": str(self.auth_file),
                         "target": "/run/zode-benchmark/opencode-auth.json",
                         "read_only": True,
-                    }
+                    },
+                    {
+                        "type": "bind",
+                        "source": str(self.pi_runtime_root),
+                        "target": "/opt/zode-pi-runtime",
+                        "read_only": True,
+                    },
                 ],
                 separators=(",", ":"),
             )
@@ -1277,11 +1321,17 @@ def initialize_run(args: argparse.Namespace) -> None:
     tasks_root = args.tasks_root.resolve()
     zode_root = args.zode_root.resolve()
     auth_file = args.auth_file.resolve()
+    pi_runtime_root = args.pi_runtime_root.resolve()
     harbor = args.harbor.resolve()
     if not auth_file.is_file() or stat.S_IMODE(auth_file.stat().st_mode) != 0o600:
         raise RuntimeError("benchmark auth file is missing or not 0600")
     if not harbor.is_file():
         raise RuntimeError("Harbor executable is unavailable")
+    if (
+        not (pi_runtime_root / "bin" / "node").is_file()
+        or not (pi_runtime_root / "bin" / "pi").exists()
+    ):
+        raise RuntimeError("pinned Pi runtime is unavailable")
     tasks = load_tasks(tasks_root)
     if (zode_root / ".git").exists():
         revision = subprocess.run(
@@ -1318,6 +1368,9 @@ def initialize_run(args: argparse.Namespace) -> None:
         "tasks_root": str(tasks_root),
         "zode_root": str(zode_root),
         "auth_file": str(auth_file),
+        "pi_runtime_root": str(pi_runtime_root),
+        "pi_runtime_node_sha256": sha256(pi_runtime_root / "bin" / "node"),
+        "pi_runtime_cli_sha256": sha256(pi_runtime_root / "bin" / "pi"),
         "harbor": str(harbor),
         "api_port": args.api_port,
         "zode_revision": revision,
@@ -1370,6 +1423,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zode-root", type=Path)
     parser.add_argument("--zode-revision")
     parser.add_argument("--auth-file", type=Path)
+    parser.add_argument("--pi-runtime-root", type=Path)
     parser.add_argument(
         "--harbor", type=Path, default=Path("/Users/zuozijian/.local/bin/harbor")
     )
@@ -1380,9 +1434,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-paused", action="store_true")
     args = parser.parse_args()
     if args.initialize and any(
-        value is None for value in (args.tasks_root, args.zode_root, args.auth_file)
+        value is None
+        for value in (
+            args.tasks_root,
+            args.zode_root,
+            args.auth_file,
+            args.pi_runtime_root,
+        )
     ):
-        parser.error("--initialize requires --tasks-root, --zode-root, and --auth-file")
+        parser.error(
+            "--initialize requires --tasks-root, --zode-root, --auth-file, "
+            "and --pi-runtime-root"
+        )
     if args.initialize_only and not args.initialize:
         parser.error("--initialize-only requires --initialize")
     return args

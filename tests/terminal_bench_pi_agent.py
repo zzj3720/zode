@@ -11,6 +11,8 @@ from harbor.models.agent.context import AgentContext
 
 PROVIDER_BASE_URL = "https://opencode.ai/zen/go/v1"
 CONTAINER_AUTH_FILE = "/run/zode-benchmark/opencode-auth.json"
+PI_RUNTIME_BIN = "/opt/zode-pi-runtime/bin"
+PI_VERSION = "0.73.1"
 
 
 class PiTerminalBenchAgent(Pi):
@@ -22,6 +24,15 @@ class PiTerminalBenchAgent(Pi):
 
     def version(self) -> str | None:
         return super().version()
+
+    async def install(self, environment: BaseEnvironment) -> None:
+        await self.exec_as_agent(
+            environment,
+            command=(
+                f"export PATH={PI_RUNTIME_BIN}:$PATH; "
+                f'test "$(pi --version)" = "{PI_VERSION}"'
+            ),
+        )
 
     @with_prompt_template
     async def run(
@@ -87,7 +98,7 @@ class PiTerminalBenchAgent(Pi):
         await self.exec_as_agent(
             environment,
             command=(
-                ". ~/.nvm/nvm.sh; "
+                f"export PATH={PI_RUNTIME_BIN}:$PATH; "
                 "pi --print --mode json --session-dir /logs/agent/pi/sessions "
                 f"{resume_flag}"
                 "--provider zode-opencode-go --model deepseek-v4-flash "
