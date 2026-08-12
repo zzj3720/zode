@@ -56,7 +56,7 @@ pub(super) fn materialize_boundary_blocking(
             SessionEvent::DeliveryAcknowledged { through_queue_id },
         ));
         let command_id = format!("delivery-boundary:v1:{through_queue_id}");
-        match store.append_verified_owned(owner, session_id, &state, &command_id, &drafts) {
+        match store.append_verified_owned(owner, session_id, state, &command_id, &drafts) {
             Ok(appended) => return Ok((Some(appended.append), appended.state)),
             Err(StoreError::OptimisticConcurrency { .. }) => {
                 state = store
@@ -153,6 +153,14 @@ pub(super) fn append_tool_batch_blocking(
         dedupe_key: Some(command_id.clone()),
         source_queue_id: None,
     };
+    let definitions_by_name = definitions
+        .iter()
+        .map(|definition| (definition.name.as_str(), definition))
+        .collect::<HashMap<_, _>>();
+    let callback_plans_by_id = callback_plans
+        .iter()
+        .map(|plan| (plan.tool_call_id.as_str(), plan))
+        .collect::<HashMap<_, _>>();
     for _ in 0..16 {
         if let Some(existing) = state
             .transcript
@@ -176,14 +184,6 @@ pub(super) fn append_tool_batch_blocking(
             return Ok((replayed_append(session_id, &command_id, &state), state));
         }
         let started_at_ms = current_time_ms();
-        let definitions = definitions
-            .iter()
-            .map(|definition| (definition.name.as_str(), definition))
-            .collect::<HashMap<_, _>>();
-        let callback_plans = callback_plans
-            .iter()
-            .map(|plan| (plan.tool_call_id.as_str(), plan))
-            .collect::<HashMap<_, _>>();
         let mut drafts = vec![EventDraft::new(
             format!("model-tool-batch-assistant-event:v1:{identity}"),
             SessionEvent::MessageAppended {
@@ -195,7 +195,7 @@ pub(super) fn append_tool_batch_blocking(
             .iter()
             .filter(|call| call.tool_name != WAIT_FOR_TOOL_NAME)
         {
-            let definition = definitions.get(call.tool_name.as_str());
+            let definition = definitions_by_name.get(call.tool_name.as_str());
             let record = AsyncToolCallRecord {
                 tool_call_id: call.tool_call_id.clone(),
                 tool_name: call.tool_name.clone(),
@@ -225,7 +225,7 @@ pub(super) fn append_tool_batch_blocking(
             if definition.is_some_and(|definition| {
                 definition.completion_mode == CompletionMode::ExternalCallback
             }) {
-                let Some(plan) = callback_plans.get(call.tool_call_id.as_str()) else {
+                let Some(plan) = callback_plans_by_id.get(call.tool_call_id.as_str()) else {
                     return Err("tool_batch_callback_plan");
                 };
                 drafts.push(EventDraft::new(
@@ -245,7 +245,7 @@ pub(super) fn append_tool_batch_blocking(
                 },
             ));
         }
-        match store.append_verified_owned(owner, session_id, &state, &command_id, &drafts) {
+        match store.append_verified_owned(owner, session_id, state, &command_id, &drafts) {
             Ok(appended) => return Ok((appended.append, appended.state)),
             Err(StoreError::OptimisticConcurrency { .. }) => {
                 state = store
@@ -492,7 +492,7 @@ pub(super) fn append_tool_results_blocking(
             ));
         }
         let command_id = format!("tool-results-command:v1:{batch_identity}");
-        match store.append_verified_owned(owner, session_id, &state, &command_id, &drafts) {
+        match store.append_verified_owned(owner, session_id, state, &command_id, &drafts) {
             Ok(appended) => return Ok((appended.append, appended.state)),
             Err(StoreError::OptimisticConcurrency { .. }) => {
                 state = store
@@ -800,7 +800,7 @@ pub(super) fn append_assistant_blocking(
                 wake_wait: false,
             },
         ));
-        match store.append_verified_owned(owner, session_id, &state, &command_id, &drafts) {
+        match store.append_verified_owned(owner, session_id, state, &command_id, &drafts) {
             Ok(appended) => return Ok((appended.append, appended.state)),
             Err(StoreError::OptimisticConcurrency { .. }) => {
                 state = store

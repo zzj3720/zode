@@ -1,18 +1,30 @@
 use super::*;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ModelRequest {
     pub owner: SessionOwner,
     pub session_id: String,
     pub activation_id: String,
     pub round_id: String,
     pub selection: SessionModelSelection,
-    pub transcript: Vec<TranscriptMessage>,
-    pub tools: Vec<ToolDefinition>,
+    pub transcript: Arc<Vec<TranscriptMessage>>,
+    pub tools: Arc<Vec<ToolDefinition>>,
+    pub(crate) prompt_fingerprint: String,
+    pub(crate) tool_schema_fingerprint: String,
     pub max_output_tokens: Option<u32>,
     pub handoff_document_tokens: Option<u32>,
     pub stream_idle_timeout: Duration,
     pub stream_observer: Arc<dyn ModelStreamObserver>,
+}
+
+pub(super) struct PreparedConversationContext {
+    transcript: Arc<Vec<TranscriptMessage>>,
+    tools: Arc<Vec<ToolDefinition>>,
+    local_input_estimate_tokens: u64,
+    estimated_input_tokens: u64,
+    selection_fingerprint: String,
+    prompt_fingerprint: String,
+    tool_schema_fingerprint: String,
 }
 
 pub(super) const MAX_CONTEXT_HANDOFF_DOCUMENT_TOKENS: u32 = 60 * 1024;
@@ -52,7 +64,7 @@ struct PreparedModelRequestInput<'a> {
 pub trait ModelExecutor: Send + Sync {
     fn complete<'a>(
         &'a self,
-        request: ModelRequest,
+        request: &'a ModelRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ModelOutcome, ModelError>> + Send + 'a>>;
 }
 
@@ -254,17 +266,13 @@ impl Runtime {
         let mut attempt_number = request_identity.attempt_number;
         let mut attempt_id = request_identity.attempt_id.clone();
         loop {
-            let completion = self
-                .model
-                .complete(request.clone())
-                .await
-                .and_then(|value| {
-                    if validate_tool_calls(&value.tool_calls, &request.tools).is_ok() {
-                        Ok(value)
-                    } else {
-                        Err(ModelError::InvalidToolArguments)
-                    }
-                });
+            let completion = self.model.complete(&request).await.and_then(|value| {
+                if validate_tool_calls(&value.tool_calls, &request.tools).is_ok() {
+                    Ok(value)
+                } else {
+                    Err(ModelError::InvalidToolArguments)
+                }
+            });
             match completion {
                 Ok(outcome) => {
                     return Ok(PreparedModelExecution {
@@ -477,18 +485,57 @@ impl Runtime {
             .await
     }
 
+    fn prepare_conversation_context(
+        &self,
+        state: &VerifiedSessionState,
+        selection: &SessionModelSelection,
+        cache: &mut ProviderContextCache,
+    ) -> Result<PreparedConversationContext, &'static str> {
+        let mut tools = self
+            .tools
+            .definitions(&state.selection.tools)
+            .map_err(|_| "tool_selection")?;
+        tools.extend(provider_runtime_tool_definitions(state));
+        let tools = Arc::new(tools);
+        let (transcript, transcript_json) = cache.prepare(state)?;
+        let metrics = model_context_metrics_from_serialized_transcript(
+            transcript_json,
+            transcript.len(),
+            &tools,
+        )?;
+        let selection_fingerprint = model_selection_fingerprint(selection)?;
+        let estimated_input_tokens = estimated_model_input_tokens_from_metrics(
+            state,
+            &transcript,
+            &selection_fingerprint,
+            &metrics.tool_schema_fingerprint,
+            metrics.local_input_estimate_tokens,
+        )?;
+        Ok(PreparedConversationContext {
+            transcript,
+            tools,
+            local_input_estimate_tokens: metrics.local_input_estimate_tokens,
+            estimated_input_tokens,
+            selection_fingerprint,
+            prompt_fingerprint: metrics.prompt_fingerprint,
+            tool_schema_fingerprint: metrics.tool_schema_fingerprint,
+        })
+    }
+
     pub(super) async fn ensure_model_context(
         self: &Arc<Self>,
         owner: &SessionOwner,
         session_id: &str,
         selection: &SessionModelSelection,
         mut state: VerifiedSessionState,
-    ) -> Result<VerifiedSessionState, &'static str> {
+        cache: &mut ProviderContextCache,
+    ) -> Result<(VerifiedSessionState, Option<PreparedConversationContext>), &'static str> {
         let Some(limits) = selection.limits.as_ref() else {
             // Historical selections predate durable model capabilities. They
             // remain executable, but the runtime must not invent a context
             // window and trigger a destructive early handoff from a guess.
-            return Ok(state);
+            let prepared = self.prepare_conversation_context(&state, selection, cache)?;
+            return Ok((state, Some(prepared)));
         };
         let normal_output_tokens = self
             .options
@@ -499,9 +546,10 @@ impl Runtime {
             normal_output_tokens,
             self.options.model_context_buffer_tokens,
         ) else {
-            return self
+            let state = self
                 .finish_unhandoffable_model_context(owner, session_id, state)
-                .await;
+                .await?;
+            return Ok((state, None));
         };
         let handoff_output_tokens = self
             .options
@@ -509,14 +557,15 @@ impl Runtime {
             .min(limits.max_output_tokens);
         let Some(handoff_input_budget) = model_input_budget(selection, handoff_output_tokens, 0)
         else {
-            return self
+            let state = self
                 .finish_unhandoffable_model_context(owner, session_id, state)
-                .await;
+                .await?;
+            return Ok((state, None));
         };
         let mut completed_handoff = false;
         loop {
             if state.active_activation.is_none() {
-                return Ok(state);
+                return Ok((state, None));
             }
             if state.pending_context_handoff.is_some() {
                 let previous_handoff_id = state
@@ -534,15 +583,8 @@ impl Runtime {
                 continue;
             }
 
-            let mut tools = self
-                .tools
-                .definitions(&state.selection.tools)
-                .map_err(|_| "tool_selection")?;
-            tools.extend(provider_runtime_tool_definitions(&state));
-            let transcript = provider_context(&state)?;
-            let estimated_input_tokens =
-                estimated_model_input_tokens(&state, selection, &transcript, &tools)?;
-            if estimated_input_tokens <= normal_input_budget {
+            let prepared = self.prepare_conversation_context(&state, selection, cache)?;
+            if prepared.estimated_input_tokens <= normal_input_budget {
                 if completed_handoff && !state.delivery_queue.is_empty() {
                     let (append, next_state) = materialize_boundary(
                         self.store.clone(),
@@ -558,7 +600,7 @@ impl Runtime {
                     completed_handoff = false;
                     continue;
                 }
-                return Ok(state);
+                return Ok((state, Some(prepared)));
             }
 
             let Some(plan) = build_context_handoff_plan(
@@ -568,27 +610,33 @@ impl Runtime {
                 self.options.model_context_handoff_document_tokens,
             )?
             else {
-                return self
+                let state = self
                     .finish_unhandoffable_model_context(owner, session_id, state)
-                    .await;
+                    .await?;
+                return Ok((state, None));
             };
             if plan.source_tokens > handoff_input_budget {
-                return self
+                let state = self
                     .finish_unhandoffable_model_context(owner, session_id, state)
-                    .await;
+                    .await?;
+                return Ok((state, None));
             }
+            let transcript = context_handoff_source(
+                &state,
+                &plan,
+                self.options.model_context_handoff_document_tokens,
+            )?;
+            let metrics = model_context_metrics(&transcript, &[])?;
             let request = ModelRequest {
                 owner: owner.clone(),
                 session_id: session_id.to_owned(),
                 activation_id: plan.activation_id.clone(),
                 round_id: plan.plan_id.clone(),
                 selection: selection.clone(),
-                transcript: context_handoff_source(
-                    &state,
-                    &plan,
-                    self.options.model_context_handoff_document_tokens,
-                )?,
-                tools: Vec::new(),
+                transcript: Arc::new(transcript),
+                tools: Arc::new(Vec::new()),
+                prompt_fingerprint: metrics.prompt_fingerprint,
+                tool_schema_fingerprint: metrics.tool_schema_fingerprint,
                 max_output_tokens: Some(handoff_output_tokens),
                 handoff_document_tokens: Some(self.options.model_context_handoff_document_tokens),
                 stream_idle_timeout: self.options.model_stream_idle_timeout,
@@ -633,18 +681,22 @@ impl Runtime {
             .min(limits.max_output_tokens);
         let handoff_input_budget = model_input_budget(selection, handoff_output_tokens, 0)
             .ok_or("context_handoff_model_budget")?;
+        let transcript = context_handoff_source(
+            state,
+            &plan,
+            self.options.model_context_handoff_document_tokens,
+        )?;
+        let metrics = model_context_metrics(&transcript, &[])?;
         let mut request = ModelRequest {
             owner: owner.clone(),
             session_id: session_id.to_owned(),
             activation_id: plan.activation_id.clone(),
             round_id: plan.plan_id.clone(),
             selection: selection.clone(),
-            transcript: context_handoff_source(
-                state,
-                &plan,
-                self.options.model_context_handoff_document_tokens,
-            )?,
-            tools: Vec::new(),
+            transcript: Arc::new(transcript),
+            tools: Arc::new(Vec::new()),
+            prompt_fingerprint: metrics.prompt_fingerprint,
+            tool_schema_fingerprint: metrics.tool_schema_fingerprint,
             max_output_tokens: Some(handoff_output_tokens),
             handoff_document_tokens: Some(self.options.model_context_handoff_document_tokens),
             stream_idle_timeout: self.options.model_stream_idle_timeout,
@@ -680,8 +732,8 @@ impl Runtime {
         let request_tokens = estimated_full_model_input_tokens(
             state,
             selection,
-            &request.transcript,
-            &request.tools,
+            request.transcript.as_slice(),
+            request.tools.as_slice(),
         )?;
         if source_digest != plan.source_digest
             || request_tokens > handoff_input_budget
@@ -832,6 +884,7 @@ impl Runtime {
         session_id: &str,
         selection: &SessionModelSelection,
         state: &VerifiedSessionState,
+        prepared: PreparedConversationContext,
         round_identity: String,
     ) -> Result<
         (
@@ -840,11 +893,15 @@ impl Runtime {
         ),
         &'static str,
     > {
-        let mut tools = self
-            .tools
-            .definitions(&state.selection.tools)
-            .map_err(|_| "tool_selection")?;
-        tools.extend(provider_runtime_tool_definitions(state));
+        let PreparedConversationContext {
+            transcript,
+            tools,
+            local_input_estimate_tokens,
+            estimated_input_tokens: _,
+            selection_fingerprint,
+            prompt_fingerprint,
+            tool_schema_fingerprint,
+        } = prepared;
         let mut request = ModelRequest {
             owner: owner.clone(),
             session_id: session_id.to_owned(),
@@ -855,8 +912,10 @@ impl Runtime {
                 .ok_or("active_activation_missing")?,
             round_id: round_identity.clone(),
             selection: selection.clone(),
-            transcript: provider_context(state)?,
+            transcript,
             tools: tools.clone(),
+            prompt_fingerprint,
+            tool_schema_fingerprint: tool_schema_fingerprint.clone(),
             max_output_tokens: selection.limits.as_ref().map(|limits| {
                 self.options
                     .model_request_max_output_tokens
@@ -866,8 +925,6 @@ impl Runtime {
             stream_idle_timeout: self.options.model_stream_idle_timeout,
             stream_observer: self.stream_observer.clone(),
         };
-        let local_input_estimate_tokens =
-            model_context_estimate_tokens(&request.transcript, &request.tools)?;
         let (prep_commits, _prepared_state, request_identity) = prepare_model_round(
             self.store.clone(),
             owner.clone(),
@@ -915,8 +972,6 @@ impl Runtime {
         let usage = match outcome.usage.as_ref() {
             Some(usage) => {
                 let context_generation = model_context_generation(state);
-                let selection_fingerprint = model_selection_fingerprint(selection)?;
-                let tool_schema_fingerprint = model_tool_schema_fingerprint(&tools)?;
                 let observed_scale = token_estimate_scale_millionths(
                     usage.input_tokens,
                     local_input_estimate_tokens,
@@ -999,9 +1054,8 @@ impl Runtime {
         .await?;
         self.observe_commit(&initial_commit.0, &initial_commit.1)
             .await;
-        let initial_replayed = initial_commit.0.replayed;
-        let initial_state = initial_commit.1.clone();
-        if initial_replayed {
+        if initial_commit.0.replayed {
+            let initial_state = initial_commit.1;
             let all_results_present = outcome.tool_calls.iter().all(|call| {
                 let message_id = tool_result_message_id(&batch_identity, &call.tool_call_id);
                 initial_state

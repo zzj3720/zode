@@ -28,6 +28,7 @@ use axum::{
     response::Response as AxumResponse,
     routing::post,
 };
+use bincode::Options;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
@@ -1483,67 +1484,306 @@ pub struct LlmHttpRecording {
     pub envelope_sha256: String,
 }
 
-pub struct ValidatedLlmHttpRecording(LlmHttpRecording);
+pub struct ValidatedLlmHttpRecording(LlmHttpHashReplayRecording);
 
 impl ValidatedLlmHttpRecording {
     pub fn request_count(&self) -> usize {
-        self.0.requests.len()
+        self.0.exchanges.len()
     }
 
     fn into_hash_replay(self) -> TestResult<LlmHttpHashReplayRecording> {
-        let LlmHttpRecording {
-            secret_slots,
-            requests,
-            ..
-        } = self.0;
-        let requires_authorization = !secret_slots.is_empty();
-        let requests = requests
-            .into_iter()
-            .map(|exchange| {
-                let request = exchange.request;
-                Ok(LlmHttpHashReplayExchange {
-                    request: LlmHttpHashReplayRequest {
-                        method: request.method.into_boxed_str(),
-                        path: request.path.into_boxed_str(),
-                        semantic_headers: request.semantic_headers.into_boxed_slice(),
-                        raw_body_sha256: decode_sha256(&request.raw_body_sha256)?,
-                    },
-                    response: exchange.response,
-                })
-            })
-            .collect::<TestResult<Vec<_>>>()?
-            .into_boxed_slice();
-        let retained_request_match_bytes = requests
-            .iter()
-            .map(|exchange| exchange.request.retained_bytes())
-            .sum();
-        Ok(LlmHttpHashReplayRecording {
-            requires_authorization,
-            requests,
-            retained_request_match_bytes,
+        Ok(self.0)
+    }
+
+    fn from_validated(recording: LlmHttpRecording) -> TestResult<Self> {
+        PinnedLlmHttpHashReplayIndex::from_recording(&recording, [0; 32])?
+            .into_hash_replay_inner(None, false)
+    }
+}
+
+const LLM_HTTP_HASH_REPLAY_INDEX_SCHEMA: &str = "zode.llm-http-hash-replay-index.v2";
+
+#[derive(Deserialize, Serialize)]
+struct PinnedLlmHttpHashReplayIndex {
+    schema: String,
+    source_file_sha256: [u8; 32],
+    requires_authorization: bool,
+    request_templates: Vec<LlmHttpReplayRequestTemplate>,
+    response_templates: Vec<LlmHttpReplayResponseTemplate>,
+    exchanges: Vec<LlmHttpIndexedReplayExchange>,
+    chunks: Vec<LlmHttpIndexedReplayChunk>,
+    response_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct LlmHttpReplayRequestTemplate {
+    method: String,
+    path: String,
+    semantic_headers: Vec<LlmHttpHeader>,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct LlmHttpReplayResponseTemplate {
+    status: Option<u16>,
+    content_type: Option<String>,
+    semantic_headers: Vec<LlmHttpHeader>,
+    outcome: LlmHttpReplayOutcome,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+enum LlmHttpReplayOutcome {
+    Complete { done_seen: bool },
+    ClientDisconnect,
+    TransportError,
+    StreamError,
+    CaptureBoundExceeded,
+}
+
+impl From<&LlmHttpResponseOutcome> for LlmHttpReplayOutcome {
+    fn from(outcome: &LlmHttpResponseOutcome) -> Self {
+        match outcome {
+            LlmHttpResponseOutcome::Complete { done_seen } => Self::Complete {
+                done_seen: *done_seen,
+            },
+            LlmHttpResponseOutcome::ClientDisconnect => Self::ClientDisconnect,
+            LlmHttpResponseOutcome::TransportError => Self::TransportError,
+            LlmHttpResponseOutcome::StreamError => Self::StreamError,
+            LlmHttpResponseOutcome::CaptureBoundExceeded => Self::CaptureBoundExceeded,
+        }
+    }
+}
+
+impl From<LlmHttpReplayOutcome> for LlmHttpResponseOutcome {
+    fn from(outcome: LlmHttpReplayOutcome) -> Self {
+        match outcome {
+            LlmHttpReplayOutcome::Complete { done_seen } => Self::Complete { done_seen },
+            LlmHttpReplayOutcome::ClientDisconnect => Self::ClientDisconnect,
+            LlmHttpReplayOutcome::TransportError => Self::TransportError,
+            LlmHttpReplayOutcome::StreamError => Self::StreamError,
+            LlmHttpReplayOutcome::CaptureBoundExceeded => Self::CaptureBoundExceeded,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct LlmHttpIndexedReplayExchange {
+    sequence: u64,
+    logical_round: u64,
+    wire_attempt: u64,
+    request_template: u16,
+    raw_body_sha256: [u8; 32],
+    response_template: u16,
+    first_chunk: u32,
+    chunk_count: u32,
+    first_byte: u32,
+    byte_count: u32,
+    done_seen: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+struct LlmHttpIndexedReplayChunk {
+    at_us: u64,
+    end_byte: u32,
+}
+
+impl PinnedLlmHttpHashReplayIndex {
+    fn from_recording(
+        recording: &LlmHttpRecording,
+        source_file_sha256: [u8; 32],
+    ) -> TestResult<Self> {
+        let mut request_templates = Vec::new();
+        let mut response_templates = Vec::new();
+        let mut exchanges = Vec::with_capacity(recording.requests.len());
+        let mut chunks = Vec::new();
+        let mut response_bytes = Vec::new();
+        for exchange in &recording.requests {
+            let request_template = LlmHttpReplayRequestTemplate {
+                method: exchange.request.method.clone(),
+                path: exchange.request.path.clone(),
+                semantic_headers: exchange.request.semantic_headers.clone(),
+            };
+            let request_template = intern_template(&mut request_templates, request_template)?;
+            let response_template = LlmHttpReplayResponseTemplate {
+                status: exchange.response.status,
+                content_type: exchange.response.content_type.clone(),
+                semantic_headers: exchange.response.semantic_headers.clone(),
+                outcome: (&exchange.response.outcome).into(),
+            };
+            let response_template = intern_template(&mut response_templates, response_template)?;
+            let first_chunk = u32::try_from(chunks.len())?;
+            let first_byte = u32::try_from(response_bytes.len())?;
+            for chunk in &exchange.response.chunks {
+                response_bytes.extend_from_slice(&hex_decode(&chunk.bytes_hex)?);
+                chunks.push(LlmHttpIndexedReplayChunk {
+                    at_us: chunk.at_us,
+                    end_byte: u32::try_from(response_bytes.len())?,
+                });
+            }
+            exchanges.push(LlmHttpIndexedReplayExchange {
+                sequence: exchange.sequence,
+                logical_round: exchange.logical_round,
+                wire_attempt: exchange.wire_attempt,
+                request_template,
+                raw_body_sha256: decode_sha256(&exchange.request.raw_body_sha256)?,
+                response_template,
+                first_chunk,
+                chunk_count: u32::try_from(exchange.response.chunks.len())?,
+                first_byte,
+                byte_count: u32::try_from(response_bytes.len())? - first_byte,
+                done_seen: chunks_contain_done(&exchange.response.chunks),
+            });
+        }
+        Ok(Self {
+            schema: LLM_HTTP_HASH_REPLAY_INDEX_SCHEMA.to_owned(),
+            source_file_sha256,
+            requires_authorization: !recording.secret_slots.is_empty(),
+            request_templates,
+            response_templates,
+            exchanges,
+            chunks,
+            response_bytes,
         })
     }
+
+    fn into_hash_replay(
+        self,
+        expected_source_sha256: &str,
+    ) -> TestResult<ValidatedLlmHttpRecording> {
+        self.into_hash_replay_inner(Some(decode_sha256(expected_source_sha256)?), true)
+    }
+
+    fn into_hash_replay_inner(
+        self,
+        expected_source_sha256: Option<[u8; 32]>,
+        require_authorization: bool,
+    ) -> TestResult<ValidatedLlmHttpRecording> {
+        if self.schema != LLM_HTTP_HASH_REPLAY_INDEX_SCHEMA
+            || expected_source_sha256.is_some_and(|expected| self.source_file_sha256 != expected)
+            || (require_authorization && !self.requires_authorization)
+            || self.exchanges.len() > 1024
+            || self.request_templates.is_empty()
+            || self.response_templates.is_empty()
+            || self.request_templates.len() > usize::from(u16::MAX)
+            || self.response_templates.len() > usize::from(u16::MAX)
+        {
+            return Err(IoError::other("pinned LLM replay index metadata is invalid").into());
+        }
+
+        for template in &self.request_templates {
+            if template.method != "POST" || !path_is_secret_safe(&template.path) {
+                return Err(IoError::other("pinned LLM request is not canonical").into());
+            }
+            validate_headers(&template.semantic_headers, true)?;
+        }
+        for template in &self.response_templates {
+            validate_replay_response_template(template)?;
+        }
+        let mut previous_round = None;
+        let mut previous_attempt = None;
+        let mut next_chunk = 0usize;
+        let mut next_byte = 0usize;
+        for (index, exchange) in self.exchanges.iter().enumerate() {
+            if exchange.sequence != index as u64 {
+                return Err(IoError::other("pinned LLM request is not canonical").into());
+            }
+            match (previous_round, previous_attempt) {
+                (None, None) if exchange.logical_round == 0 && exchange.wire_attempt == 0 => {}
+                (Some(round), Some(attempt)) if exchange.logical_round == round => {
+                    if exchange.wire_attempt != attempt + 1 {
+                        return Err(IoError::other("pinned LLM attempts are not ordered").into());
+                    }
+                }
+                (Some(round), Some(_))
+                    if exchange.logical_round == round + 1 && exchange.wire_attempt == 0 => {}
+                _ => {
+                    return Err(IoError::other("pinned LLM rounds are not ordered").into());
+                }
+            }
+            previous_round = Some(exchange.logical_round);
+            previous_attempt = Some(exchange.wire_attempt);
+            let template = self
+                .response_templates
+                .get(usize::from(exchange.response_template))
+                .ok_or_else(|| IoError::other("pinned LLM response template is invalid"))?;
+            if self
+                .request_templates
+                .get(usize::from(exchange.request_template))
+                .is_none()
+            {
+                return Err(IoError::other("pinned LLM request template is invalid").into());
+            }
+            let first_chunk = usize::try_from(exchange.first_chunk)?;
+            let chunk_count = usize::try_from(exchange.chunk_count)?;
+            let first_byte = usize::try_from(exchange.first_byte)?;
+            let byte_count = usize::try_from(exchange.byte_count)?;
+            if first_chunk != next_chunk || first_byte != next_byte {
+                return Err(IoError::other("pinned LLM replay ranges are not contiguous").into());
+            }
+            let chunk_end = first_chunk
+                .checked_add(chunk_count)
+                .ok_or_else(|| IoError::other("pinned LLM chunk range overflowed"))?;
+            let byte_end = first_byte
+                .checked_add(byte_count)
+                .ok_or_else(|| IoError::other("pinned LLM byte range overflowed"))?;
+            let response_chunks = self
+                .chunks
+                .get(first_chunk..chunk_end)
+                .ok_or_else(|| IoError::other("pinned LLM chunk range is invalid"))?;
+            let response_bytes = self
+                .response_bytes
+                .get(first_byte..byte_end)
+                .ok_or_else(|| IoError::other("pinned LLM byte range is invalid"))?;
+            validate_indexed_response(
+                template,
+                response_chunks,
+                first_byte,
+                response_bytes,
+                exchange.done_seen,
+            )?;
+            next_chunk = chunk_end;
+            next_byte = byte_end;
+        }
+        if next_chunk != self.chunks.len() || next_byte != self.response_bytes.len() {
+            return Err(IoError::other("pinned LLM replay index has unused data").into());
+        }
+        let retained_request_match_bytes = self
+            .request_templates
+            .iter()
+            .map(LlmHttpReplayRequestTemplate::retained_bytes)
+            .sum::<usize>()
+            + self.exchanges.len() * (32 + 2);
+        Ok(ValidatedLlmHttpRecording(LlmHttpHashReplayRecording {
+            requires_authorization: self.requires_authorization,
+            request_templates: self.request_templates.into_boxed_slice(),
+            response_templates: self.response_templates.into_boxed_slice(),
+            exchanges: self.exchanges.into_boxed_slice(),
+            chunks: self.chunks.into_boxed_slice(),
+            response_bytes: Bytes::from(self.response_bytes),
+            retained_request_match_bytes,
+        }))
+    }
+}
+
+fn intern_template<T: PartialEq>(templates: &mut Vec<T>, value: T) -> TestResult<u16> {
+    if let Some(index) = templates.iter().position(|template| template == &value) {
+        return Ok(u16::try_from(index)?);
+    }
+    let index = u16::try_from(templates.len())?;
+    templates.push(value);
+    Ok(index)
 }
 
 struct LlmHttpHashReplayRecording {
     requires_authorization: bool,
-    requests: Box<[LlmHttpHashReplayExchange]>,
+    request_templates: Box<[LlmHttpReplayRequestTemplate]>,
+    response_templates: Box<[LlmHttpReplayResponseTemplate]>,
+    exchanges: Box<[LlmHttpIndexedReplayExchange]>,
+    chunks: Box<[LlmHttpIndexedReplayChunk]>,
+    response_bytes: Bytes,
     retained_request_match_bytes: usize,
 }
 
-struct LlmHttpHashReplayExchange {
-    request: LlmHttpHashReplayRequest,
-    response: LlmHttpRecordingResponse,
-}
-
-struct LlmHttpHashReplayRequest {
-    method: Box<str>,
-    path: Box<str>,
-    semantic_headers: Box<[LlmHttpHeader]>,
-    raw_body_sha256: [u8; 32],
-}
-
-impl LlmHttpHashReplayRequest {
+impl LlmHttpReplayRequestTemplate {
     fn retained_bytes(&self) -> usize {
         self.method.len()
             + self.path.len()
@@ -1552,7 +1792,6 @@ impl LlmHttpHashReplayRequest {
                 .iter()
                 .map(|header| header.name.len() + header.value.len())
                 .sum::<usize>()
-            + self.raw_body_sha256.len()
     }
 }
 
@@ -1699,7 +1938,78 @@ impl LlmHttpRecording {
     }
 
     pub fn load_compressed_validated(path: &Path) -> TestResult<ValidatedLlmHttpRecording> {
-        Self::load_compressed(path).map(ValidatedLlmHttpRecording)
+        ValidatedLlmHttpRecording::from_validated(Self::load_compressed(path)?)
+    }
+
+    /// Loads a compact replay index whose own pinned digest and source-cassette
+    /// digest bind it to the immutable full recording. Runtime replay need not
+    /// repeatedly decompress and parse the growing request bodies.
+    pub fn load_pinned_compressed_hash_replay_index(
+        source_path: &Path,
+        expected_source_sha256: &'static str,
+        index_path: &Path,
+        expected_index_sha256: &'static str,
+    ) -> TestResult<ValidatedLlmHttpRecording> {
+        let source = fs::read(source_path)?;
+        if source.len() as u64 > MAX_LLM_COMPRESSED_RECORDING_BYTES {
+            return Err(IoError::other("compressed LLM recording exceeds its size bound").into());
+        }
+        if sha256_hex(&source) != expected_source_sha256 {
+            return Err(IoError::other("pinned LLM recording file digest is invalid").into());
+        }
+        let compressed_index = fs::read(index_path)?;
+        if compressed_index.len() as u64 > MAX_LLM_COMPRESSED_RECORDING_BYTES
+            || sha256_hex(&compressed_index) != expected_index_sha256
+        {
+            return Err(IoError::other("pinned LLM replay index digest is invalid").into());
+        }
+        let decoder = zstd::stream::read::Decoder::new(compressed_index.as_slice())?;
+        let mut bytes = Vec::new();
+        decoder
+            .take(MAX_LLM_LONG_RUN_RECORDING_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_LLM_LONG_RUN_RECORDING_BYTES {
+            return Err(IoError::other("expanded LLM replay index exceeds its size bound").into());
+        }
+        let index: PinnedLlmHttpHashReplayIndex = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_little_endian()
+            .reject_trailing_bytes()
+            .with_limit(MAX_LLM_LONG_RUN_RECORDING_BYTES)
+            .deserialize(&bytes)?;
+        index.into_hash_replay(expected_source_sha256)
+    }
+
+    pub fn promote_compressed_hash_replay_index(
+        source_path: &Path,
+        expected_source_sha256: &str,
+        index_path: &Path,
+        forbidden: &[&str],
+    ) -> TestResult<u64> {
+        let source = fs::read(source_path)?;
+        if source.len() as u64 > MAX_LLM_COMPRESSED_RECORDING_BYTES
+            || sha256_hex(&source) != expected_source_sha256
+        {
+            return Err(IoError::other("pinned LLM recording file digest is invalid").into());
+        }
+        let recording = Self::load_compressed(source_path)?;
+        let index = PinnedLlmHttpHashReplayIndex::from_recording(
+            &recording,
+            decode_sha256(expected_source_sha256)?,
+        )?;
+        let bytes = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_little_endian()
+            .serialize(&index)?;
+        for marker in forbidden.iter().filter(|marker| !marker.is_empty()) {
+            if bytes_contain(&bytes, marker.as_bytes()) {
+                return Err(IoError::other(
+                    "LLM replay index contained forbidden credential material",
+                )
+                .into());
+            }
+        }
+        promote_immutable_compressed_bytes(index_path, &bytes)
     }
 
     fn load_with_bound(path: &Path, max_bytes: u64) -> TestResult<Self> {
@@ -1750,67 +2060,7 @@ impl LlmHttpRecording {
                 .into());
             }
         }
-        let parent = path
-            .parent()
-            .ok_or_else(|| IoError::other("LLM recording path has no parent"))?;
-        fs::create_dir_all(parent)?;
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| IoError::other("LLM recording file name is invalid"))?;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let temporary = parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
-        let mut options = fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let prepare = (|| -> TestResult<u64> {
-            let file = options.open(&temporary)?;
-            let mut encoder =
-                zstd::stream::write::Encoder::new(file, LLM_COMPRESSED_RECORDING_LEVEL)?;
-            encoder.include_checksum(true)?;
-            encoder.write_all(&bytes)?;
-            let file = encoder.finish()?;
-            file.sync_all()?;
-            drop(file);
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444))?;
-                fs::File::open(&temporary)?.sync_all()?;
-            }
-            Ok(fs::metadata(&temporary)?.len())
-        })();
-        let compressed_bytes = match prepare {
-            Ok(compressed_bytes) => compressed_bytes,
-            Err(error) => {
-                let _ = fs::remove_file(&temporary);
-                return Err(error);
-            }
-        };
-
-        if let Err(error) = fs::hard_link(&temporary, path) {
-            let _ = fs::remove_file(&temporary);
-            return Err(if error.kind() == ErrorKind::AlreadyExists {
-                IoError::new(
-                    ErrorKind::AlreadyExists,
-                    "tracked compressed LLM recording is immutable",
-                )
-            } else {
-                error
-            }
-            .into());
-        }
-        fs::remove_file(&temporary)?;
-        fs::File::open(parent)?.sync_all()?;
-        Ok(compressed_bytes)
+        promote_immutable_compressed_bytes(path, &bytes)
     }
 
     fn write_atomic_with_mode(
@@ -2005,6 +2255,68 @@ impl LlmHttpRecording {
     }
 }
 
+fn promote_immutable_compressed_bytes(path: &Path, bytes: &[u8]) -> TestResult<u64> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| IoError::other("LLM recording path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| IoError::other("LLM recording file name is invalid"))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temporary = parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let prepare = (|| -> TestResult<u64> {
+        let file = options.open(&temporary)?;
+        let mut encoder = zstd::stream::write::Encoder::new(file, LLM_COMPRESSED_RECORDING_LEVEL)?;
+        encoder.include_checksum(true)?;
+        encoder.write_all(bytes)?;
+        let file = encoder.finish()?;
+        file.sync_all()?;
+        drop(file);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444))?;
+            fs::File::open(&temporary)?.sync_all()?;
+        }
+        Ok(fs::metadata(&temporary)?.len())
+    })();
+    let compressed_bytes = match prepare {
+        Ok(compressed_bytes) => compressed_bytes,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    if let Err(error) = fs::hard_link(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(if error.kind() == ErrorKind::AlreadyExists {
+            IoError::new(
+                ErrorKind::AlreadyExists,
+                "tracked compressed LLM recording is immutable",
+            )
+        } else {
+            error
+        }
+        .into());
+    }
+    fs::remove_file(&temporary)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(compressed_bytes)
+}
+
 struct Sha256Writer<'a>(&'a mut Sha256);
 
 impl Write for Sha256Writer<'_> {
@@ -2105,6 +2417,83 @@ fn validate_response(response: &LlmHttpRecordingResponse) -> TestResult<()> {
         {
             return Err(IoError::other("LLM response chunks are not ordered").into());
         }
+    }
+    Ok(())
+}
+
+fn validate_replay_response_template(template: &LlmHttpReplayResponseTemplate) -> TestResult<()> {
+    let response = LlmHttpRecordingResponse {
+        status: template.status,
+        content_type: template.content_type.clone(),
+        semantic_headers: template.semantic_headers.clone(),
+        chunks: Vec::new(),
+        outcome: template.outcome.into(),
+    };
+    match template.outcome {
+        LlmHttpReplayOutcome::TransportError => {
+            if response.status.is_some()
+                || response.content_type.is_some()
+                || !response.semantic_headers.is_empty()
+            {
+                return Err(IoError::other("LLM transport outcome has response data").into());
+            }
+        }
+        LlmHttpReplayOutcome::ClientDisconnect if response.status.is_none() => {
+            if response.content_type.is_some() || !response.semantic_headers.is_empty() {
+                return Err(
+                    IoError::other("LLM pre-response disconnect has response metadata").into(),
+                );
+            }
+        }
+        _ => validate_http_response(&response)?,
+    }
+    Ok(())
+}
+
+fn validate_indexed_response(
+    template: &LlmHttpReplayResponseTemplate,
+    chunks: &[LlmHttpIndexedReplayChunk],
+    first_byte: usize,
+    response_bytes: &[u8],
+    done_seen: bool,
+) -> TestResult<()> {
+    if chunks.len() > MAX_LLM_RESPONSE_CHUNKS || response_bytes.len() > MAX_LLM_RESPONSE_BYTES {
+        return Err(IoError::other("LLM response capture bound exceeded").into());
+    }
+    let response_end = first_byte
+        .checked_add(response_bytes.len())
+        .ok_or_else(|| IoError::other("LLM response byte range overflowed"))?;
+    let mut previous_at_us = 0;
+    let mut previous_end = first_byte;
+    for chunk in chunks {
+        let end = usize::try_from(chunk.end_byte)?;
+        if chunk.at_us < previous_at_us
+            || chunk.at_us - previous_at_us > MAX_LLM_CHUNK_DELAY_US
+            || end < previous_end
+            || end > response_end
+        {
+            return Err(IoError::other("LLM indexed response chunk is invalid").into());
+        }
+        previous_at_us = chunk.at_us;
+        previous_end = end;
+    }
+    if previous_end != response_end {
+        return Err(IoError::other("LLM indexed response byte range is incomplete").into());
+    }
+    let contains_done = response_bytes
+        .windows(b"data: [DONE]".len())
+        .any(|window| window == b"data: [DONE]");
+    if contains_done != done_seen
+        || matches!(
+            template.outcome,
+            LlmHttpReplayOutcome::Complete {
+                done_seen: expected
+            } if expected != done_seen
+        )
+        || (matches!(template.outcome, LlmHttpReplayOutcome::TransportError)
+            && (!chunks.is_empty() || !response_bytes.is_empty()))
+    {
+        return Err(IoError::other("LLM indexed response outcome is inconsistent").into());
     }
     Ok(())
 }
@@ -2310,20 +2699,93 @@ impl LlmHttpReplayRecording {
     fn request_count(&self) -> usize {
         match self {
             Self::Full(recording) => recording.requests.len(),
-            Self::Hashes(recording) => recording.requests.len(),
+            Self::Hashes(recording) => recording.exchanges.len(),
         }
     }
 
-    fn response(&self, index: usize) -> Option<&LlmHttpRecordingResponse> {
+    fn response_status(&self, index: usize) -> Option<u16> {
         match self {
             Self::Full(recording) => recording
                 .requests
                 .get(index)
-                .map(|exchange| &exchange.response),
+                .and_then(|exchange| exchange.response.status),
             Self::Hashes(recording) => recording
+                .response_template(index)
+                .and_then(|template| template.status),
+        }
+    }
+
+    fn response_content_type(&self, index: usize) -> Option<&str> {
+        match self {
+            Self::Full(recording) => recording
                 .requests
                 .get(index)
-                .map(|exchange| &exchange.response),
+                .and_then(|exchange| exchange.response.content_type.as_deref()),
+            Self::Hashes(recording) => recording
+                .response_template(index)
+                .and_then(|template| template.content_type.as_deref()),
+        }
+    }
+
+    fn response_headers(&self, index: usize) -> Option<&[LlmHttpHeader]> {
+        match self {
+            Self::Full(recording) => recording
+                .requests
+                .get(index)
+                .map(|exchange| exchange.response.semantic_headers.as_slice()),
+            Self::Hashes(recording) => recording
+                .response_template(index)
+                .map(|template| template.semantic_headers.as_slice()),
+        }
+    }
+
+    fn response_outcome(&self, index: usize) -> Option<LlmHttpReplayOutcome> {
+        match self {
+            Self::Full(recording) => recording
+                .requests
+                .get(index)
+                .map(|exchange| (&exchange.response.outcome).into()),
+            Self::Hashes(recording) => recording
+                .response_template(index)
+                .map(|template| template.outcome),
+        }
+    }
+
+    fn response_chunk_count(&self, index: usize) -> Option<usize> {
+        match self {
+            Self::Full(recording) => recording
+                .requests
+                .get(index)
+                .map(|exchange| exchange.response.chunks.len()),
+            Self::Hashes(recording) => recording
+                .exchanges
+                .get(index)
+                .and_then(|exchange| usize::try_from(exchange.chunk_count).ok()),
+        }
+    }
+
+    fn response_chunk(&self, index: usize, chunk_index: usize) -> TestResult<Option<(u64, Bytes)>> {
+        match self {
+            Self::Full(recording) => recording
+                .requests
+                .get(index)
+                .and_then(|exchange| exchange.response.chunks.get(chunk_index))
+                .map(|chunk| Ok((chunk.at_us, Bytes::from(hex_decode(&chunk.bytes_hex)?))))
+                .transpose(),
+            Self::Hashes(recording) => recording.response_chunk(index, chunk_index).map(Some),
+        }
+    }
+
+    fn response_done_seen(&self, index: usize) -> bool {
+        match self {
+            Self::Full(recording) => recording
+                .requests
+                .get(index)
+                .is_some_and(|exchange| chunks_contain_done(&exchange.response.chunks)),
+            Self::Hashes(recording) => recording
+                .exchanges
+                .get(index)
+                .is_some_and(|exchange| exchange.done_seen),
         }
     }
 
@@ -2342,12 +2804,9 @@ impl LlmHttpReplayRecording {
                     && exchange.request.semantic_headers == semantic_headers
                     && exchange.request.raw_body_sha256 == sha256_hex(body)
             }),
-            Self::Hashes(recording) => recording.requests.get(index).is_some_and(|exchange| {
-                exchange.request.method.as_ref() == method
-                    && exchange.request.path.as_ref() == path
-                    && exchange.request.semantic_headers.as_ref() == semantic_headers
-                    && exchange.request.raw_body_sha256 == sha256(body)
-            }),
+            Self::Hashes(recording) => {
+                recording.request_matches(index, method, path, semantic_headers, body)
+            }
         }
     }
 
@@ -2374,6 +2833,69 @@ impl LlmHttpReplayRecording {
             Self::Full(recording) => Some(recording),
             Self::Hashes(_) => None,
         }
+    }
+}
+
+impl LlmHttpHashReplayRecording {
+    fn response_template(&self, index: usize) -> Option<&LlmHttpReplayResponseTemplate> {
+        let exchange = self.exchanges.get(index)?;
+        self.response_templates
+            .get(usize::from(exchange.response_template))
+    }
+
+    fn request_matches(
+        &self,
+        index: usize,
+        method: &str,
+        path: &str,
+        semantic_headers: &[LlmHttpHeader],
+        body: &[u8],
+    ) -> bool {
+        let Some(exchange) = self.exchanges.get(index) else {
+            return false;
+        };
+        let Some(template) = self
+            .request_templates
+            .get(usize::from(exchange.request_template))
+        else {
+            return false;
+        };
+        template.method == method
+            && template.path == path
+            && template.semantic_headers == semantic_headers
+            && exchange.raw_body_sha256 == sha256(body)
+    }
+
+    fn response_chunk(&self, index: usize, chunk_index: usize) -> TestResult<(u64, Bytes)> {
+        let exchange = self
+            .exchanges
+            .get(index)
+            .ok_or_else(|| IoError::other("LLM replay response index is invalid"))?;
+        let first_chunk = usize::try_from(exchange.first_chunk)?;
+        let chunk_count = usize::try_from(exchange.chunk_count)?;
+        if chunk_index >= chunk_count {
+            return Err(IoError::other("LLM replay chunk index is invalid").into());
+        }
+        let absolute_chunk = first_chunk + chunk_index;
+        let chunk = self
+            .chunks
+            .get(absolute_chunk)
+            .ok_or_else(|| IoError::other("LLM replay chunk range is invalid"))?;
+        let start = if chunk_index == 0 {
+            usize::try_from(exchange.first_byte)?
+        } else {
+            usize::try_from(
+                self.chunks
+                    .get(absolute_chunk - 1)
+                    .ok_or_else(|| IoError::other("LLM replay chunk start is invalid"))?
+                    .end_byte,
+            )?
+        };
+        let end = usize::try_from(chunk.end_byte)?;
+        if start > end || end > self.response_bytes.len() {
+            return Err(IoError::other("LLM replay chunk bytes are invalid").into());
+        }
+        Ok((chunk.at_us, self.response_bytes.slice(start..end)))
     }
 }
 
@@ -3150,7 +3672,7 @@ impl LlmHttpProxy {
     ) -> TestResult<Self> {
         recording.validate()?;
         Self::replay_validated_hashes_with_authorization(
-            ValidatedLlmHttpRecording(recording),
+            ValidatedLlmHttpRecording::from_validated(recording)?,
             captured_timing,
             expected_authorization,
         )
@@ -3937,10 +4459,10 @@ async fn replay_llm_http_request(
         *next += 1;
         expected_index
     };
-    let response = recording
-        .response(expected_index)
+    let outcome = recording
+        .response_outcome(expected_index)
         .expect("matched replay request has a response");
-    if matches!(&response.outcome, LlmHttpResponseOutcome::TransportError) {
+    if matches!(outcome, LlmHttpReplayOutcome::TransportError) {
         let state_for_stream = state.clone();
         if terminal_hold.is_some() {
             state_for_stream
@@ -3970,60 +4492,62 @@ async fn replay_llm_http_request(
             .body(Body::from_stream(stream))
             .expect("LLM transport-error replay response builds");
     }
-    let status = response
-        .status
+    let status = recording
+        .response_status(expected_index)
         .unwrap_or(AxumStatusCode::BAD_GATEWAY.as_u16());
-    let response_content_type = response.content_type.clone();
-    let retry_after = response
-        .semantic_headers
+    let response_content_type = recording
+        .response_content_type(expected_index)
+        .map(str::to_owned);
+    let retry_after = recording
+        .response_headers(expected_index)
+        .expect("matched replay request has response headers")
         .iter()
         .find(|header| header.name == "retry-after")
         .map(|header| header.value.clone());
-    let outcome = response.outcome.clone();
     let state_for_stream = state.clone();
     let recording_for_stream = recording.clone();
     let stream = stream! {
-        let response = recording_for_stream
-            .response(expected_index)
-            .expect("matched replay request has a streaming response");
         let started = Instant::now();
-        let total_chunks = response.chunks.len();
+        let total_chunks = recording_for_stream
+            .response_chunk_count(expected_index)
+            .expect("matched replay request has a streaming response");
         let terminal_required = matches!(
             outcome,
-            LlmHttpResponseOutcome::StreamError
-                | LlmHttpResponseOutcome::ClientDisconnect
-                | LlmHttpResponseOutcome::CaptureBoundExceeded
+            LlmHttpReplayOutcome::StreamError
+                | LlmHttpReplayOutcome::ClientDisconnect
+                | LlmHttpReplayOutcome::CaptureBoundExceeded
         ) && !matches!(
             outcome,
-            LlmHttpResponseOutcome::ClientDisconnect
-                if chunks_contain_done(&response.chunks)
+            LlmHttpReplayOutcome::ClientDisconnect
+                if recording_for_stream.response_done_seen(expected_index)
         );
         let mut completion = ReplayCompletion::new(state_for_stream.clone());
         if total_chunks == 0 {
             completion.all_chunks_emitted = true;
         }
-        for (index, chunk) in response.chunks.iter().enumerate() {
+        for index in 0..total_chunks {
+            let (at_us, bytes) = match recording_for_stream
+                .response_chunk(expected_index, index)
+            {
+                Ok(Some(chunk)) => chunk,
+                _ => {
+                    yield Err(std::io::Error::other("LLM recording chunk is invalid"));
+                    return;
+                }
+            };
             if captured_timing {
-                let target = Duration::from_micros(chunk.at_us);
+                let target = Duration::from_micros(at_us);
                 let elapsed = started.elapsed();
                 if target > elapsed {
                     sleep(target - elapsed).await;
                 }
             }
-            match hex_decode(&chunk.bytes_hex) {
-                Ok(bytes) => {
-                    state_for_stream
-                        .replay_chunk_count
-                        .fetch_add(1, Ordering::SeqCst);
-                    state_for_stream.replay_chunk_seen.notify_waiters();
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from(bytes));
-                    completion.all_chunks_emitted = index + 1 == total_chunks;
-                }
-                Err(_) => {
-                    yield Err(std::io::Error::other("LLM recording chunk is invalid"));
-                    return;
-                }
-            }
+            state_for_stream
+                .replay_chunk_count
+                .fetch_add(1, Ordering::SeqCst);
+            state_for_stream.replay_chunk_seen.notify_waiters();
+            yield Ok::<Bytes, std::io::Error>(bytes);
+            completion.all_chunks_emitted = index + 1 == total_chunks;
         }
         if let Some(hold) = terminal_hold {
             state_for_stream
@@ -4037,7 +4561,7 @@ async fn replay_llm_http_request(
             // at the final chunk, the stream is dropped before this point and
             // ReplayCompletion must remain uncompleted.
             completion.terminal_error_emitted = true;
-            let message = if matches!(outcome, LlmHttpResponseOutcome::CaptureBoundExceeded) {
+            let message = if matches!(outcome, LlmHttpReplayOutcome::CaptureBoundExceeded) {
                 "LLM recording response capture bound exceeded"
             } else {
                 "LLM recording response disconnected"

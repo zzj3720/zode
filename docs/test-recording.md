@@ -274,6 +274,15 @@ event trace must match the reviewed manifest after deterministic normalization
 of run-local identities and clocks. An unexpected provider request, tool call,
 event, duplicate, or unconsumed expected fact fails the E2E.
 
+After a tracked long-run cassette's compressed-file SHA-256 matches its pinned
+reviewed value, replay may consume a separately pinned compact index containing
+only its source SHA-256, ordered request hashes, semantic headers, and responses.
+The index is a derived acceleration structure, not another evidence authority:
+the immutable full cassette remains the source, both compressed files are
+digest-checked, and every live request body is hashed and matched at the same
+sequence position. Deterministic replay therefore need not repeatedly
+decompress or parse cumulative raw request bodies and canonical JSON.
+
 The canonical DeepSWE live and replay runners use Cargo's optimized release
 profile. This does not skip or replace any assertion; it keeps the real
 Endpoint's hashing, JSON, reducer, and snapshot costs representative instead of

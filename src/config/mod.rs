@@ -121,6 +121,14 @@ struct RuntimeConfig {
 struct ProviderExecutionConfig {
     adapter_kinds: Vec<String>,
     allowed_base_url_origins: Vec<String>,
+    #[serde(default)]
+    transport_retry: ProviderTransportRetryConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ProviderTransportRetryConfig {
+    initial_delay_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -267,16 +275,36 @@ impl EndpointConfig {
             .map(|store| store.directory.as_path())
     }
 
-    pub(crate) fn provider_execution_policy(&self) -> (Vec<String>, Vec<String>) {
+    pub(crate) fn provider_execution_policy(
+        &self,
+    ) -> (
+        Vec<String>,
+        Vec<String>,
+        zode::provider::ProviderTransportRetryPolicy,
+    ) {
         self.provider_execution
             .as_ref()
             .map(|execution| {
                 (
                     execution.adapter_kinds.clone(),
                     execution.allowed_base_url_origins.clone(),
+                    zode::provider::ProviderTransportRetryPolicy {
+                        initial_delay: Duration::from_millis(
+                            execution.transport_retry.initial_delay_ms,
+                        ),
+                    },
                 )
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| {
+                let retry = ProviderTransportRetryConfig::default();
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    zode::provider::ProviderTransportRetryPolicy {
+                        initial_delay: Duration::from_millis(retry.initial_delay_ms),
+                    },
+                )
+            })
     }
 
     pub(crate) fn tool_specs(&self) -> Vec<zode::tools::HttpToolSpec> {
@@ -449,6 +477,14 @@ impl Default for RuntimeConfig {
             model_retry_base_ms: 500,
             model_retry_max_ms: 5_000,
             model_stream_idle_timeout_ms: 30_000,
+        }
+    }
+}
+
+impl Default for ProviderTransportRetryConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay_ms: 2_000,
         }
     }
 }
@@ -707,6 +743,11 @@ fn validate_provider_execution(config: &mut ProviderExecutionConfig) -> Result<(
     }
     config.adapter_kinds.sort();
     config.allowed_base_url_origins = parse_origins(&config.allowed_base_url_origins)?;
+    validate_positive(
+        config.transport_retry.initial_delay_ms,
+        MAX_MODEL_RETRY_MS,
+        "provider_execution.transport_retry.initial_delay_ms",
+    )?;
     Ok(())
 }
 

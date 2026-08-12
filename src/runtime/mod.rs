@@ -31,11 +31,11 @@ use callback::*;
 use commit::*;
 use context::{
     build_context_handoff_plan, context_handoff_source, context_handoff_source_facts,
-    estimated_full_model_input_tokens, estimated_model_input_tokens, execute_runtime_read_tool,
-    model_context_estimate_tokens, model_context_generation, model_context_text_tokens,
-    model_input_budget, model_selection_fingerprint, model_tool_schema_fingerprint,
-    provider_context, provider_runtime_tool_definitions, runtime_tool_definitions,
-    token_estimate_scale_millionths,
+    estimated_full_model_input_tokens, estimated_model_input_tokens_from_metrics,
+    execute_runtime_read_tool, model_context_generation, model_context_metrics,
+    model_context_metrics_from_serialized_transcript, model_context_text_tokens,
+    model_input_budget, model_selection_fingerprint, provider_runtime_tool_definitions,
+    runtime_tool_definitions, token_estimate_scale_millionths, ProviderContextCache,
 };
 
 use crate::{
@@ -816,7 +816,7 @@ impl Runtime {
         state = self
             .recover_model_round(owner.clone(), session_id.clone(), state)
             .await?;
-
+        let mut context_cache = ProviderContextCache::default();
         loop {
             if state.active_wait.is_some() && state.delivery_queue.is_empty() {
                 if let Some(activation) = state.active_activation.as_ref() {
@@ -849,14 +849,29 @@ impl Runtime {
             if let Some(trigger_identity) =
                 unresolved_user(&state).map(|trigger| trigger.message_id.clone())
             {
-                state = self
-                    .ensure_model_context(&owner, &session_id, &selection, state)
+                let (next_state, prepared) = self
+                    .ensure_model_context(
+                        &owner,
+                        &session_id,
+                        &selection,
+                        state,
+                        &mut context_cache,
+                    )
                     .await?;
+                state = next_state;
                 if state.active_activation.is_none() {
                     return Ok(());
                 }
+                let prepared = prepared.ok_or("model_context_missing")?;
                 let round = self
-                    .run_model_round(&owner, &session_id, &selection, &state, trigger_identity)
+                    .run_model_round(
+                        &owner,
+                        &session_id,
+                        &selection,
+                        &state,
+                        prepared,
+                        trigger_identity,
+                    )
                     .await;
                 let (commits, next_state) = match round {
                     Ok(round) => round,
@@ -875,14 +890,29 @@ impl Runtime {
             }
 
             if let Some(round_identity) = model_followup_identity(&state) {
-                state = self
-                    .ensure_model_context(&owner, &session_id, &selection, state)
+                let (next_state, prepared) = self
+                    .ensure_model_context(
+                        &owner,
+                        &session_id,
+                        &selection,
+                        state,
+                        &mut context_cache,
+                    )
                     .await?;
+                state = next_state;
                 if state.active_activation.is_none() {
                     return Ok(());
                 }
+                let prepared = prepared.ok_or("model_context_missing")?;
                 let round = self
-                    .run_model_round(&owner, &session_id, &selection, &state, round_identity)
+                    .run_model_round(
+                        &owner,
+                        &session_id,
+                        &selection,
+                        &state,
+                        prepared,
+                        round_identity,
+                    )
                     .await;
                 let (commits, next_state) = match round {
                     Ok(round) => round,

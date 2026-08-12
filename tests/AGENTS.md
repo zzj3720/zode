@@ -105,6 +105,8 @@ recording, fixture promotion, and replay.
   machine-specific limit. Local performance diagnosis may explicitly set
   `ZODE_DEEPSWE_REPLAY_MAX_MS` to turn a measured regression into a typed red;
   the same explicit budget must be used before and after a performance repair.
+  `ZODE_DEEPSWE_REPLAY_MAX_LOAD_MS` separately bounds validation and loading of
+  the pinned event trace plus provider replay index.
   `ZODE_DEEPSWE_REPLAY_MAX_ORDINARY_BOUNDARY_MS` similarly bounds the aggregate
   ordinary provider/tool transition time while excluding recorded retry
   backoff. `ZODE_DEEPSWE_REPLAY_MAX_FIXTURE_START_MS` isolates duplicate

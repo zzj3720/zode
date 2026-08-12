@@ -117,7 +117,10 @@ The v0 configuration shape is conceptually:
   },
   "provider_execution": {
     "adapter_kinds": ["openai_compatible"],
-    "allowed_base_url_origins": ["http://127.0.0.1"]
+    "allowed_base_url_origins": ["http://127.0.0.1"],
+    "transport_retry": {
+      "initial_delay_ms": 2000
+    }
   },
   "callback": {
     "allowed_public_origins": ["https://controller.example.test"]
@@ -148,7 +151,10 @@ documented semantics. Endpoint configuration enables provider adapter kinds
 release) and enforces outbound policy; users do not repeat provider base URLs, models, auth
 profiles, or defaults on every device. A controller supplies the concrete
 non-secret execution descriptor in session selection. Aimux retains its bounded
-transport retry before a stream is established. `model_step_max_attempts`
+transport retry before a stream is established. The default above matches the
+provider adapters' production retry delay. A deterministic performance replay
+may shorten it while retaining the same retry count and request/response
+sequence. `model_step_max_attempts`
 separately bounds how many times Endpoint may call aimux for one prepared model
 step after aimux surfaces a retryable failure; it includes the first call and
 must be at least one. Retry delay uses bounded jitter between the configured

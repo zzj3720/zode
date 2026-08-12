@@ -68,7 +68,7 @@ pub(super) fn append_model_attempt_failure_blocking(
         match store.append_verified_owned(
             owner,
             session_id,
-            &state,
+            state,
             &command_id,
             &[EventDraft::new(
                 event_id.clone(),
@@ -206,11 +206,8 @@ pub(super) fn model_request_draft(
         &serde_json::to_string(&selection.provider_execution)
             .map_err(|_| "provider_fingerprint")?,
     );
-    let prompt_fingerprint = stable_digest(
-        "model-prompt",
-        &serde_json::to_string(&request.transcript).map_err(|_| "prompt_fingerprint")?,
-    );
-    let tool_schema_fingerprint = model_tool_schema_fingerprint(&request.tools)?;
+    let prompt_fingerprint = request.prompt_fingerprint.clone();
+    let tool_schema_fingerprint = request.tool_schema_fingerprint.clone();
     let stream_idle_timeout_ms = u64::try_from(request.stream_idle_timeout.as_millis())
         .map_err(|_| "model_stream_idle_timeout")?;
     let request_fingerprint = stable_digest(
@@ -306,7 +303,7 @@ pub(super) async fn append_context_handoff_plan(
             if already_prepared {
                 return Ok((replayed_append(&session_id, &command_id, &current), current));
             }
-            match store.append_verified_owned(&owner, &session_id, &current, &command_id, &drafts) {
+            match store.append_verified_owned(&owner, &session_id, current, &command_id, &drafts) {
                 Ok(appended) => return Ok((appended.append, appended.state)),
                 Err(StoreError::OptimisticConcurrency { .. }) => continue,
                 Err(StoreError::CommandIdempotencyConflict { .. }) => {
@@ -324,7 +321,7 @@ pub(super) async fn append_context_handoff_plan(
 pub(super) struct ToolBatchInput {
     pub(super) round_identity: String,
     pub(super) assistant_content: String,
-    pub(super) definitions: Vec<ToolDefinition>,
+    pub(super) definitions: Arc<Vec<ToolDefinition>>,
     pub(super) callback_plans: Vec<CallbackPlan>,
     pub(super) tool_calls: Vec<ToolCall>,
 }
@@ -383,7 +380,7 @@ pub(super) async fn append_runtime_events_from_state(
 ) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     tokio::task::spawn_blocking(move || {
         for _ in 0..16 {
-            match store.append_verified_owned(&owner, &session_id, &state, &command_id, &events) {
+            match store.append_verified_owned(&owner, &session_id, state, &command_id, &events) {
                 Ok(appended) => return Ok((appended.append, appended.state)),
                 Err(StoreError::OptimisticConcurrency { .. }) => {
                     state = store
@@ -427,7 +424,7 @@ pub(super) async fn append_expired_timer(
             match store.append_verified_owned(
                 &owner,
                 &session_id,
-                &state,
+                state,
                 &format!("wait-expired:{}", timer.wait_id),
                 &[EventDraft::new(
                     format!("wait-expired-event:{}", timer.wait_id),
@@ -727,7 +724,7 @@ pub(super) async fn append_context_handoff_document(
                     },
                 ),
             ];
-            match store.append_verified_owned(&owner, &session_id, &state, &command_id, &events) {
+            match store.append_verified_owned(&owner, &session_id, state, &command_id, &events) {
                 Ok(appended) => return Ok((appended.append, appended.state)),
                 Err(StoreError::OptimisticConcurrency { .. }) => continue,
                 Err(StoreError::CommandIdempotencyConflict { .. }) => {
@@ -815,7 +812,7 @@ pub(super) async fn append_context_handoff_failure(
                     finished_at_ms,
                 },
             ));
-            match store.append_verified_owned(&owner, &session_id, &state, &command_id, &events) {
+            match store.append_verified_owned(&owner, &session_id, state, &command_id, &events) {
                 Ok(appended) => return Ok((appended.append, appended.state)),
                 Err(StoreError::OptimisticConcurrency { .. }) => continue,
                 Err(StoreError::CommandIdempotencyConflict { .. }) => {
@@ -926,7 +923,7 @@ pub(super) async fn append_model_attempts_exhausted(
             match store.append_verified_owned(
                 &owner,
                 &session_id,
-                &state,
+                state,
                 &command_id,
                 &[EventDraft::new(
                     event_id.clone(),

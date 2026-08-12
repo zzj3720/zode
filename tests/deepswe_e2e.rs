@@ -41,6 +41,10 @@ const TRACKED_LLM_REPLAY: &str =
     "tests/fixtures/deepswe/anko_default_function_arguments_deepseek_v4_flash.v2.llm.json.zst";
 const TRACKED_LLM_REPLAY_SHA256: &str =
     "de73313a636f29b72d2b4baf8ff727e7120dd5f026dc7cba075da8db8c2a0598";
+const TRACKED_LLM_REPLAY_INDEX: &str =
+    "tests/fixtures/deepswe/anko_default_function_arguments_deepseek_v4_flash.v2.llm-index.bin.zst";
+const TRACKED_LLM_REPLAY_INDEX_SHA256: &str =
+    "ad8628520a8619b0d649850c1b73149b0b7cd29a9f8987076f39811ff0376f41";
 const TRACKED_EVENT_REPLAY: &str =
     "tests/fixtures/deepswe/anko_default_function_arguments_deepseek_v4_flash.v2.events.json";
 const TRACKED_EVENT_REPLAY_SHA256: &str =
@@ -355,10 +359,46 @@ fn sqlite_file_set_bytes(path: &Path) -> TestResult<u64> {
     Ok(total)
 }
 
+fn positive_env_u64(name: &'static str) -> TestResult<Option<u64>> {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("{name} must be a positive integer"),
+                    )
+                })
+        })
+        .transpose()
+        .map_err(Into::into)
+}
+
+#[derive(Clone, Copy)]
+enum ProviderTiming {
+    Live,
+    Replay,
+}
+
+impl ProviderTiming {
+    fn apply(self, config: &mut Value) {
+        if matches!(self, Self::Replay) {
+            config["provider_execution"]["transport_retry"] = json!({
+                "initial_delay_ms": 1
+            });
+        }
+    }
+}
+
 fn benchmark_config(
     database: &Path,
     provider_origin: &str,
     shell_url: &str,
+    provider_timing: ProviderTiming,
 ) -> TestResult<PathBuf> {
     let tool = json!({
         "name": "shell",
@@ -380,6 +420,7 @@ fn benchmark_config(
     let path = write_endpoint_config(database, vec![tool], 3)?;
     let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
     config["provider_execution"]["allowed_base_url_origins"] = json!([provider_origin]);
+    provider_timing.apply(&mut config);
     // The generic E2E config snapshots every event so short snapshot tests can
     // exercise that path. A long benchmark instead inherits the production
     // policy unless a diagnostic run explicitly selects a cadence below.
@@ -519,12 +560,18 @@ async fn run_benchmark(
     provider_key: &str,
     provider_base_url: &str,
     database: &TempDatabase,
+    provider_timing: ProviderTiming,
 ) -> TestResult<Value> {
     let benchmark_started = Instant::now();
     let provider_origin = url::Url::parse(provider_base_url)?
         .origin()
         .ascii_serialization();
-    let config = benchmark_config(database.path(), &provider_origin, shell_url)?;
+    let config = benchmark_config(
+        database.path(),
+        &provider_origin,
+        shell_url,
+        provider_timing,
+    )?;
     let mut endpoint = TestZode::start(
         database.path(),
         &config,
@@ -626,14 +673,21 @@ async fn run_benchmark(
             || state["tool_calls"]
                 .as_array()
                 .is_some_and(|calls| calls.iter().any(|call| call["status"] == "running"));
-        if terminal_outcome != "finished"
+        let scored_terminal = match terminal_outcome.as_str() {
+            "finished" => has_assistant,
+            "failed" => {
+                !state["last_model_attempts_exhausted"].is_null()
+                    || !state["last_context_handoff_failure"].is_null()
+            }
+            _ => false,
+        };
+        if !scored_terminal
             || state["status"] != "idle"
             || !state["active_activation"].is_null()
             || has_pending_work
-            || !has_assistant
         {
             return Err(Error::other(format!(
-                "DeepSWE terminal event with outcome {terminal_outcome} did not converge to an idle session with a durable assistant message: {}",
+                "DeepSWE terminal event with outcome {terminal_outcome} did not converge to an idle, scoreable attempt: {}",
                 benchmark_state_summary(&state)
             ))
             .into());
@@ -700,6 +754,7 @@ async fn e2e_live_deepswe_opencode_go_records_and_completes() -> TestResult<()> 
         &key,
         &provider_base_url,
         &database,
+        ProviderTiming::Live,
     )
     .await;
     let mut cleanup_errors = Vec::new();
@@ -812,6 +867,7 @@ async fn e2e_deepswe_tool_only_terminal_attempt_reaches_verifier_boundary() -> T
         REPLAY_PROVIDER_KEY,
         &model.provider_url(),
         &database,
+        ProviderTiming::Live,
     )
     .await;
     let model_stop = model.stop().await;
@@ -836,6 +892,54 @@ async fn e2e_deepswe_tool_only_terminal_attempt_reaches_verifier_boundary() -> T
     }) {
         return Err(Error::other(
             "DeepSWE tool-only terminal fixture unexpectedly emitted assistant prose",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_deepswe_terminal_model_failure_reaches_verifier_boundary() -> TestResult<()> {
+    let mut model = ModelFixture::start(vec![
+        ModelScript::tool_call(
+            "terminal-failure-shell",
+            "shell",
+            r#"{"command":"printf work-before-terminal-failure"}"#,
+        ),
+        ModelScript::status(400),
+        ModelScript::status(400),
+        ModelScript::status(400),
+    ])
+    .await?;
+    let mut shell = ToolFixture::start(vec![ToolScript::Response(json!({
+        "status": "completed",
+        "result": {"content": "work-before-terminal-failure-ok"}
+    }))])
+    .await?;
+    let database = TempDatabase::new("deepswe-terminal-model-failure")?;
+
+    let primary = run_benchmark(
+        "Run one shell command, then let the provider exhaust the final model step.",
+        &shell.adapter_url(),
+        REPLAY_PROVIDER_KEY,
+        &model.provider_url(),
+        &database,
+        ProviderTiming::Live,
+    )
+    .await;
+    let model_stop = model.stop().await;
+    let shell_stop = shell.stop().await;
+    model_stop?;
+    shell_stop?;
+    let state = primary?;
+
+    if model.request_count() != 4
+        || shell.completed_count() != 1
+        || state["status"] != "idle"
+        || state["last_model_attempts_exhausted"].is_null()
+    {
+        return Err(Error::other(
+            "DeepSWE terminal model failure did not reach the verifier boundary as one valid attempt",
         )
         .into());
     }
@@ -879,6 +983,7 @@ async fn e2e_replayed_deepswe_recording_completes_through_real_endpoint() -> Tes
         REPLAY_PROVIDER_KEY,
         &recorder.base_url("/zen/go/v1"),
         &database,
+        ProviderTiming::Replay,
     )
     .await;
     let exhausted = recorder.replay_exhausted();
@@ -909,85 +1014,15 @@ async fn e2e_replayed_deepswe_recording_completes_through_real_endpoint() -> Tes
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_recorded_deepswe_long_run_replays_through_real_endpoint() -> TestResult<()> {
     let replay_started = Instant::now();
-    let performance_budget = env::var("ZODE_DEEPSWE_REPLAY_MAX_MS")
-        .ok()
-        .map(|value| {
-            value
-                .parse::<u64>()
-                .ok()
-                .filter(|milliseconds| *milliseconds > 0)
-                .map(Duration::from_millis)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        "ZODE_DEEPSWE_REPLAY_MAX_MS must be a positive integer",
-                    )
-                })
-        })
-        .transpose()?;
-    let ordinary_boundary_budget = env::var("ZODE_DEEPSWE_REPLAY_MAX_ORDINARY_BOUNDARY_MS")
-        .ok()
-        .map(|value| {
-            value
-                .parse::<u128>()
-                .ok()
-                .filter(|milliseconds| *milliseconds > 0)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        "ZODE_DEEPSWE_REPLAY_MAX_ORDINARY_BOUNDARY_MS must be a positive integer",
-                    )
-                })
-        })
-        .transpose()?;
-    let fixture_start_budget = env::var("ZODE_DEEPSWE_REPLAY_MAX_FIXTURE_START_MS")
-        .ok()
-        .map(|value| {
-            value
-                .parse::<u128>()
-                .ok()
-                .filter(|milliseconds| *milliseconds > 0)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        "ZODE_DEEPSWE_REPLAY_MAX_FIXTURE_START_MS must be a positive integer",
-                    )
-                })
-        })
-        .transpose()?;
-    let retained_request_budget = env::var("ZODE_DEEPSWE_REPLAY_MAX_RETAINED_REQUEST_BYTES")
-        .ok()
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .ok()
-                .filter(|bytes| *bytes > 0)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        "ZODE_DEEPSWE_REPLAY_MAX_RETAINED_REQUEST_BYTES must be a positive integer",
-                    )
-                })
-        })
-        .transpose()?;
-    let database_budget = env::var("ZODE_DEEPSWE_REPLAY_MAX_DATABASE_BYTES")
-        .ok()
-        .map(|value| {
-            value
-                .parse::<u64>()
-                .ok()
-                .filter(|bytes| *bytes > 0)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        "ZODE_DEEPSWE_REPLAY_MAX_DATABASE_BYTES must be a positive integer",
-                    )
-                })
-        })
-        .transpose()?;
-    if file_sha256(Path::new(TRACKED_LLM_REPLAY))? != TRACKED_LLM_REPLAY_SHA256 {
-        return Err(Error::other("DeepSWE provider cassette file digest is invalid").into());
-    }
+    let performance_budget =
+        positive_env_u64("ZODE_DEEPSWE_REPLAY_MAX_MS")?.map(Duration::from_millis);
+    let load_budget = positive_env_u64("ZODE_DEEPSWE_REPLAY_MAX_LOAD_MS")?;
+    let ordinary_boundary_budget =
+        positive_env_u64("ZODE_DEEPSWE_REPLAY_MAX_ORDINARY_BOUNDARY_MS")?;
+    let fixture_start_budget = positive_env_u64("ZODE_DEEPSWE_REPLAY_MAX_FIXTURE_START_MS")?;
+    let retained_request_budget =
+        positive_env_u64("ZODE_DEEPSWE_REPLAY_MAX_RETAINED_REQUEST_BYTES")?;
+    let database_budget = positive_env_u64("ZODE_DEEPSWE_REPLAY_MAX_DATABASE_BYTES")?;
     let trace = DeepSweEventTrace::load(
         Path::new(TRACKED_EVENT_REPLAY),
         TRACKED_EVENT_REPLAY_SHA256,
@@ -997,7 +1032,13 @@ async fn e2e_recorded_deepswe_long_run_replays_through_real_endpoint() -> TestRe
     if trace.event_count() != 1_442 || trace.tool_count()? != 158 {
         return Err(Error::other("DeepSWE event trace has the wrong causal extent").into());
     }
-    let recording = LlmHttpRecording::load_compressed_validated(Path::new(TRACKED_LLM_REPLAY))?;
+    let event_trace_loaded = replay_started.elapsed();
+    let recording = LlmHttpRecording::load_pinned_compressed_hash_replay_index(
+        Path::new(TRACKED_LLM_REPLAY),
+        TRACKED_LLM_REPLAY_SHA256,
+        Path::new(TRACKED_LLM_REPLAY_INDEX),
+        TRACKED_LLM_REPLAY_INDEX_SHA256,
+    )?;
     if recording.request_count() != 177 {
         return Err(Error::other("DeepSWE cassette has the wrong exchange count").into());
     }
@@ -1024,6 +1065,7 @@ async fn e2e_recorded_deepswe_long_run_replays_through_real_endpoint() -> TestRe
             REPLAY_PROVIDER_KEY,
             &recorder.base_url("/zen/go/v1"),
             &database,
+            ProviderTiming::Replay,
         ),
     )
     .await
@@ -1058,9 +1100,11 @@ async fn e2e_recorded_deepswe_long_run_replays_through_real_endpoint() -> TestRe
     }
     let elapsed = replay_started.elapsed();
     eprintln!(
-        "ZODE_DEEPSWE_REPLAY_PERF elapsed_ms={} load_ms={} fixture_start_ms={} journey_ms={} fixture_stop_ms={} database_verify_ms={} retained_request_bytes={} database_bytes={}",
+        "ZODE_DEEPSWE_REPLAY_PERF elapsed_ms={} load_ms={} event_trace_load_ms={} replay_index_load_ms={} fixture_start_ms={} journey_ms={} fixture_stop_ms={} database_verify_ms={} retained_request_bytes={} database_bytes={}",
         elapsed.as_millis(),
         fixtures_loaded.as_millis(),
+        event_trace_loaded.as_millis(),
+        (fixtures_loaded - event_trace_loaded).as_millis(),
         (fixtures_started - fixtures_loaded).as_millis(),
         (journey_finished - fixtures_started).as_millis(),
         (fixtures_stopped - journey_finished).as_millis(),
@@ -1081,7 +1125,17 @@ async fn e2e_recorded_deepswe_long_run_replays_through_real_endpoint() -> TestRe
             .into());
         }
     }
-    if ordinary_boundary_budget.is_some_and(|budget| ordinary_boundary_us > budget * 1_000) {
+    let load_ms = fixtures_loaded.as_millis();
+    if load_budget.is_some_and(|budget| load_ms > u128::from(budget)) {
+        return Err(Error::new(
+            ErrorKind::TimedOut,
+            format!("DeepSWE replay loaded correctly but cassette validation took {load_ms} ms"),
+        )
+        .into());
+    }
+    if ordinary_boundary_budget
+        .is_some_and(|budget| ordinary_boundary_us > u128::from(budget) * 1_000)
+    {
         return Err(Error::new(
             ErrorKind::TimedOut,
             format!(
@@ -1092,7 +1146,7 @@ async fn e2e_recorded_deepswe_long_run_replays_through_real_endpoint() -> TestRe
         .into());
     }
     let fixture_start_ms = (fixtures_started - fixtures_loaded).as_millis();
-    if fixture_start_budget.is_some_and(|budget| fixture_start_ms > budget) {
+    if fixture_start_budget.is_some_and(|budget| fixture_start_ms > u128::from(budget)) {
         return Err(Error::new(
             ErrorKind::TimedOut,
             format!(
@@ -1101,7 +1155,9 @@ async fn e2e_recorded_deepswe_long_run_replays_through_real_endpoint() -> TestRe
         )
         .into());
     }
-    if retained_request_budget.is_some_and(|budget| retained_request_bytes > budget) {
+    if retained_request_budget
+        .is_some_and(|budget| retained_request_bytes as u128 > u128::from(budget))
+    {
         return Err(Error::other(format!(
             "DeepSWE replay completed correctly but retained {retained_request_bytes} request-matching bytes"
         ))

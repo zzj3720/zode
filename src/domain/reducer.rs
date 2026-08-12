@@ -50,12 +50,17 @@ impl SessionState {
         &self,
         event: &SessionEvent,
     ) -> Result<Self, DomainError> {
+        self.clone().apply_event_from_valid_state_owned(event)
+    }
+
+    pub(crate) fn apply_event_from_valid_state_owned(
+        mut self,
+        event: &SessionEvent,
+    ) -> Result<Self, DomainError> {
         self.validate_event_position(event)?;
         event.validate()?;
-        let mut next = self.clone();
-        next.apply_payload(event)?;
-        if next == *self {
-            return Ok(next);
+        if !self.apply_payload(event)? {
+            return Ok(self);
         }
         // Validate the projected state at the version that the event will
         // occupy. Creation installs owner/timestamp/selection while the
@@ -63,11 +68,11 @@ impl SessionState {
         // advancing would classify that legitimate transition as an
         // uncreated state. No-op transitions return above and retain the
         // caller's version for reducer-level idempotency filtering.
-        next.stream_version = next
+        self.stream_version = self
             .stream_version
             .checked_add(1)
             .ok_or(DomainError::VersionOverflow)?;
-        Ok(next)
+        Ok(self)
     }
 
     pub fn decide_batch(&self, events: &[SessionEvent]) -> Result<DomainDecision, DomainError> {
@@ -103,6 +108,13 @@ impl SessionState {
 
     pub fn apply_record(&self, record: &EventRecord) -> Result<Self, DomainError> {
         self.validate()?;
+        self.clone().apply_record_from_valid_state_owned(record)
+    }
+
+    pub(crate) fn apply_record_from_valid_state_owned(
+        mut self,
+        record: &EventRecord,
+    ) -> Result<Self, DomainError> {
         if record.event_schema_version != EVENT_SCHEMA_VERSION {
             return Err(DomainError::UnsupportedEventSchema(
                 record.event_schema_version,
@@ -130,12 +142,11 @@ impl SessionState {
         }
         self.validate_event_position(&record.event)?;
         record.event.validate()?;
-        let mut next = self.clone();
-        next.apply_payload(&record.event)?;
-        next.stream_version = record.stream_version;
-        next.dedupe_facts.remember(event_key);
-        next.validate()?;
-        Ok(next)
+        self.apply_payload(&record.event)?;
+        self.stream_version = record.stream_version;
+        self.dedupe_facts.remember(event_key);
+        self.validate()?;
+        Ok(self)
     }
 
     /// Attach the immutable event identity after storage has committed an
@@ -488,7 +499,7 @@ impl SessionState {
         Ok(())
     }
 
-    fn apply_payload(&mut self, event: &SessionEvent) -> Result<(), DomainError> {
+    fn apply_payload(&mut self, event: &SessionEvent) -> Result<bool, DomainError> {
         match event {
             SessionEvent::SessionCreated {
                 session_id,
@@ -515,10 +526,15 @@ impl SessionState {
                     .checked_add(1)
                     .ok_or(DomainError::VersionOverflow)?;
             }
-            SessionEvent::StatusChanged { status } => self.status = status.clone(),
+            SessionEvent::StatusChanged { status } => {
+                if self.status == *status {
+                    return Ok(false);
+                }
+                self.status = status.clone();
+            }
             SessionEvent::DeliveryQueued { delivery } => {
                 if delivery.queue_id <= self.delivery_ack {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if let Some(existing) = self
                     .delivery_queue
@@ -526,7 +542,7 @@ impl SessionState {
                     .find(|queued| queued.queue_id == delivery.queue_id)
                 {
                     if existing == delivery {
-                        return Ok(());
+                        return Ok(false);
                     }
                     return Err(DomainError::ConflictingDelivery(
                         delivery.delivery_id.clone(),
@@ -537,7 +553,7 @@ impl SessionState {
                     .contains(&format!("delivery:{}", delivery.delivery_id))
                     || self.dedupe_facts.contains(&delivery.dedupe_key)
                 {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if self.delivery_queue.len() >= MAX_DELIVERY_QUEUE_ITEMS {
                     return Err(DomainError::CollectionTooLarge {
@@ -568,7 +584,7 @@ impl SessionState {
             }
             SessionEvent::DeliveryAcknowledged { through_queue_id } => {
                 if *through_queue_id <= self.delivery_ack {
-                    return Ok(());
+                    return Ok(false);
                 }
                 let max_queued = self
                     .delivery_ack
@@ -618,7 +634,7 @@ impl SessionState {
                     if existing_message_id == message.message_id
                         && self.transcript.iter().any(|existing| existing == message)
                     {
-                        return Ok(());
+                        return Ok(false);
                     }
                     return Err(DomainError::ConflictingDelivery(
                         self.delivery_queue[index].delivery_id.clone(),
@@ -654,7 +670,7 @@ impl SessionState {
                     .find(|existing| existing.message_id == message.message_id)
                 {
                     if existing == message {
-                        return Ok(());
+                        return Ok(false);
                     }
                     return Err(DomainError::ConflictingTranscriptMessage(
                         message.message_id.clone(),
@@ -665,7 +681,7 @@ impl SessionState {
                     .as_ref()
                     .is_some_and(|key| self.dedupe_facts.contains(key))
                 {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if self.transcript.len() >= MAX_TRANSCRIPT_MESSAGES {
                     return Err(DomainError::CollectionTooLarge {
@@ -832,7 +848,7 @@ impl SessionState {
                 }
                 if let Some(existing) = &self.pending_context_handoff {
                     if existing == plan {
-                        return Ok(());
+                        return Ok(false);
                     }
                     return Err(DomainError::InvalidState(
                         "context handoff already has a pending plan".into(),
@@ -861,7 +877,7 @@ impl SessionState {
                 if let Some(existing) = &self.latest_context_handoff {
                     if existing.handoff_id == handoff.handoff_id && existing == handoff {
                         self.pending_context_handoff = None;
-                        return Ok(());
+                        return Ok(true);
                     }
                     if Some(existing.handoff_id.as_str()) != handoff.previous_handoff_id.as_deref()
                     {
@@ -982,7 +998,7 @@ impl SessionState {
                     if existing.attempt_id == *attempt_id
                         && existing.attempt_number == *attempt_number
                     {
-                        return Ok(());
+                        return Ok(false);
                     }
                     return Err(DomainError::InvalidState(
                         "model request already has an attempt".into(),
@@ -1031,7 +1047,7 @@ impl SessionState {
                 )?;
                 match attempt.outcome {
                     ModelAttemptOutcome::Running => attempt.outcome = ModelAttemptOutcome::Failed,
-                    ModelAttemptOutcome::Failed => return Ok(()),
+                    ModelAttemptOutcome::Failed => return Ok(false),
                     _ => {
                         return Err(DomainError::InvalidState(
                             "model attempt failure is not first-wins".into(),
@@ -1059,7 +1075,7 @@ impl SessionState {
                     ModelAttemptOutcome::Running => {
                         attempt.outcome = ModelAttemptOutcome::Interrupted
                     }
-                    ModelAttemptOutcome::Interrupted => return Ok(()),
+                    ModelAttemptOutcome::Interrupted => return Ok(false),
                     _ => {
                         return Err(DomainError::InvalidState(
                             "model attempt interruption is not first-wins".into(),
@@ -1105,7 +1121,7 @@ impl SessionState {
             SessionEvent::ModelAttemptsExhausted { fact } => {
                 if let Some(existing) = &self.last_model_attempts_exhausted {
                     if existing == fact {
-                        return Ok(());
+                        return Ok(false);
                     }
                     if existing.activation_id == fact.activation_id {
                         return Err(DomainError::InvalidState(
@@ -1170,7 +1186,7 @@ impl SessionState {
                 }
                 if let Some(existing) = &round.retry {
                     if existing == schedule {
-                        return Ok(());
+                        return Ok(false);
                     }
                     return Err(DomainError::InvalidState(
                         "model retry schedule has conflicting semantics".into(),
@@ -1205,7 +1221,7 @@ impl SessionState {
                     ModelAttemptOutcome::Running => {
                         attempt.outcome = ModelAttemptOutcome::Completed
                     }
-                    ModelAttemptOutcome::Completed => return Ok(()),
+                    ModelAttemptOutcome::Completed => return Ok(false),
                     _ => {
                         return Err(DomainError::InvalidState(
                             "model completion requires a running attempt".into(),
@@ -1246,7 +1262,7 @@ impl SessionState {
                 if let Some(existing) = &self.last_model_attempt_failure {
                     if existing.trigger_message_id == failure.trigger_message_id {
                         if existing == failure {
-                            return Ok(());
+                            return Ok(false);
                         }
                         return Err(DomainError::InvalidState(
                             "current user message has conflicting terminal model failures".into(),
@@ -1256,6 +1272,12 @@ impl SessionState {
                 self.last_model_attempt_failure = Some(failure.clone());
             }
             SessionEvent::WaitSet { wait } => {
+                if self.active_wait.as_ref() == Some(wait)
+                    && self.active_timer.is_none()
+                    && self.wake_pending_wait_id.is_none()
+                {
+                    return Ok(false);
+                }
                 self.active_wait = Some(wait.clone());
                 self.active_timer = None;
                 self.wake_pending_wait_id = None;
@@ -1269,11 +1291,14 @@ impl SessionState {
                         "wait timer does not match active wait".into(),
                     ));
                 }
+                if self.active_timer.as_ref() == Some(timer) {
+                    return Ok(false);
+                }
                 self.active_timer = Some(timer.clone());
             }
             SessionEvent::WaitCleared { wait_id } | SessionEvent::WaitExpired { wait_id } => {
                 if self.wake_pending_wait_id.as_deref() == Some(wait_id.as_str()) {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if self
                     .active_wait
@@ -1283,12 +1308,14 @@ impl SessionState {
                     self.active_wait = None;
                     self.active_timer = None;
                     self.wake_pending_wait_id = None;
+                } else {
+                    return Ok(false);
                 }
             }
             SessionEvent::AsyncToolCallStarted { record } => {
                 if let Some(existing) = self.async_tool_calls.get(&record.tool_call_id) {
                     if existing == record {
-                        return Ok(());
+                        return Ok(false);
                     }
                     return Err(DomainError::ConflictingAsyncToolCallStart(
                         record.tool_call_id.clone(),
@@ -1334,7 +1361,7 @@ impl SessionState {
                 }
                 match record.status {
                     AsyncToolStatus::Planned => record.status = AsyncToolStatus::Running,
-                    AsyncToolStatus::Running => return Ok(()),
+                    AsyncToolStatus::Running => return Ok(false),
                     AsyncToolStatus::UnknownOutcome if record.retry_dispatch_deduplicated => {
                         record.status = AsyncToolStatus::Running
                     }
@@ -1356,7 +1383,7 @@ impl SessionState {
                     .ok_or_else(|| DomainError::UnknownAsyncToolCall(tool_call_id.clone()))?;
                 match record.status {
                     AsyncToolStatus::Running => record.status = AsyncToolStatus::UnknownOutcome,
-                    AsyncToolStatus::UnknownOutcome => return Ok(()),
+                    AsyncToolStatus::UnknownOutcome => return Ok(false),
                     _ => {
                         return Err(DomainError::InvalidState(
                             "only a running tool call can become unknown outcome".into(),
@@ -1374,10 +1401,10 @@ impl SessionState {
                     .get_mut(tool_call_id)
                     .ok_or_else(|| DomainError::UnknownAsyncToolCall(tool_call_id.clone()))?;
                 if record.status == AsyncToolStatus::UnknownOutcome {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if record.status.is_terminal() {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if *completed_at_ms < record.started_at_ms {
                     return Err(DomainError::InvalidTimestampOrder {
@@ -1416,7 +1443,7 @@ impl SessionState {
                 }
                 if let Some(existing) = self.callback_bindings.get(&binding.callback_id) {
                     if existing == binding {
-                        return Ok(());
+                        return Ok(false);
                     }
                     return Err(DomainError::InvalidState(
                         "callback id has conflicting binding".into(),
@@ -1452,7 +1479,7 @@ impl SessionState {
                 }
                 if let Some(existing) = &binding.payload_fingerprint {
                     if existing == payload_fingerprint {
-                        return Ok(());
+                        return Ok(false);
                     }
                     return Err(DomainError::CallbackPayloadConflict(callback_id.clone()));
                 }
@@ -1494,7 +1521,7 @@ impl SessionState {
                 }
                 if let Some(existing) = &binding.payload_fingerprint {
                     if existing == payload_fingerprint {
-                        return Ok(());
+                        return Ok(false);
                     }
                     return Err(DomainError::CallbackPayloadConflict(callback_id.clone()));
                 }
@@ -1527,7 +1554,10 @@ impl SessionState {
                     .get_mut(tool_call_id)
                     .ok_or_else(|| DomainError::UnknownAsyncToolCall(tool_call_id.clone()))?;
                 if record.status.is_terminal() {
-                    return Ok(());
+                    return Ok(false);
+                }
+                if record.progress.as_ref() == Some(progress) {
+                    return Ok(false);
                 }
                 record.progress = Some(progress.clone());
             }
@@ -1546,7 +1576,7 @@ impl SessionState {
                     ));
                 }
                 if record.status.is_terminal() {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if *completed_at_ms < record.started_at_ms {
                     return Err(DomainError::InvalidTimestampOrder {
@@ -1575,7 +1605,7 @@ impl SessionState {
                     ));
                 }
                 if record.status.is_terminal() {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if *completed_at_ms < record.started_at_ms {
                     return Err(DomainError::InvalidTimestampOrder {
@@ -1604,7 +1634,7 @@ impl SessionState {
                     ));
                 }
                 if record.status.is_terminal() {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if *completed_at_ms < record.started_at_ms {
                     return Err(DomainError::InvalidTimestampOrder {
@@ -1618,9 +1648,15 @@ impl SessionState {
                 record.cancel_reason = Some(reason.clone());
                 record.completed_at_ms = Some(*completed_at_ms);
             }
-            SessionEvent::DedupeRecorded { key } => self.dedupe_facts.remember(key.clone()),
+            SessionEvent::DedupeRecorded { key } => {
+                let changed = self.dedupe_facts.recent_keys.back() != Some(key);
+                self.dedupe_facts.remember(key.clone());
+                if !changed {
+                    return Ok(false);
+                }
+            }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn validate_event_position(&self, event: &SessionEvent) -> Result<(), DomainError> {
