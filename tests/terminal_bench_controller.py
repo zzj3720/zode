@@ -520,6 +520,7 @@ class Controller:
             "capacity_cpus",
             "capacity_memory_mb",
             "retry_lanes",
+            "park_lanes",
             "hold_tasks",
             "release_tasks",
         }
@@ -542,17 +543,23 @@ class Controller:
             ):
                 raise ValueError(f"{field} must be a positive integer")
         retry_lanes = value.get("retry_lanes", [])
-        if (
-            not isinstance(retry_lanes, list)
-            or any(
-                isinstance(lane, bool)
-                or not isinstance(lane, int)
-                or not 1 <= lane <= MAX_WORKERS
-                for lane in retry_lanes
-            )
-            or len(set(retry_lanes)) != len(retry_lanes)
-        ):
-            raise ValueError("retry_lanes must contain unique lane numbers 1 through 3")
+        park_lanes = value.get("park_lanes", [])
+        for field, lanes in (("retry_lanes", retry_lanes), ("park_lanes", park_lanes)):
+            if (
+                not isinstance(lanes, list)
+                or any(
+                    isinstance(lane, bool)
+                    or not isinstance(lane, int)
+                    or not 1 <= lane <= MAX_WORKERS
+                    for lane in lanes
+                )
+                or len(set(lanes)) != len(lanes)
+            ):
+                raise ValueError(
+                    f"{field} must contain unique lane numbers 1 through 3"
+                )
+        if set(retry_lanes) & set(park_lanes):
+            raise ValueError("a lane cannot be retried and parked in one request")
         hold_tasks = value.get("hold_tasks", [])
         release_tasks = value.get("release_tasks", [])
         for field, tasks in (
@@ -569,7 +576,12 @@ class Controller:
             raise ValueError("a task cannot be held and released in one request")
 
         def mutation(queue: dict[str, Any]) -> dict[str, Any]:
-            for field in allowed - {"retry_lanes", "hold_tasks", "release_tasks"}:
+            for field in allowed - {
+                "retry_lanes",
+                "park_lanes",
+                "hold_tasks",
+                "release_tasks",
+            }:
                 if field in value:
                     queue["control"][field] = value[field]
             if value.get("paused") is False:
@@ -582,6 +594,25 @@ class Controller:
                     raise ValueError(f"lane {lane} still has an active pair")
                 lease["attention"] = None
             held_tasks = queue.setdefault("held_tasks", {})
+            for lane in park_lanes:
+                if not queue["control"]["paused"]:
+                    raise ValueError("active or stale lanes can be parked only while paused")
+                lease = queue["leases"].get(str(lane))
+                if lease is None:
+                    raise ValueError(f"lane {lane} has no task to park")
+                with self.state_lock:
+                    if str(lane) in self.state["active_processes"]:
+                        raise ValueError(f"lane {lane} still has a running pair")
+                held = dict(lease)
+                held.pop("lane", None)
+                held.pop("leased_at", None)
+                held.pop("active_pair", None)
+                held["attention"] = {
+                    "at": now(),
+                    "reason": "paired attempt became stale across controller generation",
+                }
+                held_tasks[str(lease["task"])] = held
+                del queue["leases"][str(lane)]
             for task in hold_tasks:
                 pending_index = next(
                     (
