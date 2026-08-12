@@ -101,6 +101,11 @@ recording, fixture promotion, and replay.
   maintain a parallel shell transcript or import recorded events into storage.
   The provider cassette supplements only exact provider HTTP bytes that the
   product intentionally does not persist in events.
+- Tool results in that manifest include both successful completions and failed
+  external-adapter outcomes. The real replay adapter must reproduce the same
+  terminal class, and the new Endpoint must independently project the matching
+  durable tool state. The real-process regression anchor is
+  `e2e_deepswe_failed_tool_outcome_is_recorded_and_replayed`.
 - The canonical DeepSWE correctness replay reports elapsed time without a
   machine-specific limit. Local performance diagnosis may explicitly set
   `ZODE_DEEPSWE_REPLAY_MAX_MS` to turn a measured regression into a typed red;

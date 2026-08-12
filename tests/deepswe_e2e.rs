@@ -4,6 +4,7 @@ mod deepswe_support;
 mod support;
 
 use std::{
+    collections::HashMap,
     env, fs,
     io::{Error, ErrorKind},
     path::{Path, PathBuf},
@@ -16,7 +17,7 @@ use axum::{
     routing::post,
     Router,
 };
-use deepswe_support::{file_sha256, DeepSweEventTrace, DeepSweToolExchange};
+use deepswe_support::{file_sha256, DeepSweEventTrace, DeepSweToolExchange, DeepSweToolOutcome};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -106,51 +107,80 @@ impl EventToolFixture {
     }
 
     fn assert_durable_outcomes(&self, session: &Value) -> TestResult<()> {
-        let expected = self
-            .state
-            .exchanges
-            .iter()
-            .map(|exchange| exchange.result_content.as_str())
-            .collect::<Vec<_>>();
         let transcript = session["transcript"]
             .as_array()
             .ok_or_else(|| Error::other("DeepSWE replay omitted the durable transcript"))?;
-        let actual = transcript
+        let mut tool_messages = HashMap::with_capacity(self.state.exchanges.len());
+        for message in transcript
             .iter()
             .filter(|message| message["role"] == "tool")
-            .map(|message| {
-                message["content"]
-                    .as_str()
-                    .ok_or_else(|| Error::other("DeepSWE replay emitted a non-text tool result"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if actual.len() != expected.len() {
+        {
+            let tool_call_id = message["tool_call_id"].as_str().ok_or_else(|| {
+                Error::other("DeepSWE replay durable tool result omitted its identity")
+            })?;
+            if tool_messages.insert(tool_call_id, message).is_some() {
+                return Err(
+                    Error::other("DeepSWE replay repeated a durable tool-result identity").into(),
+                );
+            }
+        }
+        if tool_messages.len() != self.state.exchanges.len() {
             return Err(
                 Error::other("DeepSWE replay did not commit every recorded tool result").into(),
             );
         }
-        if actual
-            .iter()
-            .zip(&expected)
-            .any(|(actual, expected)| *actual != *expected)
-        {
-            return Err(Error::other(
-                "DeepSWE replay durable tool result did not match its recorded input",
-            )
-            .into());
+        for expected in &self.state.exchanges {
+            let message = tool_messages
+                .get(expected.tool_call_id.as_str())
+                .ok_or_else(|| Error::other("DeepSWE replay omitted a durable tool identity"))?;
+            let content = message["content"]
+                .as_str()
+                .ok_or_else(|| Error::other("DeepSWE replay emitted a non-text tool result"))?;
+            if let DeepSweToolOutcome::Completed(expected_content) = &expected.outcome {
+                if content != expected_content {
+                    return Err(Error::other(
+                        "DeepSWE replay durable tool result did not match its recorded input",
+                    )
+                    .into());
+                }
+            }
         }
-        let tool_calls = session["tool_calls"]
+        let projected_tools = session["tool_calls"]
             .as_array()
             .ok_or_else(|| Error::other("DeepSWE replay omitted tool-call projections"))?;
-        if tool_calls.len() != expected.len()
-            || tool_calls
-                .iter()
-                .any(|call| call["status"] != "completed" || call["result"].is_null())
-        {
-            return Err(Error::other(
-                "DeepSWE replay did not project every recorded tool outcome as completed",
-            )
-            .into());
+        let mut tool_calls = HashMap::with_capacity(self.state.exchanges.len());
+        for call in projected_tools {
+            let tool_call_id = call["tool_call_id"].as_str().ok_or_else(|| {
+                Error::other("DeepSWE replay projected a tool outcome without identity")
+            })?;
+            if tool_calls.insert(tool_call_id, call).is_some() {
+                return Err(
+                    Error::other("DeepSWE replay repeated a projected tool identity").into(),
+                );
+            }
+        }
+        if tool_calls.len() != self.state.exchanges.len() {
+            return Err(Error::other("DeepSWE replay omitted a projected tool outcome").into());
+        }
+        for expected in &self.state.exchanges {
+            let call = tool_calls
+                .get(expected.tool_call_id.as_str())
+                .ok_or_else(|| Error::other("DeepSWE replay omitted a projected tool identity"))?;
+            let valid = match &expected.outcome {
+                DeepSweToolOutcome::Completed(_) => {
+                    call["status"] == "completed"
+                        && !call["result"].is_null()
+                        && call["error"].is_null()
+                }
+                DeepSweToolOutcome::Failed => {
+                    call["status"] == "failed"
+                        && call["result"].is_null()
+                        && !call["error"].is_null()
+                }
+            };
+            if !valid {
+                return Err(Error::other("DeepSWE replay projected the wrong tool outcome").into());
+            }
         }
         Ok(())
     }
@@ -212,10 +242,16 @@ async fn replay_event_tool_request(
             Json(json!({"result": {"content": "event-derived tool mismatch"}})),
         );
     };
-    (
-        axum::http::StatusCode::OK,
-        Json(json!({"result": {"content": expected.result_content}})),
-    )
+    match expected.outcome {
+        DeepSweToolOutcome::Completed(content) => (
+            axum::http::StatusCode::OK,
+            Json(json!({"result": {"content": content}})),
+        ),
+        DeepSweToolOutcome::Failed => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"result": {"content": "recorded tool failure"}})),
+        ),
+    }
 }
 
 fn report_boundary_gaps(provider: Vec<Instant>, tool: Vec<Instant>) -> u128 {
@@ -943,6 +979,77 @@ async fn e2e_deepswe_terminal_model_failure_reaches_verifier_boundary() -> TestR
         )
         .into());
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_deepswe_failed_tool_outcome_is_recorded_and_replayed() -> TestResult<()> {
+    const PROVIDER_FIXTURE_SHA256: &str =
+        "f05477636ed4ab48678812d576b0503979edc59721ca0daf9e23781a99811bca";
+    let instruction = "Run the failing shell command once, then report that it failed.";
+    let scripts = || {
+        vec![
+            ModelScript::tool_call("failed-shell", "shell", r#"{"command":"exit 17"}"#),
+            ModelScript::final_text("The shell command failed."),
+        ]
+    };
+
+    let mut recording_model = ModelFixture::start(scripts()).await?;
+    let mut failing_shell = ToolFixture::start(vec![ToolScript::Status(500)]).await?;
+    let recording_database = TempDatabase::new("deepswe-failed-tool-recording")?;
+    let recording = run_benchmark(
+        instruction,
+        &failing_shell.adapter_url(),
+        REPLAY_PROVIDER_KEY,
+        &recording_model.provider_url(),
+        &recording_database,
+        ProviderTiming::Replay,
+    )
+    .await;
+    recording_model.stop().await?;
+    failing_shell.stop().await?;
+    let recording_state = recording?;
+    let recorded_tools = recording_state["tool_calls"]
+        .as_array()
+        .ok_or_else(|| Error::other("DeepSWE failed-tool recording omitted tool projections"))?;
+    if recorded_tools.len() != 1
+        || recorded_tools[0]["status"] != "failed"
+        || !recorded_tools[0]["result"].is_null()
+        || recorded_tools[0]["error"].is_null()
+    {
+        return Err(Error::other(
+            "DeepSWE failed-tool recording did not reach one durable failed outcome",
+        )
+        .into());
+    }
+
+    let recording_database_path = recording_database.path().to_owned();
+    let trace = spawn_db_blocking(move || {
+        DeepSweEventTrace::read_stopped_database(&recording_database_path, PROVIDER_FIXTURE_SHA256)
+    })
+    .await??;
+
+    let mut replay_model = ModelFixture::start(scripts()).await?;
+    let mut replay_shell = EventToolFixture::start(&trace).await?;
+    let replay_database = TempDatabase::new("deepswe-failed-tool-replay")?;
+    let replay = run_benchmark(
+        instruction,
+        &replay_shell.url(),
+        REPLAY_PROVIDER_KEY,
+        &replay_model.provider_url(),
+        &replay_database,
+        ProviderTiming::Replay,
+    )
+    .await;
+    replay_model.stop().await?;
+    replay_shell.stop().await?;
+    let replay_state = replay?;
+    replay_shell.assert_exhausted()?;
+    replay_shell.assert_durable_outcomes(&replay_state)?;
+
+    let replay_database_path = replay_database.path().to_owned();
+    spawn_db_blocking(move || trace.assert_matches_stopped_database(&replay_database_path))
+        .await??;
     Ok(())
 }
 

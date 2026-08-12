@@ -61,7 +61,13 @@ struct DeepSweEventBlob {
 pub struct DeepSweToolExchange {
     pub tool_call_id: String,
     pub command: String,
-    pub result_content: String,
+    pub outcome: DeepSweToolOutcome,
+}
+
+#[derive(Clone, Debug)]
+pub enum DeepSweToolOutcome {
+    Completed(String),
+    Failed,
 }
 
 #[derive(Serialize)]
@@ -236,9 +242,9 @@ impl DeepSweEventTrace {
             .iter()
             .map(|blob| (blob.blob_id.as_str(), blob))
             .collect::<HashMap<_, _>>();
-        let mut exchanges = Vec::<DeepSweToolExchange>::new();
+        let mut inputs = Vec::<(String, String)>::new();
         let mut indexes = HashMap::<String, usize>::new();
-        let mut completed = Vec::<bool>::new();
+        let mut outcomes = Vec::<Option<DeepSweToolOutcome>>::new();
         for event in &self.events {
             match event.event_type.as_str() {
                 "async_tool_call_started" => {
@@ -257,35 +263,57 @@ impl DeepSweEventTrace {
                         )
                         .into());
                     }
-                    indexes.insert(tool_call_id.to_owned(), exchanges.len());
-                    exchanges.push(DeepSweToolExchange {
-                        tool_call_id: tool_call_id.to_owned(),
-                        command: command.to_owned(),
-                        result_content: String::new(),
-                    });
-                    completed.push(false);
+                    indexes.insert(tool_call_id.to_owned(), inputs.len());
+                    inputs.push((tool_call_id.to_owned(), command.to_owned()));
+                    outcomes.push(None);
                 }
                 "async_tool_call_completed" => {
                     let tool_call_id = required_string(&event.payload, "/tool_call_id")?;
                     let index = indexes.get(tool_call_id).copied().ok_or_else(|| {
                         Error::other("DeepSWE tool completion has no matching start")
                     })?;
-                    if completed[index] {
-                        return Err(
-                            Error::other("DeepSWE event trace repeats a tool completion").into(),
-                        );
+                    if outcomes[index].is_some() {
+                        return Err(Error::other(
+                            "DeepSWE event trace repeats a terminal tool outcome",
+                        )
+                        .into());
                     }
-                    exchanges[index].result_content =
-                        tool_result_content(&event.payload, tool_call_id, &blobs)?;
-                    completed[index] = true;
+                    outcomes[index] = Some(DeepSweToolOutcome::Completed(tool_result_content(
+                        &event.payload,
+                        tool_call_id,
+                        &blobs,
+                    )?));
+                }
+                "async_tool_call_failed" => {
+                    let tool_call_id = required_string(&event.payload, "/tool_call_id")?;
+                    let index = indexes.get(tool_call_id).copied().ok_or_else(|| {
+                        Error::other("DeepSWE tool failure has no matching start")
+                    })?;
+                    if outcomes[index].is_some() {
+                        return Err(Error::other(
+                            "DeepSWE event trace repeats a terminal tool outcome",
+                        )
+                        .into());
+                    }
+                    let _ = required_string(&event.payload, "/error/class")?;
+                    let _ = required_string(&event.payload, "/error/message")?;
+                    outcomes[index] = Some(DeepSweToolOutcome::Failed);
                 }
                 _ => {}
             }
         }
-        if exchanges.is_empty() || completed.iter().any(|value| !value) {
+        if inputs.is_empty() || outcomes.iter().any(Option::is_none) {
             return Err(Error::other("DeepSWE event trace has incomplete tool outcomes").into());
         }
-        Ok(exchanges)
+        Ok(inputs
+            .into_iter()
+            .zip(outcomes)
+            .map(|((tool_call_id, command), outcome)| DeepSweToolExchange {
+                tool_call_id,
+                command,
+                outcome: outcome.expect("DeepSWE tool outcomes were checked above"),
+            })
+            .collect())
     }
 
     pub fn assert_matches_stopped_database(&self, database: &Path) -> TestResult<()> {

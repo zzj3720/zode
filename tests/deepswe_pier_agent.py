@@ -143,7 +143,7 @@ class _ShellBridge(ThreadingHTTPServer):
                     exchange = {
                         "tool_call_id": tool_call_id,
                         "command": command,
-                        "result_content": None,
+                        "outcome": None,
                     }
                     started[tool_call_id] = exchange
                     self.replay.append(exchange)
@@ -156,12 +156,33 @@ class _ShellBridge(ThreadingHTTPServer):
                         )
                         content = blobs.get(blob_id)
                     exchange = started.get(tool_call_id)
-                    if exchange is None or not isinstance(content, str):
+                    if (
+                        exchange is None
+                        or exchange["outcome"] is not None
+                        or not isinstance(content, str)
+                    ):
                         raise ValueError("DeepSWE event trace tool result is invalid")
-                    exchange["result_content"] = content
+                    exchange["outcome"] = {
+                        "kind": "completed",
+                        "result_content": content,
+                    }
+                elif event["event_type"] == "async_tool_call_failed":
+                    tool_call_id = payload.get("tool_call_id")
+                    error = payload.get("error")
+                    exchange = started.get(tool_call_id)
+                    if (
+                        exchange is None
+                        or exchange["outcome"] is not None
+                        or not isinstance(error, dict)
+                        or not isinstance(error.get("class"), str)
+                        or not error["class"]
+                        or not isinstance(error.get("message"), str)
+                        or not error["message"]
+                    ):
+                        raise ValueError("DeepSWE event trace tool failure is invalid")
+                    exchange["outcome"] = {"kind": "failed"}
             if not self.replay or any(
-                not isinstance(exchange["result_content"], str)
-                for exchange in self.replay
+                not isinstance(exchange["outcome"], dict) for exchange in self.replay
             ):
                 raise ValueError("DeepSWE event trace has incomplete tool outcomes")
 
@@ -174,32 +195,56 @@ class _ShellBridge(ThreadingHTTPServer):
                 if replay_index < len(self.replay)
                 else None
             )
-        future = asyncio.run_coroutine_threadsafe(
-            self.environment.exec(
-                f"bash -lc {shlex.quote(command)}",
-                cwd="/app",
-                timeout_sec=600,
-            ),
-            self.loop,
-        )
-        result = future.result(timeout=620)
-        stdout = _bounded(result.stdout)
-        stderr = _bounded(result.stderr)
-        actual = {
-            "exit_code": result.return_code,
-            "stdout": stdout,
-            "stderr": stderr,
-        }
+        actual = None
+        actual_failed = False
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.environment.exec(
+                    f"bash -lc {shlex.quote(command)}",
+                    cwd="/app",
+                    timeout_sec=600,
+                ),
+                self.loop,
+            )
+            result = future.result(timeout=620)
+            actual = {
+                "exit_code": result.return_code,
+                "stdout": _bounded(result.stdout),
+                "stderr": _bounded(result.stderr),
+            }
+        except Exception:
+            if expected is None:
+                raise
+            actual_failed = True
+
         returned = actual
+        response_status = 200
         replay_error = None
         if expected is not None:
-            returned = json.loads(expected["result_content"])
+            outcome = expected["outcome"]
             if expected["command"] != command:
                 replay_error = "DeepSWE shell command did not match event trace"
-            elif returned.get("exit_code") != result.return_code:
-                replay_error = "DeepSWE shell exit code did not match event trace"
+            if outcome["kind"] == "completed":
+                returned = json.loads(outcome["result_content"])
+                if actual_failed:
+                    replay_error = replay_error or (
+                        "DeepSWE shell failed but the event trace recorded completion"
+                    )
+                elif returned.get("exit_code") != actual["exit_code"]:
+                    replay_error = replay_error or (
+                        "DeepSWE shell exit code did not match event trace"
+                    )
+            else:
+                returned = {"error": "recorded tool failure"}
+                response_status = 500
+                if not actual_failed:
+                    replay_error = replay_error or (
+                        "DeepSWE shell completed but the event trace recorded failure"
+                    )
         elif self.replay:
             replay_error = "DeepSWE event replay observed an extra shell command"
+        if returned is None:
+            raise RuntimeError("shell execution produced no result")
         content = json.dumps(
             returned,
             ensure_ascii=False,
@@ -207,7 +252,7 @@ class _ShellBridge(ThreadingHTTPServer):
         with self.recording_lock:
             if replay_error is not None and self.replay_error is None:
                 self.replay_error = replay_error
-        return {"result": {"content": content}}
+        return response_status, {"result": {"content": content}}
 
     def assert_replay_complete(self) -> None:
         with self.recording_lock:
@@ -232,9 +277,9 @@ class _ShellHandler(BaseHTTPRequestHandler):
             command = body.get("input", {}).get("command")
             if not isinstance(command, str) or not command.strip():
                 raise ValueError("shell command is required")
-            response = self.server.execute(command)
+            status, response = self.server.execute(command)
             encoded = json.dumps(response, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
+            self.send_response(status)
         except Exception as error:  # keep tool failure observable to the model
             encoded = json.dumps(
                 {"result": {"content": json.dumps({"error": str(error)})}}

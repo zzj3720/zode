@@ -250,11 +250,19 @@ them into storage:
 
 For example, a recorded user delivery is replayed as the corresponding public
 message command. `AsyncToolCallStarted` supplies the exact tool name and input
-that the real HTTP tool adapter must receive, while its matching
-`AsyncToolCallCompleted` supplies the recorded external result returned by the
-test-owned tool fixture. Endpoint must independently commit both lifecycle
-events in the same causal position. Even when an event represents an admitted
-input, the harness never appends that event directly.
+that the real HTTP tool adapter must receive. Its matching terminal event
+supplies the external outcome that the test-owned tool fixture must reproduce:
+`AsyncToolCallCompleted` returns the recorded result, while
+`AsyncToolCallFailed` returns a failed adapter response. Endpoint must
+independently commit both lifecycle events in the same causal position. Even
+when an event represents an admitted input, the harness never appends that
+event directly.
+
+`e2e_deepswe_failed_tool_outcome_is_recorded_and_replayed` freezes the failed
+branch through two fresh real Endpoint processes. The first run observes a
+real HTTP tool failure and exports the stopped session trace; the second
+replays that failure through the same public message and HTTP tool boundaries,
+then requires the stopped event log and projected failed tool outcome to match.
 
 The causal manifest is closed over immutable blobs referenced by those events.
 When a tool result exceeds the inline event bound, the trace carries the exact
