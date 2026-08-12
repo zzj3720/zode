@@ -124,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_options = config.runtime_options();
     let credential_replica_directory = control.credential_replica_directory().map(PathBuf::from);
     let replicas = Arc::new(ReplicaStore::open(credential_replica_directory.as_deref())?);
-    let (adapter_kinds, allowed_origins) = config.provider_execution_policy();
+    let (adapter_kinds, allowed_origins, transport_retry) = config.provider_execution_policy();
     let capabilities_body = api::build_capabilities_body_with_callback(
         control.endpoint_id(),
         adapter_kinds.clone(),
@@ -132,7 +132,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         true,
     )?;
     let health_body = api::build_health_body(control.endpoint_id())?;
-    let provider_policy = ProviderExecutionPolicy::new(adapter_kinds, allowed_origins);
+    let provider_policy =
+        ProviderExecutionPolicy::new(adapter_kinds, allowed_origins, transport_retry);
     let tool_specs = config.tool_specs();
     let blob_store = config
         .blob_store_directory()

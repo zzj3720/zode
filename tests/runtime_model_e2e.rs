@@ -651,6 +651,7 @@ fn incident_recording(path: &Path, owner: &str) -> TestResult<LlmHttpRecording> 
         secret_slots: vec!["SLOT_PROVIDER_MODEL_AUTHORIZATION".to_owned()],
         provider: provider.to_owned(),
         model: model.to_owned(),
+        recording_class: Default::default(),
         requests,
         envelope_sha256: String::new(),
     }
@@ -1747,10 +1748,10 @@ async fn e2e_golden_assembled_model_tool_loop_survives_restart() -> TestResult<(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_round_boundary_steering_waits_for_the_next_model_round() -> TestResult<()> {
     let database = TempDatabase::new("runtime-steering")?;
-    let release = Arc::new(Notify::new());
+    let hold = ModelHold::new();
     let mut model = ModelFixture::start(vec![
-        ModelScript::hold(
-            release.clone(),
+        ModelScript::hold_entered(
+            hold.clone(),
             ModelScript::tool_call("call-steering", "fixture_tool", r#"{"value":"x"}"#),
         ),
         ModelScript::final_text("steered final"),
@@ -1773,6 +1774,7 @@ async fn e2e_round_boundary_steering_waits_for_the_next_model_round() -> TestRes
         create_session(&client, &server, &model.provider_url(), "create-steering").await?;
     post_message(&client, &server, &session_id, "steering-a", "message A").await?;
     model.wait_for_requests(1).await?;
+    hold.wait_entered().await?;
     let first_wire = model
         .request(0)
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "first model request missing"))?;
@@ -1783,7 +1785,7 @@ async fn e2e_round_boundary_steering_waits_for_the_next_model_round() -> TestRes
         1,
         "same-session activations overlapped"
     );
-    release.notify_waiters();
+    hold.release();
     tool.wait_for_invocations(1).await?;
     model.wait_for_requests(2).await?;
     let second_wire = model
@@ -1799,9 +1801,9 @@ async fn e2e_round_boundary_steering_waits_for_the_next_model_round() -> TestRes
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_round_boundary_final_defers_steering_to_next_activation() -> TestResult<()> {
     let database = TempDatabase::new("runtime-final-boundary")?;
-    let release = Arc::new(Notify::new());
+    let hold = ModelHold::new();
     let mut model = ModelFixture::start(vec![
-        ModelScript::hold(release.clone(), ModelScript::final_text("A finished")),
+        ModelScript::hold_entered(hold.clone(), ModelScript::final_text("A finished")),
         ModelScript::final_text("B finished later"),
     ])
     .await?;
@@ -1823,13 +1825,14 @@ async fn e2e_round_boundary_final_defers_steering_to_next_activation() -> TestRe
     .await?;
     post_message(&client, &server, &session_id, "final-a", "message A").await?;
     model.wait_for_requests(1).await?;
+    hold.wait_entered().await?;
     post_message(&client, &server, &session_id, "final-b", "message B").await?;
     assert_eq!(
         model.request_count(),
         1,
         "a second round started before A finished"
     );
-    release.notify_waiters();
+    hold.release();
     model.wait_for_requests(2).await?;
     let second_wire = model
         .request(1)
@@ -1844,9 +1847,9 @@ async fn e2e_round_boundary_final_defers_steering_to_next_activation() -> TestRe
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_concurrent_inputs_preserve_both_assistant_rounds() -> TestResult<()> {
     let database = TempDatabase::new("runtime-concurrent-inputs")?;
-    let release = Arc::new(Notify::new());
+    let hold = ModelHold::new();
     let mut model = ModelFixture::start(vec![
-        ModelScript::hold(release.clone(), ModelScript::final_text("assistant A")),
+        ModelScript::hold_entered(hold.clone(), ModelScript::final_text("assistant A")),
         ModelScript::final_text("assistant B"),
     ])
     .await?;
@@ -1877,6 +1880,7 @@ async fn e2e_concurrent_inputs_preserve_both_assistant_rounds() -> TestResult<()
     )
     .await?;
     model.wait_for_requests(1).await?;
+    hold.wait_entered().await?;
     post_message(
         &client,
         &server,
@@ -1891,7 +1895,7 @@ async fn e2e_concurrent_inputs_preserve_both_assistant_rounds() -> TestResult<()
         "input B started an overlapping round"
     );
 
-    release.notify_waiters();
+    hold.release();
     model.wait_for_requests(2).await?;
     let first_assistant = next_event_with_kind(&mut events, "assistant_message_committed")
         .await
@@ -1958,9 +1962,9 @@ async fn e2e_concurrent_inputs_preserve_both_assistant_rounds() -> TestResult<()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_get_rehydrates_while_model_request_is_held() -> TestResult<()> {
     let database = TempDatabase::new("runtime-get-nonblocking")?;
-    let release = Arc::new(Notify::new());
-    let mut model = ModelFixture::start(vec![ModelScript::hold(
-        release.clone(),
+    let hold = ModelHold::new();
+    let mut model = ModelFixture::start(vec![ModelScript::hold_entered(
+        hold.clone(),
         ModelScript::final_text("held final"),
     )])
     .await?;
@@ -1992,13 +1996,14 @@ async fn e2e_get_rehydrates_while_model_request_is_held() -> TestResult<()> {
         .as_u64()
         .ok_or_else(|| Error::other("message acceptance omitted version"))?;
     model.wait_for_requests(1).await?;
+    hold.wait_entered().await?;
 
     let observed = timeout(
         Duration::from_secs(1),
         get_session(&client, &server, &session_id),
     )
     .await;
-    release.notify_waiters();
+    hold.release();
     let cleanup = async {
         server.stop().await?;
         model.stop().await?;
@@ -5226,10 +5231,10 @@ async fn e2e_context_handoff_restart_reuses_committed_document() -> TestResult<(
 async fn e2e_hard_crash_rebuilds_fresh_request_without_consuming_attempt_budget() -> TestResult<()>
 {
     let database = TempDatabase::new("runtime-crash-exhausted")?;
-    let release = Arc::new(Notify::new());
+    let hold = ModelHold::new();
     let mut model = ModelFixture::start(vec![
-        ModelScript::hold(
-            release.clone(),
+        ModelScript::hold_entered(
+            hold.clone(),
             ModelScript::final_text("discarded pre-crash candidate"),
         ),
         ModelScript::final_text("fresh request after crash"),
@@ -5255,8 +5260,9 @@ async fn e2e_hard_crash_rebuilds_fresh_request_without_consuming_attempt_budget(
     )
     .await?;
     model.wait_for_requests(1).await?;
+    hold.wait_entered().await?;
     server.stop().await?;
-    release.notify_waiters();
+    hold.release();
     let mut restarted = ConfiguredServer::start(&database, &config).await?;
     model.wait_for_requests(2).await?;
     let state = timeout(Duration::from_secs(5), async {

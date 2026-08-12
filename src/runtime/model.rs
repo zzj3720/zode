@@ -1,18 +1,30 @@
 use super::*;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ModelRequest {
     pub owner: SessionOwner,
     pub session_id: String,
     pub activation_id: String,
     pub round_id: String,
     pub selection: SessionModelSelection,
-    pub transcript: Vec<TranscriptMessage>,
-    pub tools: Vec<ToolDefinition>,
+    pub transcript: Arc<Vec<TranscriptMessage>>,
+    pub tools: Arc<Vec<ToolDefinition>>,
+    pub(crate) prompt_fingerprint: String,
+    pub(crate) tool_schema_fingerprint: String,
     pub max_output_tokens: Option<u32>,
     pub handoff_document_tokens: Option<u32>,
     pub stream_idle_timeout: Duration,
     pub stream_observer: Arc<dyn ModelStreamObserver>,
+}
+
+pub(super) struct PreparedConversationContext {
+    transcript: Arc<Vec<TranscriptMessage>>,
+    tools: Arc<Vec<ToolDefinition>>,
+    local_input_estimate_tokens: u64,
+    estimated_input_tokens: u64,
+    selection_fingerprint: String,
+    prompt_fingerprint: String,
+    tool_schema_fingerprint: String,
 }
 
 pub(super) const MAX_CONTEXT_HANDOFF_DOCUMENT_TOKENS: u32 = 60 * 1024;
@@ -39,10 +51,20 @@ pub struct ModelTokenUsage {
     pub output_tokens: u64,
 }
 
+struct PreparedModelRequestInput<'a> {
+    owner: &'a SessionOwner,
+    session_id: &'a str,
+    auth_revision: u64,
+    state: VerifiedSessionState,
+    request: ModelRequest,
+    identity: &'a PreparedRequestIdentity,
+    purpose: ModelRequestPurpose,
+}
+
 pub trait ModelExecutor: Send + Sync {
     fn complete<'a>(
         &'a self,
-        request: ModelRequest,
+        request: &'a ModelRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ModelOutcome, ModelError>> + Send + 'a>>;
 }
 
@@ -51,8 +73,8 @@ impl Runtime {
         self: &Arc<Self>,
         owner: SessionOwner,
         session_id: String,
-        state: SessionState,
-    ) -> Result<SessionState, &'static str> {
+        state: VerifiedSessionState,
+    ) -> Result<VerifiedSessionState, &'static str> {
         let Some(round) = state.active_model_round.clone() else {
             return Ok(state);
         };
@@ -107,9 +129,9 @@ impl Runtime {
         self: &Arc<Self>,
         owner: SessionOwner,
         session_id: String,
-        mut state: SessionState,
+        mut state: VerifiedSessionState,
         attempt: crate::domain::ModelAttemptRecord,
-    ) -> Result<SessionState, &'static str> {
+    ) -> Result<VerifiedSessionState, &'static str> {
         let Some(request) = state
             .active_model_round
             .as_ref()
@@ -193,8 +215,8 @@ impl Runtime {
         self: &Arc<Self>,
         owner: SessionOwner,
         session_id: String,
-        mut state: SessionState,
-    ) -> Result<SessionState, &'static str> {
+        mut state: VerifiedSessionState,
+    ) -> Result<VerifiedSessionState, &'static str> {
         let records = state
             .async_tool_calls
             .values()
@@ -229,33 +251,36 @@ impl Runtime {
 
     async fn execute_prepared_model_request(
         self: &Arc<Self>,
-        owner: &SessionOwner,
-        session_id: &str,
-        selection: &SessionModelSelection,
-        request: ModelRequest,
-        request_identity: &PreparedRequestIdentity,
-        purpose: ModelRequestPurpose,
+        input: PreparedModelRequestInput<'_>,
     ) -> Result<PreparedModelExecution, &'static str> {
+        let PreparedModelRequestInput {
+            owner,
+            session_id,
+            auth_revision,
+            mut state,
+            request,
+            identity: request_identity,
+            purpose,
+        } = input;
         let request_id = request_identity.request_id.clone();
         let mut attempt_number = request_identity.attempt_number;
         let mut attempt_id = request_identity.attempt_id.clone();
         loop {
-            let completion = self
-                .model
-                .complete(request.clone())
-                .await
-                .and_then(|value| {
-                    if validate_tool_calls(&value.tool_calls, &request.tools).is_ok() {
-                        Ok(value)
-                    } else {
-                        Err(ModelError::InvalidToolArguments)
-                    }
-                });
+            let completion = self.model.complete(&request).await.and_then(|value| {
+                if validate_tool_calls(&value.tool_calls, &request.tools).is_ok() {
+                    Ok(value)
+                } else {
+                    Err(ModelError::InvalidToolArguments)
+                }
+            });
             match completion {
                 Ok(outcome) => {
-                    return Ok(PreparedModelExecution::Completed {
-                        outcome,
-                        attempt_id,
+                    return Ok(PreparedModelExecution {
+                        state,
+                        completion: PreparedModelCompletion::Completed {
+                            outcome,
+                            attempt_id,
+                        },
                     });
                 }
                 Err(ModelError::AuthReplicaUnavailable) => {
@@ -297,7 +322,10 @@ impl Runtime {
                             "credential replica unavailable",
                         )
                         .await?;
-                    return Ok(PreparedModelExecution::Terminal(Box::new(terminal)));
+                    return Ok(PreparedModelExecution {
+                        state: terminal,
+                        completion: PreparedModelCompletion::Terminal,
+                    });
                 }
                 Err(error) => {
                     let error_class = model_error_class(&error);
@@ -315,6 +343,7 @@ impl Runtime {
                     )
                     .await?;
                     self.observe_commit(&failed.0, &failed.1).await;
+                    state = failed.1.clone();
                     if attempt_number >= request_identity.maximum_attempts {
                         let exhausted = append_model_attempts_exhausted(
                             self.store.clone(),
@@ -337,7 +366,10 @@ impl Runtime {
                                 terminal_message,
                             )
                             .await?;
-                        return Ok(PreparedModelExecution::Terminal(Box::new(terminal)));
+                        return Ok(PreparedModelExecution {
+                            state: terminal,
+                            completion: PreparedModelCompletion::Terminal,
+                        });
                     }
                     let next_number = attempt_number.saturating_add(1);
                     let next_id =
@@ -360,23 +392,26 @@ impl Runtime {
                         maximum_attempts: request_identity.maximum_attempts,
                         error_class: error_class.to_owned(),
                     };
-                    let scheduled = append_runtime_event(
+                    let scheduled = append_runtime_event_from_state(
                         self.store.clone(),
                         owner.clone(),
                         session_id.to_owned(),
+                        state,
                         format!("model-retry:{request_id}:{next_number}"),
                         format!("model-retry-event:{request_id}:{next_number}"),
                         SessionEvent::ModelStepRetryScheduled { schedule },
                     )
                     .await?;
                     self.observe_commit(&scheduled.0, &scheduled.1).await;
+                    state = scheduled.1;
                     if delay > 0 {
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
-                    let started = append_runtime_event(
+                    let started = append_runtime_event_from_state(
                         self.store.clone(),
                         owner.clone(),
                         session_id.to_owned(),
+                        state,
                         format!("model-attempt-start:{request_id}:{next_number}"),
                         format!("model-attempt-start-event:{request_id}:{next_number}"),
                         SessionEvent::ModelAttemptStarted {
@@ -385,12 +420,13 @@ impl Runtime {
                             request_id: request_id.clone(),
                             attempt_id: next_id.clone(),
                             attempt_number: next_number,
-                            auth_revision: selection.auth_revision,
+                            auth_revision,
                             started_at_ms: current_time_ms(),
                         },
                     )
                     .await?;
                     self.observe_commit(&started.0, &started.1).await;
+                    state = started.1;
                     attempt_number = next_number;
                     attempt_id = next_id;
                 }
@@ -402,11 +438,11 @@ impl Runtime {
         self: &Arc<Self>,
         owner: &SessionOwner,
         session_id: &str,
-        mut state: SessionState,
+        mut state: VerifiedSessionState,
         purpose: ModelRequestPurpose,
         error_class: ModelAttemptErrorClass,
         error_message: &'static str,
-    ) -> Result<SessionState, &'static str> {
+    ) -> Result<VerifiedSessionState, &'static str> {
         match purpose {
             ModelRequestPurpose::Conversation => {
                 if state
@@ -449,18 +485,57 @@ impl Runtime {
             .await
     }
 
+    fn prepare_conversation_context(
+        &self,
+        state: &VerifiedSessionState,
+        selection: &SessionModelSelection,
+        cache: &mut ProviderContextCache,
+    ) -> Result<PreparedConversationContext, &'static str> {
+        let mut tools = self
+            .tools
+            .definitions(&state.selection.tools)
+            .map_err(|_| "tool_selection")?;
+        tools.extend(provider_runtime_tool_definitions(state));
+        let tools = Arc::new(tools);
+        let (transcript, transcript_json) = cache.prepare(state)?;
+        let metrics = model_context_metrics_from_serialized_transcript(
+            transcript_json,
+            transcript.len(),
+            &tools,
+        )?;
+        let selection_fingerprint = model_selection_fingerprint(selection)?;
+        let estimated_input_tokens = estimated_model_input_tokens_from_metrics(
+            state,
+            &transcript,
+            &selection_fingerprint,
+            &metrics.tool_schema_fingerprint,
+            metrics.local_input_estimate_tokens,
+        )?;
+        Ok(PreparedConversationContext {
+            transcript,
+            tools,
+            local_input_estimate_tokens: metrics.local_input_estimate_tokens,
+            estimated_input_tokens,
+            selection_fingerprint,
+            prompt_fingerprint: metrics.prompt_fingerprint,
+            tool_schema_fingerprint: metrics.tool_schema_fingerprint,
+        })
+    }
+
     pub(super) async fn ensure_model_context(
         self: &Arc<Self>,
         owner: &SessionOwner,
         session_id: &str,
         selection: &SessionModelSelection,
-        mut state: SessionState,
-    ) -> Result<SessionState, &'static str> {
+        mut state: VerifiedSessionState,
+        cache: &mut ProviderContextCache,
+    ) -> Result<(VerifiedSessionState, Option<PreparedConversationContext>), &'static str> {
         let Some(limits) = selection.limits.as_ref() else {
             // Historical selections predate durable model capabilities. They
             // remain executable, but the runtime must not invent a context
             // window and trigger a destructive early handoff from a guess.
-            return Ok(state);
+            let prepared = self.prepare_conversation_context(&state, selection, cache)?;
+            return Ok((state, Some(prepared)));
         };
         let normal_output_tokens = self
             .options
@@ -471,9 +546,10 @@ impl Runtime {
             normal_output_tokens,
             self.options.model_context_buffer_tokens,
         ) else {
-            return self
+            let state = self
                 .finish_unhandoffable_model_context(owner, session_id, state)
-                .await;
+                .await?;
+            return Ok((state, None));
         };
         let handoff_output_tokens = self
             .options
@@ -481,14 +557,15 @@ impl Runtime {
             .min(limits.max_output_tokens);
         let Some(handoff_input_budget) = model_input_budget(selection, handoff_output_tokens, 0)
         else {
-            return self
+            let state = self
                 .finish_unhandoffable_model_context(owner, session_id, state)
-                .await;
+                .await?;
+            return Ok((state, None));
         };
         let mut completed_handoff = false;
         loop {
             if state.active_activation.is_none() {
-                return Ok(state);
+                return Ok((state, None));
             }
             if state.pending_context_handoff.is_some() {
                 let previous_handoff_id = state
@@ -506,15 +583,8 @@ impl Runtime {
                 continue;
             }
 
-            let mut tools = self
-                .tools
-                .definitions(&state.selection.tools)
-                .map_err(|_| "tool_selection")?;
-            tools.extend(provider_runtime_tool_definitions(&state));
-            let transcript = provider_context(&state)?;
-            let estimated_input_tokens =
-                estimated_model_input_tokens(&state, selection, &transcript, &tools)?;
-            if estimated_input_tokens <= normal_input_budget {
+            let prepared = self.prepare_conversation_context(&state, selection, cache)?;
+            if prepared.estimated_input_tokens <= normal_input_budget {
                 if completed_handoff && !state.delivery_queue.is_empty() {
                     let (append, next_state) = materialize_boundary(
                         self.store.clone(),
@@ -530,7 +600,7 @@ impl Runtime {
                     completed_handoff = false;
                     continue;
                 }
-                return Ok(state);
+                return Ok((state, Some(prepared)));
             }
 
             let Some(plan) = build_context_handoff_plan(
@@ -540,27 +610,33 @@ impl Runtime {
                 self.options.model_context_handoff_document_tokens,
             )?
             else {
-                return self
+                let state = self
                     .finish_unhandoffable_model_context(owner, session_id, state)
-                    .await;
+                    .await?;
+                return Ok((state, None));
             };
             if plan.source_tokens > handoff_input_budget {
-                return self
+                let state = self
                     .finish_unhandoffable_model_context(owner, session_id, state)
-                    .await;
+                    .await?;
+                return Ok((state, None));
             }
+            let transcript = context_handoff_source(
+                &state,
+                &plan,
+                self.options.model_context_handoff_document_tokens,
+            )?;
+            let metrics = model_context_metrics(&transcript, &[])?;
             let request = ModelRequest {
                 owner: owner.clone(),
                 session_id: session_id.to_owned(),
                 activation_id: plan.activation_id.clone(),
                 round_id: plan.plan_id.clone(),
                 selection: selection.clone(),
-                transcript: context_handoff_source(
-                    &state,
-                    &plan,
-                    self.options.model_context_handoff_document_tokens,
-                )?,
-                tools: Vec::new(),
+                transcript: Arc::new(transcript),
+                tools: Arc::new(Vec::new()),
+                prompt_fingerprint: metrics.prompt_fingerprint,
+                tool_schema_fingerprint: metrics.tool_schema_fingerprint,
                 max_output_tokens: Some(handoff_output_tokens),
                 handoff_document_tokens: Some(self.options.model_context_handoff_document_tokens),
                 stream_idle_timeout: self.options.model_stream_idle_timeout,
@@ -586,8 +662,8 @@ impl Runtime {
         owner: &SessionOwner,
         session_id: &str,
         selection: &SessionModelSelection,
-        state: &SessionState,
-    ) -> Result<SessionState, &'static str> {
+        state: &VerifiedSessionState,
+    ) -> Result<VerifiedSessionState, &'static str> {
         let plan = state
             .pending_context_handoff
             .clone()
@@ -605,18 +681,22 @@ impl Runtime {
             .min(limits.max_output_tokens);
         let handoff_input_budget = model_input_budget(selection, handoff_output_tokens, 0)
             .ok_or("context_handoff_model_budget")?;
+        let transcript = context_handoff_source(
+            state,
+            &plan,
+            self.options.model_context_handoff_document_tokens,
+        )?;
+        let metrics = model_context_metrics(&transcript, &[])?;
         let mut request = ModelRequest {
             owner: owner.clone(),
             session_id: session_id.to_owned(),
             activation_id: plan.activation_id.clone(),
             round_id: plan.plan_id.clone(),
             selection: selection.clone(),
-            transcript: context_handoff_source(
-                state,
-                &plan,
-                self.options.model_context_handoff_document_tokens,
-            )?,
-            tools: Vec::new(),
+            transcript: Arc::new(transcript),
+            tools: Arc::new(Vec::new()),
+            prompt_fingerprint: metrics.prompt_fingerprint,
+            tool_schema_fingerprint: metrics.tool_schema_fingerprint,
             max_output_tokens: Some(handoff_output_tokens),
             handoff_document_tokens: Some(self.options.model_context_handoff_document_tokens),
             stream_idle_timeout: self.options.model_stream_idle_timeout,
@@ -652,8 +732,8 @@ impl Runtime {
         let request_tokens = estimated_full_model_input_tokens(
             state,
             selection,
-            &request.transcript,
-            &request.tools,
+            request.transcript.as_slice(),
+            request.tools.as_slice(),
         )?;
         if source_digest != plan.source_digest
             || request_tokens > handoff_input_budget
@@ -674,22 +754,24 @@ impl Runtime {
             .or(request.max_output_tokens)
             .ok_or("context_handoff_output_limit_missing")?;
         let execution = self
-            .execute_prepared_model_request(
+            .execute_prepared_model_request(PreparedModelRequestInput {
                 owner,
                 session_id,
-                selection,
+                auth_revision: selection.auth_revision,
+                state: prepared_state,
                 request,
-                &request_identity,
-                ModelRequestPurpose::ContextHandoff,
-            )
+                identity: &request_identity,
+                purpose: ModelRequestPurpose::ContextHandoff,
+            })
             .await?;
-        let (outcome, attempt_id) = match execution {
-            PreparedModelExecution::Completed {
+        let (outcome, attempt_id) = match execution.completion {
+            PreparedModelCompletion::Completed {
                 outcome,
                 attempt_id,
             } => (outcome, attempt_id),
-            PreparedModelExecution::Terminal(state) => return Ok(*state),
+            PreparedModelCompletion::Terminal => return Ok(execution.state),
         };
+        let completed_state = execution.state;
         let encoded_document = outcome.text.trim();
         let decoded_document =
             serde_json::from_str::<ContextHandoffModelDocument>(encoded_document);
@@ -706,13 +788,11 @@ impl Runtime {
             || document.is_empty()
             || document_tokens > u64::from(document_token_limit)
         {
-            let current =
-                rehydrate(self.store.clone(), owner.clone(), session_id.to_owned()).await?;
             return self
                 .finish_context_handoff_plan_failure(
                     owner,
                     session_id,
-                    current,
+                    completed_state,
                     "context handoff returned an invalid bounded document",
                     Some((&request_identity, &attempt_id)),
                 )
@@ -753,10 +833,10 @@ impl Runtime {
         self: &Arc<Self>,
         owner: &SessionOwner,
         session_id: &str,
-        state: SessionState,
+        state: VerifiedSessionState,
         message: &'static str,
         completed_request: Option<(&PreparedRequestIdentity, &str)>,
-    ) -> Result<SessionState, &'static str> {
+    ) -> Result<VerifiedSessionState, &'static str> {
         let failed = append_context_handoff_failure(
             self.store.clone(),
             owner.clone(),
@@ -774,8 +854,8 @@ impl Runtime {
         self: &Arc<Self>,
         owner: &SessionOwner,
         session_id: &str,
-        mut state: SessionState,
-    ) -> Result<SessionState, &'static str> {
+        mut state: VerifiedSessionState,
+    ) -> Result<VerifiedSessionState, &'static str> {
         let trigger_message_id = state
             .transcript
             .iter()
@@ -803,14 +883,25 @@ impl Runtime {
         owner: &SessionOwner,
         session_id: &str,
         selection: &SessionModelSelection,
-        state: &SessionState,
+        state: &VerifiedSessionState,
+        prepared: PreparedConversationContext,
         round_identity: String,
-    ) -> Result<(Vec<(AppendResult, SessionState)>, SessionState), &'static str> {
-        let mut tools = self
-            .tools
-            .definitions(&state.selection.tools)
-            .map_err(|_| "tool_selection")?;
-        tools.extend(provider_runtime_tool_definitions(state));
+    ) -> Result<
+        (
+            Vec<(AppendResult, VerifiedSessionState)>,
+            VerifiedSessionState,
+        ),
+        &'static str,
+    > {
+        let PreparedConversationContext {
+            transcript,
+            tools,
+            local_input_estimate_tokens,
+            estimated_input_tokens: _,
+            selection_fingerprint,
+            prompt_fingerprint,
+            tool_schema_fingerprint,
+        } = prepared;
         let mut request = ModelRequest {
             owner: owner.clone(),
             session_id: session_id.to_owned(),
@@ -821,8 +912,10 @@ impl Runtime {
                 .ok_or("active_activation_missing")?,
             round_id: round_identity.clone(),
             selection: selection.clone(),
-            transcript: provider_context(state)?,
+            transcript,
             tools: tools.clone(),
+            prompt_fingerprint,
+            tool_schema_fingerprint: tool_schema_fingerprint.clone(),
             max_output_tokens: selection.limits.as_ref().map(|limits| {
                 self.options
                     .model_request_max_output_tokens
@@ -832,8 +925,6 @@ impl Runtime {
             stream_idle_timeout: self.options.model_stream_idle_timeout,
             stream_observer: self.stream_observer.clone(),
         };
-        let local_input_estimate_tokens =
-            model_context_estimate_tokens(&request.transcript, &request.tools)?;
         let (prep_commits, _prepared_state, request_identity) = prepare_model_round(
             self.store.clone(),
             owner.clone(),
@@ -859,28 +950,28 @@ impl Runtime {
         request.round_id = request_identity.round_id.clone();
         let tools = request.tools.clone();
         let execution = self
-            .execute_prepared_model_request(
+            .execute_prepared_model_request(PreparedModelRequestInput {
                 owner,
                 session_id,
-                selection,
+                auth_revision: selection.auth_revision,
+                state: _prepared_state,
                 request,
-                &request_identity,
-                ModelRequestPurpose::Conversation,
-            )
+                identity: &request_identity,
+                purpose: ModelRequestPurpose::Conversation,
+            })
             .await?;
-        let (outcome, attempt_id) = match execution {
-            PreparedModelExecution::Completed {
+        let (outcome, attempt_id) = match execution.completion {
+            PreparedModelCompletion::Completed {
                 outcome,
                 attempt_id,
             } => (outcome, attempt_id),
-            PreparedModelExecution::Terminal(state) => return Ok((Vec::new(), *state)),
+            PreparedModelCompletion::Terminal => return Ok((Vec::new(), execution.state)),
         };
+        let completed_state = execution.state;
         let request_id = request_identity.request_id.clone();
         let usage = match outcome.usage.as_ref() {
             Some(usage) => {
                 let context_generation = model_context_generation(state);
-                let selection_fingerprint = model_selection_fingerprint(selection)?;
-                let tool_schema_fingerprint = model_tool_schema_fingerprint(&tools)?;
                 let observed_scale = token_estimate_scale_millionths(
                     usage.input_tokens,
                     local_input_estimate_tokens,
@@ -912,10 +1003,11 @@ impl Runtime {
             }
             None => None,
         };
-        let completed = append_runtime_event(
+        let completed = append_runtime_event_from_state(
             self.store.clone(),
             owner.clone(),
             session_id.to_owned(),
+            completed_state,
             format!("model-request-complete:{request_id}"),
             format!("model-request-complete-event:{request_id}"),
             SessionEvent::ModelRequestCompleted {
@@ -933,6 +1025,7 @@ impl Runtime {
                 self.store.clone(),
                 owner.clone(),
                 session_id.to_owned(),
+                completed.1,
                 round_identity,
                 outcome.text,
             )
@@ -949,6 +1042,7 @@ impl Runtime {
             self.store.clone(),
             owner.clone(),
             session_id.to_owned(),
+            completed.1,
             ToolBatchInput {
                 round_identity,
                 assistant_content: outcome.text.clone(),
@@ -960,9 +1054,8 @@ impl Runtime {
         .await?;
         self.observe_commit(&initial_commit.0, &initial_commit.1)
             .await;
-        let initial_replayed = initial_commit.0.replayed;
-        let initial_state = initial_commit.1.clone();
-        if initial_replayed {
+        if initial_commit.0.replayed {
+            let initial_state = initial_commit.1;
             let all_results_present = outcome.tool_calls.iter().all(|call| {
                 let message_id = tool_result_message_id(&batch_identity, &call.tool_call_id);
                 initial_state
@@ -998,6 +1091,7 @@ impl Runtime {
             self.store.clone(),
             owner.clone(),
             session_id.to_owned(),
+            initial_commit.1,
             batch_identity,
             outcome.tool_calls,
             results,

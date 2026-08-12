@@ -28,6 +28,7 @@ use axum::{
     response::Response as AxumResponse,
     routing::post,
 };
+use bincode::Options;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
@@ -206,6 +207,11 @@ impl TestZode {
 
     pub async fn stop(&mut self, forbidden: &[&str]) -> TestResult<()> {
         self.stop_inner(forbidden).await.map(|_| ())
+    }
+
+    pub async fn stop_with_output(&mut self, forbidden: &[&str]) -> TestResult<(Vec<u8>, Vec<u8>)> {
+        let stopped = self.stop_inner(forbidden).await?;
+        Ok((stopped.stdout, stopped.stderr))
     }
 
     pub async fn stop_with_process_capture(
@@ -1464,9 +1470,48 @@ pub const MAX_LLM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 // Reasoning-capable providers can emit one SSE frame per short reasoning token.
 // Keep the byte ceiling authoritative while allowing a bounded long-task stream
 // to reach that ceiling instead of failing first on harmless frame granularity.
-const MAX_LLM_RESPONSE_CHUNKS: usize = 65_536;
+pub const MAX_LLM_RESPONSE_CHUNKS: usize = 65_536;
+const MAX_LLM_LONG_RUN_OUTPUT_TOKENS: usize = 128_000;
+const MAX_LLM_LONG_RUN_RESPONSE_BYTES: usize = MAX_LLM_LONG_RUN_OUTPUT_TOKENS * 256;
+const MAX_LLM_LONG_RUN_RESPONSE_CHUNKS: usize = MAX_LLM_LONG_RUN_OUTPUT_TOKENS * 2;
 pub const MAX_LLM_CHUNK_DELAY_US: u64 = 60_000_000;
 const MAX_PUBLIC_HTTP_GAP_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct LlmHttpResponseLimits {
+    max_bytes: usize,
+    max_chunks: usize,
+}
+
+const ORDINARY_LLM_RESPONSE_LIMITS: LlmHttpResponseLimits = LlmHttpResponseLimits {
+    max_bytes: MAX_LLM_RESPONSE_BYTES,
+    max_chunks: MAX_LLM_RESPONSE_CHUNKS,
+};
+const LONG_RUN_LLM_RESPONSE_LIMITS: LlmHttpResponseLimits = LlmHttpResponseLimits {
+    max_bytes: MAX_LLM_LONG_RUN_RESPONSE_BYTES,
+    max_chunks: MAX_LLM_LONG_RUN_RESPONSE_CHUNKS,
+};
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmHttpRecordingClass {
+    #[default]
+    Ordinary,
+    LongRun,
+}
+
+impl LlmHttpRecordingClass {
+    fn is_ordinary(&self) -> bool {
+        *self == Self::Ordinary
+    }
+
+    fn response_limits(self) -> LlmHttpResponseLimits {
+        match self {
+            Self::Ordinary => ORDINARY_LLM_RESPONSE_LIMITS,
+            Self::LongRun => LONG_RUN_LLM_RESPONSE_LIMITS,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1479,8 +1524,321 @@ pub struct LlmHttpRecording {
     pub secret_slots: Vec<String>,
     pub provider: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "LlmHttpRecordingClass::is_ordinary")]
+    pub recording_class: LlmHttpRecordingClass,
     pub requests: Vec<LlmHttpRecordingExchange>,
     pub envelope_sha256: String,
+}
+
+pub struct ValidatedLlmHttpRecording(LlmHttpHashReplayRecording);
+
+impl ValidatedLlmHttpRecording {
+    pub fn request_count(&self) -> usize {
+        self.0.exchanges.len()
+    }
+
+    fn into_hash_replay(self) -> TestResult<LlmHttpHashReplayRecording> {
+        Ok(self.0)
+    }
+
+    fn from_validated(recording: LlmHttpRecording) -> TestResult<Self> {
+        PinnedLlmHttpHashReplayIndex::from_recording(&recording, [0; 32])?
+            .into_hash_replay_inner(None, false)
+    }
+}
+
+const LLM_HTTP_HASH_REPLAY_INDEX_SCHEMA: &str = "zode.llm-http-hash-replay-index.v2";
+
+#[derive(Deserialize, Serialize)]
+struct PinnedLlmHttpHashReplayIndex {
+    schema: String,
+    source_file_sha256: [u8; 32],
+    requires_authorization: bool,
+    request_templates: Vec<LlmHttpReplayRequestTemplate>,
+    response_templates: Vec<LlmHttpReplayResponseTemplate>,
+    exchanges: Vec<LlmHttpIndexedReplayExchange>,
+    chunks: Vec<LlmHttpIndexedReplayChunk>,
+    response_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct LlmHttpReplayRequestTemplate {
+    method: String,
+    path: String,
+    semantic_headers: Vec<LlmHttpHeader>,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct LlmHttpReplayResponseTemplate {
+    status: Option<u16>,
+    content_type: Option<String>,
+    semantic_headers: Vec<LlmHttpHeader>,
+    outcome: LlmHttpReplayOutcome,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+enum LlmHttpReplayOutcome {
+    Complete { done_seen: bool },
+    ClientDisconnect,
+    TransportError,
+    StreamError,
+    CaptureBoundExceeded,
+}
+
+impl From<&LlmHttpResponseOutcome> for LlmHttpReplayOutcome {
+    fn from(outcome: &LlmHttpResponseOutcome) -> Self {
+        match outcome {
+            LlmHttpResponseOutcome::Complete { done_seen } => Self::Complete {
+                done_seen: *done_seen,
+            },
+            LlmHttpResponseOutcome::ClientDisconnect => Self::ClientDisconnect,
+            LlmHttpResponseOutcome::TransportError => Self::TransportError,
+            LlmHttpResponseOutcome::StreamError => Self::StreamError,
+            LlmHttpResponseOutcome::CaptureBoundExceeded => Self::CaptureBoundExceeded,
+        }
+    }
+}
+
+impl From<LlmHttpReplayOutcome> for LlmHttpResponseOutcome {
+    fn from(outcome: LlmHttpReplayOutcome) -> Self {
+        match outcome {
+            LlmHttpReplayOutcome::Complete { done_seen } => Self::Complete { done_seen },
+            LlmHttpReplayOutcome::ClientDisconnect => Self::ClientDisconnect,
+            LlmHttpReplayOutcome::TransportError => Self::TransportError,
+            LlmHttpReplayOutcome::StreamError => Self::StreamError,
+            LlmHttpReplayOutcome::CaptureBoundExceeded => Self::CaptureBoundExceeded,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct LlmHttpIndexedReplayExchange {
+    sequence: u64,
+    logical_round: u64,
+    wire_attempt: u64,
+    request_template: u16,
+    raw_body_sha256: [u8; 32],
+    response_template: u16,
+    first_chunk: u32,
+    chunk_count: u32,
+    first_byte: u32,
+    byte_count: u32,
+    done_seen: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+struct LlmHttpIndexedReplayChunk {
+    at_us: u64,
+    end_byte: u32,
+}
+
+impl PinnedLlmHttpHashReplayIndex {
+    fn from_recording(
+        recording: &LlmHttpRecording,
+        source_file_sha256: [u8; 32],
+    ) -> TestResult<Self> {
+        let mut request_templates = Vec::new();
+        let mut response_templates = Vec::new();
+        let mut exchanges = Vec::with_capacity(recording.requests.len());
+        let mut chunks = Vec::new();
+        let mut response_bytes = Vec::new();
+        for exchange in &recording.requests {
+            let request_template = LlmHttpReplayRequestTemplate {
+                method: exchange.request.method.clone(),
+                path: exchange.request.path.clone(),
+                semantic_headers: exchange.request.semantic_headers.clone(),
+            };
+            let request_template = intern_template(&mut request_templates, request_template)?;
+            let response_template = LlmHttpReplayResponseTemplate {
+                status: exchange.response.status,
+                content_type: exchange.response.content_type.clone(),
+                semantic_headers: exchange.response.semantic_headers.clone(),
+                outcome: (&exchange.response.outcome).into(),
+            };
+            let response_template = intern_template(&mut response_templates, response_template)?;
+            let first_chunk = u32::try_from(chunks.len())?;
+            let first_byte = u32::try_from(response_bytes.len())?;
+            for chunk in &exchange.response.chunks {
+                response_bytes.extend_from_slice(&hex_decode(&chunk.bytes_hex)?);
+                chunks.push(LlmHttpIndexedReplayChunk {
+                    at_us: chunk.at_us,
+                    end_byte: u32::try_from(response_bytes.len())?,
+                });
+            }
+            exchanges.push(LlmHttpIndexedReplayExchange {
+                sequence: exchange.sequence,
+                logical_round: exchange.logical_round,
+                wire_attempt: exchange.wire_attempt,
+                request_template,
+                raw_body_sha256: decode_sha256(&exchange.request.raw_body_sha256)?,
+                response_template,
+                first_chunk,
+                chunk_count: u32::try_from(exchange.response.chunks.len())?,
+                first_byte,
+                byte_count: u32::try_from(response_bytes.len())? - first_byte,
+                done_seen: chunks_contain_done(&exchange.response.chunks),
+            });
+        }
+        Ok(Self {
+            schema: LLM_HTTP_HASH_REPLAY_INDEX_SCHEMA.to_owned(),
+            source_file_sha256,
+            requires_authorization: !recording.secret_slots.is_empty(),
+            request_templates,
+            response_templates,
+            exchanges,
+            chunks,
+            response_bytes,
+        })
+    }
+
+    fn into_hash_replay(
+        self,
+        expected_source_sha256: &str,
+    ) -> TestResult<ValidatedLlmHttpRecording> {
+        self.into_hash_replay_inner(Some(decode_sha256(expected_source_sha256)?), true)
+    }
+
+    fn into_hash_replay_inner(
+        self,
+        expected_source_sha256: Option<[u8; 32]>,
+        require_authorization: bool,
+    ) -> TestResult<ValidatedLlmHttpRecording> {
+        if self.schema != LLM_HTTP_HASH_REPLAY_INDEX_SCHEMA
+            || expected_source_sha256.is_some_and(|expected| self.source_file_sha256 != expected)
+            || (require_authorization && !self.requires_authorization)
+            || self.exchanges.len() > 1024
+            || self.request_templates.is_empty()
+            || self.response_templates.is_empty()
+            || self.request_templates.len() > usize::from(u16::MAX)
+            || self.response_templates.len() > usize::from(u16::MAX)
+        {
+            return Err(IoError::other("pinned LLM replay index metadata is invalid").into());
+        }
+
+        for template in &self.request_templates {
+            if template.method != "POST" || !path_is_secret_safe(&template.path) {
+                return Err(IoError::other("pinned LLM request is not canonical").into());
+            }
+            validate_headers(&template.semantic_headers, true)?;
+        }
+        for template in &self.response_templates {
+            validate_replay_response_template(template)?;
+        }
+        let mut previous_round = None;
+        let mut previous_attempt = None;
+        let mut next_chunk = 0usize;
+        let mut next_byte = 0usize;
+        for (index, exchange) in self.exchanges.iter().enumerate() {
+            if exchange.sequence != index as u64 {
+                return Err(IoError::other("pinned LLM request is not canonical").into());
+            }
+            match (previous_round, previous_attempt) {
+                (None, None) if exchange.logical_round == 0 && exchange.wire_attempt == 0 => {}
+                (Some(round), Some(attempt)) if exchange.logical_round == round => {
+                    if exchange.wire_attempt != attempt + 1 {
+                        return Err(IoError::other("pinned LLM attempts are not ordered").into());
+                    }
+                }
+                (Some(round), Some(_))
+                    if exchange.logical_round == round + 1 && exchange.wire_attempt == 0 => {}
+                _ => {
+                    return Err(IoError::other("pinned LLM rounds are not ordered").into());
+                }
+            }
+            previous_round = Some(exchange.logical_round);
+            previous_attempt = Some(exchange.wire_attempt);
+            let template = self
+                .response_templates
+                .get(usize::from(exchange.response_template))
+                .ok_or_else(|| IoError::other("pinned LLM response template is invalid"))?;
+            if self
+                .request_templates
+                .get(usize::from(exchange.request_template))
+                .is_none()
+            {
+                return Err(IoError::other("pinned LLM request template is invalid").into());
+            }
+            let first_chunk = usize::try_from(exchange.first_chunk)?;
+            let chunk_count = usize::try_from(exchange.chunk_count)?;
+            let first_byte = usize::try_from(exchange.first_byte)?;
+            let byte_count = usize::try_from(exchange.byte_count)?;
+            if first_chunk != next_chunk || first_byte != next_byte {
+                return Err(IoError::other("pinned LLM replay ranges are not contiguous").into());
+            }
+            let chunk_end = first_chunk
+                .checked_add(chunk_count)
+                .ok_or_else(|| IoError::other("pinned LLM chunk range overflowed"))?;
+            let byte_end = first_byte
+                .checked_add(byte_count)
+                .ok_or_else(|| IoError::other("pinned LLM byte range overflowed"))?;
+            let response_chunks = self
+                .chunks
+                .get(first_chunk..chunk_end)
+                .ok_or_else(|| IoError::other("pinned LLM chunk range is invalid"))?;
+            let response_bytes = self
+                .response_bytes
+                .get(first_byte..byte_end)
+                .ok_or_else(|| IoError::other("pinned LLM byte range is invalid"))?;
+            validate_indexed_response(
+                template,
+                response_chunks,
+                first_byte,
+                response_bytes,
+                exchange.done_seen,
+            )?;
+            next_chunk = chunk_end;
+            next_byte = byte_end;
+        }
+        if next_chunk != self.chunks.len() || next_byte != self.response_bytes.len() {
+            return Err(IoError::other("pinned LLM replay index has unused data").into());
+        }
+        let retained_request_match_bytes = self
+            .request_templates
+            .iter()
+            .map(LlmHttpReplayRequestTemplate::retained_bytes)
+            .sum::<usize>()
+            + self.exchanges.len() * (32 + 2);
+        Ok(ValidatedLlmHttpRecording(LlmHttpHashReplayRecording {
+            requires_authorization: self.requires_authorization,
+            request_templates: self.request_templates.into_boxed_slice(),
+            response_templates: self.response_templates.into_boxed_slice(),
+            exchanges: self.exchanges.into_boxed_slice(),
+            chunks: self.chunks.into_boxed_slice(),
+            response_bytes: Bytes::from(self.response_bytes),
+            retained_request_match_bytes,
+        }))
+    }
+}
+
+fn intern_template<T: PartialEq>(templates: &mut Vec<T>, value: T) -> TestResult<u16> {
+    if let Some(index) = templates.iter().position(|template| template == &value) {
+        return Ok(u16::try_from(index)?);
+    }
+    let index = u16::try_from(templates.len())?;
+    templates.push(value);
+    Ok(index)
+}
+
+struct LlmHttpHashReplayRecording {
+    requires_authorization: bool,
+    request_templates: Box<[LlmHttpReplayRequestTemplate]>,
+    response_templates: Box<[LlmHttpReplayResponseTemplate]>,
+    exchanges: Box<[LlmHttpIndexedReplayExchange]>,
+    chunks: Box<[LlmHttpIndexedReplayChunk]>,
+    response_bytes: Bytes,
+    retained_request_match_bytes: usize,
+}
+
+impl LlmHttpReplayRequestTemplate {
+    fn retained_bytes(&self) -> usize {
+        self.method.len()
+            + self.path.len()
+            + self
+                .semantic_headers
+                .iter()
+                .map(|header| header.name.len() + header.value.len())
+                .sum::<usize>()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1576,6 +1934,29 @@ pub struct LlmHttpAttemptPlan {
 }
 
 impl LlmHttpRecording {
+    fn retained_request_match_bytes(&self) -> usize {
+        self.requests
+            .iter()
+            .map(|exchange| {
+                let request = &exchange.request;
+                request.method.len()
+                    + request.path.len()
+                    + request
+                        .semantic_headers
+                        .iter()
+                        .map(|header| header.name.len() + header.value.len())
+                        .sum::<usize>()
+                    + request.raw_body_hex.len()
+                    + request.canonical_json.as_ref().map_or(0, String::len)
+                    + request.raw_body_sha256.len()
+                    + request
+                        .canonical_json_sha256
+                        .as_ref()
+                        .map_or(0, String::len)
+            })
+            .sum()
+    }
+
     pub fn load(path: &Path) -> TestResult<Self> {
         Self::load_with_bound(path, MAX_LLM_RECORDING_BYTES)
     }
@@ -1600,6 +1981,81 @@ impl LlmHttpRecording {
         let recording: Self = serde_json::from_slice(&bytes)?;
         recording.validate()?;
         Ok(recording)
+    }
+
+    pub fn load_compressed_validated(path: &Path) -> TestResult<ValidatedLlmHttpRecording> {
+        ValidatedLlmHttpRecording::from_validated(Self::load_compressed(path)?)
+    }
+
+    /// Loads a compact replay index whose own pinned digest and source-cassette
+    /// digest bind it to the immutable full recording. Runtime replay need not
+    /// repeatedly decompress and parse the growing request bodies.
+    pub fn load_pinned_compressed_hash_replay_index(
+        source_path: &Path,
+        expected_source_sha256: &'static str,
+        index_path: &Path,
+        expected_index_sha256: &'static str,
+    ) -> TestResult<ValidatedLlmHttpRecording> {
+        let source = fs::read(source_path)?;
+        if source.len() as u64 > MAX_LLM_COMPRESSED_RECORDING_BYTES {
+            return Err(IoError::other("compressed LLM recording exceeds its size bound").into());
+        }
+        if sha256_hex(&source) != expected_source_sha256 {
+            return Err(IoError::other("pinned LLM recording file digest is invalid").into());
+        }
+        let compressed_index = fs::read(index_path)?;
+        if compressed_index.len() as u64 > MAX_LLM_COMPRESSED_RECORDING_BYTES
+            || sha256_hex(&compressed_index) != expected_index_sha256
+        {
+            return Err(IoError::other("pinned LLM replay index digest is invalid").into());
+        }
+        let decoder = zstd::stream::read::Decoder::new(compressed_index.as_slice())?;
+        let mut bytes = Vec::new();
+        decoder
+            .take(MAX_LLM_LONG_RUN_RECORDING_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_LLM_LONG_RUN_RECORDING_BYTES {
+            return Err(IoError::other("expanded LLM replay index exceeds its size bound").into());
+        }
+        let index: PinnedLlmHttpHashReplayIndex = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_little_endian()
+            .reject_trailing_bytes()
+            .with_limit(MAX_LLM_LONG_RUN_RECORDING_BYTES)
+            .deserialize(&bytes)?;
+        index.into_hash_replay(expected_source_sha256)
+    }
+
+    pub fn promote_compressed_hash_replay_index(
+        source_path: &Path,
+        expected_source_sha256: &str,
+        index_path: &Path,
+        forbidden: &[&str],
+    ) -> TestResult<u64> {
+        let source = fs::read(source_path)?;
+        if source.len() as u64 > MAX_LLM_COMPRESSED_RECORDING_BYTES
+            || sha256_hex(&source) != expected_source_sha256
+        {
+            return Err(IoError::other("pinned LLM recording file digest is invalid").into());
+        }
+        let recording = Self::load_compressed(source_path)?;
+        let index = PinnedLlmHttpHashReplayIndex::from_recording(
+            &recording,
+            decode_sha256(expected_source_sha256)?,
+        )?;
+        let bytes = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_little_endian()
+            .serialize(&index)?;
+        for marker in forbidden.iter().filter(|marker| !marker.is_empty()) {
+            if bytes_contain(&bytes, marker.as_bytes()) {
+                return Err(IoError::other(
+                    "LLM replay index contained forbidden credential material",
+                )
+                .into());
+            }
+        }
+        promote_immutable_compressed_bytes(index_path, &bytes)
     }
 
     fn load_with_bound(path: &Path, max_bytes: u64) -> TestResult<Self> {
@@ -1650,67 +2106,7 @@ impl LlmHttpRecording {
                 .into());
             }
         }
-        let parent = path
-            .parent()
-            .ok_or_else(|| IoError::other("LLM recording path has no parent"))?;
-        fs::create_dir_all(parent)?;
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| IoError::other("LLM recording file name is invalid"))?;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let temporary = parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
-        let mut options = fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let prepare = (|| -> TestResult<u64> {
-            let file = options.open(&temporary)?;
-            let mut encoder =
-                zstd::stream::write::Encoder::new(file, LLM_COMPRESSED_RECORDING_LEVEL)?;
-            encoder.include_checksum(true)?;
-            encoder.write_all(&bytes)?;
-            let file = encoder.finish()?;
-            file.sync_all()?;
-            drop(file);
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444))?;
-                fs::File::open(&temporary)?.sync_all()?;
-            }
-            Ok(fs::metadata(&temporary)?.len())
-        })();
-        let compressed_bytes = match prepare {
-            Ok(compressed_bytes) => compressed_bytes,
-            Err(error) => {
-                let _ = fs::remove_file(&temporary);
-                return Err(error);
-            }
-        };
-
-        if let Err(error) = fs::hard_link(&temporary, path) {
-            let _ = fs::remove_file(&temporary);
-            return Err(if error.kind() == ErrorKind::AlreadyExists {
-                IoError::new(
-                    ErrorKind::AlreadyExists,
-                    "tracked compressed LLM recording is immutable",
-                )
-            } else {
-                error
-            }
-            .into());
-        }
-        fs::remove_file(&temporary)?;
-        fs::File::open(parent)?.sync_all()?;
-        Ok(compressed_bytes)
+        promote_immutable_compressed_bytes(path, &bytes)
     }
 
     fn write_atomic_with_mode(
@@ -1863,17 +2259,123 @@ impl LlmHttpRecording {
             if !canonical_valid || sha256_hex(&raw_body) != exchange.request.raw_body_sha256 {
                 return Err(IoError::other("LLM recording request digest is invalid").into());
             }
-            validate_response(&exchange.response)?;
+            validate_response(&exchange.response, self.recording_class.response_limits())?;
         }
         Ok(())
     }
 
     fn envelope_digest(&self) -> String {
-        let mut unsigned = self.clone();
-        unsigned.envelope_sha256.clear();
-        serde_json::to_vec(&unsigned)
-            .map(|bytes| sha256_hex(&bytes))
+        #[derive(Serialize)]
+        struct UnsignedRecording<'a> {
+            schema: &'a str,
+            recording_id: &'a str,
+            purpose: &'a str,
+            owner: &'a str,
+            boundary: &'a str,
+            secret_slots: &'a [String],
+            provider: &'a str,
+            model: &'a str,
+            #[serde(skip_serializing_if = "LlmHttpRecordingClass::is_ordinary")]
+            recording_class: &'a LlmHttpRecordingClass,
+            requests: &'a [LlmHttpRecordingExchange],
+            envelope_sha256: &'static str,
+        }
+        let unsigned = UnsignedRecording {
+            schema: &self.schema,
+            recording_id: &self.recording_id,
+            purpose: &self.purpose,
+            owner: &self.owner,
+            boundary: &self.boundary,
+            secret_slots: &self.secret_slots,
+            provider: &self.provider,
+            model: &self.model,
+            recording_class: &self.recording_class,
+            requests: &self.requests,
+            envelope_sha256: "",
+        };
+        let mut hasher = Sha256::new();
+        let encoded = {
+            let mut writer = Sha256Writer(&mut hasher);
+            serde_json::to_writer(&mut writer, &unsigned)
+        };
+        encoded
+            .map(|()| format!("{:x}", hasher.finalize()))
             .unwrap_or_default()
+    }
+}
+
+fn promote_immutable_compressed_bytes(path: &Path, bytes: &[u8]) -> TestResult<u64> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| IoError::other("LLM recording path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| IoError::other("LLM recording file name is invalid"))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temporary = parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let prepare = (|| -> TestResult<u64> {
+        let file = options.open(&temporary)?;
+        let mut encoder = zstd::stream::write::Encoder::new(file, LLM_COMPRESSED_RECORDING_LEVEL)?;
+        encoder.include_checksum(true)?;
+        encoder.write_all(bytes)?;
+        let file = encoder.finish()?;
+        file.sync_all()?;
+        drop(file);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444))?;
+            fs::File::open(&temporary)?.sync_all()?;
+        }
+        Ok(fs::metadata(&temporary)?.len())
+    })();
+    let compressed_bytes = match prepare {
+        Ok(compressed_bytes) => compressed_bytes,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    if let Err(error) = fs::hard_link(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(if error.kind() == ErrorKind::AlreadyExists {
+            IoError::new(
+                ErrorKind::AlreadyExists,
+                "tracked compressed LLM recording is immutable",
+            )
+        } else {
+            error
+        }
+        .into());
+    }
+    fs::remove_file(&temporary)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(compressed_bytes)
+}
+
+struct Sha256Writer<'a>(&'a mut Sha256);
+
+impl Write for Sha256Writer<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1903,7 +2405,10 @@ fn validate_headers(headers: &[LlmHttpHeader], request: bool) -> TestResult<()> 
     Ok(())
 }
 
-fn validate_response(response: &LlmHttpRecordingResponse) -> TestResult<()> {
+fn validate_response(
+    response: &LlmHttpRecordingResponse,
+    limits: LlmHttpResponseLimits,
+) -> TestResult<()> {
     match &response.outcome {
         LlmHttpResponseOutcome::TransportError => {
             if response.status.is_some()
@@ -1936,7 +2441,7 @@ fn validate_response(response: &LlmHttpRecordingResponse) -> TestResult<()> {
             validate_http_response(response)?
         }
     }
-    if response.chunks.len() > MAX_LLM_RESPONSE_CHUNKS {
+    if response.chunks.len() > limits.max_chunks {
         return Err(IoError::other("LLM response capture chunk bound exceeded").into());
     }
     let mut response_bytes = 0usize;
@@ -1953,7 +2458,7 @@ fn validate_response(response: &LlmHttpRecordingResponse) -> TestResult<()> {
         response_bytes = response_bytes
             .checked_add(bytes.len())
             .ok_or_else(|| IoError::other("LLM response capture byte bound exceeded"))?;
-        if response_bytes > MAX_LLM_RESPONSE_BYTES {
+        if response_bytes > limits.max_bytes {
             return Err(IoError::other("LLM response capture byte bound exceeded").into());
         }
         if chunk.sequence != index as u64
@@ -1964,6 +2469,85 @@ fn validate_response(response: &LlmHttpRecordingResponse) -> TestResult<()> {
         {
             return Err(IoError::other("LLM response chunks are not ordered").into());
         }
+    }
+    Ok(())
+}
+
+fn validate_replay_response_template(template: &LlmHttpReplayResponseTemplate) -> TestResult<()> {
+    let response = LlmHttpRecordingResponse {
+        status: template.status,
+        content_type: template.content_type.clone(),
+        semantic_headers: template.semantic_headers.clone(),
+        chunks: Vec::new(),
+        outcome: template.outcome.into(),
+    };
+    match template.outcome {
+        LlmHttpReplayOutcome::TransportError => {
+            if response.status.is_some()
+                || response.content_type.is_some()
+                || !response.semantic_headers.is_empty()
+            {
+                return Err(IoError::other("LLM transport outcome has response data").into());
+            }
+        }
+        LlmHttpReplayOutcome::ClientDisconnect if response.status.is_none() => {
+            if response.content_type.is_some() || !response.semantic_headers.is_empty() {
+                return Err(
+                    IoError::other("LLM pre-response disconnect has response metadata").into(),
+                );
+            }
+        }
+        _ => validate_http_response(&response)?,
+    }
+    Ok(())
+}
+
+fn validate_indexed_response(
+    template: &LlmHttpReplayResponseTemplate,
+    chunks: &[LlmHttpIndexedReplayChunk],
+    first_byte: usize,
+    response_bytes: &[u8],
+    done_seen: bool,
+) -> TestResult<()> {
+    if chunks.len() > LONG_RUN_LLM_RESPONSE_LIMITS.max_chunks
+        || response_bytes.len() > LONG_RUN_LLM_RESPONSE_LIMITS.max_bytes
+    {
+        return Err(IoError::other("LLM response capture bound exceeded").into());
+    }
+    let response_end = first_byte
+        .checked_add(response_bytes.len())
+        .ok_or_else(|| IoError::other("LLM response byte range overflowed"))?;
+    let mut previous_at_us = 0;
+    let mut previous_end = first_byte;
+    for chunk in chunks {
+        let end = usize::try_from(chunk.end_byte)?;
+        if chunk.at_us < previous_at_us
+            || chunk.at_us - previous_at_us > MAX_LLM_CHUNK_DELAY_US
+            || end < previous_end
+            || end > response_end
+        {
+            return Err(IoError::other("LLM indexed response chunk is invalid").into());
+        }
+        previous_at_us = chunk.at_us;
+        previous_end = end;
+    }
+    if previous_end != response_end {
+        return Err(IoError::other("LLM indexed response byte range is incomplete").into());
+    }
+    let contains_done = response_bytes
+        .windows(b"data: [DONE]".len())
+        .any(|window| window == b"data: [DONE]");
+    if contains_done != done_seen
+        || matches!(
+            template.outcome,
+            LlmHttpReplayOutcome::Complete {
+                done_seen: expected
+            } if expected != done_seen
+        )
+        || (matches!(template.outcome, LlmHttpReplayOutcome::TransportError)
+            && (!chunks.is_empty() || !response_bytes.is_empty()))
+    {
+        return Err(IoError::other("LLM indexed response outcome is inconsistent").into());
     }
     Ok(())
 }
@@ -2045,6 +2629,25 @@ fn chunks_contain_done(chunks: &[LlmHttpRecordingChunk]) -> bool {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn decode_sha256(value: &str) -> TestResult<[u8; 32]> {
+    if value.len() != 64 {
+        return Err(IoError::other("SHA-256 digest has the wrong length").into());
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0])
+            .ok_or_else(|| IoError::other("SHA-256 digest encoding is invalid"))?;
+        let low = hex_nibble(pair[1])
+            .ok_or_else(|| IoError::other("SHA-256 digest encoding is invalid"))?;
+        digest[index] = (high << 4) | low;
+    }
+    Ok(digest)
 }
 
 pub fn canonical_json(body: &[u8]) -> TestResult<String> {
@@ -2131,13 +2734,224 @@ enum LlmHttpProxyMode {
         model: String,
         metadata: LlmHttpRecordingMetadata,
         sink: std::sync::Arc<RecordingSink>,
+        recording_class: LlmHttpRecordingClass,
     },
     Replay {
-        recording: LlmHttpRecording,
+        recording: LlmHttpReplayRecording,
         captured_timing: bool,
         expected_authorization: Option<String>,
         terminal_hold: Option<std::sync::Arc<Notify>>,
     },
+}
+
+#[derive(Clone)]
+enum LlmHttpReplayRecording {
+    Full(std::sync::Arc<LlmHttpRecording>),
+    Hashes(std::sync::Arc<LlmHttpHashReplayRecording>),
+}
+
+impl LlmHttpReplayRecording {
+    fn request_count(&self) -> usize {
+        match self {
+            Self::Full(recording) => recording.requests.len(),
+            Self::Hashes(recording) => recording.exchanges.len(),
+        }
+    }
+
+    fn response_status(&self, index: usize) -> Option<u16> {
+        match self {
+            Self::Full(recording) => recording
+                .requests
+                .get(index)
+                .and_then(|exchange| exchange.response.status),
+            Self::Hashes(recording) => recording
+                .response_template(index)
+                .and_then(|template| template.status),
+        }
+    }
+
+    fn response_content_type(&self, index: usize) -> Option<&str> {
+        match self {
+            Self::Full(recording) => recording
+                .requests
+                .get(index)
+                .and_then(|exchange| exchange.response.content_type.as_deref()),
+            Self::Hashes(recording) => recording
+                .response_template(index)
+                .and_then(|template| template.content_type.as_deref()),
+        }
+    }
+
+    fn response_headers(&self, index: usize) -> Option<&[LlmHttpHeader]> {
+        match self {
+            Self::Full(recording) => recording
+                .requests
+                .get(index)
+                .map(|exchange| exchange.response.semantic_headers.as_slice()),
+            Self::Hashes(recording) => recording
+                .response_template(index)
+                .map(|template| template.semantic_headers.as_slice()),
+        }
+    }
+
+    fn response_outcome(&self, index: usize) -> Option<LlmHttpReplayOutcome> {
+        match self {
+            Self::Full(recording) => recording
+                .requests
+                .get(index)
+                .map(|exchange| (&exchange.response.outcome).into()),
+            Self::Hashes(recording) => recording
+                .response_template(index)
+                .map(|template| template.outcome),
+        }
+    }
+
+    fn response_chunk_count(&self, index: usize) -> Option<usize> {
+        match self {
+            Self::Full(recording) => recording
+                .requests
+                .get(index)
+                .map(|exchange| exchange.response.chunks.len()),
+            Self::Hashes(recording) => recording
+                .exchanges
+                .get(index)
+                .and_then(|exchange| usize::try_from(exchange.chunk_count).ok()),
+        }
+    }
+
+    fn response_chunk(&self, index: usize, chunk_index: usize) -> TestResult<Option<(u64, Bytes)>> {
+        match self {
+            Self::Full(recording) => recording
+                .requests
+                .get(index)
+                .and_then(|exchange| exchange.response.chunks.get(chunk_index))
+                .map(|chunk| Ok((chunk.at_us, Bytes::from(hex_decode(&chunk.bytes_hex)?))))
+                .transpose(),
+            Self::Hashes(recording) => recording.response_chunk(index, chunk_index).map(Some),
+        }
+    }
+
+    fn response_done_seen(&self, index: usize) -> bool {
+        match self {
+            Self::Full(recording) => recording
+                .requests
+                .get(index)
+                .is_some_and(|exchange| chunks_contain_done(&exchange.response.chunks)),
+            Self::Hashes(recording) => recording
+                .exchanges
+                .get(index)
+                .is_some_and(|exchange| exchange.done_seen),
+        }
+    }
+
+    fn request_matches(
+        &self,
+        index: usize,
+        method: &str,
+        path: &str,
+        semantic_headers: &[LlmHttpHeader],
+        body: &[u8],
+    ) -> bool {
+        match self {
+            Self::Full(recording) => recording.requests.get(index).is_some_and(|exchange| {
+                exchange.request.method == method
+                    && exchange.request.path == path
+                    && exchange.request.semantic_headers == semantic_headers
+                    && exchange.request.raw_body_sha256 == sha256_hex(body)
+            }),
+            Self::Hashes(recording) => {
+                recording.request_matches(index, method, path, semantic_headers, body)
+            }
+        }
+    }
+
+    fn requires_authorization(&self) -> bool {
+        match self {
+            Self::Full(recording) => !recording.secret_slots.is_empty(),
+            Self::Hashes(recording) => recording.requires_authorization,
+        }
+    }
+
+    fn retains_observed_bodies(&self) -> bool {
+        matches!(self, Self::Full(_))
+    }
+
+    fn retained_request_match_bytes(&self) -> usize {
+        match self {
+            Self::Full(recording) => recording.retained_request_match_bytes(),
+            Self::Hashes(recording) => recording.retained_request_match_bytes,
+        }
+    }
+
+    fn full(&self) -> Option<&LlmHttpRecording> {
+        match self {
+            Self::Full(recording) => Some(recording),
+            Self::Hashes(_) => None,
+        }
+    }
+}
+
+impl LlmHttpHashReplayRecording {
+    fn response_template(&self, index: usize) -> Option<&LlmHttpReplayResponseTemplate> {
+        let exchange = self.exchanges.get(index)?;
+        self.response_templates
+            .get(usize::from(exchange.response_template))
+    }
+
+    fn request_matches(
+        &self,
+        index: usize,
+        method: &str,
+        path: &str,
+        semantic_headers: &[LlmHttpHeader],
+        body: &[u8],
+    ) -> bool {
+        let Some(exchange) = self.exchanges.get(index) else {
+            return false;
+        };
+        let Some(template) = self
+            .request_templates
+            .get(usize::from(exchange.request_template))
+        else {
+            return false;
+        };
+        template.method == method
+            && template.path == path
+            && template.semantic_headers == semantic_headers
+            && exchange.raw_body_sha256 == sha256(body)
+    }
+
+    fn response_chunk(&self, index: usize, chunk_index: usize) -> TestResult<(u64, Bytes)> {
+        let exchange = self
+            .exchanges
+            .get(index)
+            .ok_or_else(|| IoError::other("LLM replay response index is invalid"))?;
+        let first_chunk = usize::try_from(exchange.first_chunk)?;
+        let chunk_count = usize::try_from(exchange.chunk_count)?;
+        if chunk_index >= chunk_count {
+            return Err(IoError::other("LLM replay chunk index is invalid").into());
+        }
+        let absolute_chunk = first_chunk + chunk_index;
+        let chunk = self
+            .chunks
+            .get(absolute_chunk)
+            .ok_or_else(|| IoError::other("LLM replay chunk range is invalid"))?;
+        let start = if chunk_index == 0 {
+            usize::try_from(exchange.first_byte)?
+        } else {
+            usize::try_from(
+                self.chunks
+                    .get(absolute_chunk - 1)
+                    .ok_or_else(|| IoError::other("LLM replay chunk start is invalid"))?
+                    .end_byte,
+            )?
+        };
+        let end = usize::try_from(chunk.end_byte)?;
+        if start > end || end > self.response_bytes.len() {
+            return Err(IoError::other("LLM replay chunk bytes are invalid").into());
+        }
+        Ok((chunk.at_us, self.response_bytes.slice(start..end)))
+    }
 }
 
 struct RecordingSink {
@@ -2722,6 +3536,7 @@ struct LlmHttpProxyState {
     client: Client,
     mode: LlmHttpProxyMode,
     observed: std::sync::Mutex<Vec<LlmHttpObservedRequest>>,
+    observed_at: std::sync::Mutex<Vec<Instant>>,
     observed_seen: Notify,
     replay_chunk_count: AtomicU64,
     replay_chunk_seen: Notify,
@@ -2742,6 +3557,7 @@ struct LlmHttpRecordMode {
     attempt_plan: Option<Vec<LlmHttpAttemptPlan>>,
     requires_authorization: bool,
     single_sequential_stream: bool,
+    recording_class: LlmHttpRecordingClass,
 }
 
 impl LlmHttpProxy {
@@ -2813,6 +3629,7 @@ impl LlmHttpProxy {
                 attempt_plan,
                 requires_authorization,
                 single_sequential_stream: false,
+                recording_class: LlmHttpRecordingClass::Ordinary,
             },
         )
         .await
@@ -2845,6 +3662,7 @@ impl LlmHttpProxy {
                 attempt_plan: None,
                 requires_authorization,
                 single_sequential_stream: true,
+                recording_class: LlmHttpRecordingClass::LongRun,
             },
         )
         .await
@@ -2870,6 +3688,7 @@ impl LlmHttpProxy {
             model: model.into(),
             metadata,
             sink,
+            recording_class: mode.recording_class,
         })
         .await
     }
@@ -2892,7 +3711,42 @@ impl LlmHttpProxy {
     ) -> TestResult<Self> {
         recording.validate()?;
         Self::start(LlmHttpProxyMode::Replay {
-            recording,
+            recording: LlmHttpReplayRecording::Full(std::sync::Arc::new(recording)),
+            captured_timing,
+            expected_authorization,
+            terminal_hold: None,
+        })
+        .await
+    }
+
+    /// Exact replay for large cassettes whose caller needs request timing and
+    /// count but does not inspect duplicate in-memory copies of request bodies.
+    /// The already-validated cassette and each incoming raw body are matched by
+    /// SHA-256, preserving exact-byte semantics without hex/canonical-JSON
+    /// expansion on every request.
+    pub async fn replay_hashes_with_authorization(
+        recording: LlmHttpRecording,
+        captured_timing: bool,
+        expected_authorization: Option<String>,
+    ) -> TestResult<Self> {
+        recording.validate()?;
+        Self::replay_validated_hashes_with_authorization(
+            ValidatedLlmHttpRecording::from_validated(recording)?,
+            captured_timing,
+            expected_authorization,
+        )
+        .await
+    }
+
+    pub async fn replay_validated_hashes_with_authorization(
+        recording: ValidatedLlmHttpRecording,
+        captured_timing: bool,
+        expected_authorization: Option<String>,
+    ) -> TestResult<Self> {
+        Self::start(LlmHttpProxyMode::Replay {
+            recording: LlmHttpReplayRecording::Hashes(std::sync::Arc::new(
+                recording.into_hash_replay()?,
+            )),
             captured_timing,
             expected_authorization,
             terminal_hold: None,
@@ -2911,7 +3765,7 @@ impl LlmHttpProxy {
     ) -> TestResult<Self> {
         recording.validate()?;
         Self::start(LlmHttpProxyMode::Replay {
-            recording,
+            recording: LlmHttpReplayRecording::Full(std::sync::Arc::new(recording)),
             captured_timing,
             expected_authorization,
             terminal_hold: Some(terminal_hold),
@@ -2928,6 +3782,7 @@ impl LlmHttpProxy {
             client,
             mode,
             observed: std::sync::Mutex::new(Vec::new()),
+            observed_at: std::sync::Mutex::new(Vec::new()),
             observed_seen: Notify::new(),
             replay_chunk_count: AtomicU64::new(0),
             replay_chunk_seen: Notify::new(),
@@ -2956,6 +3811,7 @@ impl LlmHttpProxy {
                 model,
                 metadata,
                 sink,
+                recording_class,
                 ..
             } => {
                 if let Some(error) = sink.flush_error() {
@@ -2970,11 +3826,15 @@ impl LlmHttpProxy {
                     secret_slots: metadata.secret_slots.clone(),
                     provider: provider.clone(),
                     model: model.clone(),
+                    recording_class: *recording_class,
                     requests: sink.finalized(),
                     envelope_sha256: String::new(),
                 }
             }
-            LlmHttpProxyMode::Replay { recording, .. } => recording.clone(),
+            LlmHttpProxyMode::Replay { recording, .. } => recording
+                .full()
+                .cloned()
+                .ok_or_else(|| IoError::other("hash replay does not retain a full recording"))?,
         };
         recording.with_digest()
     }
@@ -2992,6 +3852,23 @@ impl LlmHttpProxy {
             .lock()
             .expect("LLM proxy observed mutex poisoned")
             .clone()
+    }
+
+    pub fn observed_request_times(&self) -> Vec<Instant> {
+        self.state
+            .observed_at
+            .lock()
+            .expect("LLM proxy observation-time mutex poisoned")
+            .clone()
+    }
+
+    pub fn replay_retained_request_match_bytes(&self) -> Option<usize> {
+        match &self.state.mode {
+            LlmHttpProxyMode::Replay { recording, .. } => {
+                Some(recording.retained_request_match_bytes())
+            }
+            LlmHttpProxyMode::Record { .. } => None,
+        }
     }
 
     pub async fn wait_for_recorded_chunks(&self, expected: u64) -> TestResult<()> {
@@ -3072,10 +3949,19 @@ impl LlmHttpProxy {
     }
 
     pub async fn wait_for_completed_exchanges(&self, expected: usize) -> TestResult<()> {
+        self.wait_for_completed_exchanges_with_timeout(expected, HTTP_RESPONSE_HEADERS_TIMEOUT)
+            .await
+    }
+
+    pub async fn wait_for_completed_exchanges_with_timeout(
+        &self,
+        expected: usize,
+        wait: Duration,
+    ) -> TestResult<()> {
         match &self.state.mode {
             LlmHttpProxyMode::Record { sink, .. } => sink.wait_for_exchanges(expected).await,
             LlmHttpProxyMode::Replay { .. } => {
-                timeout(HTTP_RESPONSE_HEADERS_TIMEOUT, async {
+                timeout(wait, async {
                     loop {
                         let notified = self.state.replay_completion_seen.notified();
                         if *self
@@ -3107,13 +3993,13 @@ impl LlmHttpProxy {
                     .next_replay
                     .lock()
                     .expect("LLM proxy replay mutex poisoned")
-                    == recording.requests.len()
+                    == recording.request_count()
                     && *self
                         .state
                         .replay_completed
                         .lock()
                         .expect("LLM replay completion mutex poisoned")
-                        == recording.requests.len()
+                        == recording.request_count()
                     && self
                         .state
                         .replay_error
@@ -3122,6 +4008,35 @@ impl LlmHttpProxy {
                         .is_none()
             }
             LlmHttpProxyMode::Record { .. } => true,
+        }
+    }
+
+    pub fn replay_prefix_exhausted_allowing_after_end(&self) -> bool {
+        match &self.state.mode {
+            LlmHttpProxyMode::Replay { recording, .. } => {
+                *self
+                    .state
+                    .next_replay
+                    .lock()
+                    .expect("LLM proxy replay mutex poisoned")
+                    == recording.request_count()
+                    && *self
+                        .state
+                        .replay_completed
+                        .lock()
+                        .expect("LLM replay completion mutex poisoned")
+                        == recording.request_count()
+                    && self
+                        .state
+                        .replay_error
+                        .lock()
+                        .expect("LLM replay error mutex poisoned")
+                        .as_deref()
+                        .is_none_or(|error| {
+                            error == "unexpected provider request after cassette end"
+                        })
+            }
+            LlmHttpProxyMode::Record { .. } => false,
         }
     }
 
@@ -3285,8 +4200,12 @@ async fn record_llm_http_request(
     request: Request,
     upstream_base_url: String,
 ) -> AxumResponse {
-    let sink = match &state.mode {
-        LlmHttpProxyMode::Record { sink, .. } => sink.clone(),
+    let (sink, response_limits) = match &state.mode {
+        LlmHttpProxyMode::Record {
+            sink,
+            recording_class,
+            ..
+        } => (sink.clone(), recording_class.response_limits()),
         LlmHttpProxyMode::Replay { .. } => unreachable!("replay request entered record path"),
     };
     let sequence = sink.allocate_sequence();
@@ -3327,6 +4246,11 @@ async fn record_llm_http_request(
             raw_body_hex: request_record.raw_body_hex.clone(),
             canonical_json: canonical_body.clone(),
         });
+    state
+        .observed_at
+        .lock()
+        .expect("LLM proxy observation-time mutex poisoned")
+        .push(Instant::now());
     state.observed_seen.notify_waiters();
 
     sink.record_ingress(sequence, &method_name, &path, &body);
@@ -3426,16 +4350,16 @@ async fn record_llm_http_request(
         while let Some(chunk) = upstream_stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    if capture.chunks.len() >= MAX_LLM_RESPONSE_CHUNKS
+                    if capture.chunks.len() >= response_limits.max_chunks
                         || capture
                             .response_bytes
                             .saturating_add(bytes.len())
-                            > MAX_LLM_RESPONSE_BYTES
+                            > response_limits.max_bytes
                     {
                         capture.bound_exceeded = true;
                         capture.sink.fail_flush(&format!(
                             "recording response capture bound exceeded ({} chunks/{} bytes)",
-                            MAX_LLM_RESPONSE_CHUNKS, MAX_LLM_RESPONSE_BYTES
+                            response_limits.max_chunks, response_limits.max_bytes
                         ));
                         break;
                     }
@@ -3550,7 +4474,7 @@ async fn record_llm_http_request(
 async fn replay_llm_http_request(
     state: std::sync::Arc<LlmHttpProxyState>,
     request: Request,
-    recording: LlmHttpRecording,
+    recording: LlmHttpReplayRecording,
     captured_timing: bool,
     expected_authorization: Option<String>,
     terminal_hold: Option<std::sync::Arc<Notify>>,
@@ -3574,10 +4498,8 @@ async fn replay_llm_http_request(
         Ok(body) => body,
         Err(_) => return llm_proxy_error(AxumStatusCode::BAD_REQUEST),
     };
-    let canonical_body = canonical_json(&body).ok();
     let semantic_headers = semantic_headers(&headers, true);
-    let raw_body_hex = hex_encode(&body);
-    if expected_authorization.is_some() || !recording.secret_slots.is_empty() {
+    if expected_authorization.is_some() || recording.requires_authorization() {
         if expected_authorization.is_none() {
             record_replay_error(&state, "replay requires an explicit authorization binding");
             return llm_proxy_error(AxumStatusCode::CONFLICT);
@@ -3601,6 +4523,11 @@ async fn replay_llm_http_request(
             return llm_proxy_error(AxumStatusCode::CONFLICT);
         }
     }
+    let (raw_body_hex, canonical_body) = if recording.retains_observed_bodies() {
+        (hex_encode(&body), canonical_json(&body).ok())
+    } else {
+        (String::new(), None)
+    };
     state
         .observed
         .lock()
@@ -3609,33 +4536,36 @@ async fn replay_llm_http_request(
             method: method.clone(),
             path: path.clone(),
             semantic_headers: semantic_headers.clone(),
-            raw_body_hex: raw_body_hex.clone(),
-            canonical_json: canonical_body.clone(),
+            raw_body_hex,
+            canonical_json: canonical_body,
         });
+    state
+        .observed_at
+        .lock()
+        .expect("LLM proxy observation-time mutex poisoned")
+        .push(Instant::now());
     state.observed_seen.notify_waiters();
-    let expected = {
+    let expected_index = {
         let mut next = state
             .next_replay
             .lock()
             .expect("LLM proxy replay mutex poisoned");
-        let Some(expected) = recording.requests.get(*next) else {
+        if *next >= recording.request_count() {
             record_replay_error(&state, "unexpected provider request after cassette end");
             return llm_proxy_error(AxumStatusCode::CONFLICT);
-        };
-        if expected.request.method != method
-            || expected.request.path != path
-            || expected.request.semantic_headers != semantic_headers
-            || expected.request.raw_body_hex != raw_body_hex
-            || expected.request.canonical_json != canonical_body
-        {
+        }
+        if !recording.request_matches(*next, &method, &path, &semantic_headers, &body) {
             record_replay_error(&state, "provider request did not match cassette");
             return llm_proxy_error(AxumStatusCode::CONFLICT);
         }
+        let expected_index = *next;
         *next += 1;
-        expected.clone()
+        expected_index
     };
-    let response = expected.response;
-    if matches!(response.outcome, LlmHttpResponseOutcome::TransportError) {
+    let outcome = recording
+        .response_outcome(expected_index)
+        .expect("matched replay request has a response");
+    if matches!(outcome, LlmHttpReplayOutcome::TransportError) {
         let state_for_stream = state.clone();
         if terminal_hold.is_some() {
             state_for_stream
@@ -3665,56 +4595,62 @@ async fn replay_llm_http_request(
             .body(Body::from_stream(stream))
             .expect("LLM transport-error replay response builds");
     }
-    let status = response
-        .status
+    let status = recording
+        .response_status(expected_index)
         .unwrap_or(AxumStatusCode::BAD_GATEWAY.as_u16());
-    let response_content_type = response.content_type.clone();
-    let retry_after = response
-        .semantic_headers
+    let response_content_type = recording
+        .response_content_type(expected_index)
+        .map(str::to_owned);
+    let retry_after = recording
+        .response_headers(expected_index)
+        .expect("matched replay request has response headers")
         .iter()
         .find(|header| header.name == "retry-after")
         .map(|header| header.value.clone());
-    let outcome = response.outcome.clone();
     let state_for_stream = state.clone();
+    let recording_for_stream = recording.clone();
     let stream = stream! {
         let started = Instant::now();
-        let total_chunks = response.chunks.len();
+        let total_chunks = recording_for_stream
+            .response_chunk_count(expected_index)
+            .expect("matched replay request has a streaming response");
         let terminal_required = matches!(
             outcome,
-            LlmHttpResponseOutcome::StreamError
-                | LlmHttpResponseOutcome::ClientDisconnect
-                | LlmHttpResponseOutcome::CaptureBoundExceeded
+            LlmHttpReplayOutcome::StreamError
+                | LlmHttpReplayOutcome::ClientDisconnect
+                | LlmHttpReplayOutcome::CaptureBoundExceeded
         ) && !matches!(
             outcome,
-            LlmHttpResponseOutcome::ClientDisconnect
-                if chunks_contain_done(&response.chunks)
+            LlmHttpReplayOutcome::ClientDisconnect
+                if recording_for_stream.response_done_seen(expected_index)
         );
         let mut completion = ReplayCompletion::new(state_for_stream.clone());
         if total_chunks == 0 {
             completion.all_chunks_emitted = true;
         }
-        for (index, chunk) in response.chunks.into_iter().enumerate() {
+        for index in 0..total_chunks {
+            let (at_us, bytes) = match recording_for_stream
+                .response_chunk(expected_index, index)
+            {
+                Ok(Some(chunk)) => chunk,
+                _ => {
+                    yield Err(std::io::Error::other("LLM recording chunk is invalid"));
+                    return;
+                }
+            };
             if captured_timing {
-                let target = Duration::from_micros(chunk.at_us);
+                let target = Duration::from_micros(at_us);
                 let elapsed = started.elapsed();
                 if target > elapsed {
                     sleep(target - elapsed).await;
                 }
             }
-            match hex_decode(&chunk.bytes_hex) {
-                Ok(bytes) => {
-                    state_for_stream
-                        .replay_chunk_count
-                        .fetch_add(1, Ordering::SeqCst);
-                    state_for_stream.replay_chunk_seen.notify_waiters();
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from(bytes));
-                    completion.all_chunks_emitted = index + 1 == total_chunks;
-                }
-                Err(_) => {
-                    yield Err(std::io::Error::other("LLM recording chunk is invalid"));
-                    return;
-                }
-            }
+            state_for_stream
+                .replay_chunk_count
+                .fetch_add(1, Ordering::SeqCst);
+            state_for_stream.replay_chunk_seen.notify_waiters();
+            yield Ok::<Bytes, std::io::Error>(bytes);
+            completion.all_chunks_emitted = index + 1 == total_chunks;
         }
         if let Some(hold) = terminal_hold {
             state_for_stream
@@ -3728,7 +4664,7 @@ async fn replay_llm_http_request(
             // at the final chunk, the stream is dropped before this point and
             // ReplayCompletion must remain uncompleted.
             completion.terminal_error_emitted = true;
-            let message = if matches!(outcome, LlmHttpResponseOutcome::CaptureBoundExceeded) {
+            let message = if matches!(outcome, LlmHttpReplayOutcome::CaptureBoundExceeded) {
                 "LLM recording response capture bound exceeded"
             } else {
                 "LLM recording response disconnected"
@@ -3837,6 +4773,7 @@ pub enum ModelScript {
     },
     LargeStream {
         bytes: usize,
+        chunk_bytes: usize,
     },
     CleanEof {
         text: String,
@@ -3959,7 +4896,14 @@ impl ModelScript {
     }
 
     pub fn large_stream(bytes: usize) -> Self {
-        Self::LargeStream { bytes }
+        Self::LargeStream {
+            bytes,
+            chunk_bytes: 1024,
+        }
+    }
+
+    pub fn fine_grained_stream(bytes: usize, chunk_bytes: usize) -> Self {
+        Self::LargeStream { bytes, chunk_bytes }
     }
 
     pub fn clean_eof(text: impl Into<String>) -> Self {
@@ -4353,7 +5297,9 @@ async fn execute_model_script(mut script: ModelScript) -> AxumResponse {
             ModelScript::StreamHold { hold } => return model_stream_hold(hold),
             ModelScript::StreamDoneHold { hold } => return model_stream_done_hold(hold),
             ModelScript::StreamFailureHold { hold } => return model_stream_failure_hold(hold),
-            ModelScript::LargeStream { bytes } => return model_large_stream(bytes),
+            ModelScript::LargeStream { bytes, chunk_bytes } => {
+                return model_large_stream(bytes, chunk_bytes);
+            }
             ModelScript::CleanEof { text } => {
                 return model_stream(vec![sse_chunk(json!({
                     "choices": [{
@@ -4429,12 +5375,15 @@ fn model_stream(chunks: Vec<bytes::Bytes>) -> AxumResponse {
         .expect("model fixture stream response builds")
 }
 
-fn model_large_stream(bytes: usize) -> AxumResponse {
-    const CHUNK_BYTES: usize = 1024;
+fn model_large_stream(bytes: usize, chunk_bytes: usize) -> AxumResponse {
+    assert!(
+        chunk_bytes >= 3,
+        "large model stream chunks require SSE framing"
+    );
     let mut remaining = bytes;
     let mut chunks = Vec::new();
     while remaining > 0 {
-        let length = remaining.min(CHUNK_BYTES);
+        let length = remaining.min(chunk_bytes);
         let mut frame = vec![b'x'; length];
         if length >= 3 {
             frame[0] = b':';

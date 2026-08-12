@@ -108,7 +108,14 @@ The recorder therefore bounds response bytes and frame count independently;
 the frame bound must accommodate the configured model output budget while the
 byte bound remains authoritative. Crossing either bound fails the live test
 and cannot silently combine a later model request with the incomplete
-exchange. The positive large-response path is frozen by
+exchange. Ordinary recordings retain their smaller abuse bound. The explicit
+single-session long-run recorder instead carries a `long_run` class in its
+envelope and derives separate byte and frame ceilings from the approved 128,000
+token output allowance; persistence, loading, and replay validate that same
+class rather than relying on an out-of-band caller assumption. The positive
+long-run path is frozen by
+`e2e_long_run_llm_recorder_records_and_replays_reasoning_stream_above_ordinary_bound`.
+The ordinary positive large-response path remains frozen by
 `e2e_llm_recorder_accepts_bounded_reasoning_stream_needed_by_handoff_generation`;
 `e2e_llm_recorder_stream_capture_bound_fails_closed` retains the upper-bound
 failure.
@@ -235,6 +242,11 @@ The trace preserves each ordered semantic event's schema version, type, and
 payload. Test-only loading is byte-bounded, checks a whole-trace digest, and
 rejects missing, extra, reordered, or changed events.
 
+A live run first writes that trace as a create-new private `0600` file inside
+the `0700` quarantine root, so the complete raw tree remains private and can be
+scanned as one unit. Only the verified archive or a later reviewed promotion is
+immutable; creating the trace must not make a quarantine member world-readable.
+
 The replay harness classifies trace entries by their role without importing
 them into storage:
 
@@ -245,11 +257,36 @@ them into storage:
 
 For example, a recorded user delivery is replayed as the corresponding public
 message command. `AsyncToolCallStarted` supplies the exact tool name and input
-that the real HTTP tool adapter must receive, while its matching
-`AsyncToolCallCompleted` supplies the recorded external result returned by the
-test-owned tool fixture. Endpoint must independently commit both lifecycle
-events in the same causal position. Even when an event represents an admitted
-input, the harness never appends that event directly.
+that the real HTTP tool adapter must receive. Its matching terminal event
+supplies the external outcome that the test-owned tool fixture must reproduce:
+`AsyncToolCallCompleted` returns the recorded result, while
+`AsyncToolCallFailed` returns a failed adapter response. Endpoint must
+independently commit both lifecycle events in the same causal position. Even
+when an event represents an admitted input, the harness never appends that
+event directly.
+
+A retained failure prefix may end after an `AsyncToolCallStarted` without its
+terminal event only when that missing terminal fact is the behavior under
+test. Such a prefix must contain exactly one unresolved tool call and it must
+be the final tool input in the trace. Replay executes that input through the
+real external adapter, positively observes the response boundary, and then
+requires the fresh Endpoint to emit the missing durable terminal event. Normal
+correctness replay continues to reject every incomplete tool outcome.
+
+`e2e_deepswe_failed_tool_outcome_is_recorded_and_replayed` freezes the failed
+branch through two fresh real Endpoint processes. The first run observes a
+real HTTP tool failure and exports the stopped session trace; the second
+replays that failure through the same public message and HTTP tool boundaries,
+then requires the stopped event log and projected failed tool outcome to match.
+
+The causal manifest is closed over immutable blobs referenced by those events.
+When a tool result exceeds the inline event bound, the trace carries the exact
+UTF-8 object addressed by that event's `BlobRef` and verifies its ID, byte
+length, media type, and SHA-256 before replay. This is not a second shell
+transcript or an environment snapshot: unreferenced files are excluded, and
+the referenced object is usable only through its originating event. Replay
+returns those bytes through the real external-tool adapter and requires the new
+Endpoint run to commit the same `BlobRef`.
 
 The provider HTTP cassette is the only supplemental long-run recording. It
 retains exact provider request/response bytes because those payloads are
@@ -259,6 +296,20 @@ the production HTTP tool-dispatch adapter. The resulting stopped database's
 event trace must match the reviewed manifest after deterministic normalization
 of run-local identities and clocks. An unexpected provider request, tool call,
 event, duplicate, or unconsumed expected fact fails the E2E.
+
+After a tracked long-run cassette's compressed-file SHA-256 matches its pinned
+reviewed value, replay may consume a separately pinned compact index containing
+only its source SHA-256, ordered request hashes, semantic headers, and responses.
+The index is a derived acceleration structure, not another evidence authority:
+the immutable full cassette remains the source, both compressed files are
+digest-checked, and every live request body is hashed and matched at the same
+sequence position. Deterministic replay therefore need not repeatedly
+decompress or parse cumulative raw request bodies and canonical JSON.
+
+The canonical DeepSWE live and replay runners use Cargo's optimized release
+profile. This does not skip or replace any assertion; it keeps the real
+Endpoint's hashing, JSON, reducer, and snapshot costs representative instead of
+letting the debug profile dominate a long deterministic replay.
 
 A separate Pier reconstruction mode may additionally start a fresh official
 benchmark environment. It derives each shell command and expected result from

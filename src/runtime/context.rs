@@ -1,16 +1,18 @@
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use serde_json::{json, Value};
-
-use crate::domain::{
-    ContextHandoffPlan, DurablePayload, SessionModelSelection, SessionState, TranscriptMessage,
-    TranscriptRole,
-};
 
 use super::{
     failed_round_placeholder_target, stable_digest, terminal_tool_content, ToolDefinition,
     ToolError, ToolExecutionCompletion, ToolExecutionResult, READ_CONTEXT_HANDOFF_TOOL_NAME,
     READ_SESSION_HISTORY_TOOL_NAME,
+};
+use crate::domain::{
+    ContextHandoffPlan, DurablePayload, SessionModelSelection, SessionState, TranscriptMessage,
+    TranscriptRole,
 };
 
 pub(super) const MODEL_CONTEXT_TOKEN_ACCOUNTING_VERSION: u32 = 2;
@@ -25,32 +27,237 @@ const HANDOFF_CONTENT_CHUNK_BYTES: usize = 8 * 1024;
 const HISTORY_CONTENT_CHUNK_BYTES: usize = 16 * 1024;
 const HISTORY_PREVIEW_BYTES: usize = 1_024;
 
+pub(super) struct ModelContextMetrics {
+    pub(super) local_input_estimate_tokens: u64,
+    pub(super) prompt_fingerprint: String,
+    pub(super) tool_schema_fingerprint: String,
+}
+
+#[derive(Default)]
+pub(super) struct ProviderContextCache {
+    cached: Option<CachedProviderContext>,
+}
+
+struct CachedProviderContext {
+    source_len: usize,
+    handoff_id: Option<String>,
+    placeholder_target: Option<String>,
+    explicit_tool_results: HashSet<String>,
+    async_dependencies: HashMap<String, Option<String>>,
+    transcript: Arc<Vec<TranscriptMessage>>,
+    transcript_json: String,
+}
+
+impl ProviderContextCache {
+    pub(super) fn prepare(
+        &mut self,
+        state: &SessionState,
+    ) -> Result<(Arc<Vec<TranscriptMessage>>, &str), &'static str> {
+        let handoff_id = state
+            .latest_context_handoff
+            .as_ref()
+            .map(|handoff| handoff.handoff_id.clone());
+        let placeholder_target = failed_round_placeholder_target(state);
+        let can_extend = self.cached.as_ref().is_some_and(|cached| {
+            cached.source_len <= state.transcript.len()
+                && cached.handoff_id == handoff_id
+                && cached.placeholder_target == placeholder_target
+                && cached.async_dependencies.iter().all(|(id, fingerprint)| {
+                    async_tool_projection_fingerprint(state, id)
+                        .is_ok_and(|current| current == *fingerprint)
+                })
+                && !state.transcript[cached.source_len..].iter().any(|message| {
+                    message.role == TranscriptRole::Tool
+                        && message
+                            .tool_call_id
+                            .as_ref()
+                            .is_some_and(|id| cached.async_dependencies.contains_key(id))
+                })
+        });
+
+        if can_extend {
+            self.extend(state)?;
+        } else {
+            self.rebuild(state, handoff_id, placeholder_target)?;
+        }
+        let cached = self.cached.as_ref().ok_or("model_context_cache")?;
+        Ok((cached.transcript.clone(), &cached.transcript_json))
+    }
+
+    fn extend(&mut self, state: &SessionState) -> Result<(), &'static str> {
+        let cached = self.cached.as_mut().ok_or("model_context_cache")?;
+        let tail = &state.transcript[cached.source_len..];
+        cached.explicit_tool_results.extend(
+            tail.iter()
+                .filter(|message| message.role == TranscriptRole::Tool)
+                .filter_map(|message| message.tool_call_id.clone()),
+        );
+        let previous_len = cached.transcript.len();
+        append_provider_transcript_messages(
+            state,
+            tail,
+            cached.placeholder_target.as_deref(),
+            &cached.explicit_tool_results,
+            Arc::make_mut(&mut cached.transcript),
+        );
+        append_json_array_tail(
+            &mut cached.transcript_json,
+            previous_len,
+            &cached.transcript[previous_len..],
+        )?;
+        cached.source_len = state.transcript.len();
+        for id in async_dependency_ids(
+            &cached.transcript[previous_len..],
+            &cached.explicit_tool_results,
+        ) {
+            cached
+                .async_dependencies
+                .insert(id.clone(), async_tool_projection_fingerprint(state, &id)?);
+        }
+        Ok(())
+    }
+
+    fn rebuild(
+        &mut self,
+        state: &SessionState,
+        handoff_id: Option<String>,
+        placeholder_target: Option<String>,
+    ) -> Result<(), &'static str> {
+        let explicit_tool_results = state
+            .transcript
+            .iter()
+            .filter(|message| message.role == TranscriptRole::Tool)
+            .filter_map(|message| message.tool_call_id.clone())
+            .collect::<HashSet<_>>();
+        let transcript = provider_context(state)?;
+        let async_dependencies = async_dependency_ids(&transcript, &explicit_tool_results)
+            .into_iter()
+            .map(|id| Ok((id.clone(), async_tool_projection_fingerprint(state, &id)?)))
+            .collect::<Result<_, &'static str>>()?;
+        let transcript_json =
+            serde_json::to_string(&transcript).map_err(|_| "model_context_transcript_encode")?;
+        self.cached = Some(CachedProviderContext {
+            source_len: state.transcript.len(),
+            handoff_id,
+            placeholder_target,
+            explicit_tool_results,
+            async_dependencies,
+            transcript: Arc::new(transcript),
+            transcript_json,
+        });
+        Ok(())
+    }
+}
+
+fn async_tool_projection_fingerprint(
+    state: &SessionState,
+    tool_call_id: &str,
+) -> Result<Option<String>, &'static str> {
+    state
+        .async_tool_calls
+        .get(tool_call_id)
+        .map(|record| {
+            serde_json::to_string(record)
+                .map(|value| stable_digest("async-tool-context", &value))
+                .map_err(|_| "model_context_async_tool_encode")
+        })
+        .transpose()
+}
+
+fn async_dependency_ids(
+    transcript: &[TranscriptMessage],
+    explicit: &HashSet<String>,
+) -> HashSet<String> {
+    let visible_results = transcript
+        .iter()
+        .filter(|message| message.role == TranscriptRole::Tool)
+        .filter_map(|message| message.tool_call_id.as_ref())
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut dependencies = transcript
+        .iter()
+        .filter(|message| message.role == TranscriptRole::Tool)
+        .filter(|message| message.content == "async_running")
+        .filter_map(|message| message.tool_call_id.clone())
+        .collect::<HashSet<_>>();
+    dependencies.extend(
+        visible_results
+            .iter()
+            .filter(|tool_call_id| !explicit.contains(*tool_call_id))
+            .cloned(),
+    );
+    dependencies.extend(
+        transcript
+            .iter()
+            .filter(|message| message.role == TranscriptRole::Assistant)
+            .flat_map(|message| &message.tool_calls)
+            .filter(|call| !visible_results.contains(&call.tool_call_id))
+            .map(|call| call.tool_call_id.clone()),
+    );
+    dependencies
+}
+
+fn append_json_array_tail<T: serde::Serialize>(
+    json: &mut String,
+    existing_len: usize,
+    tail: &[T],
+) -> Result<(), &'static str> {
+    if tail.is_empty() {
+        return Ok(());
+    }
+    if json.pop() != Some(']') {
+        return Err("model_context_cache");
+    }
+    for (index, value) in tail.iter().enumerate() {
+        if existing_len > 0 || index > 0 {
+            json.push(',');
+        }
+        json.push_str(
+            &serde_json::to_string(value).map_err(|_| "model_context_transcript_encode")?,
+        );
+    }
+    json.push(']');
+    Ok(())
+}
+
 pub(super) fn provider_transcript(state: &SessionState) -> Vec<TranscriptMessage> {
     let placeholder_target = failed_round_placeholder_target(state);
-    let placeholder = placeholder_target
-        .as_ref()
-        .map(|trigger_message_id| TranscriptMessage {
-            message_id: stable_digest("model-failure-placeholder", trigger_message_id),
-            role: TranscriptRole::Assistant,
-            content: String::new(),
-            tool_call_id: None,
-            tool_calls: Vec::new(),
-            dedupe_key: None,
-            source_queue_id: None,
-        });
     let mut projected =
-        Vec::with_capacity(state.transcript.len() + usize::from(placeholder.is_some()));
+        Vec::with_capacity(state.transcript.len() + usize::from(placeholder_target.is_some()));
     let existing_tool_results = state
         .transcript
         .iter()
         .filter(|message| message.role == TranscriptRole::Tool)
-        .filter_map(|message| message.tool_call_id.as_deref())
+        .filter_map(|message| message.tool_call_id.clone())
         .collect::<HashSet<_>>();
-    for original in &state.transcript {
-        if placeholder_target
-            .as_deref()
-            .is_some_and(|target| target == original.message_id)
-        {
+    append_provider_transcript_messages(
+        state,
+        &state.transcript,
+        placeholder_target.as_deref(),
+        &existing_tool_results,
+        &mut projected,
+    );
+    projected
+}
+
+fn append_provider_transcript_messages(
+    state: &SessionState,
+    source: &[TranscriptMessage],
+    placeholder_target: Option<&str>,
+    existing_tool_results: &HashSet<String>,
+    projected: &mut Vec<TranscriptMessage>,
+) {
+    let placeholder = placeholder_target.map(|trigger_message_id| TranscriptMessage {
+        message_id: stable_digest("model-failure-placeholder", trigger_message_id),
+        role: TranscriptRole::Assistant,
+        content: String::new(),
+        tool_call_id: None,
+        tool_calls: Vec::new(),
+        dedupe_key: None,
+        source_queue_id: None,
+    });
+    for original in source {
+        if placeholder_target.is_some_and(|target| target == original.message_id) {
             if let Some(placeholder) = &placeholder {
                 projected.push(placeholder.clone());
             }
@@ -73,7 +280,7 @@ pub(super) fn provider_transcript(state: &SessionState) -> Vec<TranscriptMessage
         projected.push(message);
         if original.role == TranscriptRole::Assistant {
             for call in &original.tool_calls {
-                if existing_tool_results.contains(call.tool_call_id.as_str()) {
+                if existing_tool_results.contains(&call.tool_call_id) {
                     continue;
                 }
                 let Some(content) = state
@@ -95,7 +302,6 @@ pub(super) fn provider_transcript(state: &SessionState) -> Vec<TranscriptMessage
             }
         }
     }
-    projected
 }
 
 pub(super) fn provider_context(
@@ -510,10 +716,24 @@ pub(super) fn model_context_estimate_tokens(
     // runtime buffer remain reserved separately, so this estimate is not the
     // context-window boundary by itself. Later rounds anchor on provider usage
     // and estimate only the newly appended tail.
-    let transcript_bytes = serde_json::to_vec(transcript)
-        .map_err(|_| "model_context_transcript_encode")?
-        .len() as u64;
-    let tool_bytes = serde_json::to_vec(
+    Ok(model_context_metrics(transcript, tools)?.local_input_estimate_tokens)
+}
+
+pub(super) fn model_context_metrics(
+    transcript: &[TranscriptMessage],
+    tools: &[ToolDefinition],
+) -> Result<ModelContextMetrics, &'static str> {
+    let transcript_json =
+        serde_json::to_string(transcript).map_err(|_| "model_context_transcript_encode")?;
+    model_context_metrics_from_serialized_transcript(&transcript_json, transcript.len(), tools)
+}
+
+pub(super) fn model_context_metrics_from_serialized_transcript(
+    transcript_json: &str,
+    transcript_len: usize,
+    tools: &[ToolDefinition],
+) -> Result<ModelContextMetrics, &'static str> {
+    let tool_json = serde_json::to_string(
         &tools
             .iter()
             .map(|tool| {
@@ -525,18 +745,20 @@ pub(super) fn model_context_estimate_tokens(
             })
             .collect::<Vec<_>>(),
     )
-    .map_err(|_| "model_context_tools_encode")?
-    .len() as u64;
-    Ok(MODEL_CONTEXT_BASE_TOKENS
+    .map_err(|_| "model_context_tools_encode")?;
+    let local_input_estimate_tokens = MODEL_CONTEXT_BASE_TOKENS
         .saturating_add(
-            transcript_bytes
-                .saturating_add(tool_bytes)
+            (transcript_json.len() as u64)
+                .saturating_add(tool_json.len() as u64)
                 .div_ceil(MODEL_CONTEXT_ESTIMATED_BYTES_PER_TOKEN),
         )
-        .saturating_add(
-            MODEL_CONTEXT_MESSAGE_FRAMING_TOKENS.saturating_mul(transcript.len() as u64),
-        )
-        .saturating_add(MODEL_CONTEXT_TOOL_FRAMING_TOKENS.saturating_mul(tools.len() as u64)))
+        .saturating_add(MODEL_CONTEXT_MESSAGE_FRAMING_TOKENS.saturating_mul(transcript_len as u64))
+        .saturating_add(MODEL_CONTEXT_TOOL_FRAMING_TOKENS.saturating_mul(tools.len() as u64));
+    Ok(ModelContextMetrics {
+        local_input_estimate_tokens,
+        prompt_fingerprint: stable_digest("model-prompt", transcript_json),
+        tool_schema_fingerprint: stable_digest("model-tools", &tool_json),
+    })
 }
 
 pub(super) fn model_context_text_tokens(text: &str) -> u64 {
@@ -579,36 +801,17 @@ pub(super) fn model_selection_fingerprint(
     ))
 }
 
-pub(super) fn model_tool_schema_fingerprint(
-    tools: &[ToolDefinition],
-) -> Result<String, &'static str> {
-    let tool_schema = tools
-        .iter()
-        .map(|tool| {
-            json!({
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.input_schema,
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(stable_digest(
-        "model-tools",
-        &serde_json::to_string(&tool_schema).map_err(|_| "tool_fingerprint")?,
-    ))
-}
-
-pub(super) fn estimated_model_input_tokens(
+pub(super) fn estimated_model_input_tokens_from_metrics(
     state: &SessionState,
-    selection: &SessionModelSelection,
     transcript: &[TranscriptMessage],
-    tools: &[ToolDefinition],
+    selection_fingerprint: &str,
+    tool_schema_fingerprint: &str,
+    full_estimate: u64,
 ) -> Result<u64, &'static str> {
-    let full_estimate = model_context_estimate_tokens(transcript, tools)?;
     let Some(anchor) = state.latest_model_usage.as_ref() else {
         return Ok(full_estimate);
     };
-    if anchor.selection_fingerprint != model_selection_fingerprint(selection)? {
+    if anchor.selection_fingerprint != selection_fingerprint {
         return Ok(full_estimate);
     }
     let Some(scale) = anchor.input_estimate_scale_millionths else {
@@ -616,7 +819,7 @@ pub(super) fn estimated_model_input_tokens(
     };
     let scale = scale.max(MODEL_CONTEXT_SCALE_DENOMINATOR);
     if anchor.context_generation != model_context_generation(state)
-        || anchor.tool_schema_fingerprint != model_tool_schema_fingerprint(tools)?
+        || anchor.tool_schema_fingerprint != tool_schema_fingerprint
     {
         return Ok(scale_token_estimate(full_estimate, scale));
     }

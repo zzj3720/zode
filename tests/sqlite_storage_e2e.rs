@@ -180,6 +180,70 @@ async fn e2e_sqlite_snapshot_cursor_follows_public_commits(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_legacy_state_digest_restarts_appends_and_preserves_history(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let database_path = test_database("legacy-state-digest")?;
+    let (mut server, client, session_id) = create_history(&database_path).await?;
+    server.stop().await?;
+
+    let database_file = database_path.path().to_owned();
+    let stream_id = session_id.clone();
+    db_blocking(move || {
+        let connection = Connection::open(database_file)?;
+        let (snapshot_id, stream_version, payload): (i64, i64, Vec<u8>) = connection.query_row(
+            "SELECT snapshot_id, stream_version, payload FROM snapshots
+             WHERE stream_id = ?1 ORDER BY stream_version DESC, snapshot_id DESC LIMIT 1",
+            params![&stream_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let legacy_digest = Sha256::digest(&payload).to_vec();
+        let snapshot_changed = connection.execute(
+            "UPDATE snapshots SET state_digest_version = 1, state_digest = ?1
+             WHERE snapshot_id = ?2",
+            params![&legacy_digest, snapshot_id],
+        )?;
+        let anchor_changed = connection.execute(
+            "UPDATE integrity_anchors SET state_digest_version = 1, state_digest = ?1
+             WHERE stream_id = ?2 AND stream_version = ?3",
+            params![&legacy_digest, &stream_id, stream_version],
+        )?;
+        if snapshot_changed != 1 || anchor_changed != 1 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(())
+    })
+    .await?;
+
+    let mut restarted = TestServer::start(&database_path).await?;
+    let response =
+        authenticated(client.post(restarted.url(&format!("/v1/sessions/{session_id}/messages"))))
+            .header("Idempotency-Key", "legacy-digest-next-message")
+            .json(&json!({"content": "message after digest upgrade"}))
+            .send_with_timeout()
+            .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let accepted = response_json(response).await?;
+    assert_eq!(accepted["version"], 3);
+    restarted.stop().await?;
+
+    let mut final_restart = TestServer::start(&database_path).await?;
+    let response =
+        authenticated(client.get(final_restart.url(&format!("/v1/sessions/{session_id}"))))
+            .send_with_timeout()
+            .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let state = response_json(response).await?;
+    final_restart.stop().await?;
+    assert_eq!(state["version"], 3);
+    assert_eq!(state["transcript"][0]["content"], "historical message");
+    assert_eq!(
+        state["transcript"][1]["content"],
+        "message after digest upgrade"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_snapshot_cannot_override_event_stream(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let database_path = test_database("snapshot-mismatch")?;
