@@ -79,8 +79,8 @@ export const globalStyles = css`
 
   input:focus-visible,
   textarea:focus-visible {
-    outline: none;
-    outline-offset: 0;
+    outline: 2px solid var(--zode-focus);
+    outline-offset: 1px;
   }
 
   .app-shell {

@@ -2966,6 +2966,9 @@ test.describe("session reconnect and runtime states", () => {
       expect(reloadedEndpointRequest.status).toBe(200);
       await expect(page.getByText("PROVISIONAL_TOKEN", { exact: true })).toHaveCount(0);
 
+      const eventIdsBeforeModelPut = new Set(
+        topology.endpointBoundary.eventRequests().flatMap((request) => request.responseEventIds),
+      );
       requireBody(
         await apiJson(
           topology.server.baseUrl,
@@ -2986,6 +2989,19 @@ test.describe("session reconnect and runtime states", () => {
       await expect(
         page.getByRole("button", { name: "Choose model", exact: true }),
       ).toContainText(REPLAY_HISTORY_MODEL, { timeout: 30_000 });
+      await expect
+        .poll(
+          () =>
+            topology.endpointBoundary
+              .eventRequests()
+              .flatMap((request) => request.responseEventIds)
+              .some((eventId) => !eventIdsBeforeModelPut.has(eventId)),
+          {
+            timeout: 15_000,
+            message: "model selection did not publish a durable event before the outage snapshot",
+          },
+        )
+        .toBe(true);
 
       const publishedBeforeOutage = new Set(
         topology.endpointBoundary.eventRequests().flatMap((request) => request.responseEventIds),
