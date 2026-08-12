@@ -34,7 +34,7 @@ use support::{
     LlmHttpRecordingMetadata, LlmHttpResponseOutcome, ModelFixture, ModelHold, ModelScript,
     ProviderRoundtripSpec, PublicHttpGapExchange, TempDatabase, TestResult, TestZode,
     LLM_HTTP_RECORDING_SCHEMA, MAX_LLM_CHUNK_DELAY_US, MAX_LLM_RESPONSE_BYTES,
-    TEST_CONTROLLER_AUTHORITY, TEST_CONTROLLER_SECRET,
+    MAX_LLM_RESPONSE_CHUNKS, TEST_CONTROLLER_AUTHORITY, TEST_CONTROLLER_SECRET,
 };
 use tokio::{sync::Notify, time::timeout};
 
@@ -2127,6 +2127,90 @@ async fn e2e_llm_recorder_accepts_bounded_reasoning_stream_needed_by_handoff_gen
     if persisted.requests[0].response.chunks.len() != recording.requests[0].response.chunks.len() {
         return Err(Error::other("persisted reasoning recording changed frame count").into());
     }
+    scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_long_run_llm_recorder_records_and_replays_reasoning_stream_above_ordinary_bound(
+) -> TestResult<()> {
+    const LONG_REASONING_STREAM_BYTES: usize = 9 * 1024 * 1024;
+    const REASONING_FRAME_BYTES: usize = 128;
+    let mut provider = ModelFixture::start(vec![ModelScript::fine_grained_stream(
+        LONG_REASONING_STREAM_BYTES,
+        REASONING_FRAME_BYTES,
+    )])
+    .await?;
+    let run_directory = new_llm_recording_run_dir()?;
+    let recording_id = run_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::other("long-run recording id was invalid"))?
+        .to_owned();
+    let mut recorder = LlmHttpProxy::record_single_sequential_stream(
+        provider.origin(),
+        PROVIDER,
+        MODEL,
+        &run_directory,
+        LlmHttpRecordingMetadata {
+            recording_id,
+            purpose: "synthetic_long_reasoning_stream".to_owned(),
+            owner: "e2e_long_run_llm_recorder_records_and_replays_reasoning_stream_above_ordinary_bound"
+                .to_owned(),
+            boundary: "endpoint_aimux_provider_http".to_owned(),
+            secret_slots: vec!["SLOT_PROVIDER_AUTHORIZATION_HEADER".to_owned()],
+        },
+    )
+    .await?;
+    let database = TempDatabase::new("recording-long-reasoning-stream")?;
+    let config = config_for_replay(database.path(), &recorder.base_url("/v1"))?;
+    let cancel = Arc::new(Notify::new());
+    let attempt = tokio::spawn(run_provider_attempt_until_cancel(
+        synthetic_spec(
+            &database,
+            config,
+            recorder.base_url("/v1"),
+            "recording-long-reasoning-stream",
+        ),
+        cancel.clone(),
+    ));
+    recorder.wait_for_completed_exchanges(1).await?;
+    cancel.notify_one();
+    attempt
+        .await
+        .map_err(|error| Error::other(format!("long reasoning capture task failed: {error}")))??;
+    recorder.stop().await?;
+    provider.stop().await?;
+    if let Some(error) = recorder.flush_error() {
+        return Err(Error::other(format!(
+            "long reasoning response failed recorder flush: {error}"
+        ))
+        .into());
+    }
+    let recording = recorder.recording()?;
+    let response = &recording.requests[0].response;
+    let captured_bytes = response
+        .chunks
+        .iter()
+        .map(|chunk| chunk.bytes_hex.len() / 2)
+        .sum::<usize>();
+    if captured_bytes != LONG_REASONING_STREAM_BYTES
+        || response.chunks.len() <= MAX_LLM_RESPONSE_CHUNKS
+        || captured_bytes <= MAX_LLM_RESPONSE_BYTES
+    {
+        return Err(Error::other(format!(
+            "long reasoning recording retained {captured_bytes} bytes in {} chunks",
+            response.chunks.len()
+        ))
+        .into());
+    }
+    let path = run_directory.join("recording.json");
+    recording.write_atomic(&path, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
+    let persisted = LlmHttpRecording::load_long_run(&path)?;
+    if persisted.requests[0].response.chunks.len() != response.chunks.len() {
+        return Err(Error::other("persisted long reasoning recording changed frame count").into());
+    }
+    replay_synthetic_failure(persisted, "replay-long-reasoning-stream").await?;
     scan_llm_recording_tree(&run_directory, &[REPLAY_SECRET, TEST_CONTROLLER_SECRET])?;
     Ok(())
 }

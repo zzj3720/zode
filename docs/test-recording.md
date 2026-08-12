@@ -108,7 +108,14 @@ The recorder therefore bounds response bytes and frame count independently;
 the frame bound must accommodate the configured model output budget while the
 byte bound remains authoritative. Crossing either bound fails the live test
 and cannot silently combine a later model request with the incomplete
-exchange. The positive large-response path is frozen by
+exchange. Ordinary recordings retain their smaller abuse bound. The explicit
+single-session long-run recorder instead carries a `long_run` class in its
+envelope and derives separate byte and frame ceilings from the approved 128,000
+token output allowance; persistence, loading, and replay validate that same
+class rather than relying on an out-of-band caller assumption. The positive
+long-run path is frozen by
+`e2e_long_run_llm_recorder_records_and_replays_reasoning_stream_above_ordinary_bound`.
+The ordinary positive large-response path remains frozen by
 `e2e_llm_recorder_accepts_bounded_reasoning_stream_needed_by_handoff_generation`;
 `e2e_llm_recorder_stream_capture_bound_fails_closed` retains the upper-bound
 failure.

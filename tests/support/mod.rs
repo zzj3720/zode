@@ -1470,9 +1470,48 @@ pub const MAX_LLM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 // Reasoning-capable providers can emit one SSE frame per short reasoning token.
 // Keep the byte ceiling authoritative while allowing a bounded long-task stream
 // to reach that ceiling instead of failing first on harmless frame granularity.
-const MAX_LLM_RESPONSE_CHUNKS: usize = 65_536;
+pub const MAX_LLM_RESPONSE_CHUNKS: usize = 65_536;
+const MAX_LLM_LONG_RUN_OUTPUT_TOKENS: usize = 128_000;
+const MAX_LLM_LONG_RUN_RESPONSE_BYTES: usize = MAX_LLM_LONG_RUN_OUTPUT_TOKENS * 256;
+const MAX_LLM_LONG_RUN_RESPONSE_CHUNKS: usize = MAX_LLM_LONG_RUN_OUTPUT_TOKENS * 2;
 pub const MAX_LLM_CHUNK_DELAY_US: u64 = 60_000_000;
 const MAX_PUBLIC_HTTP_GAP_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct LlmHttpResponseLimits {
+    max_bytes: usize,
+    max_chunks: usize,
+}
+
+const ORDINARY_LLM_RESPONSE_LIMITS: LlmHttpResponseLimits = LlmHttpResponseLimits {
+    max_bytes: MAX_LLM_RESPONSE_BYTES,
+    max_chunks: MAX_LLM_RESPONSE_CHUNKS,
+};
+const LONG_RUN_LLM_RESPONSE_LIMITS: LlmHttpResponseLimits = LlmHttpResponseLimits {
+    max_bytes: MAX_LLM_LONG_RUN_RESPONSE_BYTES,
+    max_chunks: MAX_LLM_LONG_RUN_RESPONSE_CHUNKS,
+};
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmHttpRecordingClass {
+    #[default]
+    Ordinary,
+    LongRun,
+}
+
+impl LlmHttpRecordingClass {
+    fn is_ordinary(&self) -> bool {
+        *self == Self::Ordinary
+    }
+
+    fn response_limits(self) -> LlmHttpResponseLimits {
+        match self {
+            Self::Ordinary => ORDINARY_LLM_RESPONSE_LIMITS,
+            Self::LongRun => LONG_RUN_LLM_RESPONSE_LIMITS,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1485,6 +1524,8 @@ pub struct LlmHttpRecording {
     pub secret_slots: Vec<String>,
     pub provider: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "LlmHttpRecordingClass::is_ordinary")]
+    pub recording_class: LlmHttpRecordingClass,
     pub requests: Vec<LlmHttpRecordingExchange>,
     pub envelope_sha256: String,
 }
@@ -2218,7 +2259,7 @@ impl LlmHttpRecording {
             if !canonical_valid || sha256_hex(&raw_body) != exchange.request.raw_body_sha256 {
                 return Err(IoError::other("LLM recording request digest is invalid").into());
             }
-            validate_response(&exchange.response)?;
+            validate_response(&exchange.response, self.recording_class.response_limits())?;
         }
         Ok(())
     }
@@ -2234,6 +2275,8 @@ impl LlmHttpRecording {
             secret_slots: &'a [String],
             provider: &'a str,
             model: &'a str,
+            #[serde(skip_serializing_if = "LlmHttpRecordingClass::is_ordinary")]
+            recording_class: &'a LlmHttpRecordingClass,
             requests: &'a [LlmHttpRecordingExchange],
             envelope_sha256: &'static str,
         }
@@ -2246,6 +2289,7 @@ impl LlmHttpRecording {
             secret_slots: &self.secret_slots,
             provider: &self.provider,
             model: &self.model,
+            recording_class: &self.recording_class,
             requests: &self.requests,
             envelope_sha256: "",
         };
@@ -2361,7 +2405,10 @@ fn validate_headers(headers: &[LlmHttpHeader], request: bool) -> TestResult<()> 
     Ok(())
 }
 
-fn validate_response(response: &LlmHttpRecordingResponse) -> TestResult<()> {
+fn validate_response(
+    response: &LlmHttpRecordingResponse,
+    limits: LlmHttpResponseLimits,
+) -> TestResult<()> {
     match &response.outcome {
         LlmHttpResponseOutcome::TransportError => {
             if response.status.is_some()
@@ -2394,7 +2441,7 @@ fn validate_response(response: &LlmHttpRecordingResponse) -> TestResult<()> {
             validate_http_response(response)?
         }
     }
-    if response.chunks.len() > MAX_LLM_RESPONSE_CHUNKS {
+    if response.chunks.len() > limits.max_chunks {
         return Err(IoError::other("LLM response capture chunk bound exceeded").into());
     }
     let mut response_bytes = 0usize;
@@ -2411,7 +2458,7 @@ fn validate_response(response: &LlmHttpRecordingResponse) -> TestResult<()> {
         response_bytes = response_bytes
             .checked_add(bytes.len())
             .ok_or_else(|| IoError::other("LLM response capture byte bound exceeded"))?;
-        if response_bytes > MAX_LLM_RESPONSE_BYTES {
+        if response_bytes > limits.max_bytes {
             return Err(IoError::other("LLM response capture byte bound exceeded").into());
         }
         if chunk.sequence != index as u64
@@ -2462,7 +2509,9 @@ fn validate_indexed_response(
     response_bytes: &[u8],
     done_seen: bool,
 ) -> TestResult<()> {
-    if chunks.len() > MAX_LLM_RESPONSE_CHUNKS || response_bytes.len() > MAX_LLM_RESPONSE_BYTES {
+    if chunks.len() > LONG_RUN_LLM_RESPONSE_LIMITS.max_chunks
+        || response_bytes.len() > LONG_RUN_LLM_RESPONSE_LIMITS.max_bytes
+    {
         return Err(IoError::other("LLM response capture bound exceeded").into());
     }
     let response_end = first_byte
@@ -2685,6 +2734,7 @@ enum LlmHttpProxyMode {
         model: String,
         metadata: LlmHttpRecordingMetadata,
         sink: std::sync::Arc<RecordingSink>,
+        recording_class: LlmHttpRecordingClass,
     },
     Replay {
         recording: LlmHttpReplayRecording,
@@ -3507,6 +3557,7 @@ struct LlmHttpRecordMode {
     attempt_plan: Option<Vec<LlmHttpAttemptPlan>>,
     requires_authorization: bool,
     single_sequential_stream: bool,
+    recording_class: LlmHttpRecordingClass,
 }
 
 impl LlmHttpProxy {
@@ -3578,6 +3629,7 @@ impl LlmHttpProxy {
                 attempt_plan,
                 requires_authorization,
                 single_sequential_stream: false,
+                recording_class: LlmHttpRecordingClass::Ordinary,
             },
         )
         .await
@@ -3610,6 +3662,7 @@ impl LlmHttpProxy {
                 attempt_plan: None,
                 requires_authorization,
                 single_sequential_stream: true,
+                recording_class: LlmHttpRecordingClass::LongRun,
             },
         )
         .await
@@ -3635,6 +3688,7 @@ impl LlmHttpProxy {
             model: model.into(),
             metadata,
             sink,
+            recording_class: mode.recording_class,
         })
         .await
     }
@@ -3757,6 +3811,7 @@ impl LlmHttpProxy {
                 model,
                 metadata,
                 sink,
+                recording_class,
                 ..
             } => {
                 if let Some(error) = sink.flush_error() {
@@ -3771,6 +3826,7 @@ impl LlmHttpProxy {
                     secret_slots: metadata.secret_slots.clone(),
                     provider: provider.clone(),
                     model: model.clone(),
+                    recording_class: *recording_class,
                     requests: sink.finalized(),
                     envelope_sha256: String::new(),
                 }
@@ -4144,8 +4200,12 @@ async fn record_llm_http_request(
     request: Request,
     upstream_base_url: String,
 ) -> AxumResponse {
-    let sink = match &state.mode {
-        LlmHttpProxyMode::Record { sink, .. } => sink.clone(),
+    let (sink, response_limits) = match &state.mode {
+        LlmHttpProxyMode::Record {
+            sink,
+            recording_class,
+            ..
+        } => (sink.clone(), recording_class.response_limits()),
         LlmHttpProxyMode::Replay { .. } => unreachable!("replay request entered record path"),
     };
     let sequence = sink.allocate_sequence();
@@ -4290,16 +4350,16 @@ async fn record_llm_http_request(
         while let Some(chunk) = upstream_stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    if capture.chunks.len() >= MAX_LLM_RESPONSE_CHUNKS
+                    if capture.chunks.len() >= response_limits.max_chunks
                         || capture
                             .response_bytes
                             .saturating_add(bytes.len())
-                            > MAX_LLM_RESPONSE_BYTES
+                            > response_limits.max_bytes
                     {
                         capture.bound_exceeded = true;
                         capture.sink.fail_flush(&format!(
                             "recording response capture bound exceeded ({} chunks/{} bytes)",
-                            MAX_LLM_RESPONSE_CHUNKS, MAX_LLM_RESPONSE_BYTES
+                            response_limits.max_chunks, response_limits.max_bytes
                         ));
                         break;
                     }
@@ -4713,6 +4773,7 @@ pub enum ModelScript {
     },
     LargeStream {
         bytes: usize,
+        chunk_bytes: usize,
     },
     CleanEof {
         text: String,
@@ -4835,7 +4896,14 @@ impl ModelScript {
     }
 
     pub fn large_stream(bytes: usize) -> Self {
-        Self::LargeStream { bytes }
+        Self::LargeStream {
+            bytes,
+            chunk_bytes: 1024,
+        }
+    }
+
+    pub fn fine_grained_stream(bytes: usize, chunk_bytes: usize) -> Self {
+        Self::LargeStream { bytes, chunk_bytes }
     }
 
     pub fn clean_eof(text: impl Into<String>) -> Self {
@@ -5229,7 +5297,9 @@ async fn execute_model_script(mut script: ModelScript) -> AxumResponse {
             ModelScript::StreamHold { hold } => return model_stream_hold(hold),
             ModelScript::StreamDoneHold { hold } => return model_stream_done_hold(hold),
             ModelScript::StreamFailureHold { hold } => return model_stream_failure_hold(hold),
-            ModelScript::LargeStream { bytes } => return model_large_stream(bytes),
+            ModelScript::LargeStream { bytes, chunk_bytes } => {
+                return model_large_stream(bytes, chunk_bytes);
+            }
             ModelScript::CleanEof { text } => {
                 return model_stream(vec![sse_chunk(json!({
                     "choices": [{
@@ -5305,12 +5375,15 @@ fn model_stream(chunks: Vec<bytes::Bytes>) -> AxumResponse {
         .expect("model fixture stream response builds")
 }
 
-fn model_large_stream(bytes: usize) -> AxumResponse {
-    const CHUNK_BYTES: usize = 1024;
+fn model_large_stream(bytes: usize, chunk_bytes: usize) -> AxumResponse {
+    assert!(
+        chunk_bytes >= 3,
+        "large model stream chunks require SSE framing"
+    );
     let mut remaining = bytes;
     let mut chunks = Vec::new();
     while remaining > 0 {
-        let length = remaining.min(CHUNK_BYTES);
+        let length = remaining.min(chunk_bytes);
         let mut frame = vec![b'x'; length];
         if length >= 3 {
             frame[0] = b':';

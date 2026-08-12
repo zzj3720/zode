@@ -131,6 +131,12 @@ recording, fixture promotion, and replay.
   `tests/fixtures/provider_recordings/`, bind it to a named real-process E2E,
   replay the original failure red, and use that exact cassette for the green
   regression after repair.
+- Ordinary provider recordings keep their existing response-byte and frame
+  bounds. DeepSWE's single-session live recorder uses the self-describing
+  `long_run` envelope class sized from the approved 128,000-token output
+  allowance; `e2e_long_run_llm_recorder_records_and_replays_reasoning_stream_above_ordinary_bound`
+  proves a response above both ordinary bounds survives private persistence and
+  real Endpoint/aimux replay without weakening the ordinary fail-closed case.
 - Terminal recorder-flush failures use
   `e2e_later_test_reproduction_of_terminal_flush_gap_is_bounded_and_captured`:
   arm `ProcessCaptureSet` before Endpoint spawn, bound the public SSE failure

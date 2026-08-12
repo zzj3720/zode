@@ -651,6 +651,7 @@ fn incident_recording(path: &Path, owner: &str) -> TestResult<LlmHttpRecording> 
         secret_slots: vec!["SLOT_PROVIDER_MODEL_AUTHORIZATION".to_owned()],
         provider: provider.to_owned(),
         model: model.to_owned(),
+        recording_class: Default::default(),
         requests,
         envelope_sha256: String::new(),
     }
