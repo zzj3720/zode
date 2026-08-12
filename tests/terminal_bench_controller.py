@@ -596,7 +596,9 @@ class Controller:
             held_tasks = queue.setdefault("held_tasks", {})
             for lane in park_lanes:
                 if not queue["control"]["paused"]:
-                    raise ValueError("active or stale lanes can be parked only while paused")
+                    raise ValueError(
+                        "active or stale lanes can be parked only while paused"
+                    )
                 lease = queue["leases"].get(str(lane))
                 if lease is None:
                     raise ValueError(f"lane {lane} has no task to park")
@@ -1108,6 +1110,8 @@ class Controller:
             "cache_miss_tokens": 0,
         }
         assistant_messages = 0
+        terminal_stop_reason: str | None = None
+        terminal_error = False
         for path in files:
             raw = path.read_bytes()
             if provider_key.encode() in raw:
@@ -1129,6 +1133,11 @@ class Controller:
                 if not isinstance(message_usage, dict):
                     continue
                 assistant_messages += 1
+                stop_reason = message.get("stopReason")
+                terminal_stop_reason = (
+                    stop_reason if isinstance(stop_reason, str) else None
+                )
+                terminal_error = bool(message.get("errorMessage"))
                 uncached_input = int(message_usage.get("input", 0) or 0)
                 cache_read = int(message_usage.get("cacheRead", 0) or 0)
                 output = int(message_usage.get("output", 0) or 0)
@@ -1139,12 +1148,15 @@ class Controller:
                 usage["cache_miss_tokens"] += uncached_input
         if assistant_messages == 0:
             raise RuntimeError("Pi native session contains no assistant usage")
+        if terminal_stop_reason != "stop" or terminal_error:
+            raise RuntimeError("Pi native session did not finish normally")
         return {
             "path": str(session_root),
             "files": len(files),
             "bytes": total_bytes,
             "sha256": digest.hexdigest(),
             "assistant_messages": assistant_messages,
+            "terminal_stop_reason": terminal_stop_reason,
             "usage": usage,
         }
 
