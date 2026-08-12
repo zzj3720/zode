@@ -591,13 +591,38 @@ class Controller:
                     ),
                     None,
                 )
-                if pending_index is None:
-                    raise ValueError(f"task {task} is not pending")
-                held_tasks[task] = queue["pending"].pop(pending_index)
+                if pending_index is not None:
+                    held_tasks[task] = queue["pending"].pop(pending_index)
+                    continue
+                lease_key = next(
+                    (
+                        lane
+                        for lane, lease in queue["leases"].items()
+                        if lease["task"] == task
+                    ),
+                    None,
+                )
+                if lease_key is None:
+                    raise ValueError(f"task {task} is neither pending nor leased")
+                lease = queue["leases"][lease_key]
+                if lease.get("active_pair") is not None:
+                    raise ValueError(f"task {task} still has an active pair")
+                if lease.get("attention") is None:
+                    raise ValueError(f"task {task} has no failure to hold")
+                held = dict(lease)
+                held.pop("lane", None)
+                held.pop("leased_at", None)
+                held.pop("active_pair", None)
+                held_tasks[task] = held
+                del queue["leases"][lease_key]
             for task in reversed(release_tasks):
                 entry = held_tasks.pop(task, None)
                 if entry is None:
                     raise ValueError(f"task {task} is not held")
+                entry.pop("lane", None)
+                entry.pop("leased_at", None)
+                entry.pop("active_pair", None)
+                entry["attention"] = None
                 queue["pending"].insert(0, entry)
             queue["control"]["changed_at"] = now()
             return dict(queue["control"])
@@ -662,9 +687,9 @@ class Controller:
                 **entry,
                 "lane": lane,
                 "leased_at": now(),
-                "completed_attempts": [],
+                "completed_attempts": list(entry.get("completed_attempts", [])),
                 "active_pair": None,
-                "attention": None,
+                "attention": entry.get("attention"),
             }
             queue["leases"][lane_key] = lease
             return dict(lease)
@@ -1343,7 +1368,7 @@ class Controller:
                 atomic_json(failure_path, failure)
                 self.mark_attention(lane, reason)
                 self._print_event({"event": "controller_halted", **failure})
-                return
+                continue
 
     def run(self) -> None:
         api_url = self.start_api()
