@@ -1720,6 +1720,19 @@ fn strip_dynamic_tool_status_fields(value: &mut Value) {
     }
 }
 
+fn contains_exact_string(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(actual) => actual == expected,
+        Value::Array(values) => values
+            .iter()
+            .any(|value| contains_exact_string(value, expected)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| contains_exact_string(value, expected)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
 fn response_semantic_fingerprint(response: &Option<IncidentResponse>) -> String {
     match response {
         Some(response) => response_fingerprint(response),
@@ -3738,6 +3751,137 @@ async fn e2e_auto_wait_timeout_does_not_cancel_running_tool() -> TestResult<()> 
     model.stop().await?;
     tool.stop().await?;
     result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_bounded_background_tool_output_reaches_durable_terminal() -> TestResult<()> {
+    let database = TempDatabase::new("async-bounded-background-output")?;
+    let bounded_content = "bounded-background-output\n".repeat(1_600);
+    assert!(bounded_content.len() < 64 * 1024);
+    assert!(
+        serde_json::to_vec(&json!({
+            "content": bounded_content,
+            "result": {"content": bounded_content},
+        }))?
+        .len()
+            > 64 * 1024,
+        "fixture must cross the historical duplicated-delivery bound"
+    );
+    let release = Arc::new(Notify::new());
+    let mut model = ModelFixture::start(vec![
+        ModelScript::tool_call(
+            "bounded-background-call",
+            "bounded_background_tool",
+            r#"{"value":"bounded"}"#,
+        ),
+        ModelScript::final_text("bounded background result observed"),
+    ])
+    .await?;
+    let mut tool = ToolFixture::start(vec![ToolScript::Hold {
+        release: release.clone(),
+        response: json!({
+            "status": "completed",
+            "result": {"content": bounded_content}
+        }),
+    }])
+    .await?;
+    let config = config_file(
+        &database,
+        &model.provider_url(),
+        vec![tool_config(
+            "bounded_background_tool",
+            &tool.adapter_url(),
+            "response",
+            "unknown_outcome",
+            "never",
+            20,
+        )],
+        1,
+    )?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-bounded-background-output",
+        &["bounded_background_tool"],
+    )
+    .await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "bounded-background-output-message",
+        "return the bounded background result",
+    )
+    .await?;
+    model.wait_for_requests(1).await?;
+    tool.wait_for_invocations(1).await?;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let state = read_session(&client, &server, &session_id).await?;
+            if state["tool_calls"].as_array().is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    call["tool_call_id"] == "bounded-background-call" && call["status"] == "running"
+                })
+            }) {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| Error::new(ErrorKind::TimedOut, "bounded tool never became running"))??;
+    release.notify_waiters();
+    tool.wait_for_completions(1).await?;
+    model.wait_for_requests(2).await?;
+    let state = timeout(Duration::from_secs(10), async {
+        loop {
+            let state = read_session(&client, &server, &session_id).await?;
+            let completed = state["tool_calls"].as_array().is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    call["tool_call_id"] == "bounded-background-call"
+                        && call["status"] == "completed"
+                        && call["result"]["content"] == bounded_content
+                })
+            });
+            let final_message = state["transcript"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["role"] == "assistant"
+                        && message["content"] == "bounded background result observed"
+                })
+            });
+            if completed && final_message {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "bounded background result did not reach durable terminal state",
+        )
+    })??;
+    assert_eq!(model.request_count(), 2);
+    assert!(model
+        .request(1)
+        .is_some_and(|request| contains_exact_string(&request["messages"], &bounded_content)));
+    assert_eq!(
+        state["tool_calls"].as_array().map(|calls| {
+            calls
+                .iter()
+                .filter(|call| call["tool_call_id"] == "bounded-background-call")
+                .count()
+        }),
+        Some(1)
+    );
+    server.stop().await?;
+    model.stop().await?;
+    tool.stop().await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

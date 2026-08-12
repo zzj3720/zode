@@ -55,12 +55,14 @@ class _ShellBridge(ThreadingHTTPServer):
         environment: BaseEnvironment,
         event_replay_path: Path | None = None,
         provider_replay_path: Path | None = None,
+        allow_trailing_pending: bool = False,
     ) -> None:
         super().__init__(("127.0.0.1", 0), _ShellHandler)
         self.loop = loop
         self.environment = environment
         self.recording_lock = threading.Lock()
         self.sequence = 0
+        self.responses_written = 0
         self.replay_error: str | None = None
         self.replay = []
         if event_replay_path is not None:
@@ -181,9 +183,18 @@ class _ShellBridge(ThreadingHTTPServer):
                     ):
                         raise ValueError("DeepSWE event trace tool failure is invalid")
                     exchange["outcome"] = {"kind": "failed"}
-            if not self.replay or any(
-                not isinstance(exchange["outcome"], dict) for exchange in self.replay
+            pending = [
+                index
+                for index, exchange in enumerate(self.replay)
+                if exchange["outcome"] is None
+            ]
+            if not self.replay or (
+                allow_trailing_pending and pending != [len(self.replay) - 1]
             ):
+                raise ValueError(
+                    "DeepSWE partial failure prefix must end in exactly one pending tool outcome"
+                )
+            if not allow_trailing_pending and pending:
                 raise ValueError("DeepSWE event trace has incomplete tool outcomes")
 
     def execute(self, command: str) -> dict[str, Any]:
@@ -224,7 +235,11 @@ class _ShellBridge(ThreadingHTTPServer):
             outcome = expected["outcome"]
             if expected["command"] != command:
                 replay_error = "DeepSWE shell command did not match event trace"
-            if outcome["kind"] == "completed":
+            if outcome is None:
+                if actual_failed:
+                    returned = {"error": "shell execution failed"}
+                    response_status = 500
+            elif outcome["kind"] == "completed":
                 returned = json.loads(outcome["result_content"])
                 if actual_failed:
                     replay_error = replay_error or (
@@ -253,6 +268,18 @@ class _ShellBridge(ThreadingHTTPServer):
             if replay_error is not None and self.replay_error is None:
                 self.replay_error = replay_error
         return response_status, {"result": {"content": content}}
+
+    def mark_response_written(self) -> None:
+        with self.recording_lock:
+            self.responses_written += 1
+
+    def observation_state(self) -> dict[str, Any]:
+        with self.recording_lock:
+            return {
+                "schema": "zode.deepswe-shell-observation.v1",
+                "requests_started": self.sequence,
+                "responses_written": self.responses_written,
+            }
 
     def assert_replay_complete(self) -> None:
         with self.recording_lock:
@@ -289,6 +316,20 @@ class _ShellHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+        self.wfile.flush()
+        self.server.mark_response_written()
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib callback name
+        if self.path != "/_zode-test/observations":
+            self.send_response(404)
+            self.end_headers()
+            return
+        encoded = json.dumps(self.server.observation_state()).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
@@ -303,6 +344,7 @@ class ZodeDeepSweAgent(BaseAgent):
         replay_file: str = "",
         event_replay_file: str = "",
         promote_llm_file: str = "",
+        partial_failure_prefix: bool | str = False,
         **kwargs: object,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -315,10 +357,17 @@ class ZodeDeepSweAgent(BaseAgent):
         self.promote_llm_file = (
             Path(promote_llm_file).resolve() if promote_llm_file else None
         )
+        self.partial_failure_prefix = (
+            partial_failure_prefix
+            if isinstance(partial_failure_prefix, bool)
+            else partial_failure_prefix.strip().lower() in {"1", "true", "yes"}
+        )
         if (self.replay_file is None) != (self.event_replay_file is None):
             raise ValueError(
                 "DeepSWE provider replay and event replay must be configured together"
             )
+        if self.partial_failure_prefix and self.replay_file is None:
+            raise ValueError("DeepSWE partial failure replay requires both replay files")
         self.initial_commit = ""
 
     @staticmethod
@@ -326,7 +375,7 @@ class ZodeDeepSweAgent(BaseAgent):
         return "zode-deepswe"
 
     def version(self) -> str:
-        return "7"
+        return "8"
 
     async def setup(self, environment: BaseEnvironment) -> None:
         probe = await environment.exec("git rev-parse HEAD", cwd="/app", timeout_sec=30)
@@ -359,15 +408,19 @@ class ZodeDeepSweAgent(BaseAgent):
             environment,
             self.event_replay_file,
             self.replay_file,
+            self.partial_failure_prefix,
         )
         thread = threading.Thread(target=bridge.serve_forever, daemon=True)
         thread.start()
         run_id = f"deepswe-{uuid.uuid4()}"
-        test_name = (
-            "e2e_replayed_deepswe_recording_completes_through_real_endpoint"
-            if self.replay_file
-            else "e2e_live_deepswe_opencode_go_records_and_completes"
-        )
+        if self.partial_failure_prefix:
+            test_name = (
+                "e2e_replayed_deepswe_returned_tool_response_reaches_durable_terminal"
+            )
+        elif self.replay_file:
+            test_name = "e2e_replayed_deepswe_recording_completes_through_real_endpoint"
+        else:
+            test_name = "e2e_live_deepswe_opencode_go_records_and_completes"
         command = [
             "cargo",
             "test",
@@ -415,7 +468,7 @@ class ZodeDeepSweAgent(BaseAgent):
 
         bridge.assert_replay_complete()
 
-        if return_code == 0:
+        if return_code == 0 and not self.partial_failure_prefix:
             collect = await environment.exec(
                 "mkdir -p /logs/artifacts && "
                 f"git diff --binary {shlex.quote(self.initial_commit)} HEAD "
@@ -431,7 +484,8 @@ class ZodeDeepSweAgent(BaseAgent):
             "zode_log": str(output_path),
             "event_replay": str(self.event_replay_file or ""),
             "run_id": run_id,
-            "patch_collected": return_code == 0,
+            "patch_collected": return_code == 0 and not self.partial_failure_prefix,
+            "partial_failure_prefix": self.partial_failure_prefix,
         }
         if return_code != 0:
             raise RuntimeError(

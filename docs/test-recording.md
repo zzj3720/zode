@@ -258,6 +258,14 @@ independently commit both lifecycle events in the same causal position. Even
 when an event represents an admitted input, the harness never appends that
 event directly.
 
+A retained failure prefix may end after an `AsyncToolCallStarted` without its
+terminal event only when that missing terminal fact is the behavior under
+test. Such a prefix must contain exactly one unresolved tool call and it must
+be the final tool input in the trace. Replay executes that input through the
+real external adapter, positively observes the response boundary, and then
+requires the fresh Endpoint to emit the missing durable terminal event. Normal
+correctness replay continues to reject every incomplete tool outcome.
+
 `e2e_deepswe_failed_tool_outcome_is_recorded_and_replayed` freezes the failed
 branch through two fresh real Endpoint processes. The first run observes a
 real HTTP tool failure and exports the stopped session trace; the second

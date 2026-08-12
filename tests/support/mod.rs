@@ -209,6 +209,11 @@ impl TestZode {
         self.stop_inner(forbidden).await.map(|_| ())
     }
 
+    pub async fn stop_with_output(&mut self, forbidden: &[&str]) -> TestResult<(Vec<u8>, Vec<u8>)> {
+        let stopped = self.stop_inner(forbidden).await?;
+        Ok((stopped.stdout, stopped.stderr))
+    }
+
     pub async fn stop_with_process_capture(
         &mut self,
         capture: &mut ProcessCaptureSet,
@@ -3888,10 +3893,19 @@ impl LlmHttpProxy {
     }
 
     pub async fn wait_for_completed_exchanges(&self, expected: usize) -> TestResult<()> {
+        self.wait_for_completed_exchanges_with_timeout(expected, HTTP_RESPONSE_HEADERS_TIMEOUT)
+            .await
+    }
+
+    pub async fn wait_for_completed_exchanges_with_timeout(
+        &self,
+        expected: usize,
+        wait: Duration,
+    ) -> TestResult<()> {
         match &self.state.mode {
             LlmHttpProxyMode::Record { sink, .. } => sink.wait_for_exchanges(expected).await,
             LlmHttpProxyMode::Replay { .. } => {
-                timeout(HTTP_RESPONSE_HEADERS_TIMEOUT, async {
+                timeout(wait, async {
                     loop {
                         let notified = self.state.replay_completion_seen.notified();
                         if *self
@@ -3938,6 +3952,35 @@ impl LlmHttpProxy {
                         .is_none()
             }
             LlmHttpProxyMode::Record { .. } => true,
+        }
+    }
+
+    pub fn replay_prefix_exhausted_allowing_after_end(&self) -> bool {
+        match &self.state.mode {
+            LlmHttpProxyMode::Replay { recording, .. } => {
+                *self
+                    .state
+                    .next_replay
+                    .lock()
+                    .expect("LLM proxy replay mutex poisoned")
+                    == recording.request_count()
+                    && *self
+                        .state
+                        .replay_completed
+                        .lock()
+                        .expect("LLM replay completion mutex poisoned")
+                        == recording.request_count()
+                    && self
+                        .state
+                        .replay_error
+                        .lock()
+                        .expect("LLM replay error mutex poisoned")
+                        .as_deref()
+                        .is_none_or(|error| {
+                            error == "unexpected provider request after cassette end"
+                        })
+            }
+            LlmHttpProxyMode::Record { .. } => false,
         }
     }
 

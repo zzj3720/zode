@@ -28,7 +28,7 @@ use support::{
     ModelScript, TempDatabase, TestResult, TestZode, ToolFixture, ToolScript,
     TEST_CONTROLLER_AUTHORITY, TEST_CONTROLLER_SECRET,
 };
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 const PROVIDER: &str = "opencode-go";
 const MODEL: &str = "deepseek-v4-flash";
@@ -177,6 +177,7 @@ impl EventToolFixture {
                         && call["result"].is_null()
                         && !call["error"].is_null()
                 }
+                DeepSweToolOutcome::Pending => false,
             };
             if !valid {
                 return Err(Error::other("DeepSWE replay projected the wrong tool outcome").into());
@@ -250,6 +251,10 @@ async fn replay_event_tool_request(
         DeepSweToolOutcome::Failed => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"result": {"content": "recorded tool failure"}})),
+        ),
+        DeepSweToolOutcome::Pending => (
+            axum::http::StatusCode::CONFLICT,
+            Json(json!({"result": {"content": "incomplete event trace"}})),
         ),
     }
 }
@@ -614,6 +619,103 @@ async fn wait_for_terminal_activation(
     })
     .await
     .map_err(|_| Error::new(ErrorKind::TimedOut, "DeepSWE agent timed out"))?
+}
+
+async fn wait_for_shell_responses(
+    client: &reqwest::Client,
+    shell_url: &str,
+    expected: usize,
+) -> TestResult<()> {
+    let mut observation_url = url::Url::parse(shell_url)?;
+    observation_url.set_path("/_zode-test/observations");
+    observation_url.set_query(None);
+    timeout(LOCAL_REPLAY_TIMEOUT, async {
+        loop {
+            let response = client.get(observation_url.clone()).send().await?;
+            if response.status() != StatusCode::OK {
+                return Err(
+                    Error::other("DeepSWE shell observation boundary was unavailable").into(),
+                );
+            }
+            let observation: Value = response.json().await?;
+            let responses = observation["responses_written"].as_u64().ok_or_else(|| {
+                Error::other("DeepSWE shell observation omitted its response count")
+            })?;
+            let expected = u64::try_from(expected)?;
+            if responses == expected {
+                return Ok(());
+            }
+            if responses > expected {
+                return Err(Error::other(
+                    "DeepSWE shell replay wrote an unexpected extra response",
+                )
+                .into());
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "DeepSWE shell response barrier timed out",
+        )
+    })?
+}
+
+async fn wait_for_tool_terminal_event(
+    response: reqwest::Response,
+    session_id: String,
+    tool_call_id: String,
+) -> TestResult<String> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::new();
+    loop {
+        let chunk = stream.next().await.ok_or_else(|| {
+            Error::new(
+                ErrorKind::UnexpectedEof,
+                "Endpoint-wide SSE ended before the replayed tool reached a terminal state",
+            )
+        })??;
+        buffer.extend_from_slice(&chunk);
+        while let Some(end) = buffer
+            .windows(2)
+            .position(|window| window == b"\n\n")
+            .map(|position| position + 2)
+        {
+            let frame = buffer.drain(..end).collect::<Vec<_>>();
+            if frame
+                .windows(REPLAY_PROVIDER_KEY.len())
+                .any(|window| window == REPLAY_PROVIDER_KEY.as_bytes())
+                || frame
+                    .windows(TEST_CONTROLLER_SECRET.len())
+                    .any(|window| window == TEST_CONTROLLER_SECRET.as_bytes())
+            {
+                return Err(Error::other("public SSE exposed credential material").into());
+            }
+            let text = std::str::from_utf8(&frame)?;
+            let event = text.lines().find_map(|line| line.strip_prefix("event: "));
+            let data = text
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .map(serde_json::from_str::<Value>)
+                .transpose()?;
+            let Some(data) = data else {
+                continue;
+            };
+            if data["session_id"] != session_id {
+                continue;
+            }
+            let kind = event.or_else(|| data["kind"].as_str());
+            if matches!(
+                kind,
+                Some("async_tool_call_completed" | "async_tool_call_failed")
+            ) && data["data"]["tool_call_id"] == tool_call_id
+            {
+                return Ok(kind.expect("terminal tool event has a kind").to_owned());
+            }
+        }
+    }
 }
 
 async fn run_benchmark(
@@ -1131,6 +1233,207 @@ async fn e2e_replayed_deepswe_recording_completes_through_real_endpoint() -> Tes
         !state["context_handoff"].is_null(),
         state["transcript"].as_array().map_or(0, Vec::len)
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "replays a retained incomplete DeepSWE failure prefix in a real task container"]
+async fn e2e_replayed_deepswe_returned_tool_response_reaches_durable_terminal() -> TestResult<()> {
+    let replay_path = required_path("ZODE_DEEPSWE_REPLAY_FILE")?;
+    let event_replay_path = required_path("ZODE_DEEPSWE_EVENT_REPLAY_FILE")?;
+    let shell_url = env::var("ZODE_DEEPSWE_SHELL_URL")?;
+    let provider_file_sha256 = file_sha256(&replay_path)?;
+    let event_file_sha256 = file_sha256(&event_replay_path)?;
+    let trace = DeepSweEventTrace::load_partial_failure_prefix(
+        &event_replay_path,
+        &event_file_sha256,
+        &provider_file_sha256,
+        &[REPLAY_PROVIDER_KEY, TEST_CONTROLLER_SECRET],
+    )?;
+    let exchanges = trace.tool_exchanges_with_trailing_pending()?;
+    let pending_tool_call_id = trace.trailing_pending_tool_call_id()?;
+    let recording = if replay_path.extension().and_then(|value| value.to_str()) == Some("zst") {
+        LlmHttpRecording::load_compressed(&replay_path)?
+    } else {
+        LlmHttpRecording::load_long_run(&replay_path)?
+    };
+    if trace.event_count() != 657 || exchanges.len() != 41 || recording.requests.len() != 41 {
+        return Err(
+            Error::other("DeepSWE stalled failure prefix has the wrong causal extent").into(),
+        );
+    }
+    let instruction = trace.instruction()?;
+    let database = TempDatabase::new("deepswe-stalled-tool-prefix")?;
+    let mut recorder = LlmHttpProxy::replay_hashes_with_authorization(
+        recording,
+        false,
+        Some(REPLAY_PROVIDER_KEY.to_owned()),
+    )
+    .await?;
+    let provider_origin = url::Url::parse(&recorder.base_url("/zen/go/v1"))?
+        .origin()
+        .ascii_serialization();
+    let config = benchmark_config(
+        database.path(),
+        &provider_origin,
+        &shell_url,
+        ProviderTiming::Replay,
+    )?;
+    let mut endpoint = TestZode::start(
+        database.path(),
+        &config,
+        &[REPLAY_PROVIDER_KEY, TEST_CONTROLLER_SECRET],
+    )
+    .await?;
+    let client = http_client()?;
+    let primary = async {
+        public_json(
+            authenticated_as(
+                client.put(endpoint.url(&format!("/v1/auth-replicas/{PROFILE}"))),
+                SUBJECT,
+            )
+            .header("Idempotency-Key", "deepswe-install-provider")
+            .json(&json!({
+                "schema": "zode.auth-replica.install.v1",
+                "authority_id": TEST_CONTROLLER_AUTHORITY,
+                "provider": PROVIDER,
+                "kind": "api_key",
+                "revision": 1,
+                "credential_schema": "openai-compatible.api-key.v1",
+                "expires_at_ms": null,
+                "secret": {
+                    "encoding": "application/zode-secret-envelope",
+                    "payload": REPLAY_PROVIDER_KEY
+                }
+            })),
+            StatusCode::CREATED,
+            REPLAY_PROVIDER_KEY,
+        )
+        .await?;
+        let created = public_json(
+            authenticated_as(client.post(endpoint.url("/v1/sessions")), SUBJECT)
+                .header("Idempotency-Key", "deepswe-create-session")
+                .json(&json!({
+                    "model": {
+                        "provider": PROVIDER,
+                        "provider_execution": {
+                            "schema": "zode.provider-execution.v1",
+                            "revision": 1,
+                            "kind": "openai_compatible",
+                            "base_url": recorder.base_url("/zen/go/v1")
+                        },
+                        "model": MODEL,
+                        "limits": {
+                            "context_window_tokens": 1_000_000,
+                            "max_output_tokens": 384_000
+                        },
+                        "auth_authority_id": TEST_CONTROLLER_AUTHORITY,
+                        "auth_profile_id": PROFILE,
+                        "minimum_auth_revision": 1
+                    },
+                    "tools": ["shell"]
+                })),
+            StatusCode::CREATED,
+            REPLAY_PROVIDER_KEY,
+        )
+        .await?;
+        let session_id = require_ulid(&created)?;
+        let events = authenticated_as(client.get(endpoint.url("/v1/events")), SUBJECT)
+            .send()
+            .await?;
+        if events.status() != StatusCode::OK {
+            return Err(Error::other("Endpoint-wide SSE did not open").into());
+        }
+        let mut terminal = tokio::spawn(wait_for_tool_terminal_event(
+            events,
+            session_id.clone(),
+            pending_tool_call_id.clone(),
+        ));
+        let journey = async {
+            public_json(
+                authenticated_as(
+                    client.post(endpoint.url(&format!("/v1/sessions/{session_id}/messages"))),
+                    SUBJECT,
+                )
+                .header("Idempotency-Key", "deepswe-instruction")
+                .json(&json!({"content": instruction})),
+                StatusCode::ACCEPTED,
+                REPLAY_PROVIDER_KEY,
+            )
+            .await?;
+            recorder
+                .wait_for_completed_exchanges_with_timeout(41, LOCAL_REPLAY_TIMEOUT)
+                .await?;
+            wait_for_shell_responses(&client, &shell_url, 41).await?;
+            let terminal_kind = timeout(Duration::from_secs(30), &mut terminal)
+                .await
+                .map_err(|_| {
+                    Error::new(
+                        ErrorKind::TimedOut,
+                        "returned DeepSWE tool response did not reach a durable terminal event",
+                    )
+                })?
+                .map_err(|error| {
+                    Error::other(format!("tool-terminal SSE task failed: {error}"))
+                })??;
+            if terminal_kind != "async_tool_call_completed" {
+                return Err(Error::other(
+                    "replayed DeepSWE tool response reached the wrong durable terminal state",
+                )
+                .into());
+            }
+            let state = public_json(
+                authenticated_as(
+                    client.get(endpoint.url(&format!("/v1/sessions/{session_id}"))),
+                    SUBJECT,
+                ),
+                StatusCode::OK,
+                REPLAY_PROVIDER_KEY,
+            )
+            .await?;
+            let terminal_projection = state["tool_calls"].as_array().and_then(|calls| {
+                calls.iter().find(|call| {
+                    call["tool_call_id"] == pending_tool_call_id && call["status"] == "completed"
+                })
+            });
+            if terminal_projection.is_none() {
+                return Err(Error::other(
+                    "returned DeepSWE tool response was not durably projected as completed",
+                )
+                .into());
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        }
+        .await;
+        terminal.abort();
+        journey
+    }
+    .await;
+
+    let endpoint_stop = endpoint
+        .stop_with_output(&[REPLAY_PROVIDER_KEY, TEST_CONTROLLER_SECRET])
+        .await;
+    let prefix_exhausted = recorder.replay_prefix_exhausted_allowing_after_end();
+    let recorder_stop = recorder.stop().await;
+    let (endpoint_stdout, endpoint_stderr) = endpoint_stop?;
+    for line in String::from_utf8_lossy(&endpoint_stdout)
+        .lines()
+        .chain(String::from_utf8_lossy(&endpoint_stderr).lines())
+        .filter(|line| line.contains("background tool completion append failed"))
+    {
+        eprintln!("ZODE_DEEPSWE_STALLED_TOOL_RUNTIME {line}");
+    }
+    recorder_stop?;
+    primary?;
+    if !prefix_exhausted {
+        return Err(
+            Error::other("DeepSWE provider failure prefix was not replayed exactly").into(),
+        );
+    }
+    if sqlite_contains_secret(database.path(), REPLAY_PROVIDER_KEY).await? {
+        return Err(Error::other("replay provider key reached runtime SQLite").into());
+    }
+    eprintln!("ZODE_DEEPSWE_STALLED_TOOL_REPLAY_COMPLETE exchanges=41 tools=41 events=657");
     Ok(())
 }
 

@@ -68,6 +68,7 @@ pub struct DeepSweToolExchange {
 pub enum DeepSweToolOutcome {
     Completed(String),
     Failed,
+    Pending,
 }
 
 #[derive(Serialize)]
@@ -155,6 +156,38 @@ impl DeepSweEventTrace {
         expected_provider_sha256: &str,
         forbidden: &[&str],
     ) -> TestResult<Self> {
+        let trace = Self::load_envelope(
+            path,
+            expected_file_sha256,
+            expected_provider_sha256,
+            forbidden,
+        )?;
+        trace.validate(expected_provider_sha256)?;
+        Ok(trace)
+    }
+
+    pub fn load_partial_failure_prefix(
+        path: &Path,
+        expected_file_sha256: &str,
+        expected_provider_sha256: &str,
+        forbidden: &[&str],
+    ) -> TestResult<Self> {
+        let trace = Self::load_envelope(
+            path,
+            expected_file_sha256,
+            expected_provider_sha256,
+            forbidden,
+        )?;
+        trace.validate_partial_failure_prefix(expected_provider_sha256)?;
+        Ok(trace)
+    }
+
+    fn load_envelope(
+        path: &Path,
+        expected_file_sha256: &str,
+        expected_provider_sha256: &str,
+        forbidden: &[&str],
+    ) -> TestResult<Self> {
         let metadata = fs::symlink_metadata(path)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(Error::other("DeepSWE event trace must be a regular file").into());
@@ -168,7 +201,9 @@ impl DeepSweEventTrace {
         }
         reject_forbidden(&bytes, forbidden)?;
         let trace: Self = serde_json::from_slice(&bytes)?;
-        trace.validate(expected_provider_sha256)?;
+        if trace.source.provider_fixture_sha256 != expected_provider_sha256 {
+            return Err(Error::other("DeepSWE event trace envelope is invalid").into());
+        }
         if trace.integrity_sha256 != trace.calculate_integrity()? {
             return Err(Error::other("DeepSWE event trace integrity is invalid").into());
         }
@@ -237,6 +272,43 @@ impl DeepSweEventTrace {
     }
 
     pub fn tool_exchanges(&self) -> TestResult<Vec<DeepSweToolExchange>> {
+        let exchanges = self.tool_exchanges_allowing_pending()?;
+        if exchanges
+            .iter()
+            .any(|exchange| matches!(exchange.outcome, DeepSweToolOutcome::Pending))
+        {
+            return Err(Error::other("DeepSWE event trace has incomplete tool outcomes").into());
+        }
+        Ok(exchanges)
+    }
+
+    pub fn tool_exchanges_with_trailing_pending(&self) -> TestResult<Vec<DeepSweToolExchange>> {
+        let exchanges = self.tool_exchanges_allowing_pending()?;
+        let pending = exchanges
+            .iter()
+            .enumerate()
+            .filter(|(_, exchange)| matches!(exchange.outcome, DeepSweToolOutcome::Pending))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if pending.as_slice() != [exchanges.len() - 1] {
+            return Err(Error::other(
+                "DeepSWE partial failure prefix must end in exactly one pending tool outcome",
+            )
+            .into());
+        }
+        Ok(exchanges)
+    }
+
+    pub fn trailing_pending_tool_call_id(&self) -> TestResult<String> {
+        let exchanges = self.tool_exchanges_with_trailing_pending()?;
+        Ok(exchanges
+            .last()
+            .expect("partial DeepSWE trace has one pending tool")
+            .tool_call_id
+            .clone())
+    }
+
+    fn tool_exchanges_allowing_pending(&self) -> TestResult<Vec<DeepSweToolExchange>> {
         let blobs = self
             .blobs
             .iter()
@@ -302,8 +374,8 @@ impl DeepSweEventTrace {
                 _ => {}
             }
         }
-        if inputs.is_empty() || outcomes.iter().any(Option::is_none) {
-            return Err(Error::other("DeepSWE event trace has incomplete tool outcomes").into());
+        if inputs.is_empty() {
+            return Err(Error::other("DeepSWE event trace has no tool exchanges").into());
         }
         Ok(inputs
             .into_iter()
@@ -311,7 +383,7 @@ impl DeepSweEventTrace {
             .map(|((tool_call_id, command), outcome)| DeepSweToolExchange {
                 tool_call_id,
                 command,
-                outcome: outcome.expect("DeepSWE tool outcomes were checked above"),
+                outcome: outcome.unwrap_or(DeepSweToolOutcome::Pending),
             })
             .collect())
     }
@@ -385,6 +457,18 @@ impl DeepSweEventTrace {
     }
 
     fn validate(&self, expected_provider_sha256: &str) -> TestResult<()> {
+        self.validate_with_tool_mode(expected_provider_sha256, false)
+    }
+
+    fn validate_partial_failure_prefix(&self, expected_provider_sha256: &str) -> TestResult<()> {
+        self.validate_with_tool_mode(expected_provider_sha256, true)
+    }
+
+    fn validate_with_tool_mode(
+        &self,
+        expected_provider_sha256: &str,
+        allow_trailing_pending: bool,
+    ) -> TestResult<()> {
         if !matches!(self.schema.as_str(), TRACE_SCHEMA_V1 | TRACE_SCHEMA_V2)
             || self.source.derivation != TRACE_DERIVATION
             || self.source.provider_fixture_sha256 != expected_provider_sha256
@@ -433,7 +517,11 @@ impl DeepSweEventTrace {
             }
         }
         let _ = self.instruction()?;
-        let _ = self.tool_exchanges()?;
+        if allow_trailing_pending {
+            let _ = self.tool_exchanges_with_trailing_pending()?;
+        } else {
+            let _ = self.tool_exchanges()?;
+        }
         Ok(())
     }
 }

@@ -552,7 +552,6 @@ pub(super) fn append_background_tool_result_blocking(
         "tool-async-result-command:v1:{batch_identity}:{}",
         call.tool_call_id
     );
-    let result_value = serde_json::to_value(&payload).map_err(|_| "background_tool_payload")?;
     for _ in 0..16 {
         let state = store
             .rehydrate_owned(owner, session_id)
@@ -594,17 +593,14 @@ pub(super) fn append_background_tool_result_blocking(
                 },
             ));
         }
+        // The terminal async-tool event is the sole durable authority for the
+        // result, status, and error.  The wakeable delivery carries only the
+        // fields needed to materialize the next runtime transcript message;
+        // copying the result here can make one otherwise-bounded inline tool
+        // response exceed the delivery envelope bound.
         let delivery_payload = DurablePayload::inline(json!({
             "message_id": message_id.clone(),
             "content": content.clone(),
-            "tool_call_id": call.tool_call_id.clone(),
-            "status": if is_failure { "failed" } else { "completed" },
-            "result": if is_failure { Value::Null } else { result_value.clone() },
-            "error": if is_failure {
-                serde_json::to_value(error.clone()).unwrap_or(Value::Null)
-            } else {
-                Value::Null
-            },
         }))
         .map_err(|_| "background_tool_delivery")?;
         drafts.push(EventDraft::new(
