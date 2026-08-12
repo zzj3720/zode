@@ -517,9 +517,11 @@ async fn public_json(
 
 async fn wait_for_terminal_activation(
     response: reqwest::Response,
+    client: &reqwest::Client,
+    session_url: &str,
     session_id: &str,
     provider_key: &str,
-) -> TestResult<String> {
+) -> TestResult<(String, Value)> {
     timeout(BENCHMARK_TIMEOUT, async {
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::new();
@@ -581,7 +583,31 @@ async fn wait_for_terminal_activation(
                         saw_activation = false;
                         continue;
                     }
-                    return Ok(outcome.to_owned());
+                    let state = public_json(
+                        authenticated_as(client.get(session_url), SUBJECT),
+                        StatusCode::OK,
+                        provider_key,
+                    )
+                    .await?;
+                    let has_pending_work = !state["wait"].is_null()
+                        || state["delivery"]["pending"]
+                            .as_array()
+                            .is_some_and(|deliveries| !deliveries.is_empty())
+                        || state["tool_calls"].as_array().is_some_and(|calls| {
+                            calls.iter().any(|call| call["status"] == "running")
+                        });
+                    if state["status"] != "idle"
+                        || !state["active_activation"].is_null()
+                        || has_pending_work
+                    {
+                        // A committed tool result may race the activation
+                        // that consumed a sibling result. Keep the same
+                        // Endpoint-wide SSE open until every durable delivery
+                        // reaches a later terminal activation.
+                        saw_activation = false;
+                        continue;
+                    }
+                    return Ok((outcome.to_owned(), state));
                 }
             }
         }
@@ -688,27 +714,18 @@ async fn run_benchmark(
         let message_admitted = benchmark_started.elapsed();
 
         let started = Instant::now();
-        let terminal_outcome =
-            wait_for_terminal_activation(events, &session_id, provider_key).await?;
-        let state = public_json(
-            authenticated_as(
-                client.get(endpoint.url(&format!("/v1/sessions/{session_id}"))),
-                SUBJECT,
-            ),
-            StatusCode::OK,
+        let session_url = endpoint.url(&format!("/v1/sessions/{session_id}"));
+        let (terminal_outcome, state) = wait_for_terminal_activation(
+            events,
+            &client,
+            &session_url,
+            &session_id,
             provider_key,
         )
         .await?;
         let has_assistant = state["transcript"]
             .as_array()
             .is_some_and(|messages| messages.iter().any(|message| message["role"] == "assistant"));
-        let has_pending_work = !state["wait"].is_null()
-            || state["delivery"]["pending"]
-                .as_array()
-                .is_some_and(|deliveries| !deliveries.is_empty())
-            || state["tool_calls"]
-                .as_array()
-                .is_some_and(|calls| calls.iter().any(|call| call["status"] == "running"));
         let scored_terminal = match terminal_outcome.as_str() {
             "finished" => has_assistant,
             "failed" => {
@@ -720,7 +737,6 @@ async fn run_benchmark(
         if !scored_terminal
             || state["status"] != "idle"
             || !state["active_activation"].is_null()
-            || has_pending_work
         {
             return Err(Error::other(format!(
                 "DeepSWE terminal event with outcome {terminal_outcome} did not converge to an idle, scoreable attempt: {}",
