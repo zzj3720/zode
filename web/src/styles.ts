@@ -2028,8 +2028,8 @@ export const globalStyles = css`
   .composer-execution-trigger:focus-visible,
   .composer-select:focus-visible,
   .composer-submit:focus-visible {
-    outline: 0;
-    outline-offset: 0;
+    outline: 2px solid var(--zode-focus);
+    outline-offset: 1px;
   }
 
   .composer-context-field > i {
