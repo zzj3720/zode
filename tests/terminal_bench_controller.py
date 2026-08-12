@@ -783,7 +783,7 @@ class Controller:
             self.state["active_processes"].pop(str(lane), None)
         self.persist_state()
 
-    def release_completed_task(self, lane: int) -> None:
+    def release_completed_task(self, lane: int) -> dict[str, Any]:
         def mutation(queue: dict[str, Any]) -> dict[str, Any]:
             lease = queue["leases"].get(str(lane))
             if lease is None:
@@ -801,6 +801,7 @@ class Controller:
         destination = self.comparisons_root / str(summary["task"]) / "summary.json"
         destination.parent.mkdir(parents=True, exist_ok=True)
         atomic_json(destination, summary)
+        return summary
 
     def task_summary(self, task_name: str) -> dict[str, Any]:
         pairs = [
