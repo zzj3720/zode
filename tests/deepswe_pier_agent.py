@@ -56,10 +56,12 @@ class _ShellBridge(ThreadingHTTPServer):
         event_replay_path: Path | None = None,
         provider_replay_path: Path | None = None,
         allow_trailing_pending: bool = False,
+        cwd: str | None = "/app",
     ) -> None:
         super().__init__(("127.0.0.1", 0), _ShellHandler)
         self.loop = loop
         self.environment = environment
+        self.cwd = cwd
         self.recording_lock = threading.Lock()
         self.sequence = 0
         self.responses_written = 0
@@ -101,9 +103,11 @@ class _ShellBridge(ThreadingHTTPServer):
             ).hexdigest()
             if digest != trace["integrity_sha256"]:
                 raise ValueError("DeepSWE event trace integrity is invalid")
-            if provider_replay_path is None or trace["source"].get(
-                "provider_fixture_sha256"
-            ) != hashlib.sha256(provider_replay_path.read_bytes()).hexdigest():
+            if (
+                provider_replay_path is None
+                or trace["source"].get("provider_fixture_sha256")
+                != hashlib.sha256(provider_replay_path.read_bytes()).hexdigest()
+            ):
                 raise ValueError("DeepSWE event trace does not match provider replay")
             blobs: dict[str, str] = {}
             for blob in trace.get("blobs", []):
@@ -153,8 +157,8 @@ class _ShellBridge(ThreadingHTTPServer):
                     tool_call_id = payload.get("tool_call_id")
                     content = payload.get("result", {}).get("Inline", {}).get("content")
                     if not isinstance(content, str):
-                        blob_id = payload.get("result", {}).get("BlobRef", {}).get(
-                            "blob_id"
+                        blob_id = (
+                            payload.get("result", {}).get("BlobRef", {}).get("blob_id")
                         )
                         content = blobs.get(blob_id)
                     exchange = started.get(tool_call_id)
@@ -202,9 +206,7 @@ class _ShellBridge(ThreadingHTTPServer):
             replay_index = self.sequence
             self.sequence += 1
             expected = (
-                self.replay[replay_index]
-                if replay_index < len(self.replay)
-                else None
+                self.replay[replay_index] if replay_index < len(self.replay) else None
             )
         actual = None
         actual_failed = False
@@ -212,7 +214,7 @@ class _ShellBridge(ThreadingHTTPServer):
             future = asyncio.run_coroutine_threadsafe(
                 self.environment.exec(
                     f"bash -lc {shlex.quote(command)}",
-                    cwd="/app",
+                    cwd=self.cwd,
                     timeout_sec=600,
                 ),
                 self.loop,
@@ -291,7 +293,9 @@ class _ShellBridge(ThreadingHTTPServer):
         if replay_error is not None:
             raise RuntimeError(replay_error)
         if sequence != replay_count:
-            raise RuntimeError("DeepSWE event replay did not consume every tool exchange")
+            raise RuntimeError(
+                "DeepSWE event replay did not consume every tool exchange"
+            )
 
 
 class _ShellHandler(BaseHTTPRequestHandler):
@@ -367,7 +371,9 @@ class ZodeDeepSweAgent(BaseAgent):
                 "DeepSWE provider replay and event replay must be configured together"
             )
         if self.partial_failure_prefix and self.replay_file is None:
-            raise ValueError("DeepSWE partial failure replay requires both replay files")
+            raise ValueError(
+                "DeepSWE partial failure replay requires both replay files"
+            )
         self.initial_commit = ""
 
     @staticmethod

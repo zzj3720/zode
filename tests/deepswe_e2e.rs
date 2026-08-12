@@ -441,9 +441,12 @@ fn benchmark_config(
     shell_url: &str,
     provider_timing: ProviderTiming,
 ) -> TestResult<PathBuf> {
+    let shell_description = env::var("ZODE_DEEPSWE_SHELL_DESCRIPTION").unwrap_or_else(|_| {
+        "Execute a shell command in the DeepSWE task container at /app. Use it to inspect files, edit the implementation, run tests, and commit the completed solution.".to_owned()
+    });
     let tool = json!({
         "name": "shell",
-        "description": "Execute a shell command in the DeepSWE task container at /app. Use it to inspect files, edit the implementation, run tests, and commit the completed solution.",
+        "description": shell_description,
         "input_schema": {
             "type": "object",
             "properties": {"command": {"type": "string"}},
