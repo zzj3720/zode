@@ -267,13 +267,13 @@ async function navigateToManagementPage(
   if (key) {
     await tabTo(
       page,
-      { role: "button", name: /^Manage Zode$/i },
+      { role: "button", name: /Manage Zode/i },
       "management menu trigger",
       80,
       key,
     );
   } else {
-    await page.getByRole("button", { name: /^Manage Zode$/i }).focus();
+    await page.getByRole("button", { name: /Manage Zode/i }).focus();
     await assertVisibleFocus(page, "management menu trigger");
   }
   await page.keyboard.press("Enter");
