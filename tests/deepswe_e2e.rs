@@ -828,14 +828,7 @@ async fn run_benchmark(
         let has_assistant = state["transcript"]
             .as_array()
             .is_some_and(|messages| messages.iter().any(|message| message["role"] == "assistant"));
-        let scored_terminal = match terminal_outcome.as_str() {
-            "finished" => has_assistant,
-            "failed" => {
-                !state["last_model_attempts_exhausted"].is_null()
-                    || !state["last_context_handoff_failure"].is_null()
-            }
-            _ => false,
-        };
+        let scored_terminal = terminal_outcome == "finished" && has_assistant;
         if !scored_terminal
             || state["status"] != "idle"
             || !state["active_activation"].is_null()
@@ -943,32 +936,30 @@ async fn e2e_live_deepswe_opencode_go_records_and_completes() -> TestResult<()> 
         }
         Err(error) => cleanup_errors.push(format!("recording finalization failed: {error}")),
     }
-    if primary.is_ok() {
-        if let Some(provider_recording_sha256) = provider_recording_sha256 {
-            let database_path = database.path().to_owned();
-            match spawn_db_blocking(move || {
-                DeepSweEventTrace::read_stopped_database(&database_path, &provider_recording_sha256)
-            })
-            .await
-            {
-                Ok(Ok(trace)) => match trace.write_private(
-                    &quarantine.join("event-trace.json"),
-                    &[&key, TEST_CONTROLLER_SECRET],
-                ) {
-                    Ok(digest) => eprintln!(
-                        "ZODE_DEEPSWE_EVENT_TRACE events={} tools={} sha256={}",
-                        trace.event_count(),
-                        trace.tool_count().unwrap_or_default(),
-                        digest
-                    ),
-                    Err(error) => cleanup_errors.push(format!("event trace flush failed: {error}")),
-                },
-                Ok(Err(error)) => cleanup_errors.push(format!("event trace failed: {error}")),
-                Err(error) => cleanup_errors.push(format!("event trace worker failed: {error}")),
-            }
-        } else {
-            cleanup_errors.push("event trace has no provider recording digest".to_owned());
+    if let Some(provider_recording_sha256) = provider_recording_sha256 {
+        let database_path = database.path().to_owned();
+        match spawn_db_blocking(move || {
+            DeepSweEventTrace::read_stopped_database(&database_path, &provider_recording_sha256)
+        })
+        .await
+        {
+            Ok(Ok(trace)) => match trace.write_private(
+                &quarantine.join("event-trace.json"),
+                &[&key, TEST_CONTROLLER_SECRET],
+            ) {
+                Ok(digest) => eprintln!(
+                    "ZODE_DEEPSWE_EVENT_TRACE events={} tools={} sha256={}",
+                    trace.event_count(),
+                    trace.tool_count().unwrap_or_default(),
+                    digest
+                ),
+                Err(error) => cleanup_errors.push(format!("event trace flush failed: {error}")),
+            },
+            Ok(Err(error)) => cleanup_errors.push(format!("event trace failed: {error}")),
+            Err(error) => cleanup_errors.push(format!("event trace worker failed: {error}")),
         }
+    } else {
+        cleanup_errors.push("event trace has no provider recording digest".to_owned());
     }
     if let Err(error) = scan_llm_recording_tree(&quarantine, &[&key, TEST_CONTROLLER_SECRET]) {
         cleanup_errors.push(error.to_string());
@@ -1053,7 +1044,7 @@ async fn e2e_deepswe_tool_only_terminal_attempt_reaches_verifier_boundary() -> T
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e_deepswe_terminal_model_failure_reaches_verifier_boundary() -> TestResult<()> {
+async fn e2e_deepswe_terminal_model_failure_is_not_scoreable() -> TestResult<()> {
     let mut model = ModelFixture::start(vec![
         ModelScript::tool_call(
             "terminal-failure-shell",
@@ -1085,15 +1076,15 @@ async fn e2e_deepswe_terminal_model_failure_reaches_verifier_boundary() -> TestR
     let shell_stop = shell.stop().await;
     model_stop?;
     shell_stop?;
-    let state = primary?;
-
-    if model.request_count() != 4
-        || shell.completed_count() != 1
-        || state["status"] != "idle"
-        || state["last_model_attempts_exhausted"].is_null()
-    {
+    if model.request_count() != 4 || shell.completed_count() != 1 {
         return Err(Error::other(
-            "DeepSWE terminal model failure did not reach the verifier boundary as one valid attempt",
+            "DeepSWE terminal model failure did not cross the real provider and tool boundaries",
+        )
+        .into());
+    }
+    if primary.is_ok() {
+        return Err(Error::other(
+            "DeepSWE terminal provider failure was incorrectly accepted as a scoreable attempt",
         )
         .into());
     }

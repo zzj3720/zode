@@ -131,6 +131,12 @@ recording, fixture promotion, and replay.
   `tests/fixtures/provider_recordings/`, bind it to a named real-process E2E,
   replay the original failure red, and use that exact cassette for the green
   regression after repair.
+- A scored DeepSWE attempt must end with a normal `finished` activation. A
+  terminal provider failure, exhausted model attempts, context-handoff failure,
+  recorder failure, or other harness/runtime error is an invalid run: preserve
+  its evidence and retry the same logical attempt without adding a zero to the
+  score. `e2e_deepswe_terminal_model_failure_is_not_scoreable` proves this at
+  the real Endpoint/provider/tool boundary.
 - Ordinary provider recordings keep their existing response-byte and frame
   bounds. DeepSWE's single-session live recorder uses the self-describing
   `long_run` envelope class sized from the approved 128,000-token output
