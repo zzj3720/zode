@@ -92,14 +92,13 @@ async function openShell(page, harness) {
 }
 
 async function exerciseNavigation(page) {
-  const recent = page.getByText("Recent", { exact: true });
-  await expect(recent).toBeVisible();
+  await expect(page.getByText("This machine", { exact: true }).first()).toBeVisible();
   const primary = page.getByRole("navigation", { name: "Primary", exact: true });
   const newSession = primary.getByRole("link", { name: "New session", exact: true });
   await expect(newSession).toHaveAttribute("href", "/");
 
-  await page.getByRole("button", { name: "Zode", exact: true }).click();
-  const management = page.getByRole("menu", { name: "Zode", exact: true });
+  await page.getByRole("button", { name: "Manage Zode", exact: true }).click();
+  const management = page.getByRole("menu", { name: "Manage Zode", exact: true });
   await expect(management.getByRole("menuitem")).toHaveCount(3);
   for (const [name, href] of [
     ["Endpoints", "/endpoints"],
@@ -165,11 +164,11 @@ async function exerciseEndpointProbe(page, harness) {
 }
 
 async function openManagement(page, name) {
-  const switcher = page.getByRole("menu", { name: "Zode", exact: true });
+  const switcher = page.getByRole("menu", { name: "Manage Zode", exact: true });
   if (!(await switcher.isVisible())) {
-    await page.getByRole("button", { name: "Zode", exact: true }).click();
+    await page.getByRole("button", { name: "Manage Zode", exact: true }).click();
   }
-  await page.getByRole("menu", { name: "Zode", exact: true })
+  await page.getByRole("menu", { name: "Manage Zode", exact: true })
     .getByRole("menuitem", { name, exact: true }).click();
 }
 

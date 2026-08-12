@@ -16,9 +16,9 @@ async function openManagement(page, name) {
     await directLink.click();
     return;
   }
-  const menu = page.getByRole("menu", { name: "Zode", exact: true });
+  const menu = page.getByRole("menu", { name: "Manage Zode", exact: true });
   if (!(await menu.isVisible())) {
-    await page.getByRole("button", { name: "Zode", exact: true }).click();
+    await page.getByRole("button", { name: "Manage Zode", exact: true }).click();
   }
   await menu.getByRole("menuitem", { name, exact: true }).click();
 }

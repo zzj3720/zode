@@ -37,6 +37,18 @@ const viewPaths: Record<Exclude<View, "session" | "not_found">, string> = {
 };
 const SidebarCollapsedContext = createContext(false);
 
+function homePath(endpointId?: string): string {
+  return endpointId ? `/?endpoint=${encodeURIComponent(endpointId)}` : viewPaths.sessions;
+}
+
+function homeEndpointFromPath(path: string): string | null {
+  try {
+    return new URL(path, "http://zode.invalid").searchParams.get("endpoint");
+  } catch {
+    return null;
+  }
+}
+
 type IconProps = { name: string; className?: string; navIcon?: boolean };
 
 function Icon({ name, className, navIcon = false }: IconProps) {
@@ -162,6 +174,7 @@ function SelectInput({
   className = "select",
   selectedLabel,
   focusStart = false,
+  leadingIconName,
 }: {
   label: string;
   value: string;
@@ -172,6 +185,7 @@ function SelectInput({
   className?: string;
   selectedLabel?: string;
   focusStart?: boolean;
+  leadingIconName?: string;
 }) {
   const currentLabel =
     selectedLabel ?? options.find((option) => option.value === value)?.label ?? placeholder;
@@ -191,6 +205,7 @@ function SelectInput({
             event.currentTarget.scrollIntoView({ block: "nearest", inline: "nearest" });
         }}
       >
+        {leadingIconName ? <Icon name={leadingIconName} /> : null}
         {selectedLabel ? (
           <Select.Value>{selectedLabel}</Select.Value>
         ) : (
@@ -333,6 +348,7 @@ function ModelExecutionMenu({
 }) {
   const [menuView, setMenuView] = useState<"simple" | "advanced">("simple");
   const [powerInteractionActive, setPowerInteractionActive] = useState(false);
+  const executionTriggerRef = useRef<HTMLButtonElement>(null);
   const selectedReasoning =
     reasoningEffortOptions.find((option) => option.value === reasoningEffort) ??
     reasoningEffortOptions[3];
@@ -344,6 +360,7 @@ function ModelExecutionMenu({
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
         <button
+          ref={executionTriggerRef}
           className="composer-execution-trigger"
           type="button"
           aria-label={ariaLabel}
@@ -354,8 +371,14 @@ function ModelExecutionMenu({
           title={title ?? ariaLabel}
         >
           {recovery ? <Icon name="warning" /> : null}
-          <span className="composer-execution-model">{modelLabel}</span>
-          <span className="composer-execution-effort">{selectedReasoning.label}</span>
+          <span className="composer-execution-trigger-content">
+            <span className="composer-execution-trigger-wrapper">
+              <span className="composer-execution-trigger-label">
+                <span className="composer-execution-model">{modelLabel}</span>
+                <span className="composer-execution-effort">{selectedReasoning.label}</span>
+              </span>
+            </span>
+          </span>
           <Icon name="caret-down" />
         </button>
       </DropdownMenu.Trigger>
@@ -367,6 +390,10 @@ function ModelExecutionMenu({
           align="start"
           sideOffset={8}
           collisionPadding={8}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            executionTriggerRef.current?.focus();
+          }}
         >
           {menuView === "simple" ? (
             <>
@@ -412,7 +439,7 @@ function ModelExecutionMenu({
                 </DropdownMenu.SubTrigger>
                 <DropdownMenu.Portal>
                   <DropdownMenu.SubContent
-                    className="model-menu-content model-menu-subcontent"
+                    className="model-menu-content model-menu-subcontent model-menu-model-subcontent"
                     sideOffset={6}
                     collisionPadding={8}
                   >
@@ -451,7 +478,7 @@ function ModelExecutionMenu({
                           </DropdownMenu.SubTrigger>
                           <DropdownMenu.Portal>
                             <DropdownMenu.SubContent
-                              className="model-menu-content model-menu-subcontent"
+                              className="model-menu-content model-menu-subcontent model-menu-model-subcontent"
                               sideOffset={6}
                               collisionPadding={8}
                             >
@@ -1165,14 +1192,6 @@ function ManagementContextItem({
   );
 }
 
-function SidebarSectionTitle({ children }: { children: ReactNode }) {
-  return (
-    <div className="sidebar-section-title" data-zode-secondary-text="true">
-      {children}
-    </div>
-  );
-}
-
 function sessionStatusState(status: string): "active" | "inactive" | "needs-resume" {
   const normalized = status.toLowerCase();
   if (
@@ -1295,17 +1314,15 @@ function Shell({
   useSignals();
   const recent = application.recentSessions.value;
   const endpoints = application.endpoints.value;
-  const recentGroups = endpoints
-    .map((endpoint) => ({
-      endpoint,
-      sessions: recent.filter((entry) => entry.endpoint === endpoint).map((entry) => entry.session),
-    }))
-    .filter((group) => group.sessions.length > 0);
-  const recentLoading =
+  const endpointGroups = endpoints.map((endpoint) => ({
+    endpoint,
+    sessions: recent.filter((entry) => entry.endpoint === endpoint).map((entry) => entry.session),
+  }));
+  const groupsLoading =
     application.endpointsState.value === "loading" || application.sessionsLoading.value;
   const endpointInventoryError = application.endpointError.value;
-  const view = application.navigation.route.value.view;
-  const newSessionSelected = view === "sessions";
+  const route = application.navigation.route.value;
+  const view = route.view;
   const [compact, setCompact] = useState(() => window.matchMedia("(max-width: 760px)").matches);
   const [collapsed, setCollapsed] = useState(compact);
   const [managementOpen, setManagementOpen] = useState(false);
@@ -1350,154 +1367,191 @@ function Shell({
     }
     previousManagementOpen.current = managementOpen;
   }, [managementOpen]);
+  useEffect(() => {
+    if (compact) setCollapsed(true);
+  }, [route.path, compact]);
   return (
     <SidebarCollapsedContext.Provider value={collapsed}>
       <div className={`app-shell${collapsed ? " sidebar-collapsed" : ""}`} data-zode-shell="true">
-        <aside className="sidebar" data-zode-shell-sidebar="true">
+        <aside
+          className="sidebar"
+          data-zode-shell-sidebar="true"
+          aria-hidden={collapsed}
+          inert={collapsed}
+        >
           <DropdownMenu.Root open={managementOpen} onOpenChange={setManagementOpen}>
-            <div className="sidebar-toolbar">
-              <IconButton
-                label="Collapse sidebar"
-                iconName="sidebar-simple"
-                buttonRef={collapseButtonRef}
-                onClick={() => setCollapsed(true)}
-              />
-              <IconButton
-                label="Back"
-                iconName="arrow-left"
-                disabled={!application.navigation.canGoBack.value}
-                onClick={() => application.navigation.back()}
-              />
-              <IconButton
-                label="Forward"
-                iconName="arrow-right"
-                disabled={!application.navigation.canGoForward.value}
-                onClick={() => application.navigation.forward()}
-              />
-            </div>
-            {appReady ? (
-              <DropdownMenu.Trigger asChild>
-                <button
-                  className="brand-button"
-                  type="button"
-                  aria-label="Zode"
-                  title="Manage Zode"
-                >
-                  <span className="brand-name">Zode</span>
-                  <Icon name="caret-down" />
-                </button>
-              </DropdownMenu.Trigger>
-            ) : (
-              <div className="brand-button" aria-label="Zode">
-                <span className="brand-name">Zode</span>
+            <div className="sidebar-content">
+              <div className="sidebar-toolbar">
+                <IconButton
+                  label="Collapse sidebar"
+                  iconName="sidebar-simple"
+                  buttonRef={collapseButtonRef}
+                  onClick={() => setCollapsed(true)}
+                />
+                <IconButton
+                  label="Back"
+                  iconName="arrow-left"
+                  disabled={!application.navigation.canGoBack.value}
+                  onClick={() => application.navigation.back()}
+                />
+                <IconButton
+                  label="Forward"
+                  iconName="arrow-right"
+                  disabled={!application.navigation.canGoForward.value}
+                  onClick={() => application.navigation.forward()}
+                />
               </div>
-            )}
-            {appReady ? (
-              <>
-                <nav className="primary-nav" aria-label="Primary">
-                  <a
-                    className={`new-session-button nav-item${newSessionSelected ? " is-selected" : ""}`}
-                    data-zode-nav-row="true"
-                    data-zode-selected={String(newSessionSelected)}
-                    data-zode-state={newSessionSelected ? "selected" : "idle"}
-                    href={viewPaths.sessions}
-                    aria-current={newSessionSelected ? "page" : undefined}
-                    onClick={(event) => {
-                      handleNavigation(event, viewPaths.sessions);
-                      queueMicrotask(() => document.getElementById("home-session-input")?.focus());
-                    }}
-                  >
-                    <Icon name="note-pencil" navIcon />
-                    <span>New session</span>
-                  </a>
-                </nav>
-                {view === "endpoints" ? (
-                  <div className="sidebar-management-context" aria-label="Current management page">
-                    <ManagementContextItem label="Endpoints" view="endpoints" iconName="devices" />
-                  </div>
-                ) : view === "providers" ? (
-                  <div className="sidebar-management-context" aria-label="Current management page">
-                    <ManagementContextItem label="Providers" view="providers" iconName="key" />
-                  </div>
-                ) : view === "settings" ? (
-                  <div className="sidebar-management-context" aria-label="Current management page">
-                    <ManagementContextItem
-                      label="Settings"
-                      view="settings"
-                      iconName="sliders-horizontal"
-                    />
-                  </div>
-                ) : null}
-                <div className="sidebar-recent">
-                  {recentGroups.length > 0 ? (
-                    recentGroups.map(({ endpoint, sessions }) => {
-                      const headingId = `sidebar-environment-${endpoint.id.replaceAll(
-                        /[^a-zA-Z0-9_-]/g,
-                        "-",
-                      )}`;
-                      return (
-                        <section
-                          className="sidebar-environment-group"
-                          aria-labelledby={headingId}
-                          key={endpoint.id}
-                        >
-                          <div
-                            className="sidebar-environment-heading"
-                            id={headingId}
-                            data-zode-secondary-text="true"
+              <div className="brand" aria-label="Zode">
+                <span className="brand-name">Zode</span>
+                <Icon name="caret-down" className="brand-chevron" />
+              </div>
+              {appReady ? (
+                <>
+                  <nav className="primary-nav" aria-label="Primary">
+                    <a
+                      className="new-session-button nav-item"
+                      data-zode-nav-row="true"
+                      data-zode-selected="false"
+                      data-zode-state="idle"
+                      href={viewPaths.sessions}
+                      onClick={(event) => {
+                        handleNavigation(event, viewPaths.sessions);
+                        queueMicrotask(() =>
+                          document.getElementById("home-session-input")?.focus(),
+                        );
+                      }}
+                    >
+                      <Icon name="note-pencil" navIcon />
+                      <span>New session</span>
+                    </a>
+                  </nav>
+                  {view === "endpoints" ? (
+                    <div
+                      className="sidebar-management-context"
+                      aria-label="Current management page"
+                    >
+                      <ManagementContextItem
+                        label="Endpoints"
+                        view="endpoints"
+                        iconName="devices"
+                      />
+                    </div>
+                  ) : view === "providers" ? (
+                    <div
+                      className="sidebar-management-context"
+                      aria-label="Current management page"
+                    >
+                      <ManagementContextItem label="Providers" view="providers" iconName="key" />
+                    </div>
+                  ) : view === "settings" ? (
+                    <div
+                      className="sidebar-management-context"
+                      aria-label="Current management page"
+                    >
+                      <ManagementContextItem
+                        label="Settings"
+                        view="settings"
+                        iconName="sliders-horizontal"
+                      />
+                    </div>
+                  ) : null}
+                  <div className="sidebar-endpoint-groups">
+                    {endpointGroups.length > 0 ? (
+                      endpointGroups.map(({ endpoint, sessions }) => {
+                        const headingId = `sidebar-environment-${endpoint.id.replaceAll(
+                          /[^a-zA-Z0-9_-]/g,
+                          "-",
+                        )}`;
+                        const unavailable = Boolean(endpoint.sessionsError.value);
+                        const loading = groupsLoading;
+                        return (
+                          <section
+                            className="sidebar-environment-group"
+                            aria-labelledby={headingId}
+                            key={endpoint.id}
                           >
-                            <Icon name="folder-simple" />
-                            <span>{endpoint.environmentLabel.value}</span>
-                          </div>
-                          {sessions.map((session) => (
-                            <SidebarSessionRow
-                              key={`${endpoint.id}:${session.id}`}
-                              endpoint={endpoint}
-                              session={session}
-                            />
-                          ))}
-                        </section>
-                      );
-                    })
-                  ) : recentLoading ? (
-                    <>
-                      <SidebarSectionTitle>Recent</SidebarSectionTitle>
+                            <a
+                              className="sidebar-environment-heading"
+                              id={headingId}
+                              href={homePath(endpoint.id)}
+                              data-zode-secondary-text="true"
+                              onClick={(event) => {
+                                handleNavigation(event, homePath(endpoint.id));
+                                application.newSession.setEndpoint(endpoint.id);
+                                queueMicrotask(() =>
+                                  document.getElementById("home-session-input")?.focus(),
+                                );
+                              }}
+                            >
+                              <Icon name="folder-simple" />
+                              <span>{endpoint.environmentLabel.value}</span>
+                            </a>
+                            {sessions.length > 0 ? (
+                              sessions.map((session) => (
+                                <SidebarSessionRow
+                                  key={`${endpoint.id}:${session.id}`}
+                                  endpoint={endpoint}
+                                  session={session}
+                                />
+                              ))
+                            ) : unavailable ? (
+                              <SidebarSessionUnavailableRow
+                                endpoint={endpoint}
+                                onRetry={() =>
+                                  void endpoint.refreshSessions().catch(() => undefined)
+                                }
+                              />
+                            ) : loading ? (
+                              <p className="sidebar-empty" role="status">
+                                Loading sessions…
+                              </p>
+                            ) : (
+                              <p className="sidebar-empty">No sessions</p>
+                            )}
+                          </section>
+                        );
+                      })
+                    ) : groupsLoading ? (
                       <p className="sidebar-empty" role="status">
-                        Loading recent sessions…
+                        Loading Endpoints…
                       </p>
-                    </>
-                  ) : endpoints.every((endpoint) => !endpoint.sessionsError.value) &&
-                    !endpointInventoryError ? (
-                    <>
-                      <SidebarSectionTitle>Recent</SidebarSectionTitle>
-                      <p className="sidebar-empty">No recent sessions</p>
-                    </>
-                  ) : endpointInventoryError ? (
-                    <>
-                      <SidebarSectionTitle>Recent</SidebarSectionTitle>
+                    ) : endpointInventoryError ? (
                       <p className="sidebar-empty sidebar-empty-error" role="status">
                         Endpoint inventory unavailable
                       </p>
-                    </>
-                  ) : null}
-                  {endpoints
-                    .filter((endpoint) => endpoint.sessionsError.value)
-                    .map((endpoint) => (
-                      <SidebarSessionUnavailableRow
-                        key={`unavailable:${endpoint.id}`}
-                        endpoint={endpoint}
-                        onRetry={() => void endpoint.refreshSessions().catch(() => undefined)}
-                      />
-                    ))}
-                </div>
-              </>
+                    ) : (
+                      <p className="sidebar-empty">No Endpoints</p>
+                    )}
+                  </div>
+                </>
+              ) : null}
+            </div>
+            {appReady ? (
+              <div className="sidebar-management-footer">
+                <DropdownMenu.Trigger asChild>
+                  <button
+                    ref={managementTriggerRef}
+                    className="sidebar-management-trigger"
+                    type="button"
+                    aria-label="Manage Zode"
+                  >
+                    <Icon name="gear" />
+                    <span>Manage</span>
+                  </button>
+                </DropdownMenu.Trigger>
+              </div>
             ) : null}
             <DropdownMenu.Portal>
               <DropdownMenu.Content
                 className="management-menu"
-                side="bottom"
+                side="top"
                 align="start"
                 sideOffset={4}
+                aria-label="Manage Zode"
+                onCloseAutoFocus={(event) => {
+                  event.preventDefault();
+                  managementTriggerRef.current?.focus();
+                }}
               >
                 <div className="management-menu-items">
                   <div className="management-menu-title">Manage</div>
@@ -2695,10 +2749,20 @@ function HomeComposer() {
   const providerId = workflow.currentProvider();
   const modelId = workflow.currentModel();
   const profileId = workflow.currentProfile();
+  const requestedEndpointId = homeEndpointFromPath(application.navigation.route.value.path);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("high");
   useEffect(() => {
     if (inputRef.current) resizeComposerInput(inputRef.current, 180, 44);
   }, [workflow.message.value]);
+  useEffect(() => {
+    if (
+      requestedEndpointId &&
+      endpointOptions.some((option) => option.value === requestedEndpointId) &&
+      application.newSession.currentEndpoint() !== requestedEndpointId
+    ) {
+      application.newSession.setEndpoint(requestedEndpointId);
+    }
+  }, [endpointOptions, requestedEndpointId]);
   const composerNeedsSetup = !workflow.ready.value;
   const setupHint = workflow.setupHint.value;
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -2713,6 +2777,20 @@ function HomeComposer() {
       aria-label="Message composer"
       onSubmit={(event) => void submit(event)}
     >
+      <div className="home-composer-context-bar" role="group" aria-label="Environment">
+        <div className="composer-context-field">
+          <SelectInput
+            label="Environment"
+            value={endpointId}
+            options={endpointOptions}
+            onChange={(value) => workflow.setEndpoint(value)}
+            disabled={endpoints.length === 0}
+            placeholder="No environment available"
+            className="select composer-select composer-environment-select"
+            leadingIconName="desktop"
+          />
+        </div>
+      </div>
       <div
         className="home-composer-body"
         data-zode-composer="true"
@@ -2742,20 +2820,8 @@ function HomeComposer() {
             {setupHint ?? "Session setup is unavailable."}
           </p>
         ) : null}
-        <div className="home-composer-footer" role="group" aria-label="Environment and execution">
+        <div className="home-composer-footer" role="group" aria-label="Model and reasoning">
           <div className="composer-utility-bar">
-            <label className="composer-context-field">
-              <Icon name="desktop" />
-              <SelectInput
-                label="Environment"
-                value={endpointId}
-                options={endpointOptions}
-                onChange={(value) => workflow.setEndpoint(value)}
-                disabled={endpoints.length === 0}
-                placeholder="No environment available"
-                className="select composer-select composer-environment-select"
-              />
-            </label>
             <ModelExecutionMenu
               groups={executionGroups}
               selected={selectedExecution}
@@ -2849,19 +2915,6 @@ function SessionPage() {
         data-zode-session-state={state}
       >
         <Notice />
-        <div
-          className="session-identity"
-          aria-label={`Endpoint ${session.environmentLabel.value}; provider ${snapshot.model?.provider ?? "unavailable"}; model ${session.modelLabel.value}; profile ${session.profileName.value}`}
-          data-zode-session-identity="true"
-        >
-          <span>{session.environmentLabel.value}</span>
-          <span aria-hidden="true">·</span>
-          <span>{snapshot.model?.provider ?? "Provider unavailable"}</span>
-          <span aria-hidden="true">·</span>
-          <span>{session.modelLabel.value}</span>
-          <span aria-hidden="true">·</span>
-          <span>{session.profileName.value}</span>
-        </div>
         <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
           {session.transcriptLength.value === 0
             ? "Session ready."
@@ -3100,7 +3153,7 @@ function SessionComposer({ session }: { session: Session }) {
           }
         }}
       />
-      <div className="composer-footer">
+      <div className="composer-footer" role="group" aria-label="Environment, model, and reasoning">
         <div className="composer-utility-bar">
           <span className="composer-context-readonly">
             <Icon name="desktop" />

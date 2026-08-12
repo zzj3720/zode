@@ -85,7 +85,6 @@ type Contract = {
     header: string;
     thread_column: string;
     composer: string;
-    secondary_surface: string;
     navigation_row: string;
     selected_row: string;
     sidebar_icon: string;
@@ -374,7 +373,6 @@ async function assertShellPalette(page: Page, contract: Contract): Promise<void>
     [contract.selectors.selected_row, "background-color", contract.palette.selected_row],
     [contract.selectors.main_surface, "background-color", contract.palette.main],
     [contract.selectors.composer, "background-color", contract.palette.composer],
-    [contract.selectors.secondary_surface, "background-color", contract.palette.secondary_surface],
     [contract.selectors.primary_text, "color", contract.palette.primary_text],
     [contract.selectors.secondary_text, "color", contract.palette.secondary_text],
     [contract.selectors.attention, "color", contract.palette.attention, true],
@@ -885,7 +883,6 @@ async function dynamicMaskBoxes(page: Page, contract: Contract): Promise<Box[]> 
       ["composer", input.selectors.composer],
       ["navigation", input.selectors.navigation_row],
       ["selected navigation", input.selectors.selected_row],
-      ["secondary surface", input.selectors.secondary_surface],
     ] as const;
     const largeSurfaceRegions = [
       ["shell", input.selectors.shell],
