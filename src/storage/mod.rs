@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeMap,
+    ops::Deref,
     path::Path,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use rusqlite::{
@@ -28,13 +29,16 @@ const PROJECTION_SCHEMA_VERSION: i64 = 1;
 const COMMAND_FINGERPRINT_VERSION: i64 = 1;
 const EVENT_FINGERPRINT_VERSION: i64 = 1;
 const EVENT_PREFIX_DIGEST_VERSION: i64 = 1;
-const STATE_DIGEST_VERSION: i64 = 1;
+const LEGACY_STATE_DIGEST_VERSION: i64 = 1;
+const STATE_DIGEST_VERSION: i64 = 2;
 const SESSION_CREATE_COMMAND_VERSION: i64 = 1;
 const INTEGRITY_DIGEST_BYTES: usize = 32;
+type IntegrityDigest = [u8; INTEGRITY_DIGEST_BYTES];
 const SESSION_LIST_CURSOR_SCHEMA: &str = "zode.session-list-cursor.v1";
 const SESSION_LIST_CURSOR_ROUTE: &str = "/v1/sessions";
 const SESSION_LIST_CURSOR_SORT_VERSION: u32 = 1;
 const MAX_SESSION_LIST_CURSOR_BYTES: usize = 4 * 1024;
+const SQLITE_STATEMENT_CACHE_CAPACITY: usize = 32;
 pub const MAX_OWNED_SESSION_SCAN_LIMIT: usize = 256;
 pub const MAX_SESSION_LIST_LIMIT: usize = 200;
 
@@ -45,6 +49,39 @@ pub struct AppendResult {
     pub events: Vec<EventRecord>,
     pub stream_version: StreamVersion,
     pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionAppendResult {
+    pub append: AppendResult,
+    pub state: VerifiedSessionState,
+}
+
+/// One immutable session projection bound to the integrity anchor that proved
+/// it.  The fields are private so callers cannot pair a valid proof with a
+/// modified projection; a new value can only come from a successful storage
+/// read or append.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerifiedSessionState {
+    state: Arc<SessionState>,
+    prefix_digest: Vec<u8>,
+    state_digest_version: i64,
+    state_digest: Vec<u8>,
+    digest_components: StateDigestComponents,
+}
+
+impl VerifiedSessionState {
+    pub fn into_state(self) -> SessionState {
+        Arc::try_unwrap(self.state).unwrap_or_else(|state| (*state).clone())
+    }
+}
+
+impl Deref for VerifiedSessionState {
+    type Target = SessionState;
+
+    fn deref(&self) -> &Self::Target {
+        self.state.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -262,16 +299,31 @@ pub trait EventStore: Send + Sync {
         &self,
         owner: &SessionOwner,
         stream_id: &str,
-        expected_version: StreamVersion,
+        current: &SessionState,
         command_id: &str,
         events: &[EventDraft],
-    ) -> Result<AppendResult, StoreError>;
+    ) -> Result<SessionAppendResult, StoreError>;
+
+    fn append_verified_owned(
+        &self,
+        owner: &SessionOwner,
+        stream_id: &str,
+        current: VerifiedSessionState,
+        command_id: &str,
+        events: &[EventDraft],
+    ) -> Result<SessionAppendResult, StoreError>;
 
     fn rehydrate_owned(
         &self,
         owner: &SessionOwner,
         stream_id: &str,
     ) -> Result<SessionState, RehydrateError>;
+
+    fn rehydrate_verified_owned(
+        &self,
+        owner: &SessionOwner,
+        stream_id: &str,
+    ) -> Result<VerifiedSessionState, RehydrateError>;
 
     fn read_stream_owned(
         &self,
@@ -317,6 +369,8 @@ pub trait EventStore: Send + Sync {
     ) -> Result<SessionListPage, StoreError>;
 
     fn write_snapshot(&self, snapshot: &SnapshotRecord) -> Result<(), StoreError>;
+
+    fn write_state_snapshot(&self, state: &SessionState) -> Result<(), StoreError>;
 
     /// Resolve an opaque callback ID from the verified append-only stream.
     ///
@@ -439,6 +493,7 @@ impl SqliteEventStore {
 
     fn from_connection(mut connection: Connection) -> Result<Self, StoreError> {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.set_prepared_statement_cache_capacity(SQLITE_STATEMENT_CACHE_CAPACITY);
         connection.execute_batch(
             "PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
@@ -453,6 +508,95 @@ impl SqliteEventStore {
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
         self.connection.lock().map_err(|_| StoreError::Poisoned)
     }
+
+    fn write_validated_snapshot(
+        &self,
+        snapshot: &SnapshotRecord,
+        payload_digest: &[u8],
+    ) -> Result<(), StoreError> {
+        let stream_version = to_sqlite_integer("snapshot stream_version", snapshot.stream_version)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_clean_storage_metadata(&transaction)?;
+        let current_version = verified_stream_head(&transaction, &snapshot.stream_id)?
+            .ok_or(StoreError::SnapshotStreamMissing(
+                snapshot.stream_id.clone(),
+            ))?
+            .version;
+        if snapshot.stream_version > current_version {
+            return Err(StoreError::SnapshotAheadOfStream {
+                snapshot: snapshot.stream_version,
+                stream: current_version,
+            });
+        }
+        let anchor =
+            read_integrity_anchor(&transaction, &snapshot.stream_id, snapshot.stream_version)?
+                .filter(|anchor| {
+                    anchor_is_current(anchor)
+                        && anchor.state_schema_version == snapshot.state_schema_version
+                        && anchor.reducer_schema_version == snapshot.reducer_schema_version
+                })
+                .ok_or_else(|| StoreError::InvalidIntegrityAnchor {
+                    stream_id: snapshot.stream_id.clone(),
+                    version: snapshot.stream_version,
+                })?;
+        let snapshot_state = snapshot_state_with_digest(snapshot, payload_digest)
+            .ok_or(StoreError::SnapshotStateMismatch)?;
+        let digest_components = StateDigestComponents::from_state(&snapshot_state)?;
+        if !digest_matches(
+            &state_digest_for_version(
+                &snapshot_state,
+                &digest_components,
+                anchor.state_digest_version,
+            )?,
+            &anchor.state_digest,
+        ) {
+            return Err(StoreError::SnapshotStateMismatch);
+        }
+        transaction.execute(
+            "INSERT INTO snapshots
+                (stream_id, stream_version, state_schema_version, reducer_schema_version,
+                 encoding, checksum, payload, event_prefix_digest_version,
+                 event_prefix_digest, state_digest_version, state_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                &snapshot.stream_id,
+                stream_version,
+                i64::from(snapshot.state_schema_version),
+                i64::from(snapshot.reducer_schema_version),
+                &snapshot.encoding,
+                &snapshot.checksum,
+                &snapshot.payload,
+                anchor.prefix_digest_version,
+                &anchor.prefix_digest,
+                anchor.state_digest_version,
+                &anchor.state_digest,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+fn execute_cached<P: rusqlite::Params>(
+    connection: &Connection,
+    sql: &str,
+    params: P,
+) -> rusqlite::Result<usize> {
+    connection.prepare_cached(sql)?.execute(params)
+}
+
+fn query_row_cached<T, P, F>(
+    connection: &Connection,
+    sql: &str,
+    params: P,
+    map: F,
+) -> rusqlite::Result<T>
+where
+    P: rusqlite::Params,
+    F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+{
+    connection.prepare_cached(sql)?.query_row(params, map)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -937,7 +1081,7 @@ fn normalize_schema_sql(sql: &str) -> String {
 }
 
 fn read_storage_metadata(connection: &Connection) -> Result<StorageMetadata, StoreError> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT singleton, storage_schema_version, projection_schema_version,
                 projections_dirty
          FROM storage_metadata ORDER BY singleton LIMIT 2",
@@ -1001,7 +1145,8 @@ fn verified_stream_head(
     connection: &Connection,
     stream_id: &str,
 ) -> Result<Option<VerifiedStreamHead>, StoreError> {
-    let (projected, persisted) = connection.query_row(
+    let (projected, persisted) = query_row_cached(
+        connection,
         "SELECT
             (SELECT current_version FROM event_streams WHERE stream_id = ?1),
             (SELECT MAX(stream_version) FROM events WHERE stream_id = ?1)",
@@ -1228,12 +1373,6 @@ fn drop_storage_triggers(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct AppendedState {
-    append: AppendResult,
-    state: SessionState,
-}
-
 #[derive(Clone, Copy)]
 struct AppendCommand<'a> {
     id: &'a str,
@@ -1265,7 +1404,7 @@ fn append_in_transaction(
     command: AppendCommand<'_>,
     mut preverified: Option<RehydratedState>,
     events: &[EventDraft],
-) -> Result<AppendedState, StoreError> {
+) -> Result<SessionAppendResult, StoreError> {
     let AppendCommand {
         id: command_id,
         fingerprint_version,
@@ -1280,20 +1419,20 @@ fn append_in_transaction(
     }
     require_clean_storage_metadata(transaction)?;
 
-    if let Some((stored_version, stored_hash, last_version)) = transaction
-        .query_row(
-            "SELECT fingerprint_version, request_hash, last_version
+    if let Some((stored_version, stored_hash, last_version)) = query_row_cached(
+        transaction,
+        "SELECT fingerprint_version, request_hash, last_version
              FROM commands WHERE stream_id = ?1 AND command_id = ?2",
-            params![stream_id, command_id],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )
-        .optional()?
+        params![stream_id, command_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )
+    .optional()?
     {
         if stored_version != fingerprint_version || !digest_matches(&stored_hash, request_hash) {
             return Err(StoreError::CommandIdempotencyConflict {
@@ -1309,21 +1448,18 @@ fn append_in_transaction(
             });
         }
         let existing_events = read_events_by_command(transaction, stream_id, command_id, head)?;
-        let state = match preverified.take() {
-            Some(restored) => restored.state,
-            None => {
-                rehydrate_from_view(transaction, stream_id)
-                    .map_err(|error| rehydrate_error_into_store_error(error, stream_id))?
-                    .state
-            }
+        let restored = match preverified.take() {
+            Some(restored) => restored,
+            None => rehydrate_from_view(transaction, stream_id)
+                .map_err(|error| rehydrate_error_into_store_error(error, stream_id))?,
         };
-        if state.stream_version != head {
+        if restored.state.stream_version != head {
             return Err(StoreError::RehydrationIntegrity {
                 stream_id: stream_id.into(),
                 version: head,
             });
         }
-        return Ok(AppendedState {
+        return Ok(SessionAppendResult {
             append: AppendResult {
                 stream_id: stream_id.into(),
                 command_id: command_id.into(),
@@ -1331,7 +1467,7 @@ fn append_in_transaction(
                 stream_version: last_version,
                 replayed: true,
             },
-            state,
+            state: seal_verified_state(restored)?,
         });
     }
 
@@ -1358,14 +1494,14 @@ fn append_in_transaction(
     }
 
     for draft in events {
-        if transaction
-            .query_row(
-                "SELECT 1 FROM events WHERE stream_id = ?1 AND event_id = ?2",
-                params![stream_id, &draft.event_id],
-                |_row| Ok(()),
-            )
-            .optional()?
-            .is_some()
+        if query_row_cached(
+            transaction,
+            "SELECT 1 FROM events WHERE stream_id = ?1 AND event_id = ?2",
+            params![stream_id, &draft.event_id],
+            |_row| Ok(()),
+        )
+        .optional()?
+        .is_some()
         {
             return Err(StoreError::EventIdempotencyConflict {
                 stream_id: stream_id.into(),
@@ -1379,10 +1515,15 @@ fn append_in_transaction(
     // not become a second durable semantic event. Compute this projection
     // before any authority insert so an invalid batch still appends nothing.
     let mut effective_drafts = Vec::with_capacity(events.len());
-    let mut candidate_state = rehydrated.state.clone();
+    let mut candidate_state = rehydrated.state;
+    let mut digest_components = rehydrated.digest_components;
     for draft in events {
-        let next = candidate_state.apply_event(&draft.event)?;
-        if next != candidate_state {
+        let previous_version = candidate_state.stream_version;
+        let previous_transcript_len = candidate_state.transcript.len();
+        let mut next = candidate_state.apply_event_from_valid_state_owned(&draft.event)?;
+        if next.stream_version != previous_version {
+            next.remember_committed_event_id(&draft.event_id)?;
+            digest_components.update_after_event(&next, previous_transcript_len, &draft.event)?;
             effective_drafts.push(draft.clone());
         }
         candidate_state = next;
@@ -1394,13 +1535,23 @@ fn append_in_transaction(
         // was stale/no-op. The key is a digest of the command identity, never
         // the caller's raw idempotency value.
         let command_digest = hex_encode(&digest_bytes(command_id.as_bytes()));
-        effective_drafts.push(EventDraft::new(
+        let draft = EventDraft::new(
             format!("command-noop:v1:{command_digest}"),
             SessionEvent::DedupeRecorded {
                 key: format!("command:{command_digest}"),
             },
-        ));
+        );
+        candidate_state = candidate_state.apply_event_from_valid_state_owned(&draft.event)?;
+        candidate_state.remember_committed_event_id(&draft.event_id)?;
+        effective_drafts.push(draft);
     }
+    // The carried projection proves the unchanged prefix once. Event-local
+    // transition checks protect every step above; one complete validation of
+    // the resulting batch still prevents an invalid reducer result from being
+    // committed without rescanning the same history before and after every
+    // event.
+    candidate_state.validate()?;
+    rehydrated.digest_components = digest_components;
 
     let mut stored_events = Vec::with_capacity(effective_drafts.len());
     for (index, draft) in effective_drafts.iter().enumerate() {
@@ -1423,7 +1574,8 @@ fn append_in_transaction(
             draft.event.kind(),
             &payload,
         );
-        transaction.execute(
+        execute_cached(
+            transaction,
             "INSERT INTO events
                 (stream_id, stream_version, event_id, command_id,
                  command_fingerprint_version, command_fingerprint,
@@ -1457,9 +1609,9 @@ fn append_in_transaction(
             event: draft.event.clone(),
         };
         rehydrated.prefix_digest = extend_prefix_digest(&rehydrated.prefix_digest, &fingerprint);
-        rehydrated.state = rehydrated.state.apply_record(&record)?;
         stored_events.push(record);
     }
+    rehydrated.state = candidate_state;
 
     let stream_version = expected_version
         .checked_add(u64::try_from(effective_drafts.len()).map_err(|_| {
@@ -1485,14 +1637,16 @@ fn append_in_transaction(
         else {
             return Err(DomainError::SessionNotCreated.into());
         };
-        transaction.execute(
+        execute_cached(
+            transaction,
             "INSERT INTO event_streams (stream_id, current_version) VALUES (?1, ?2)",
             params![
                 stream_id,
                 to_sqlite_integer("stream_version", stream_version)?,
             ],
         )?;
-        transaction.execute(
+        execute_cached(
+            transaction,
             "INSERT INTO session_create_receipts
                 (authority_id, subject, command_id, fingerprint_version, request_hash,
                  stream_id, stream_version, creation_global_position)
@@ -1507,7 +1661,8 @@ fn append_in_transaction(
                 to_sqlite_integer("creation_global_position", created.global_position)?,
             ],
         )?;
-        transaction.execute(
+        execute_cached(
+            transaction,
             "INSERT INTO session_index
                 (stream_id, authority_id, subject, creation_global_position,
                  created_at_ms, status)
@@ -1522,7 +1677,8 @@ fn append_in_transaction(
             ],
         )?;
     } else {
-        let changed = transaction.execute(
+        let changed = execute_cached(
+            transaction,
             "UPDATE event_streams SET current_version = ?2 WHERE stream_id = ?1",
             params![
                 stream_id,
@@ -1535,7 +1691,8 @@ fn append_in_transaction(
                 version: stream_version,
             });
         }
-        let changed = transaction.execute(
+        let changed = execute_cached(
+            transaction,
             "UPDATE session_index SET status = ?2 WHERE stream_id = ?1",
             params![stream_id, session_status_sql(&rehydrated.state.status)],
         )?;
@@ -1543,7 +1700,9 @@ fn append_in_transaction(
             return Err(StoreError::InvalidSessionCreateReceipt);
         }
     }
-    transaction.execute(
+    let resulting_state_digest = state_digest_v2(&rehydrated.state, &rehydrated.digest_components)?;
+    execute_cached(
+        transaction,
         "INSERT INTO commands
             (stream_id, command_id, fingerprint_version, request_hash,
              first_version, last_version, event_count)
@@ -1560,7 +1719,8 @@ fn append_in_transaction(
             })?,
         ],
     )?;
-    transaction.execute(
+    execute_cached(
+        transaction,
         "INSERT INTO integrity_anchors
             (stream_id, stream_version, event_prefix_digest_version,
              event_prefix_digest, state_schema_version, reducer_schema_version,
@@ -1574,11 +1734,11 @@ fn append_in_transaction(
             i64::from(STATE_SCHEMA_VERSION),
             i64::from(REDUCER_SCHEMA_VERSION),
             STATE_DIGEST_VERSION,
-            state_digest(&rehydrated.state)?,
+            &resulting_state_digest,
         ],
     )?;
 
-    Ok(AppendedState {
+    Ok(SessionAppendResult {
         append: AppendResult {
             stream_id: stream_id.into(),
             command_id: command_id.into(),
@@ -1586,7 +1746,13 @@ fn append_in_transaction(
             stream_version,
             replayed: false,
         },
-        state: rehydrated.state,
+        state: VerifiedSessionState {
+            state: Arc::new(rehydrated.state),
+            prefix_digest: rehydrated.prefix_digest,
+            state_digest_version: STATE_DIGEST_VERSION,
+            state_digest: resulting_state_digest,
+            digest_components: rehydrated.digest_components,
+        },
     })
 }
 
@@ -1606,28 +1772,35 @@ struct VerifiedOwnedStream {
     rehydrated: RehydratedState,
 }
 
+#[derive(Debug)]
+struct VerifiedOwnedHead {
+    head: VerifiedStreamHead,
+    creation: SessionCreation,
+    projected_status: SessionStatus,
+}
+
 fn verified_creation_event(
     connection: &Connection,
     stream_id: &str,
 ) -> Result<SessionCreation, StoreError> {
-    let raw = connection
-        .query_row(
-            "SELECT global_position, stream_id, stream_version, event_id, command_id,
+    let raw = query_row_cached(
+        connection,
+        "SELECT global_position, stream_id, stream_version, event_id, command_id,
                     event_schema_version, event_type, payload,
                     event_fingerprint_version, event_fingerprint,
                     command_fingerprint_version, command_fingerprint
              FROM events WHERE stream_id = ?1 AND stream_version = 1",
-            params![stream_id],
-            |row| {
-                Ok((
-                    decode_persisted_event_row(row)?,
-                    row.get::<_, i64>(10)?,
-                    row.get::<_, Vec<u8>>(11)?,
-                ))
-            },
-        )
-        .optional()?
-        .ok_or(StoreError::InvalidSessionCreateReceipt)?;
+        params![stream_id],
+        |row| {
+            Ok((
+                decode_persisted_event_row(row)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, Vec<u8>>(11)?,
+            ))
+        },
+    )
+    .optional()?
+    .ok_or(StoreError::InvalidSessionCreateReceipt)?;
     let event = decode_persisted_event(raw.0)?;
     let (owner, created_at_ms) = match &event.record.event {
         SessionEvent::SessionCreated {
@@ -1657,52 +1830,139 @@ fn verified_owned_stream(
     owner: &SessionOwner,
     stream_id: &str,
 ) -> Result<VerifiedOwnedStream, StoreError> {
+    let verified = verified_owned_head(connection, owner, stream_id)?;
+    let restored = rehydrate_verified_stream(connection, stream_id, &verified.head)
+        .map_err(|error| rehydrate_error_into_store_error(error, stream_id))?;
+    if restored.state.stream_version != verified.head.version
+        || restored.state.owner.as_ref() != Some(owner)
+        || restored.state.created_at_ms != Some(verified.creation.created_at_ms)
+        || restored.state.status != verified.projected_status
+    {
+        return Err(StoreError::InvalidSessionCreateReceipt);
+    }
+    Ok(VerifiedOwnedStream {
+        head: verified.head,
+        creation: verified.creation,
+        rehydrated: restored,
+    })
+}
+
+fn verified_current_state(
+    owner: &SessionOwner,
+    stream_id: &str,
+    current: &SessionState,
+    verified: &VerifiedOwnedHead,
+) -> Result<RehydratedState, StoreError> {
+    current.validate()?;
+    if current.session_id != stream_id
+        || current.owner.as_ref() != Some(owner)
+        || current.created_at_ms != Some(verified.creation.created_at_ms)
+        || current.status != verified.projected_status
+    {
+        return Err(StoreError::InvalidSessionCreateReceipt);
+    }
+    let digest_components = StateDigestComponents::from_state(current)?;
+    let digest = state_digest_for_version(
+        current,
+        &digest_components,
+        verified.head.anchor.state_digest_version,
+    )?;
+    if !digest_matches(&digest, &verified.head.anchor.state_digest) {
+        return Err(StoreError::RehydrationIntegrity {
+            stream_id: stream_id.into(),
+            version: current.stream_version,
+        });
+    }
+    Ok(RehydratedState {
+        state: current.clone(),
+        prefix_digest: verified.head.anchor.prefix_digest.clone(),
+        state_digest_version: Some(verified.head.anchor.state_digest_version),
+        state_digest: Some(digest),
+        digest_components,
+    })
+}
+
+fn verified_carried_state(
+    owner: &SessionOwner,
+    stream_id: &str,
+    current: VerifiedSessionState,
+    verified: &VerifiedOwnedHead,
+) -> Result<RehydratedState, StoreError> {
+    if current.session_id != stream_id
+        || current.owner.as_ref() != Some(owner)
+        || current.created_at_ms != Some(verified.creation.created_at_ms)
+        || current.status != verified.projected_status
+        || current.stream_version != verified.head.version
+        || !digest_matches(&current.prefix_digest, &verified.head.anchor.prefix_digest)
+        || current.state_digest_version != verified.head.anchor.state_digest_version
+        || !digest_matches(&current.state_digest, &verified.head.anchor.state_digest)
+    {
+        return Err(StoreError::RehydrationIntegrity {
+            stream_id: stream_id.into(),
+            version: current.stream_version,
+        });
+    }
+    let VerifiedSessionState {
+        state,
+        prefix_digest,
+        state_digest_version,
+        state_digest,
+        digest_components,
+    } = current;
+    Ok(RehydratedState {
+        state: Arc::try_unwrap(state).unwrap_or_else(|state| (*state).clone()),
+        prefix_digest,
+        state_digest_version: Some(state_digest_version),
+        state_digest: Some(state_digest),
+        digest_components,
+    })
+}
+
+fn verified_owned_head(
+    connection: &Connection,
+    owner: &SessionOwner,
+    stream_id: &str,
+) -> Result<VerifiedOwnedHead, StoreError> {
     owner.validate()?;
     require_clean_storage_metadata(connection)?;
-    let projection = connection
-        .query_row(
-            "SELECT streams.current_version, sessions.creation_global_position,
+    let projection = query_row_cached(
+        connection,
+        "SELECT streams.current_version, sessions.creation_global_position,
                     sessions.created_at_ms, sessions.status
              FROM session_index AS sessions
              JOIN event_streams AS streams ON streams.stream_id = sessions.stream_id
              WHERE sessions.stream_id = ?1 AND sessions.authority_id = ?2
                AND sessions.subject = ?3",
-            params![stream_id, &owner.authority_id, &owner.subject],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()?
-        .ok_or(StoreError::SessionNotFound)?;
+        params![stream_id, &owner.authority_id, &owner.subject],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        },
+    )
+    .optional()?
+    .ok_or(StoreError::SessionNotFound)?;
     let head = verified_stream_head(connection, stream_id)?
         .ok_or(StoreError::InvalidSessionCreateReceipt)?;
     let projected_version = from_sqlite_integer("current_version", projection.0)?;
     let projected_creation = from_sqlite_integer("creation_global_position", projection.1)?;
     let creation = verified_creation_event(connection, stream_id)?;
-    let restored = rehydrate_verified_stream(connection, stream_id, &head)
-        .map_err(|error| rehydrate_error_into_store_error(error, stream_id))?;
     let projected_status = session_status_from_sql(&projection.3)?;
     if projected_version != head.version
         || creation.owner != *owner
         || creation.created_at_ms != projection.2
         || creation.record.global_position != projected_creation
         || creation.record.stream_id != stream_id
-        || restored.state.stream_version != head.version
-        || restored.state.owner.as_ref() != Some(owner)
-        || restored.state.created_at_ms != Some(creation.created_at_ms)
-        || restored.state.status != projected_status
     {
         return Err(StoreError::InvalidSessionCreateReceipt);
     }
-    Ok(VerifiedOwnedStream {
+    Ok(VerifiedOwnedHead {
         head,
         creation,
-        rehydrated: restored,
+        projected_status,
     })
 }
 
@@ -1864,7 +2124,7 @@ impl EventStore for SqliteEventStore {
         transaction.commit()?;
         Ok(SessionCreateResult {
             append: appended.append,
-            state: appended.state,
+            state: appended.state.into_state(),
         })
     }
 
@@ -1884,17 +2144,61 @@ impl EventStore for SqliteEventStore {
         &self,
         owner: &SessionOwner,
         stream_id: &str,
-        expected_version: StreamVersion,
+        current: &SessionState,
         command_id: &str,
         events: &[EventDraft],
-    ) -> Result<AppendResult, StoreError> {
+    ) -> Result<SessionAppendResult, StoreError> {
         require_text("stream_id", stream_id)?;
         require_text("command_id", command_id)?;
         validate_event_batch(events)?;
         let request_hash = hash_events(events)?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let verified = verified_owned_stream(&transaction, owner, stream_id)?;
+        let verified = verified_owned_head(&transaction, owner, stream_id)?;
+        let preverified = (current.stream_version == verified.head.version)
+            .then(|| verified_current_state(owner, stream_id, current, &verified))
+            .transpose()?;
+        let appended = append_in_transaction(
+            &transaction,
+            stream_id,
+            current.stream_version,
+            AppendCommand {
+                id: command_id,
+                fingerprint_version: COMMAND_FINGERPRINT_VERSION,
+                request_hash: &request_hash,
+            },
+            preverified,
+            events,
+        )?;
+        mark_projections_clean(&transaction)?;
+        transaction.commit()?;
+        Ok(appended)
+    }
+
+    fn append_verified_owned(
+        &self,
+        owner: &SessionOwner,
+        stream_id: &str,
+        current: VerifiedSessionState,
+        command_id: &str,
+        events: &[EventDraft],
+    ) -> Result<SessionAppendResult, StoreError> {
+        require_text("stream_id", stream_id)?;
+        require_text("command_id", command_id)?;
+        validate_event_batch(events)?;
+        let request_hash = hash_events(events)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let verified = verified_owned_head(&transaction, owner, stream_id)?;
+        let expected_version = current.stream_version;
+        if expected_version != verified.head.version {
+            return Err(StoreError::OptimisticConcurrency {
+                stream_id: stream_id.into(),
+                expected: expected_version,
+                actual: verified.head.version,
+            });
+        }
+        let preverified = verified_carried_state(owner, stream_id, current, &verified)?;
         let appended = append_in_transaction(
             &transaction,
             stream_id,
@@ -1904,12 +2208,12 @@ impl EventStore for SqliteEventStore {
                 fingerprint_version: COMMAND_FINGERPRINT_VERSION,
                 request_hash: &request_hash,
             },
-            Some(verified.rehydrated),
+            Some(preverified),
             events,
         )?;
         mark_projections_clean(&transaction)?;
         transaction.commit()?;
-        Ok(appended.append)
+        Ok(appended)
     }
 
     fn rehydrate_owned(
@@ -1922,10 +2226,26 @@ impl EventStore for SqliteEventStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(StoreError::from)?;
-        let result = (|| {
-            let verified = verified_owned_stream(&transaction, owner, stream_id)?;
-            Ok(verified.rehydrated.state)
-        })();
+        let result = verified_owned_stream(&transaction, owner, stream_id)
+            .map(|restored| restored.rehydrated.state)
+            .map_err(RehydrateError::from);
+        transaction.commit().map_err(StoreError::from)?;
+        result
+    }
+
+    fn rehydrate_verified_owned(
+        &self,
+        owner: &SessionOwner,
+        stream_id: &str,
+    ) -> Result<VerifiedSessionState, RehydrateError> {
+        require_text("stream_id", stream_id)?;
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(StoreError::from)?;
+        let result = verified_owned_stream(&transaction, owner, stream_id)
+            .and_then(|restored| seal_verified_state(restored.rehydrated))
+            .map_err(RehydrateError::from);
         transaction.commit().map_err(StoreError::from)?;
         result
     }
@@ -1939,7 +2259,7 @@ impl EventStore for SqliteEventStore {
         require_text("stream_id", stream_id)?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let verified = verified_owned_stream(&transaction, owner, stream_id)?;
+        let verified = verified_owned_head(&transaction, owner, stream_id)?;
         let events = event_records(read_stored_events(
             &transaction,
             stream_id,
@@ -1960,7 +2280,7 @@ impl EventStore for SqliteEventStore {
         require_text("stream_id", stream_id)?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let verified = verified_owned_stream(&transaction, owner, stream_id)?;
+        let verified = verified_owned_head(&transaction, owner, stream_id)?;
         if limit == 0 {
             transaction.commit()?;
             return Ok(Vec::new());
@@ -2034,7 +2354,7 @@ impl EventStore for SqliteEventStore {
             let head = match verified_heads.get(&event.record.stream_id) {
                 Some(head) => *head,
                 None => {
-                    let head = verified_owned_stream(&transaction, owner, &event.record.stream_id)?
+                    let head = verified_owned_head(&transaction, owner, &event.record.stream_id)?
                         .head
                         .version;
                     verified_heads.insert(event.record.stream_id.clone(), head);
@@ -2283,63 +2603,31 @@ impl EventStore for SqliteEventStore {
                 snapshot.encoding.clone(),
             ));
         }
-        if !snapshot.checksum_matches() {
+        let payload_digest = digest_bytes(&snapshot.payload);
+        if !snapshot_checksum_matches_digest(snapshot, &payload_digest) {
             return Err(StoreError::InvalidSnapshotChecksum);
         }
-        if snapshot_state(snapshot).is_none() {
+        if snapshot_state_with_digest(snapshot, &payload_digest).is_none() {
             return Err(StoreError::SnapshotStateMismatch);
         }
-        let stream_version = to_sqlite_integer("snapshot stream_version", snapshot.stream_version)?;
-        let mut connection = self.lock()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_clean_storage_metadata(&transaction)?;
-        let current_version = verified_stream_head(&transaction, &snapshot.stream_id)?
-            .ok_or(StoreError::SnapshotStreamMissing(
-                snapshot.stream_id.clone(),
-            ))?
-            .version;
-        if snapshot.stream_version > current_version {
-            return Err(StoreError::SnapshotAheadOfStream {
-                snapshot: snapshot.stream_version,
-                stream: current_version,
-            });
-        }
-        let anchor =
-            read_integrity_anchor(&transaction, &snapshot.stream_id, snapshot.stream_version)?
-                .filter(|anchor| {
-                    anchor_is_current(anchor)
-                        && anchor.state_schema_version == snapshot.state_schema_version
-                        && anchor.reducer_schema_version == snapshot.reducer_schema_version
-                })
-                .ok_or_else(|| StoreError::InvalidIntegrityAnchor {
-                    stream_id: snapshot.stream_id.clone(),
-                    version: snapshot.stream_version,
-                })?;
-        if !digest_matches(&digest_bytes(&snapshot.payload), &anchor.state_digest) {
-            return Err(StoreError::SnapshotStateMismatch);
-        }
-        transaction.execute(
-            "INSERT INTO snapshots
-                (stream_id, stream_version, state_schema_version, reducer_schema_version,
-                 encoding, checksum, payload, event_prefix_digest_version,
-                 event_prefix_digest, state_digest_version, state_digest)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                &snapshot.stream_id,
-                stream_version,
-                i64::from(snapshot.state_schema_version),
-                i64::from(snapshot.reducer_schema_version),
-                &snapshot.encoding,
-                &snapshot.checksum,
-                &snapshot.payload,
-                anchor.prefix_digest_version,
-                &anchor.prefix_digest,
-                anchor.state_digest_version,
-                &anchor.state_digest,
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(())
+        self.write_validated_snapshot(snapshot, &payload_digest)
+    }
+
+    fn write_state_snapshot(&self, state: &SessionState) -> Result<(), StoreError> {
+        state.validate()?;
+        let payload = serde_json::to_vec(state)?;
+        let payload_digest = digest_bytes(&payload);
+        let snapshot = SnapshotRecord {
+            snapshot_id: None,
+            stream_id: state.session_id.clone(),
+            stream_version: state.stream_version,
+            state_schema_version: STATE_SCHEMA_VERSION,
+            reducer_schema_version: REDUCER_SCHEMA_VERSION,
+            encoding: SNAPSHOT_ENCODING_JSON.into(),
+            checksum: checksum_from_digest(&payload_digest),
+            payload,
+        };
+        self.write_validated_snapshot(&snapshot, &payload_digest)
     }
 }
 
@@ -2572,8 +2860,16 @@ fn rebuild_projections_in_transaction(transaction: &Transaction<'_>) -> Result<(
                 stream_id: stream_id.clone(),
                 version: head,
             })?;
+        let components = StateDigestComponents::from_state(state)?;
         if !digest_matches(prefix, &verified.anchor.prefix_digest)
-            || !digest_matches(&state_digest(state)?, &verified.anchor.state_digest)
+            || !digest_matches(
+                &state_digest_for_version(
+                    state,
+                    &components,
+                    verified.anchor.state_digest_version,
+                )?,
+                &verified.anchor.state_digest,
+            )
         {
             return Err(StoreError::RehydrationIntegrity {
                 stream_id,
@@ -2585,7 +2881,8 @@ fn rebuild_projections_in_transaction(transaction: &Transaction<'_>) -> Result<(
 }
 
 fn mark_projections_clean(connection: &Connection) -> Result<(), StoreError> {
-    let changed = connection.execute(
+    let changed = execute_cached(
+        connection,
         "UPDATE storage_metadata SET projections_dirty = 0,
             storage_schema_version = ?1, projection_schema_version = ?2
          WHERE singleton = 1",
@@ -2626,6 +2923,38 @@ struct IntegrityAnchor {
 struct RehydratedState {
     state: SessionState,
     prefix_digest: Vec<u8>,
+    state_digest_version: Option<i64>,
+    state_digest: Option<Vec<u8>>,
+    digest_components: StateDigestComponents,
+}
+
+fn seal_verified_state(mut restored: RehydratedState) -> Result<VerifiedSessionState, StoreError> {
+    let state_digest_version = restored
+        .state_digest_version
+        .unwrap_or(STATE_DIGEST_VERSION);
+    let state_digest = match restored.state_digest.take() {
+        Some(digest) => digest,
+        None => state_digest_for_version(
+            &restored.state,
+            &restored.digest_components,
+            state_digest_version,
+        )?,
+    };
+    if restored.prefix_digest.len() != INTEGRITY_DIGEST_BYTES
+        || state_digest.len() != INTEGRITY_DIGEST_BYTES
+    {
+        return Err(StoreError::RehydrationIntegrity {
+            stream_id: restored.state.session_id.clone(),
+            version: restored.state.stream_version,
+        });
+    }
+    Ok(VerifiedSessionState {
+        state: Arc::new(restored.state),
+        prefix_digest: restored.prefix_digest,
+        state_digest_version,
+        state_digest,
+        digest_components: restored.digest_components,
+    })
 }
 
 #[derive(Debug)]
@@ -2652,6 +2981,9 @@ fn rehydrate_from_view(
         return Ok(RehydratedState {
             state: SessionState::new(stream_id),
             prefix_digest: prefix_digest_seed(stream_id),
+            state_digest_version: None,
+            state_digest: None,
+            digest_components: StateDigestComponents::empty(),
         });
     };
 
@@ -2678,7 +3010,9 @@ fn rehydrate_verified_stream(
         else {
             continue;
         };
-        let Some(state) = validated_snapshot_state(&candidate, &snapshot_anchor) else {
+        let Some((state, digest_components)) =
+            validated_snapshot_state(&candidate, &snapshot_anchor)
+        else {
             continue;
         };
         if !snapshot_prefix_matches_events(
@@ -2693,11 +3027,18 @@ fn rehydrate_verified_stream(
             connection,
             stream_id,
             stream_head,
-            state,
-            snapshot_anchor.prefix_digest.clone(),
+            RehydratedState {
+                state,
+                prefix_digest: snapshot_anchor.prefix_digest.clone(),
+                state_digest_version: Some(snapshot_anchor.state_digest_version),
+                state_digest: Some(snapshot_anchor.state_digest.clone()),
+                digest_components,
+            },
         );
-        if let Ok(restored) = restored {
+        if let Ok(mut restored) = restored {
             if restored_matches_anchor(&restored, head_anchor)? {
+                restored.state_digest_version = Some(head_anchor.state_digest_version);
+                restored.state_digest = Some(head_anchor.state_digest.clone());
                 return Ok(restored);
             }
         }
@@ -2707,8 +3048,13 @@ fn rehydrate_verified_stream(
         connection,
         stream_id,
         stream_head,
-        SessionState::new(stream_id),
-        prefix_digest_seed(stream_id),
+        RehydratedState {
+            state: SessionState::new(stream_id),
+            prefix_digest: prefix_digest_seed(stream_id),
+            state_digest_version: None,
+            state_digest: None,
+            digest_components: StateDigestComponents::empty(),
+        },
     )?;
     if !restored_matches_anchor(&restored, head_anchor)? {
         return Err(StoreError::RehydrationIntegrity {
@@ -2717,7 +3063,11 @@ fn rehydrate_verified_stream(
         }
         .into());
     }
-    Ok(restored)
+    Ok(RehydratedState {
+        state_digest_version: Some(head_anchor.state_digest_version),
+        state_digest: Some(head_anchor.state_digest.clone()),
+        ..restored
+    })
 }
 
 fn snapshot_prefix_matches_events(
@@ -2769,34 +3119,49 @@ fn replay_tail(
     connection: &Connection,
     stream_id: &str,
     head: StreamVersion,
-    mut state: SessionState,
-    mut prefix_digest: Vec<u8>,
+    mut restored: RehydratedState,
 ) -> Result<RehydratedState, RehydrateError> {
-    let after = state.stream_version;
+    let after = restored.state.stream_version;
     let events = read_stored_events(connection, stream_id, after, head)?;
     for event in events {
-        prefix_digest = extend_prefix_digest(&prefix_digest, &event.fingerprint);
-        state = state.apply_record(&event.record)?;
+        restored.prefix_digest = extend_prefix_digest(&restored.prefix_digest, &event.fingerprint);
+        let previous_transcript_len = restored.state.transcript.len();
+        restored.state = restored
+            .state
+            .apply_record_from_valid_state_owned(&event.record)?;
+        restored.digest_components.update_after_event(
+            &restored.state,
+            previous_transcript_len,
+            &event.record.event,
+        )?;
+        restored.state_digest_version = None;
+        restored.state_digest = None;
     }
-    if state.stream_version != head {
+    if restored.state.stream_version != head {
         return Err(RehydrateError::IncompleteReplay {
-            actual: state.stream_version,
+            actual: restored.state.stream_version,
             expected: head,
         });
     }
-    Ok(RehydratedState {
-        state,
-        prefix_digest,
-    })
+    restored.state.validate()?;
+    Ok(restored)
 }
 
 fn restored_matches_anchor(
     restored: &RehydratedState,
     anchor: &IntegrityAnchor,
 ) -> Result<bool, StoreError> {
+    let state_digest = match (&restored.state_digest_version, &restored.state_digest) {
+        (Some(version), Some(digest)) if *version == anchor.state_digest_version => digest.clone(),
+        _ => state_digest_for_version(
+            &restored.state,
+            &restored.digest_components,
+            anchor.state_digest_version,
+        )?,
+    };
     Ok(anchor_is_current(anchor)
         && digest_matches(&restored.prefix_digest, &anchor.prefix_digest)
-        && digest_matches(&state_digest(&restored.state)?, &anchor.state_digest))
+        && digest_matches(&state_digest, &anchor.state_digest))
 }
 
 fn anchor_is_current(anchor: &IntegrityAnchor) -> bool {
@@ -2804,7 +3169,10 @@ fn anchor_is_current(anchor: &IntegrityAnchor) -> bool {
         && anchor.prefix_digest.len() == INTEGRITY_DIGEST_BYTES
         && anchor.state_schema_version == STATE_SCHEMA_VERSION
         && anchor.reducer_schema_version == REDUCER_SCHEMA_VERSION
-        && anchor.state_digest_version == STATE_DIGEST_VERSION
+        && matches!(
+            anchor.state_digest_version,
+            LEGACY_STATE_DIGEST_VERSION | STATE_DIGEST_VERSION
+        )
         && anchor.state_digest.len() == INTEGRITY_DIGEST_BYTES
 }
 
@@ -2813,29 +3181,29 @@ fn read_integrity_anchor(
     stream_id: &str,
     stream_version: StreamVersion,
 ) -> Result<Option<IntegrityAnchor>, StoreError> {
-    let raw = connection
-        .query_row(
-            "SELECT event_prefix_digest_version, event_prefix_digest,
+    let raw = query_row_cached(
+        connection,
+        "SELECT event_prefix_digest_version, event_prefix_digest,
                     state_schema_version, reducer_schema_version,
                     state_digest_version, state_digest
              FROM integrity_anchors
              WHERE stream_id = ?1 AND stream_version = ?2",
-            params![
-                stream_id,
-                to_sqlite_integer("stream_version", stream_version)?
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, SqlValue>(0)?,
-                    row.get::<_, SqlValue>(1)?,
-                    row.get::<_, SqlValue>(2)?,
-                    row.get::<_, SqlValue>(3)?,
-                    row.get::<_, SqlValue>(4)?,
-                    row.get::<_, SqlValue>(5)?,
-                ))
-            },
-        )
-        .optional()?;
+        params![
+            stream_id,
+            to_sqlite_integer("stream_version", stream_version)?
+        ],
+        |row| {
+            Ok((
+                row.get::<_, SqlValue>(0)?,
+                row.get::<_, SqlValue>(1)?,
+                row.get::<_, SqlValue>(2)?,
+                row.get::<_, SqlValue>(3)?,
+                row.get::<_, SqlValue>(4)?,
+                row.get::<_, SqlValue>(5)?,
+            ))
+        },
+    )
+    .optional()?;
     Ok(raw.and_then(|raw| {
         Some(IntegrityAnchor {
             prefix_digest_version: sqlite_i64(raw.0)?,
@@ -2923,22 +3291,25 @@ fn next_snapshot_candidate(
 fn validated_snapshot_state(
     candidate: &SnapshotWithReferences,
     anchor: &IntegrityAnchor,
-) -> Option<SessionState> {
+) -> Option<(SessionState, StateDigestComponents)> {
     if !anchor_is_current(anchor) {
         return None;
     }
+    let payload_digest = digest_bytes(&candidate.snapshot.payload);
     if candidate.prefix_digest_version != anchor.prefix_digest_version
         || !digest_matches(&candidate.prefix_digest, &anchor.prefix_digest)
         || candidate.state_digest_version != anchor.state_digest_version
         || !digest_matches(&candidate.state_digest, &anchor.state_digest)
-        || !digest_matches(
-            &digest_bytes(&candidate.snapshot.payload),
-            &anchor.state_digest,
-        )
     {
         return None;
     }
-    snapshot_state(&candidate.snapshot)
+    let state = snapshot_state_with_digest(&candidate.snapshot, &payload_digest)?;
+    let components = StateDigestComponents::from_state(&state).ok()?;
+    digest_matches(
+        &state_digest_for_version(&state, &components, anchor.state_digest_version).ok()?,
+        &anchor.state_digest,
+    )
+    .then_some((state, components))
 }
 
 fn read_stored_events(
@@ -3105,8 +3476,184 @@ fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-fn state_digest(state: &SessionState) -> Result<Vec<u8>, StoreError> {
+fn legacy_state_digest(state: &SessionState) -> Result<Vec<u8>, StoreError> {
     Ok(digest_bytes(&serde_json::to_vec(state)?))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StateDigestComponents {
+    transcript: IntegrityDigest,
+    async_tools: Arc<BTreeMap<String, IntegrityDigest>>,
+    async_tools_root: IntegrityDigest,
+}
+
+impl StateDigestComponents {
+    fn empty() -> Self {
+        Self::from_parts(transcript_digest_seed(), BTreeMap::new())
+    }
+
+    fn from_state(state: &SessionState) -> Result<Self, StoreError> {
+        let transcript = state
+            .transcript
+            .iter()
+            .try_fold(transcript_digest_seed(), extend_transcript_digest)?;
+        let async_tools = state
+            .async_tool_calls
+            .iter()
+            .map(|(id, record)| Ok((id.clone(), async_tool_digest(id, record)?)))
+            .collect::<Result<_, StoreError>>()?;
+        Ok(Self::from_parts(transcript, async_tools))
+    }
+
+    fn from_parts(
+        transcript: IntegrityDigest,
+        async_tools: BTreeMap<String, IntegrityDigest>,
+    ) -> Self {
+        let async_tools = Arc::new(async_tools);
+        Self {
+            transcript,
+            async_tools_root: digest_async_tool_map(&async_tools),
+            async_tools,
+        }
+    }
+
+    fn update_after_event(
+        &mut self,
+        state: &SessionState,
+        previous_transcript_len: usize,
+        event: &SessionEvent,
+    ) -> Result<(), StoreError> {
+        for message in state
+            .transcript
+            .get(previous_transcript_len..)
+            .ok_or_else(|| StoreError::RehydrationIntegrity {
+                stream_id: state.session_id.clone(),
+                version: state.stream_version,
+            })?
+        {
+            self.transcript = extend_transcript_digest(self.transcript, message)?;
+        }
+        if let Some(id) = async_tool_event_key(event) {
+            let record =
+                state
+                    .async_tool_calls
+                    .get(id)
+                    .ok_or_else(|| StoreError::RehydrationIntegrity {
+                        stream_id: state.session_id.clone(),
+                        version: state.stream_version,
+                    })?;
+            Arc::make_mut(&mut self.async_tools)
+                .insert(id.to_owned(), async_tool_digest(id, record)?);
+            self.async_tools_root = digest_async_tool_map(&self.async_tools);
+        }
+        Ok(())
+    }
+}
+
+fn transcript_digest_seed() -> IntegrityDigest {
+    Sha256::digest(b"zode:session-transcript-digest:v1").into()
+}
+
+fn extend_transcript_digest<T: Serialize>(
+    previous: IntegrityDigest,
+    message: &T,
+) -> Result<IntegrityDigest, StoreError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zode:session-transcript-link:v1");
+    hash_field(&mut hasher, &previous);
+    hash_field(&mut hasher, &serde_json::to_vec(message)?);
+    Ok(hasher.finalize().into())
+}
+
+fn async_tool_digest<T: Serialize>(id: &str, record: &T) -> Result<IntegrityDigest, StoreError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zode:async-tool-entry-digest:v1");
+    hash_field(&mut hasher, id.as_bytes());
+    hash_field(&mut hasher, &serde_json::to_vec(record)?);
+    Ok(hasher.finalize().into())
+}
+
+fn digest_async_tool_map(entries: &BTreeMap<String, IntegrityDigest>) -> IntegrityDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zode:async-tool-map-digest:v1");
+    hasher.update((entries.len() as u64).to_be_bytes());
+    for digest in entries.values() {
+        hash_field(&mut hasher, digest);
+    }
+    hasher.finalize().into()
+}
+
+fn async_tool_event_key(event: &SessionEvent) -> Option<&str> {
+    match event {
+        SessionEvent::AsyncToolCallStarted { record } => Some(&record.tool_call_id),
+        SessionEvent::AsyncToolCallRunning { tool_call_id }
+        | SessionEvent::AsyncToolCallUnknownOutcome { tool_call_id, .. }
+        | SessionEvent::AsyncToolCallRuntimeRestarted { tool_call_id, .. }
+        | SessionEvent::AsyncToolCallCallbackCompleted { tool_call_id, .. }
+        | SessionEvent::AsyncToolCallCallbackFailed { tool_call_id, .. }
+        | SessionEvent::AsyncToolCallProgress { tool_call_id, .. }
+        | SessionEvent::AsyncToolCallCompleted { tool_call_id, .. }
+        | SessionEvent::AsyncToolCallFailed { tool_call_id, .. }
+        | SessionEvent::AsyncToolCallCancelled { tool_call_id, .. } => Some(tool_call_id),
+        _ => None,
+    }
+}
+
+fn state_digest_v2(
+    state: &SessionState,
+    components: &StateDigestComponents,
+) -> Result<Vec<u8>, StoreError> {
+    let projection = (
+        (STATE_SCHEMA_VERSION, REDUCER_SCHEMA_VERSION),
+        (
+            &state.session_id,
+            &state.owner,
+            &state.created_at_ms,
+            &state.selection,
+            state.selection_version,
+            &state.status,
+        ),
+        (
+            &components.transcript,
+            &state.last_model_attempt_failure,
+            &state.delivery_queue,
+            state.delivery_ack,
+            &state.active_wait,
+            &state.active_timer,
+            &state.wake_pending_wait_id,
+            &components.async_tools_root,
+        ),
+        (
+            &state.active_activation,
+            &state.active_model_round,
+            &state.pending_context_handoff,
+            &state.latest_context_handoff,
+            &state.latest_model_usage,
+            &state.last_context_handoff_failure,
+            &state.callback_bindings,
+            &state.last_model_attempts_exhausted,
+        ),
+        (state.stream_version, &state.dedupe_facts),
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(b"zode:session-state-digest:v2");
+    hash_field(&mut hasher, &serde_json::to_vec(&projection)?);
+    Ok(hasher.finalize().to_vec())
+}
+
+fn state_digest_for_version(
+    state: &SessionState,
+    components: &StateDigestComponents,
+    version: i64,
+) -> Result<Vec<u8>, StoreError> {
+    match version {
+        LEGACY_STATE_DIGEST_VERSION => legacy_state_digest(state),
+        STATE_DIGEST_VERSION => state_digest_v2(state, components),
+        _ => Err(StoreError::InvalidIntegrityAnchor {
+            stream_id: state.session_id.clone(),
+            version: state.stream_version,
+        }),
+    }
 }
 
 fn digest_bytes(bytes: &[u8]) -> Vec<u8> {
@@ -3125,11 +3672,16 @@ fn digest_matches(left: &[u8], right: &[u8]) -> bool {
 }
 
 fn checksum(payload: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(payload))
+    checksum_from_digest(&digest_bytes(payload))
 }
 
-fn snapshot_state(snapshot: &SnapshotRecord) -> Option<SessionState> {
-    if snapshot.encoding != SNAPSHOT_ENCODING_JSON || !snapshot.checksum_matches() {
+fn snapshot_state_with_digest(
+    snapshot: &SnapshotRecord,
+    payload_digest: &[u8],
+) -> Option<SessionState> {
+    if snapshot.encoding != SNAPSHOT_ENCODING_JSON
+        || !snapshot_checksum_matches_digest(snapshot, payload_digest)
+    {
         return None;
     }
     let state = serde_json::from_slice::<SessionState>(&snapshot.payload).ok()?;
@@ -3137,6 +3689,14 @@ fn snapshot_state(snapshot: &SnapshotRecord) -> Option<SessionState> {
         && state.stream_version == snapshot.stream_version
         && state.validate().is_ok())
     .then_some(state)
+}
+
+fn snapshot_checksum_matches_digest(snapshot: &SnapshotRecord, payload_digest: &[u8]) -> bool {
+    snapshot.checksum == checksum_from_digest(payload_digest)
+}
+
+fn checksum_from_digest(digest: &[u8]) -> String {
+    format!("sha256:{}", hex_encode(digest))
 }
 
 fn require_text(field: &'static str, value: &str) -> Result<(), StoreError> {
@@ -3350,7 +3910,7 @@ fn read_events_by_command(
     command_id: &str,
     through_version: StreamVersion,
 ) -> Result<Vec<EventRecord>, StoreError> {
-    let mut statement = transaction.prepare(
+    let mut statement = transaction.prepare_cached(
         "SELECT global_position, stream_id, stream_version, event_id, command_id,
                 event_schema_version, event_type, payload,
                 event_fingerprint_version, event_fingerprint

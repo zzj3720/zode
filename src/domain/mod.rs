@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 mod reducer;
 pub use reducer::DomainError;
 
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -415,25 +415,41 @@ pub enum TranscriptRole {
     Runtime,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct InlinePayload(Value);
+#[derive(Clone, Debug, PartialEq)]
+pub struct InlinePayload {
+    value: Value,
+    encoded_len: usize,
+}
 
 impl InlinePayload {
     pub fn new(value: Value) -> Result<Self, DomainError> {
-        let bytes = serde_json::to_vec(&value)
+        let encoded_len = serde_json::to_vec(&value)
             .map_err(|error| DomainError::InvalidDurablePayload(error.to_string()))?
             .len();
-        if bytes > MAX_INLINE_PAYLOAD_BYTES {
+        if encoded_len > MAX_INLINE_PAYLOAD_BYTES {
             return Err(DomainError::DurablePayloadTooLarge {
-                bytes,
+                bytes: encoded_len,
                 max: MAX_INLINE_PAYLOAD_BYTES,
             });
         }
-        Ok(Self(value))
+        Ok(Self { value, encoded_len })
     }
 
     pub fn value(&self) -> &Value {
-        &self.0
+        &self.value
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
+}
+
+impl Serialize for InlinePayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.value.serialize(serializer)
     }
 }
 
@@ -506,9 +522,7 @@ impl DurablePayload {
     pub fn validate(&self) -> Result<(), DomainError> {
         match self {
             Self::Inline(value) => {
-                let bytes = serde_json::to_vec(value.value())
-                    .map_err(|error| DomainError::InvalidDurablePayload(error.to_string()))?
-                    .len();
+                let bytes = value.encoded_len();
                 if bytes > MAX_INLINE_PAYLOAD_BYTES {
                     return Err(DomainError::DurablePayloadTooLarge {
                         bytes,

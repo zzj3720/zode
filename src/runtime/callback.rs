@@ -202,7 +202,7 @@ pub(super) fn complete_external_callback_blocking(
         match store.append_owned(
             &lookup.owner,
             &lookup.session_id,
-            lookup.state.stream_version,
+            &lookup.state,
             &command_id,
             &drafts,
         ) {
@@ -253,7 +253,7 @@ pub(super) fn cancel_tool_call_blocking(
         match store.append_owned(
             owner,
             session_id,
-            state.stream_version,
+            &state,
             command_id,
             &[EventDraft::new(
                 event_id,
@@ -264,11 +264,9 @@ pub(super) fn cancel_tool_call_blocking(
                 },
             )],
         ) {
-            Ok(_) => {
-                let state = store
-                    .rehydrate_owned(owner, session_id)
-                    .map_err(|_| RuntimeCommandError::Backend)?;
-                return state
+            Ok(appended) => {
+                return appended
+                    .state
                     .async_tool_calls
                     .get(tool_call_id)
                     .cloned()
@@ -313,7 +311,7 @@ pub(super) fn reconcile_tool_call_blocking(
         match store.append_owned(
             owner,
             session_id,
-            state.stream_version,
+            &state,
             command_id,
             &[EventDraft::new(
                 event_id,
@@ -322,16 +320,15 @@ pub(super) fn reconcile_tool_call_blocking(
                 },
             )],
         ) {
-            Ok(append) => {
-                let state = store
-                    .rehydrate_owned(owner, session_id)
-                    .map_err(|_| RuntimeCommandError::Backend)?;
-                let record = state
+            Ok(appended) => {
+                let record = appended
+                    .state
                     .async_tool_calls
                     .get(tool_call_id)
                     .cloned()
                     .ok_or(RuntimeCommandError::NotFound)?;
-                let admitted = (!append.replayed).then_some((append, state));
+                let admitted = (!appended.append.replayed)
+                    .then_some((appended.append, appended.state.into_state()));
                 return Ok((record, admitted));
             }
             Err(StoreError::OptimisticConcurrency { .. }) => continue,
@@ -368,7 +365,7 @@ pub(super) fn append_retry_dispatch_unknown_blocking(
         match store.append_owned(
             owner,
             session_id,
-            state.stream_version,
+            &state,
             &command_id,
             &[EventDraft::new(
                 event_id,
@@ -378,12 +375,7 @@ pub(super) fn append_retry_dispatch_unknown_blocking(
                 },
             )],
         ) {
-            Ok(append) => {
-                let state = store
-                    .rehydrate_owned(owner, session_id)
-                    .map_err(|_| "retry_dispatch_unknown_rehydrate")?;
-                return Ok(Some((append, state)));
-            }
+            Ok(appended) => return Ok(Some((appended.append, appended.state.into_state()))),
             Err(StoreError::OptimisticConcurrency { .. }) => continue,
             Err(StoreError::CommandIdempotencyConflict { .. })
             | Err(StoreError::EventIdempotencyConflict { .. }) => return Ok(None),

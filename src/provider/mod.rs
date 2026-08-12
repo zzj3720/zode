@@ -408,6 +408,11 @@ pub struct AimuxProvider {
     policy: ProviderExecutionPolicy,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ProviderTransportRetryPolicy {
+    pub initial_delay: std::time::Duration,
+}
+
 #[derive(Debug, Error)]
 pub enum ProviderExecutionValidationError {
     #[error("invalid provider execution descriptor")]
@@ -422,6 +427,7 @@ pub enum ProviderExecutionValidationError {
 pub struct ProviderExecutionPolicy {
     adapter_kinds: Vec<String>,
     allowed_origins: Vec<String>,
+    transport_retry: ProviderTransportRetryPolicy,
 }
 
 pub fn credential_schema_for_adapter(kind: &str) -> Option<&'static str> {
@@ -433,10 +439,15 @@ pub fn credential_schema_for_adapter(kind: &str) -> Option<&'static str> {
 }
 
 impl ProviderExecutionPolicy {
-    pub fn new(adapter_kinds: Vec<String>, allowed_origins: Vec<String>) -> Self {
+    pub fn new(
+        adapter_kinds: Vec<String>,
+        allowed_origins: Vec<String>,
+        transport_retry: ProviderTransportRetryPolicy,
+    ) -> Self {
         Self {
             adapter_kinds,
             allowed_origins,
+            transport_retry,
         }
     }
 
@@ -490,8 +501,8 @@ impl AimuxProvider {
         Self { replicas, policy }
     }
 
-    async fn complete_request(&self, request: ModelRequest) -> Result<ModelOutcome, ModelError> {
-        let selection = request.selection;
+    async fn complete_request(&self, request: &ModelRequest) -> Result<ModelOutcome, ModelError> {
+        let selection = &request.selection;
         if let Err(error) = self.policy.validate(&selection.provider_execution) {
             return Err(match error {
                 ProviderExecutionValidationError::AdapterDisabled => ModelError::Unavailable,
@@ -531,7 +542,7 @@ impl AimuxProvider {
         }
 
         let prompt = prompt_from_transcript(
-            &request.transcript,
+            request.transcript.as_slice(),
             selection.provider_execution.kind == "openai_compatible",
         )?;
         let tools = request
@@ -564,19 +575,22 @@ impl AimuxProvider {
             }),
             ..CallOptions::new(prompt)
         };
+        let transport_retry = self.policy.transport_retry;
         let mut stream = match selection.provider_execution.kind.as_str() {
             "openai_compatible" => {
-                let config = OpenAIConfig::new(credential.secret.clone())
+                let mut config = OpenAIConfig::new(credential.secret.clone())
                     .with_base_url(selection.provider_execution.base_url.clone())
                     .with_provider(selection.provider.clone());
+                config.retry_config.initial_delay = transport_retry.initial_delay;
                 OpenAIProvider::new(config)
                     .model(&selection.model)
                     .do_stream(&options)
                     .await
             }
             "anthropic" => {
-                let config = AnthropicConfig::new(credential.secret.clone())
+                let mut config = AnthropicConfig::new(credential.secret.clone())
                     .with_base_url(selection.provider_execution.base_url.clone());
+                config.retry_config.initial_delay = transport_retry.initial_delay;
                 AnthropicProvider::new(config)
                     .model(&selection.model)
                     .do_stream(&options)
@@ -722,7 +736,7 @@ fn timeout_millis(timeout: std::time::Duration) -> u64 {
 impl ModelExecutor for AimuxProvider {
     fn complete<'a>(
         &'a self,
-        request: ModelRequest,
+        request: &'a ModelRequest,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ModelOutcome, ModelError>> + Send + 'a>,
     > {

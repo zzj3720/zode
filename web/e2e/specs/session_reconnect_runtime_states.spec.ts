@@ -3003,13 +3003,13 @@ test.describe("session reconnect and runtime states", () => {
         )
         .toBe(true);
 
-      const publishedBeforeOutage = new Set(
-        topology.endpointBoundary.eventRequests().flatMap((request) => request.responseEventIds),
-      );
       const cursorCountBeforeOutage = sseRequests.length;
       await topology.server.stop();
       await topology.assertServerStoreHasNoSessionMirror();
       await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible({ timeout: 30_000 });
+      const publishedBeforeOutage = new Set(
+        topology.endpointBoundary.eventRequests().flatMap((request) => request.responseEventIds),
+      );
       const resumedRequestId = topology.nextSseRequestId();
       await page.context().setExtraHTTPHeaders({
         "Cf-Access-Jwt-Assertion": topology.accessAssertion,

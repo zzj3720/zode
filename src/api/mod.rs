@@ -1014,19 +1014,16 @@ async fn append_message(
             message: expected_message,
             wake_wait: true,
         };
-        let append = store
+        let appended = store
             .append_owned(
                 &owner,
                 &id,
-                current.stream_version,
+                &current,
                 &command_id,
                 &[EventDraft::new(event_id, event)],
             )
             .map_err(ServiceError::store)?;
-        let state = store
-            .rehydrate_owned(&owner, &id)
-            .map_err(ServiceError::rehydrate)?;
-        Ok((append, state))
+        Ok((appended.append, appended.state.into_state()))
     })
     .await
     .map_err(ApiError::from_service)?;
@@ -1119,13 +1116,13 @@ async fn select_model(
         {
             return Err(ServiceError::AuthReplicaUnavailable);
         }
-        let mut selection = current.selection;
+        let mut selection = current.selection.clone();
         selection.model = Some(model);
-        let append = store
+        let appended = store
             .append_owned(
                 &owner,
                 &id,
-                current.stream_version,
+                &current,
                 &command_id,
                 &[EventDraft::new(
                     event_id,
@@ -1133,10 +1130,7 @@ async fn select_model(
                 )],
             )
             .map_err(ServiceError::store)?;
-        let state = store
-            .rehydrate_owned(&owner, &id)
-            .map_err(ServiceError::rehydrate)?;
-        Ok((append, state))
+        Ok((appended.append, appended.state.into_state()))
     })
     .await
     .map_err(ApiError::from_service)?;
@@ -1393,16 +1387,11 @@ fn enqueue_model_delivery(
         match store.append_owned(
             owner,
             session_id,
-            current.stream_version,
+            &current,
             &spec.command_id,
             &[EventDraft::new(spec.event_id.clone(), event)],
         ) {
-            Ok(append) => {
-                let state = store
-                    .rehydrate_owned(owner, session_id)
-                    .map_err(ServiceError::rehydrate)?;
-                return Ok((append, state));
-            }
+            Ok(appended) => return Ok((appended.append, appended.state.into_state())),
             Err(StoreError::OptimisticConcurrency { .. }) => {
                 current = store
                     .rehydrate_owned(owner, session_id)

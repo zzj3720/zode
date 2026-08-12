@@ -1,8 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, File, OpenOptions},
     io::{Error, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
@@ -13,10 +13,12 @@ use sha2::{Digest, Sha256};
 
 use crate::support::TestResult;
 
-const TRACE_SCHEMA: &str = "zode.deepswe-event-trace.v1";
+const TRACE_SCHEMA_V1: &str = "zode.deepswe-event-trace.v1";
+const TRACE_SCHEMA_V2: &str = "zode.deepswe-event-trace.v2";
 const TRACE_DERIVATION: &str =
     "real_endpoint_replay_of_retained_first_live_provider_and_tool_boundaries";
-const MAX_TRACE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TRACE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_TRACE_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +26,8 @@ pub struct DeepSweEventTrace {
     schema: String,
     source: DeepSweEventTraceSource,
     events: Vec<DeepSweEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    blobs: Vec<DeepSweEventBlob>,
     integrity_sha256: String,
 }
 
@@ -43,15 +47,40 @@ struct DeepSweEvent {
     payload: Value,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DeepSweEventBlob {
+    blob_id: String,
+    byte_len: u64,
+    sha256: String,
+    media_type: Option<String>,
+    content: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct DeepSweToolExchange {
     pub tool_call_id: String,
     pub command: String,
-    pub result_content: String,
+    pub outcome: DeepSweToolOutcome,
+}
+
+#[derive(Clone, Debug)]
+pub enum DeepSweToolOutcome {
+    Completed(String),
+    Failed,
+    Pending,
 }
 
 #[derive(Serialize)]
 struct DeepSweEventTraceDigest<'a> {
+    schema: &'a str,
+    source: &'a DeepSweEventTraceSource,
+    events: &'a [DeepSweEvent],
+    blobs: &'a [DeepSweEventBlob],
+}
+
+#[derive(Serialize)]
+struct DeepSweEventTraceDigestV1<'a> {
     schema: &'a str,
     source: &'a DeepSweEventTraceSource,
     events: &'a [DeepSweEvent],
@@ -105,13 +134,15 @@ impl DeepSweEventTrace {
                 },
             )
             .collect::<TestResult<Vec<_>>>()?;
+        let blobs = read_referenced_blobs(database, &events)?;
         let mut trace = Self {
-            schema: TRACE_SCHEMA.to_owned(),
+            schema: TRACE_SCHEMA_V2.to_owned(),
             source: DeepSweEventTraceSource {
                 provider_fixture_sha256: provider_fixture_sha256.to_owned(),
                 derivation: TRACE_DERIVATION.to_owned(),
             },
             events,
+            blobs,
             integrity_sha256: String::new(),
         };
         trace.validate(provider_fixture_sha256)?;
@@ -120,6 +151,38 @@ impl DeepSweEventTrace {
     }
 
     pub fn load(
+        path: &Path,
+        expected_file_sha256: &str,
+        expected_provider_sha256: &str,
+        forbidden: &[&str],
+    ) -> TestResult<Self> {
+        let trace = Self::load_envelope(
+            path,
+            expected_file_sha256,
+            expected_provider_sha256,
+            forbidden,
+        )?;
+        trace.validate(expected_provider_sha256)?;
+        Ok(trace)
+    }
+
+    pub fn load_partial_failure_prefix(
+        path: &Path,
+        expected_file_sha256: &str,
+        expected_provider_sha256: &str,
+        forbidden: &[&str],
+    ) -> TestResult<Self> {
+        let trace = Self::load_envelope(
+            path,
+            expected_file_sha256,
+            expected_provider_sha256,
+            forbidden,
+        )?;
+        trace.validate_partial_failure_prefix(expected_provider_sha256)?;
+        Ok(trace)
+    }
+
+    fn load_envelope(
         path: &Path,
         expected_file_sha256: &str,
         expected_provider_sha256: &str,
@@ -138,14 +201,16 @@ impl DeepSweEventTrace {
         }
         reject_forbidden(&bytes, forbidden)?;
         let trace: Self = serde_json::from_slice(&bytes)?;
-        trace.validate(expected_provider_sha256)?;
+        if trace.source.provider_fixture_sha256 != expected_provider_sha256 {
+            return Err(Error::other("DeepSWE event trace envelope is invalid").into());
+        }
         if trace.integrity_sha256 != trace.calculate_integrity()? {
             return Err(Error::other("DeepSWE event trace integrity is invalid").into());
         }
         Ok(trace)
     }
 
-    pub fn promote_immutable(&self, path: &Path, forbidden: &[&str]) -> TestResult<String> {
+    pub fn write_private(&self, path: &Path, forbidden: &[&str]) -> TestResult<String> {
         if path.exists() {
             return Err(Error::other("DeepSWE event trace destination already exists").into());
         }
@@ -172,7 +237,6 @@ impl DeepSweEventTrace {
                 .open(&temporary)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444))?;
             fs::hard_link(&temporary, path)?;
             File::open(parent)?.sync_all()?;
             Ok(())
@@ -208,9 +272,51 @@ impl DeepSweEventTrace {
     }
 
     pub fn tool_exchanges(&self) -> TestResult<Vec<DeepSweToolExchange>> {
-        let mut exchanges = Vec::<DeepSweToolExchange>::new();
+        let exchanges = self.tool_exchanges_allowing_pending()?;
+        if exchanges
+            .iter()
+            .any(|exchange| matches!(exchange.outcome, DeepSweToolOutcome::Pending))
+        {
+            return Err(Error::other("DeepSWE event trace has incomplete tool outcomes").into());
+        }
+        Ok(exchanges)
+    }
+
+    pub fn tool_exchanges_with_trailing_pending(&self) -> TestResult<Vec<DeepSweToolExchange>> {
+        let exchanges = self.tool_exchanges_allowing_pending()?;
+        let pending = exchanges
+            .iter()
+            .enumerate()
+            .filter(|(_, exchange)| matches!(exchange.outcome, DeepSweToolOutcome::Pending))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if pending.as_slice() != [exchanges.len() - 1] {
+            return Err(Error::other(
+                "DeepSWE partial failure prefix must end in exactly one pending tool outcome",
+            )
+            .into());
+        }
+        Ok(exchanges)
+    }
+
+    pub fn trailing_pending_tool_call_id(&self) -> TestResult<String> {
+        let exchanges = self.tool_exchanges_with_trailing_pending()?;
+        Ok(exchanges
+            .last()
+            .expect("partial DeepSWE trace has one pending tool")
+            .tool_call_id
+            .clone())
+    }
+
+    fn tool_exchanges_allowing_pending(&self) -> TestResult<Vec<DeepSweToolExchange>> {
+        let blobs = self
+            .blobs
+            .iter()
+            .map(|blob| (blob.blob_id.as_str(), blob))
+            .collect::<HashMap<_, _>>();
+        let mut inputs = Vec::<(String, String)>::new();
         let mut indexes = HashMap::<String, usize>::new();
-        let mut completed = Vec::<bool>::new();
+        let mut outcomes = Vec::<Option<DeepSweToolOutcome>>::new();
         for event in &self.events {
             match event.event_type.as_str() {
                 "async_tool_call_started" => {
@@ -229,35 +335,57 @@ impl DeepSweEventTrace {
                         )
                         .into());
                     }
-                    indexes.insert(tool_call_id.to_owned(), exchanges.len());
-                    exchanges.push(DeepSweToolExchange {
-                        tool_call_id: tool_call_id.to_owned(),
-                        command: command.to_owned(),
-                        result_content: String::new(),
-                    });
-                    completed.push(false);
+                    indexes.insert(tool_call_id.to_owned(), inputs.len());
+                    inputs.push((tool_call_id.to_owned(), command.to_owned()));
+                    outcomes.push(None);
                 }
                 "async_tool_call_completed" => {
                     let tool_call_id = required_string(&event.payload, "/tool_call_id")?;
                     let index = indexes.get(tool_call_id).copied().ok_or_else(|| {
                         Error::other("DeepSWE tool completion has no matching start")
                     })?;
-                    if completed[index] {
-                        return Err(
-                            Error::other("DeepSWE event trace repeats a tool completion").into(),
-                        );
+                    if outcomes[index].is_some() {
+                        return Err(Error::other(
+                            "DeepSWE event trace repeats a terminal tool outcome",
+                        )
+                        .into());
                     }
-                    exchanges[index].result_content =
-                        required_string(&event.payload, "/result/Inline/content")?.to_owned();
-                    completed[index] = true;
+                    outcomes[index] = Some(DeepSweToolOutcome::Completed(tool_result_content(
+                        &event.payload,
+                        tool_call_id,
+                        &blobs,
+                    )?));
+                }
+                "async_tool_call_failed" => {
+                    let tool_call_id = required_string(&event.payload, "/tool_call_id")?;
+                    let index = indexes.get(tool_call_id).copied().ok_or_else(|| {
+                        Error::other("DeepSWE tool failure has no matching start")
+                    })?;
+                    if outcomes[index].is_some() {
+                        return Err(Error::other(
+                            "DeepSWE event trace repeats a terminal tool outcome",
+                        )
+                        .into());
+                    }
+                    let _ = required_string(&event.payload, "/error/class")?;
+                    let _ = required_string(&event.payload, "/error/message")?;
+                    outcomes[index] = Some(DeepSweToolOutcome::Failed);
                 }
                 _ => {}
             }
         }
-        if exchanges.is_empty() || completed.iter().any(|value| !value) {
-            return Err(Error::other("DeepSWE event trace has incomplete tool outcomes").into());
+        if inputs.is_empty() {
+            return Err(Error::other("DeepSWE event trace has no tool exchanges").into());
         }
-        Ok(exchanges)
+        Ok(inputs
+            .into_iter()
+            .zip(outcomes)
+            .map(|((tool_call_id, command), outcome)| DeepSweToolExchange {
+                tool_call_id,
+                command,
+                outcome: outcome.unwrap_or(DeepSweToolOutcome::Pending),
+            })
+            .collect())
     }
 
     pub fn assert_matches_stopped_database(&self, database: &Path) -> TestResult<()> {
@@ -294,6 +422,11 @@ impl DeepSweEventTrace {
                 .into());
             }
         }
+        if self.blobs != actual.blobs {
+            return Err(
+                Error::other("DeepSWE event replay produced a different blob closure").into(),
+            );
+        }
         Ok(())
     }
 
@@ -306,15 +439,37 @@ impl DeepSweEventTrace {
     }
 
     fn calculate_integrity(&self) -> TestResult<String> {
-        Ok(sha256_hex(&serde_json::to_vec(&DeepSweEventTraceDigest {
-            schema: &self.schema,
-            source: &self.source,
-            events: &self.events,
-        })?))
+        let bytes = if self.schema == TRACE_SCHEMA_V1 {
+            serde_json::to_vec(&DeepSweEventTraceDigestV1 {
+                schema: &self.schema,
+                source: &self.source,
+                events: &self.events,
+            })?
+        } else {
+            serde_json::to_vec(&DeepSweEventTraceDigest {
+                schema: &self.schema,
+                source: &self.source,
+                events: &self.events,
+                blobs: &self.blobs,
+            })?
+        };
+        Ok(sha256_hex(&bytes))
     }
 
     fn validate(&self, expected_provider_sha256: &str) -> TestResult<()> {
-        if self.schema != TRACE_SCHEMA
+        self.validate_with_tool_mode(expected_provider_sha256, false)
+    }
+
+    fn validate_partial_failure_prefix(&self, expected_provider_sha256: &str) -> TestResult<()> {
+        self.validate_with_tool_mode(expected_provider_sha256, true)
+    }
+
+    fn validate_with_tool_mode(
+        &self,
+        expected_provider_sha256: &str,
+        allow_trailing_pending: bool,
+    ) -> TestResult<()> {
+        if !matches!(self.schema.as_str(), TRACE_SCHEMA_V1 | TRACE_SCHEMA_V2)
             || self.source.derivation != TRACE_DERIVATION
             || self.source.provider_fixture_sha256 != expected_provider_sha256
             || self.events.is_empty()
@@ -334,8 +489,39 @@ impl DeepSweEventTrace {
                 return Err(Error::other("DeepSWE event trace sequence is invalid").into());
             }
         }
+        let referenced = referenced_blob_metadata(&self.events)?;
+        if self.schema == TRACE_SCHEMA_V1 {
+            if !referenced.is_empty() || !self.blobs.is_empty() {
+                return Err(
+                    Error::other("DeepSWE v1 event trace cannot contain blob references").into(),
+                );
+            }
+        } else {
+            let mut observed = BTreeMap::new();
+            let mut total_bytes = 0_u64;
+            for blob in &self.blobs {
+                validate_trace_blob(blob)?;
+                total_bytes = total_bytes
+                    .checked_add(blob.byte_len)
+                    .ok_or_else(|| Error::other("DeepSWE blob closure byte count overflowed"))?;
+                if total_bytes > MAX_TRACE_BLOB_BYTES
+                    || observed
+                        .insert(blob.blob_id.clone(), blob_metadata(blob))
+                        .is_some()
+                {
+                    return Err(Error::other("DeepSWE event trace blob closure is invalid").into());
+                }
+            }
+            if observed != referenced {
+                return Err(Error::other("DeepSWE event trace blob closure is incomplete").into());
+            }
+        }
         let _ = self.instruction()?;
-        let _ = self.tool_exchanges()?;
+        if allow_trailing_pending {
+            let _ = self.tool_exchanges_with_trailing_pending()?;
+        } else {
+            let _ = self.tool_exchanges()?;
+        }
         Ok(())
     }
 }
@@ -439,6 +625,156 @@ fn required_string<'a>(value: &'a Value, pointer: &str) -> TestResult<&'a str> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| Error::other(format!("DeepSWE event trace is missing {pointer}")).into())
+}
+
+fn tool_result_content(
+    payload: &Value,
+    tool_call_id: &str,
+    blobs: &HashMap<&str, &DeepSweEventBlob>,
+) -> TestResult<String> {
+    if let Some(content) = payload
+        .pointer("/result/Inline/content")
+        .and_then(Value::as_str)
+    {
+        return Ok(content.to_owned());
+    }
+    let blob_id = required_string(payload, "/result/BlobRef/blob_id")?;
+    let blob = blobs.get(blob_id).copied().ok_or_else(|| {
+        Error::other(format!(
+            "DeepSWE tool result {tool_call_id} references a missing blob"
+        ))
+    })?;
+    Ok(blob.content.clone())
+}
+
+fn read_referenced_blobs(
+    database: &Path,
+    events: &[DeepSweEvent],
+) -> TestResult<Vec<DeepSweEventBlob>> {
+    let referenced = referenced_blob_metadata(events)?;
+    let directory = database
+        .parent()
+        .ok_or_else(|| Error::other("DeepSWE database has no parent directory"))?
+        .join("blobs");
+    let mut blobs = Vec::with_capacity(referenced.len());
+    let mut total_bytes = 0_u64;
+    for (blob_id, metadata) in referenced {
+        total_bytes = total_bytes
+            .checked_add(metadata.byte_len)
+            .ok_or_else(|| Error::other("DeepSWE blob closure byte count overflowed"))?;
+        if total_bytes > MAX_TRACE_BLOB_BYTES {
+            return Err(
+                Error::other("DeepSWE event trace blob closure exceeds its byte bound").into(),
+            );
+        }
+        let path = directory.join(&blob_id);
+        let file_metadata = fs::symlink_metadata(&path)?;
+        if file_metadata.file_type().is_symlink()
+            || !file_metadata.is_file()
+            || file_metadata.len() != metadata.byte_len
+        {
+            return Err(Error::other("DeepSWE referenced blob is invalid").into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if file_metadata.nlink() != 1 || file_metadata.mode() & 0o777 != 0o600 {
+                return Err(Error::other("DeepSWE referenced blob permissions are invalid").into());
+            }
+        }
+        let content = String::from_utf8(fs::read(path)?)
+            .map_err(|_| Error::other("DeepSWE referenced tool blob is not UTF-8"))?;
+        let blob = DeepSweEventBlob {
+            blob_id,
+            byte_len: metadata.byte_len,
+            sha256: metadata.sha256,
+            media_type: metadata.media_type,
+            content,
+        };
+        validate_trace_blob(&blob)?;
+        blobs.push(blob);
+    }
+    Ok(blobs)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReferencedBlobMetadata {
+    byte_len: u64,
+    sha256: String,
+    media_type: Option<String>,
+}
+
+fn referenced_blob_metadata(
+    events: &[DeepSweEvent],
+) -> TestResult<BTreeMap<String, ReferencedBlobMetadata>> {
+    let mut referenced = BTreeMap::new();
+    for event in events {
+        collect_blob_metadata(&event.payload, &mut referenced)?;
+    }
+    Ok(referenced)
+}
+
+fn collect_blob_metadata(
+    value: &Value,
+    referenced: &mut BTreeMap<String, ReferencedBlobMetadata>,
+) -> TestResult<()> {
+    match value {
+        Value::Object(object) => {
+            if let Some(blob) = object.get("BlobRef") {
+                let blob_id = required_string(blob, "/blob_id")?.to_owned();
+                let byte_len = blob
+                    .pointer("/byte_len")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| Error::other("DeepSWE BlobRef has no byte_len"))?;
+                let sha256 = required_string(blob, "/sha256")?.to_owned();
+                let media_type = match blob.get("media_type") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
+                    _ => return Err(Error::other("DeepSWE BlobRef has invalid media_type").into()),
+                };
+                let metadata = ReferencedBlobMetadata {
+                    byte_len,
+                    sha256,
+                    media_type,
+                };
+                if referenced
+                    .insert(blob_id, metadata.clone())
+                    .is_some_and(|existing| existing != metadata)
+                {
+                    return Err(Error::other("DeepSWE BlobRef metadata conflicts").into());
+                }
+            }
+            for child in object.values() {
+                collect_blob_metadata(child, referenced)?;
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_blob_metadata(child, referenced)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn blob_metadata(blob: &DeepSweEventBlob) -> ReferencedBlobMetadata {
+    ReferencedBlobMetadata {
+        byte_len: blob.byte_len,
+        sha256: blob.sha256.clone(),
+        media_type: blob.media_type.clone(),
+    }
+}
+
+fn validate_trace_blob(blob: &DeepSweEventBlob) -> TestResult<()> {
+    let digest = format!("sha256:{}", sha256_hex(blob.content.as_bytes()));
+    if blob.blob_id != digest
+        || blob.sha256 != digest
+        || blob.byte_len != u64::try_from(blob.content.len())?
+    {
+        return Err(Error::other("DeepSWE event trace blob integrity is invalid").into());
+    }
+    Ok(())
 }
 
 fn value_digest(value: &Value) -> TestResult<String> {

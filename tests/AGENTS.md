@@ -101,11 +101,48 @@ recording, fixture promotion, and replay.
   maintain a parallel shell transcript or import recorded events into storage.
   The provider cassette supplements only exact provider HTTP bytes that the
   product intentionally does not persist in events.
+- Tool results in that manifest include both successful completions and failed
+  external-adapter outcomes. The real replay adapter must reproduce the same
+  terminal class, and the new Endpoint must independently project the matching
+  durable tool state. The real-process regression anchor is
+  `e2e_deepswe_failed_tool_outcome_is_recorded_and_replayed`.
+- The canonical DeepSWE correctness replay reports elapsed time without a
+  machine-specific limit. Local performance diagnosis may explicitly set
+  `ZODE_DEEPSWE_REPLAY_MAX_MS` to turn a measured regression into a typed red;
+  the same explicit budget must be used before and after a performance repair.
+  `ZODE_DEEPSWE_REPLAY_MAX_LOAD_MS` separately bounds validation and loading of
+  the pinned event trace plus provider replay index.
+  `ZODE_DEEPSWE_REPLAY_MAX_ORDINARY_BOUNDARY_MS` similarly bounds the aggregate
+  ordinary provider/tool transition time while excluding recorded retry
+  backoff. `ZODE_DEEPSWE_REPLAY_MAX_FIXTURE_START_MS` isolates duplicate
+  cassette validation and fixture startup from both measures.
+  `ZODE_DEEPSWE_REPLAY_MAX_RETAINED_REQUEST_BYTES` bounds the replay index's
+  retained request-matching representation after cassette validation; response
+  bytes are excluded because the fixture must still deliver them.
+  `ZODE_DEEPSWE_REPLAY_MAX_DATABASE_BYTES` bounds the stopped Endpoint's SQLite
+  file set so a diagnostic snapshot cadence cannot silently duplicate the
+  growing long-task state throughout an otherwise-correct replay.
+- DeepSWE live and replay runs use the production snapshot policy by default.
+  `ZODE_DEEPSWE_SNAPSHOT_EVERY_EVENTS=off|N` is an explicit diagnostic override;
+  the generic short-E2E cadence of one snapshot per event must not leak into a
+  long benchmark.
 - Successful recordings may stay as ignored run artifacts. A recorded problem
   may not remain only in a live log: promote the sanitized cassette under
   `tests/fixtures/provider_recordings/`, bind it to a named real-process E2E,
   replay the original failure red, and use that exact cassette for the green
   regression after repair.
+- A scored DeepSWE attempt must end with a normal `finished` activation. A
+  terminal provider failure, exhausted model attempts, context-handoff failure,
+  recorder failure, or other harness/runtime error is an invalid run: preserve
+  its evidence and retry the same logical attempt without adding a zero to the
+  score. `e2e_deepswe_terminal_model_failure_is_not_scoreable` proves this at
+  the real Endpoint/provider/tool boundary.
+- Ordinary provider recordings keep their existing response-byte and frame
+  bounds. DeepSWE's single-session live recorder uses the self-describing
+  `long_run` envelope class sized from the approved 128,000-token output
+  allowance; `e2e_long_run_llm_recorder_records_and_replays_reasoning_stream_above_ordinary_bound`
+  proves a response above both ordinary bounds survives private persistence and
+  real Endpoint/aimux replay without weakening the ordinary fail-closed case.
 - Terminal recorder-flush failures use
   `e2e_later_test_reproduction_of_terminal_flush_gap_is_bounded_and_captured`:
   arm `ProcessCaptureSet` before Endpoint spawn, bound the public SSE failure
@@ -177,6 +214,12 @@ recording, fixture promotion, and replay.
   e2e_recorded_opencode_provider_roundtrip_and_restart -- --exact --nocapture`
   is the offline replay gate once the reviewed recording exists. Captured
   timing is opt-in; immediate replay is the default regression mode.
+- `cargo test --release --locked --test deepswe_e2e
+  e2e_recorded_deepswe_long_run_replays_through_real_endpoint -- --exact
+  --nocapture` is the canonical 1,442-event DeepSWE replay gate. The optimized
+  profile changes no assertions or replay semantics; it prevents debug-only
+  hashing and serialization overhead from dominating the long real-process
+  scenario.
 - `cargo fmt --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `rg '#\[cfg\(test\)\]|#\[test\]|#\[tokio::test\]' src --glob '*.rs'` must return no

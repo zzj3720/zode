@@ -4,8 +4,8 @@ pub(super) async fn materialize_boundary(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
-    state: crate::domain::SessionState,
-) -> Result<(Option<AppendResult>, crate::domain::SessionState), &'static str> {
+    state: VerifiedSessionState,
+) -> Result<(Option<AppendResult>, VerifiedSessionState), &'static str> {
     tokio::task::spawn_blocking(move || {
         materialize_boundary_blocking(&*store, &owner, &session_id, state)
     })
@@ -17,8 +17,8 @@ pub(super) fn materialize_boundary_blocking(
     store: &dyn EventStore,
     owner: &SessionOwner,
     session_id: &str,
-    mut state: crate::domain::SessionState,
-) -> Result<(Option<AppendResult>, crate::domain::SessionState), &'static str> {
+    mut state: VerifiedSessionState,
+) -> Result<(Option<AppendResult>, VerifiedSessionState), &'static str> {
     for _ in 0..16 {
         let Some(last_delivery) = state.delivery_queue.last() else {
             return Ok((None, state));
@@ -56,22 +56,11 @@ pub(super) fn materialize_boundary_blocking(
             SessionEvent::DeliveryAcknowledged { through_queue_id },
         ));
         let command_id = format!("delivery-boundary:v1:{through_queue_id}");
-        match store.append_owned(
-            owner,
-            session_id,
-            state.stream_version,
-            &command_id,
-            &drafts,
-        ) {
-            Ok(append) => {
-                let state = store
-                    .rehydrate_owned(owner, session_id)
-                    .map_err(|_| "materialize_rehydrate")?;
-                return Ok((Some(append), state));
-            }
+        match store.append_verified_owned(owner, session_id, state, &command_id, &drafts) {
+            Ok(appended) => return Ok((Some(appended.append), appended.state)),
             Err(StoreError::OptimisticConcurrency { .. }) => {
                 state = store
-                    .rehydrate_owned(owner, session_id)
+                    .rehydrate_verified_owned(owner, session_id)
                     .map_err(|_| "materialize_rehydrate")?;
             }
             Err(error) => {
@@ -129,10 +118,11 @@ pub(super) async fn append_tool_batch(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
+    state: VerifiedSessionState,
     input: ToolBatchInput,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     tokio::task::spawn_blocking(move || {
-        append_tool_batch_blocking(&*store, &owner, &session_id, &input)
+        append_tool_batch_blocking(&*store, &owner, &session_id, state, &input)
     })
     .await
     .map_err(|_| "tool_batch_join")?
@@ -142,8 +132,9 @@ pub(super) fn append_tool_batch_blocking(
     store: &dyn EventStore,
     owner: &SessionOwner,
     session_id: &str,
+    mut state: VerifiedSessionState,
     input: &ToolBatchInput,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     let ToolBatchInput {
         round_identity,
         assistant_content,
@@ -162,10 +153,15 @@ pub(super) fn append_tool_batch_blocking(
         dedupe_key: Some(command_id.clone()),
         source_queue_id: None,
     };
+    let definitions_by_name = definitions
+        .iter()
+        .map(|definition| (definition.name.as_str(), definition))
+        .collect::<HashMap<_, _>>();
+    let callback_plans_by_id = callback_plans
+        .iter()
+        .map(|plan| (plan.tool_call_id.as_str(), plan))
+        .collect::<HashMap<_, _>>();
     for _ in 0..16 {
-        let state = store
-            .rehydrate_owned(owner, session_id)
-            .map_err(|_| "tool_batch_rehydrate")?;
         if let Some(existing) = state
             .transcript
             .iter()
@@ -188,14 +184,6 @@ pub(super) fn append_tool_batch_blocking(
             return Ok((replayed_append(session_id, &command_id, &state), state));
         }
         let started_at_ms = current_time_ms();
-        let definitions = definitions
-            .iter()
-            .map(|definition| (definition.name.as_str(), definition))
-            .collect::<HashMap<_, _>>();
-        let callback_plans = callback_plans
-            .iter()
-            .map(|plan| (plan.tool_call_id.as_str(), plan))
-            .collect::<HashMap<_, _>>();
         let mut drafts = vec![EventDraft::new(
             format!("model-tool-batch-assistant-event:v1:{identity}"),
             SessionEvent::MessageAppended {
@@ -207,7 +195,7 @@ pub(super) fn append_tool_batch_blocking(
             .iter()
             .filter(|call| call.tool_name != WAIT_FOR_TOOL_NAME)
         {
-            let definition = definitions.get(call.tool_name.as_str());
+            let definition = definitions_by_name.get(call.tool_name.as_str());
             let record = AsyncToolCallRecord {
                 tool_call_id: call.tool_call_id.clone(),
                 tool_name: call.tool_name.clone(),
@@ -237,7 +225,7 @@ pub(super) fn append_tool_batch_blocking(
             if definition.is_some_and(|definition| {
                 definition.completion_mode == CompletionMode::ExternalCallback
             }) {
-                let Some(plan) = callback_plans.get(call.tool_call_id.as_str()) else {
+                let Some(plan) = callback_plans_by_id.get(call.tool_call_id.as_str()) else {
                     return Err("tool_batch_callback_plan");
                 };
                 drafts.push(EventDraft::new(
@@ -257,20 +245,13 @@ pub(super) fn append_tool_batch_blocking(
                 },
             ));
         }
-        match store.append_owned(
-            owner,
-            session_id,
-            state.stream_version,
-            &command_id,
-            &drafts,
-        ) {
-            Ok(append) => {
-                let state = store
-                    .rehydrate_owned(owner, session_id)
+        match store.append_verified_owned(owner, session_id, state, &command_id, &drafts) {
+            Ok(appended) => return Ok((appended.append, appended.state)),
+            Err(StoreError::OptimisticConcurrency { .. }) => {
+                state = store
+                    .rehydrate_verified_owned(owner, session_id)
                     .map_err(|_| "tool_batch_rehydrate")?;
-                return Ok((append, state));
             }
-            Err(StoreError::OptimisticConcurrency { .. }) => continue,
             Err(_) => return Err("tool_batch_append"),
         }
     }
@@ -281,15 +262,17 @@ pub(super) async fn append_tool_results(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
+    state: VerifiedSessionState,
     batch_identity: String,
     tool_calls: Vec<ToolCall>,
     results: Vec<Result<ToolExecutionResult, ToolError>>,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     tokio::task::spawn_blocking(move || {
         append_tool_results_blocking(
             &*store,
             &owner,
             &session_id,
+            state,
             &batch_identity,
             &tool_calls,
             &results,
@@ -303,18 +286,16 @@ pub(super) fn append_tool_results_blocking(
     store: &dyn EventStore,
     owner: &SessionOwner,
     session_id: &str,
+    mut state: VerifiedSessionState,
     batch_identity: &str,
     tool_calls: &[ToolCall],
     results: &[Result<ToolExecutionResult, ToolError>],
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     let result_message_ids = tool_calls
         .iter()
         .map(|call| tool_result_message_id(batch_identity, &call.tool_call_id))
         .collect::<Vec<_>>();
     for _ in 0..16 {
-        let state = store
-            .rehydrate_owned(owner, session_id)
-            .map_err(|_| "tool_results_rehydrate")?;
         let all_messages_present = result_message_ids.iter().all(|message_id| {
             state
                 .transcript
@@ -511,20 +492,13 @@ pub(super) fn append_tool_results_blocking(
             ));
         }
         let command_id = format!("tool-results-command:v1:{batch_identity}");
-        match store.append_owned(
-            owner,
-            session_id,
-            state.stream_version,
-            &command_id,
-            &drafts,
-        ) {
-            Ok(append) => {
-                let state = store
-                    .rehydrate_owned(owner, session_id)
+        match store.append_verified_owned(owner, session_id, state, &command_id, &drafts) {
+            Ok(appended) => return Ok((appended.append, appended.state)),
+            Err(StoreError::OptimisticConcurrency { .. }) => {
+                state = store
+                    .rehydrate_verified_owned(owner, session_id)
                     .map_err(|_| "tool_results_rehydrate")?;
-                return Ok((append, state));
             }
-            Err(StoreError::OptimisticConcurrency { .. }) => continue,
             Err(_) => return Err("tool_results_append"),
         }
     }
@@ -578,7 +552,6 @@ pub(super) fn append_background_tool_result_blocking(
         "tool-async-result-command:v1:{batch_identity}:{}",
         call.tool_call_id
     );
-    let result_value = serde_json::to_value(&payload).map_err(|_| "background_tool_payload")?;
     for _ in 0..16 {
         let state = store
             .rehydrate_owned(owner, session_id)
@@ -620,17 +593,14 @@ pub(super) fn append_background_tool_result_blocking(
                 },
             ));
         }
+        // The terminal async-tool event is the sole durable authority for the
+        // result, status, and error.  The wakeable delivery carries only the
+        // fields needed to materialize the next runtime transcript message;
+        // copying the result here can make one otherwise-bounded inline tool
+        // response exceed the delivery envelope bound.
         let delivery_payload = DurablePayload::inline(json!({
             "message_id": message_id.clone(),
             "content": content.clone(),
-            "tool_call_id": call.tool_call_id.clone(),
-            "status": if is_failure { "failed" } else { "completed" },
-            "result": if is_failure { Value::Null } else { result_value.clone() },
-            "error": if is_failure {
-                serde_json::to_value(error.clone()).unwrap_or(Value::Null)
-            } else {
-                Value::Null
-            },
         }))
         .map_err(|_| "background_tool_delivery")?;
         drafts.push(EventDraft::new(
@@ -655,19 +625,8 @@ pub(super) fn append_background_tool_result_blocking(
                 },
             },
         ));
-        match store.append_owned(
-            owner,
-            session_id,
-            state.stream_version,
-            &command_id,
-            &drafts,
-        ) {
-            Ok(append) => {
-                let state = store
-                    .rehydrate_owned(owner, session_id)
-                    .map_err(|_| "background_tool_rehydrate")?;
-                return Ok(Some((append, state)));
-            }
+        match store.append_owned(owner, session_id, &state, &command_id, &drafts) {
+            Ok(appended) => return Ok(Some((appended.append, appended.state.into_state()))),
             Err(StoreError::OptimisticConcurrency { .. }) => continue,
             Err(StoreError::CommandIdempotencyConflict { .. })
             | Err(StoreError::EventIdempotencyConflict { .. }) => continue,
@@ -751,11 +710,19 @@ pub(super) async fn append_assistant(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
+    state: VerifiedSessionState,
     trigger_message_id: String,
     content: String,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     tokio::task::spawn_blocking(move || {
-        append_assistant_blocking(&*store, &owner, &session_id, &trigger_message_id, &content)
+        append_assistant_blocking(
+            &*store,
+            &owner,
+            &session_id,
+            state,
+            &trigger_message_id,
+            &content,
+        )
     })
     .await
     .map_err(|_| "assistant_join")?
@@ -765,9 +732,10 @@ pub(super) fn append_assistant_blocking(
     store: &dyn EventStore,
     owner: &SessionOwner,
     session_id: &str,
+    mut state: VerifiedSessionState,
     trigger_message_id: &str,
     content: &str,
-) -> Result<(AppendResult, SessionState), &'static str> {
+) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     let identity = assistant_identity(owner, session_id, trigger_message_id);
     let command_id = format!("model-assistant-command:v1:{identity}");
     let event_id = format!("model-assistant-event:v1:{identity}");
@@ -782,9 +750,6 @@ pub(super) fn append_assistant_blocking(
     };
 
     for _ in 0..16 {
-        let state = store
-            .rehydrate_owned(owner, session_id)
-            .map_err(|_| "assistant_rehydrate")?;
         if let Some(existing) = state
             .transcript
             .iter()
@@ -831,20 +796,13 @@ pub(super) fn append_assistant_blocking(
                 wake_wait: false,
             },
         ));
-        match store.append_owned(
-            owner,
-            session_id,
-            state.stream_version,
-            &command_id,
-            &drafts,
-        ) {
-            Ok(append) => {
-                let state = store
-                    .rehydrate_owned(owner, session_id)
+        match store.append_verified_owned(owner, session_id, state, &command_id, &drafts) {
+            Ok(appended) => return Ok((appended.append, appended.state)),
+            Err(StoreError::OptimisticConcurrency { .. }) => {
+                state = store
+                    .rehydrate_verified_owned(owner, session_id)
                     .map_err(|_| "assistant_rehydrate")?;
-                return Ok((append, state));
             }
-            Err(StoreError::OptimisticConcurrency { .. }) => continue,
             Err(_) => return Err("assistant_append"),
         }
     }
