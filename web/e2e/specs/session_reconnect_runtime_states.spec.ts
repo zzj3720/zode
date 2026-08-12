@@ -2984,8 +2984,8 @@ test.describe("session reconnect and runtime states", () => {
         "browser reconnect cursor consumption barrier",
       );
       await expect(
-        page.getByLabel(new RegExp(`model ${REPLAY_HISTORY_MODEL}`, "i")),
-      ).toBeVisible({ timeout: 30_000 });
+        page.getByRole("button", { name: "Choose model", exact: true }),
+      ).toContainText(REPLAY_HISTORY_MODEL, { timeout: 30_000 });
 
       const publishedBeforeOutage = new Set(
         topology.endpointBoundary.eventRequests().flatMap((request) => request.responseEventIds),

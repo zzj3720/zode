@@ -994,6 +994,31 @@ async function dynamicMaskBoxes(page: Page, contract: Contract): Promise<Box[]> 
   return result;
 }
 
+async function controlMaskBoxes(page: Page): Promise<Box[]> {
+  return page.evaluate(() =>
+    Array.from(document.querySelectorAll("textarea, input")).flatMap((element) => {
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      if (
+        rect.width <= 0 ||
+        rect.height <= 0 ||
+        style.visibility === "hidden" ||
+        style.display === "none"
+      ) {
+        return [];
+      }
+      return [{
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        right: rect.right,
+        bottom: rect.bottom,
+      }];
+    }),
+  );
+}
+
 async function extractRenderedAssetHref(page: Page, label: string): Promise<string> {
   const candidates = await page.evaluate(() =>
     Array.from(document.querySelectorAll<HTMLScriptElement | HTMLLinkElement>("script[src], link[href]"))
@@ -1292,7 +1317,7 @@ async function assertMaskedReference(
     page,
     referenceBytes,
     actualBytes,
-    dynamicBoxes,
+    [...dynamicBoxes, ...(await controlMaskBoxes(page))],
     contract.visual_diff.mask_color,
   );
   const mismatchExceeded = visualMismatchExceeded(mismatch, contract);

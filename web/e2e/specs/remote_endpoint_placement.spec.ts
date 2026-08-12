@@ -880,7 +880,7 @@ async function addRemoteEndpoint(
     elements.map((element) => (element as HTMLInputElement).value),
   );
   expect(secretValues.every((value) => value === "")).toBe(true);
-  await expect(page.getByText(REMOTE_LABEL, { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: REMOTE_LABEL, exact: true })).toBeVisible();
   return endpoint;
 }
 

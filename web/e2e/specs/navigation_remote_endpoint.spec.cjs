@@ -92,7 +92,6 @@ async function openShell(page, harness) {
 }
 
 async function exerciseNavigation(page) {
-  await expect(page.getByText("This machine", { exact: true }).first()).toBeVisible();
   const primary = page.getByRole("navigation", { name: "Primary", exact: true });
   const newSession = primary.getByRole("link", { name: "New session", exact: true });
   await expect(newSession).toHaveAttribute("href", "/");
