@@ -520,6 +520,8 @@ class Controller:
             "capacity_cpus",
             "capacity_memory_mb",
             "retry_lanes",
+            "hold_tasks",
+            "release_tasks",
         }
         unknown = set(value) - allowed
         if unknown:
@@ -551,9 +553,23 @@ class Controller:
             or len(set(retry_lanes)) != len(retry_lanes)
         ):
             raise ValueError("retry_lanes must contain unique lane numbers 1 through 3")
+        hold_tasks = value.get("hold_tasks", [])
+        release_tasks = value.get("release_tasks", [])
+        for field, tasks in (
+            ("hold_tasks", hold_tasks),
+            ("release_tasks", release_tasks),
+        ):
+            if (
+                not isinstance(tasks, list)
+                or any(not isinstance(task, str) or not task for task in tasks)
+                or len(set(tasks)) != len(tasks)
+            ):
+                raise ValueError(f"{field} must contain unique non-empty task names")
+        if set(hold_tasks) & set(release_tasks):
+            raise ValueError("a task cannot be held and released in one request")
 
         def mutation(queue: dict[str, Any]) -> dict[str, Any]:
-            for field in allowed - {"retry_lanes"}:
+            for field in allowed - {"retry_lanes", "hold_tasks", "release_tasks"}:
                 if field in value:
                     queue["control"][field] = value[field]
             for lane in retry_lanes:
@@ -563,6 +579,24 @@ class Controller:
                 if lease.get("active_pair") is not None:
                     raise ValueError(f"lane {lane} still has an active pair")
                 lease["attention"] = None
+            held_tasks = queue.setdefault("held_tasks", {})
+            for task in hold_tasks:
+                pending_index = next(
+                    (
+                        index
+                        for index, entry in enumerate(queue["pending"])
+                        if entry["task"] == task
+                    ),
+                    None,
+                )
+                if pending_index is None:
+                    raise ValueError(f"task {task} is not pending")
+                held_tasks[task] = queue["pending"].pop(pending_index)
+            for task in reversed(release_tasks):
+                entry = held_tasks.pop(task, None)
+                if entry is None:
+                    raise ValueError(f"task {task} is not held")
+                queue["pending"].insert(0, entry)
             queue["control"]["changed_at"] = now()
             return dict(queue["control"])
 
@@ -1295,7 +1329,11 @@ class Controller:
         try:
             while not self.stop.wait(1):
                 queue = self.store.read()
-                if not queue["pending"] and not queue["leases"]:
+                if (
+                    not queue["pending"]
+                    and not queue["leases"]
+                    and not queue.get("held_tasks")
+                ):
                     self.stop.set()
                     break
                 if not any(worker.is_alive() for worker in workers):
@@ -1395,6 +1433,7 @@ def initialize_run(args: argparse.Namespace) -> None:
             "pause_reason": "initialized_paused" if args.start_paused else None,
         },
         "pending": [task.queue_value() for task in runnable],
+        "held_tasks": {},
         "leases": {},
         "completed_tasks": [],
         "unsupported": [
