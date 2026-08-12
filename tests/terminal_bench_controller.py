@@ -981,9 +981,47 @@ class Controller:
                     },
                 }
             self.persist_state()
-            return_codes = {
-                agent: process.wait() for agent, process in processes.items()
-            }
+            return_codes: dict[str, int] = {}
+            while len(return_codes) != len(processes):
+                for agent, process in processes.items():
+                    if agent in return_codes:
+                        continue
+                    code = process.poll()
+                    if code is None:
+                        continue
+                    return_codes[agent] = code
+                    with self.state_lock:
+                        active_state = self.state["active_processes"].get(str(lane))
+                        if active_state is not None:
+                            active_state.setdefault("finished", {})[agent] = {
+                                "at": now(),
+                                "return_code": code,
+                            }
+                    self.persist_state()
+                if (
+                    any(code != 0 for code in return_codes.values())
+                    or self.stop.is_set()
+                ):
+                    for agent, process in processes.items():
+                        if agent in return_codes or process.poll() is not None:
+                            continue
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                    for agent, process in processes.items():
+                        if agent in return_codes:
+                            continue
+                        try:
+                            return_codes[agent] = process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            return_codes[agent] = process.wait()
+                    break
+                self.stop.wait(0.5)
         finally:
             for log in logs.values():
                 log.close()
