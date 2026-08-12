@@ -572,6 +572,8 @@ class Controller:
             for field in allowed - {"retry_lanes", "hold_tasks", "release_tasks"}:
                 if field in value:
                     queue["control"][field] = value[field]
+            if value.get("paused") is False:
+                queue["control"]["pause_reason"] = None
             for lane in retry_lanes:
                 lease = queue["leases"].get(str(lane))
                 if lease is None or lease.get("attention") is None:
