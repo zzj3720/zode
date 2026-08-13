@@ -58,8 +58,8 @@ use crate::domain::{
     ContextHandoffDocument, ContextHandoffPlan, DeliveryKind, DurablePayload, EventDraft,
     EventRecord, ModelAttemptError, ModelAttemptErrorClass, ModelAttemptFailure,
     ModelRequestPurpose, ModelRetrySchedule, ModelUsageAnchor, SessionEvent, SessionModelSelection,
-    SessionOwner, SessionSelection, SessionState, ToolCall, ToolError as DomainToolError,
-    TranscriptMessage, TranscriptRole, WaitSource, WAIT_MAX_SECONDS, WAIT_MIN_SECONDS,
+    SessionOwner, SessionState, ToolCall, ToolError as DomainToolError, TranscriptMessage,
+    TranscriptRole, WaitSource, WAIT_MAX_SECONDS, WAIT_MIN_SECONDS,
 };
 
 #[derive(Debug)]
@@ -863,7 +863,6 @@ impl Runtime {
                 owner.clone(),
                 session_id.clone(),
                 &state,
-                &state.selection,
             )
             .await?;
             self.observe_commit(&append, &next_state).await;

@@ -20,41 +20,14 @@ pub(super) fn materialize_boundary_blocking(
     mut state: VerifiedSessionState,
 ) -> Result<(Option<AppendResult>, VerifiedSessionState), &'static str> {
     for _ in 0..16 {
-        let Some(last_delivery) = state.delivery_queue.last() else {
+        let Some(through_queue_id) = state
+            .delivery_queue
+            .last()
+            .map(|delivery| delivery.queue_id)
+        else {
             return Ok((None, state));
         };
-        let through_queue_id = last_delivery.queue_id;
-        let mut drafts = Vec::new();
-        for delivery in &state.delivery_queue {
-            if delivery.materialized_message_id.is_some() {
-                continue;
-            }
-            let candidate = materialize_message(delivery)?;
-            // Callback completion atomically appends its terminal Tool
-            // transcript message together with the wakeable delivery.  The
-            // delivery acknowledges that existing message; it must not try
-            // to materialize a second Runtime row with the same ID.
-            let message = state
-                .transcript
-                .iter()
-                .find(|existing| {
-                    existing.message_id == candidate.message_id
-                        && existing.source_queue_id == Some(delivery.queue_id)
-                })
-                .cloned()
-                .unwrap_or(candidate);
-            drafts.push(EventDraft::new(
-                materialization_event_id(delivery),
-                SessionEvent::DeliveryMaterialized {
-                    queue_id: delivery.queue_id,
-                    message,
-                },
-            ));
-        }
-        drafts.push(EventDraft::new(
-            acknowledgement_event_id(through_queue_id),
-            SessionEvent::DeliveryAcknowledged { through_queue_id },
-        ));
+        let drafts = delivery_materialize_drafts(&state)?;
         let command_id = format!("delivery-boundary:v1:{through_queue_id}");
         match store.append_verified_owned(owner, session_id, state, &command_id, &drafts) {
             Ok(appended) => return Ok((Some(appended.append), appended.state)),
@@ -70,6 +43,50 @@ pub(super) fn materialize_boundary_blocking(
         }
     }
     Err("materialize_concurrency")
+}
+
+pub(super) fn delivery_materialize_drafts(
+    state: &SessionState,
+) -> Result<Vec<EventDraft>, &'static str> {
+    let Some(through_queue_id) = state
+        .delivery_queue
+        .last()
+        .map(|delivery| delivery.queue_id)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut drafts = Vec::new();
+    for delivery in &state.delivery_queue {
+        if delivery.materialized_message_id.is_some() {
+            continue;
+        }
+        let candidate = materialize_message(delivery)?;
+        // Callback completion atomically appends its terminal Tool
+        // transcript message together with the wakeable delivery.  The
+        // delivery acknowledges that existing message; it must not try
+        // to materialize a second Runtime row with the same ID.
+        let message = state
+            .transcript
+            .iter()
+            .find(|existing| {
+                existing.message_id == candidate.message_id
+                    && existing.source_queue_id == Some(delivery.queue_id)
+            })
+            .cloned()
+            .unwrap_or(candidate);
+        drafts.push(EventDraft::new(
+            materialization_event_id(delivery),
+            SessionEvent::DeliveryMaterialized {
+                queue_id: delivery.queue_id,
+                message,
+            },
+        ));
+    }
+    drafts.push(EventDraft::new(
+        acknowledgement_event_id(through_queue_id),
+        SessionEvent::DeliveryAcknowledged { through_queue_id },
+    ));
+    Ok(drafts)
 }
 
 pub(super) fn materialize_message(

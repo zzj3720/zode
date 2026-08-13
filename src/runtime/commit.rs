@@ -469,9 +469,78 @@ pub(super) async fn start_activation(
     owner: SessionOwner,
     session_id: String,
     state: &VerifiedSessionState,
-    selection: &SessionSelection,
 ) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
-    let activation_id = stable_digest(
+    let started_at_ms = clock.now_ms();
+    let mut state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        // Claim, ActivationStarted, and already-queued first-boundary
+        // materialize must share one expected-version append. A crash after
+        // start-only would otherwise leave the session active with those
+        // deliveries still unmaterialized.
+        for _ in 0..16 {
+            if let Some(activation) = &state.active_activation {
+                return Ok((
+                    replayed_append(
+                        &session_id,
+                        &format!("activation-start:{}", activation.activation_id),
+                        &state,
+                    ),
+                    state,
+                ));
+            }
+            if !state.is_startup_runnable() {
+                return Ok((
+                    replayed_append(&session_id, "activation-start:not-runnable", &state),
+                    state,
+                ));
+            }
+            let minimum_auth_revision = state
+                .selection
+                .model
+                .as_ref()
+                .map(|model| model.auth_revision)
+                .ok_or("activation_without_model")?;
+            let activation_id = activation_claim_id(&owner, &session_id, &state);
+            let mut drafts = vec![EventDraft::new(
+                format!("activation-start-event:{activation_id}"),
+                SessionEvent::ActivationStarted {
+                    activation_id: activation_id.clone(),
+                    selection: state.selection.clone(),
+                    selection_version: state.selection_version,
+                    minimum_auth_revision,
+                    started_at_ms,
+                },
+            )];
+            drafts.extend(delivery_materialize_drafts(&state)?);
+            let command_id = format!("activation-start:{activation_id}");
+            match store.append_verified_owned(&owner, &session_id, state, &command_id, &drafts) {
+                Ok(appended) => return Ok((appended.append, appended.state)),
+                Err(StoreError::OptimisticConcurrency { .. }) => {
+                    state = store
+                        .rehydrate_verified_owned(&owner, &session_id)
+                        .map_err(|_| "activation_start_rehydrate")?;
+                }
+                Err(StoreError::CommandIdempotencyConflict { .. })
+                | Err(StoreError::EventIdempotencyConflict { .. }) => {
+                    state = store
+                        .rehydrate_verified_owned(&owner, &session_id)
+                        .map_err(|_| "activation_start_rehydrate")?;
+                    if state.active_activation.is_some() {
+                        return Ok((replayed_append(&session_id, &command_id, &state), state));
+                    }
+                    return Err("activation_start_conflict");
+                }
+                Err(_) => return Err("activation_start_append"),
+            }
+        }
+        Err("activation_start_concurrency")
+    })
+    .await
+    .map_err(|_| "activation_start_join")?
+}
+
+fn activation_claim_id(owner: &SessionOwner, session_id: &str, state: &SessionState) -> String {
+    stable_digest(
         "activation",
         &format!(
             "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
@@ -481,28 +550,7 @@ pub(super) async fn start_activation(
             state.selection_version,
             state.stream_version,
         ),
-    );
-    let minimum_auth_revision = selection
-        .model
-        .as_ref()
-        .map(|model| model.auth_revision)
-        .ok_or("activation_without_model")?;
-    append_runtime_event_from_state(
-        store,
-        owner,
-        session_id,
-        state.clone(),
-        format!("activation-start:{activation_id}"),
-        format!("activation-start-event:{activation_id}"),
-        SessionEvent::ActivationStarted {
-            activation_id,
-            selection: state.selection.clone(),
-            selection_version: state.selection_version,
-            minimum_auth_revision,
-            started_at_ms: clock.now_ms(),
-        },
     )
-    .await
 }
 
 pub(super) async fn finish_activation(
