@@ -18,12 +18,12 @@ events, and the deterministic session projection. It does not own effects.
   process; restart reconstructs a new request from durable semantic facts.
 - The original model `tool_call_id` is the lifecycle identity. Do not add a
   parallel async-task identity.
-- `SessionCreated` fixes the Endpoint-generated session ID, immutable
-  controller-authority/opaque-subject owner, creation time, and initial
-  non-secret selection. It never carries a raw idempotency key. Collection
-  command identity and canonical request fingerprint are versioned event-
-  envelope facts computed before ULID allocation, so concurrent candidates do
-  not change one logical create fingerprint.
+- `SessionCreated` fixes the Endpoint-generated session ID, creation time, and
+  initial non-secret selection. It does not record a caller owner. It never
+  carries a raw idempotency key. Collection command identity and canonical
+  request fingerprint are versioned event-envelope facts computed before ULID
+  allocation, so concurrent candidates do not change one logical create
+  fingerprint.
 - Invalid transitions return a typed invariant error and append nothing.
   Terminal tool transitions are first-wins; stale timers and duplicate
   completions are explicit no-op command outcomes, not second terminal events.
@@ -48,9 +48,9 @@ events, and the deterministic session projection. It does not own effects.
 - Keep bounded durable collections bounded in the projection itself. Large
   outputs use immutable blob references; redacted values never retain their
   original secret bytes.
-- Ownership is immutable after the first event. A history whose creation event
-  predates or omits the supported owner schema fails closed; no controller,
-  migration, or projection repair may infer a replacement owner.
+- Sessions are not owned by a caller. `SessionCreated` does not carry an
+  access-control owner. Historical owner fields, if present in old events, are
+  not an ACL.
 
 ## Acceptance
 

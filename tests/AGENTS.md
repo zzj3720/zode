@@ -39,7 +39,7 @@ recording, fixture promotion, and replay.
   final durable order and count.
 - Recovery tests stop the process, mutate only the test-owned environment,
   restart the real binary, and finish with a positive HTTP/SSE assertion.
-- Credential-replica tests use controller-authenticated public provisioning
+- Credential-replica tests use the public provisioning
   routes to race install revisions and tombstones, then prove lower revisions
   cannot overwrite or resurrect newer state. Endpoint tests do not create
   OAuth attempts, provider defaults, sharing policy, or Server-managed

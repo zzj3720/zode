@@ -36,11 +36,10 @@ resource. Every human or service actor admitted by the configured Access
 application has the same management capabilities and sees the same management
 resources. Provider profiles are deployment-shared, not personal.
 
-Sessions are the deliberate exception to shared visibility. Server derives one
-opaque subject from the validated Access actor; Endpoint records and enforces
-that subject. Two admitted actors can manage the same Endpoint and profiles but
-cannot list, read, stream, or mutate each other's sessions. Server has no
-session ACL or session-owner row.
+Sessions on one Endpoint are shared with the rest of that trust domain. Two
+admitted actors can manage the same Endpoint, profiles, and sessions. Server
+has no session ACL or session-owner row and does not forward a subject to
+Endpoint.
 
 ### Ingress authentication
 
@@ -53,12 +52,11 @@ bypass. Missing or invalid assertions return one safe authentication error.
 
 Human actors use a non-empty Access `sub`; service-token actors use non-empty
 `common_name` with an empty `sub`. A versioned keyed derivation produces an
-`access_actor_key` for receipt/OAuth-attempt scope and a separately domain-
-separated Endpoint subject. Raw JWTs, Access cookies, subjects, service-token
-IDs, and email are never persisted or logged. `server_authority_id` remains the
-stable Server/controller and provider-replica writer identity. AUD is validated
-but excluded from subject derivation so recreating the Access application does
-not silently orphan sessions.
+`access_actor_key` for Server-owned receipt/OAuth-attempt scope. Raw JWTs,
+Access cookies, service-token IDs, and email are never persisted or logged.
+`server_authority_id` remains the stable Server and provider-replica writer
+identity. AUD is validated but excluded from actor-key derivation so recreating
+the Access application does not silently orphan Server-owned receipts.
 
 Zode exposes no login, logout, current-user, workspace, principal, role, grant,
 invite, or account-management route. Cloudflare owns browser login/session
@@ -111,14 +109,7 @@ response.
 Endpoint session mutations are the exception to Server receipt storage: Server
 validates and forwards `Idempotency-Key` unchanged. Endpoint owns the
 receipt and replay, so Server never stores a session command or its result.
-Server also forwards a stable opaque subject derived from the validated Access
-actor under its configured controller authority. Browser input cannot
-override this value; Endpoint owns the resulting session ACL check. The subject
-is a bounded pseudonymous keyed derivation, not an email, display name, raw
-Access subject, or service-token ID. Its derivation key/version is durable
-across restart; rotating it requires an
-explicit Endpoint ownership-migration design rather than silently abandoning
-existing sessions.
+Server does not forward `Zode-Subject` or an Endpoint control bearer.
 
 For every session mutation, Server validates the Access actor, resolves the
 Endpoint record, then performs Endpoint's replay-only lookup with the exact
@@ -188,8 +179,6 @@ An Endpoint representation contains:
   "kind": "local",
   "status": "online",
   "disabled": false,
-  "controller_authority_id": "controller-opaque",
-  "controller_credential_revision": 2,
   "capabilities": {
     "providers": ["provider-type"],
     "tools": ["shell", "workspace"],
@@ -215,35 +204,22 @@ pretends to be a heartbeat emitted by Endpoint.
 ```json
 {
   "label": "Laptop",
-  "base_url": "https://endpoint.example.test",
-  "control_auth": {
-    "kind": "bearer",
-    "secret": "secret input"
-  }
+  "base_url": "https://endpoint.example.test"
 }
 ```
 
-Server stages the control secret outside SQLite and probes the authenticated
-Endpoint identity/capability route. Endpoint returns its own stable
-`endpoint_id`; the final catalog record keyed by that ID, safe response, and
-receipt commit atomically. Crash recovery resumes the same staged secret and
-probe, which returns the same ID; it cannot create a second Endpoint. An ID
-already present under the Server authority must use the explicit update route and cannot
-create a second catalog row. Public responses omit `base_url` details that
-policy marks sensitive and always omit the secret.
+Server probes the reachable Endpoint identity/capability route. Endpoint
+returns its own stable `endpoint_id`; the final catalog record keyed by that
+ID, safe response, and receipt commit atomically. Crash recovery resumes the
+same probe, which returns the same ID; it cannot create a second Endpoint. An
+ID already present under the Server authority must use the explicit update
+route and cannot create a second catalog row. Public responses omit `base_url`
+details that policy marks sensitive. There is no Endpoint control secret and
+no controller-auth rotation route.
 
 `PUT /v1/endpoints/{endpoint_id}` changes label, address, or disabled state.
-Address change must revalidate the same Endpoint-owned ID and stable controller
-authority. It cannot retarget the catalog record to another device.
-
-`POST /v1/endpoints/{endpoint_id}/control-auth-rotations` stages a new Server
-secret, invokes Endpoint's controller-auth rotation with the current secret,
-probes the new credential for the same Endpoint-owned ID and
-`controller_authority_id`, then atomically promotes the Server secret reference.
-The durable operation retains both safe secret references until recovery knows
-which revision won; a lost response probes new first, then resumes with the
-same operation. Rotation never changes Endpoint ID, controller authority,
-delegated subject, session ownership, or Endpoint idempotency scope.
+Address change must revalidate the same Endpoint-owned ID. It cannot retarget
+the catalog record to another device.
 
 V0 has no `DELETE` for an Endpoint record. `PUT` may disable it reversibly, but
 the stable `endpoint_id` remains reserved so session bookmarks and callback
@@ -636,7 +612,7 @@ Create admission is replay-aware and ordered:
    and constructs the exact forwarded body from
    the client-frozen descriptor plus stable Server authority/callback fields.
 2. It sends an authenticated replay-only create lookup to Endpoint with the
-   same authority, subject, body, and `Idempotency-Key`. Endpoint returns the
+   same body and `Idempotency-Key`. Endpoint returns the
    original response on a matching receipt, conflict on a changed fingerprint,
    or a typed receipt miss without creating anything.
 3. A receipt hit is returned immediately even if the profile was subsequently
@@ -697,11 +673,10 @@ opaque outside Endpoint even though its v0 representation is a ULID.
 
 Server validates and forwards session mutations with the caller's stable
 idempotency key. It maps public responses without exposing Endpoint address,
-control auth, internal errors, provider credential revision fingerprints, or
+internal errors, provider credential revision fingerprints, or
 private tool callback bearers. It treats `session_id` only as an opaque URL
-segment and does not persist or index it. It derives the same opaque subject for
-every request by that Access actor; Endpoint returns not-found for another
-subject's session.
+segment and does not persist or index it. Every admitted Access actor sees
+every session on that Endpoint.
 
 Tool projections preserve Endpoint's complete `allowed_actions` array. Server
 does not infer Cancel or retry eligibility from status and Web does not add an
@@ -732,13 +707,11 @@ Event IDs remain durable Endpoint-global event positions and support
 Server forwards the Endpoint public event schema without allocating a second
 event identity. The route supplies `endpoint_id`; each session-owned frame
 contains the Endpoint-generated `session_id`, session version, kind, and data.
-The validated Access actor is translated to the same opaque Endpoint subject as
-session reads and commands, so one stream multiplexes only that actor's visible
-sessions.
+One stream multiplexes every public session on that Endpoint.
 
 For each attached browser/client Endpoint stream, Server opens Endpoint
 `GET /v1/events` and forwards the client's `Last-Event-ID` unchanged. Endpoint
-owns subject filtering, replay/live handoff, ordering, and deduplication. Server
+owns replay/live handoff, ordering, and deduplication. Server
 stores neither events nor cursors and does not open one downstream stream per
 session. If Endpoint is unreachable, the proxy returns or closes with a safe
 Endpoint-unavailable condition and cannot invent missing session facts.

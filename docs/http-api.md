@@ -12,31 +12,26 @@ design change.
   are UTF-8 JSON.
 - Every mutating command requires `Idempotency-Key` except the external
   callback route whose opaque callback ID is its one-invocation identity.
-- Normal session routes require authenticated controller context containing a
-  stable opaque subject. Endpoint derives `controller_authority_id` from the
-  control credential and accepts a bounded `Zode-Subject` claim only from that
-  authenticated controller. It stores the authority/subject ownership scope,
-  not a Server or Cloudflare Access actor object. Controller-scoped identity,
-  health, capabilities, controller-auth, and auth-replica routes authenticate
-  the bearer but neither require nor consume `Zode-Subject`; a catalog probe or
-  credential distribution operation is not a session owner. Callback bearer
-  routes are separate capabilities.
-- An authenticated controller may add
-  `Zode-Idempotency-Mode: replay-only` to any session mutation. Endpoint checks
-  only the authority/subject/command-scoped receipt: a matching fingerprint
-  returns the original status/body, a changed fingerprint conflicts, and no
-  receipt returns `404 idempotency_receipt_not_found`. Replay-only never runs
-  current semantic validation, allocates identity, appends, wakes, or issues an
-  effect.
+- Endpoint HTTP and SSE do not require `Authorization` or `Zode-Subject`.
+  Those headers, if sent, are ignored. Trust is the listen address. Identity,
+  health, capabilities, auth-replica, session, and SSE routes are reachable
+  by any caller who can connect. The external-tool callback route is the only
+  exception: it still requires its distinct invocation bearer.
+- A caller may add `Zode-Idempotency-Mode: replay-only` to any session
+  mutation. Endpoint checks only the command-scoped receipt: a matching
+  fingerprint returns the original status/body, a changed fingerprint
+  conflicts, and no receipt returns `404 idempotency_receipt_not_found`.
+  Replay-only never runs current semantic validation, allocates identity,
+  appends, wakes, or issues an effect.
 - An idempotency replay returns the original status and body. Reuse with a
   different canonical semantic body returns `409 conflict` and performs no
   mutation.
-- Canonical identity includes controller authority, the opaque subject for a
-  session command, the command kind, and path resource IDs; JSON object key
-  order and whitespace do not change it, while array order and schema-defined
-  semantic values do. Only a versioned one-way digest is durable. Commands
-  containing secret material use a restart-stable Endpoint-keyed HMAC; raw
-  canonical request bytes never enter SQLite or operation journals.
+- Canonical identity includes the command kind and path resource IDs; JSON
+  object key order and whitespace do not change it, while array order and
+  schema-defined semantic values do. Only a versioned one-way digest is
+  durable. Commands containing secret material use a restart-stable
+  Endpoint-keyed HMAC; raw canonical request bytes never enter SQLite or
+  operation journals.
 - Generated IDs are opaque strings. Clients must not parse timestamps,
   provider names, or database positions from them.
 - Unknown or invalid public input is rejected before effects begin. Durable
@@ -64,7 +59,7 @@ Required classes are:
 | HTTP    | Code family                     | Meaning                                                                                        |
 | ------- | ------------------------------- | ---------------------------------------------------------------------------------------------- |
 | 400     | `malformed_request`             | Invalid JSON, header encoding, or SSE cursor                                                   |
-| 401/403 | `unauthenticated` / `forbidden` | Missing or invalid control/callback authorization                                              |
+| 401/403 | `unauthenticated` / `forbidden` | Missing or invalid external-callback invocation bearer                                         |
 | 404     | resource-specific `*_not_found` | Public resource does not exist                                                                 |
 | 409     | `conflict`                      | Idempotency mismatch, optimistic conflict, or losing terminal race                             |
 | 413     | `payload_too_large`             | A public bound was exceeded                                                                    |
@@ -81,10 +76,11 @@ never copied into public output.
 
 Endpoint accepts `--config <json-path>`. Existing `--listen` and `--database`
 flags may remain explicit development overrides. Configuration contains
-non-secret adapter wiring. Credentials arrive through the authenticated
-auth-replica provisioning API or an explicit standalone controller bootstrap;
-they are never embedded in configuration examples, session commands, or
-session events.
+non-secret adapter wiring. Credentials arrive through the auth-replica
+provisioning API; they are never embedded in configuration examples, session
+commands, or session events. The listen address is the trust boundary.
+Default and all-in-one deployments bind loopback. Binding a non-local address
+is an operator extra layer, not an Endpoint authentication feature.
 
 The v0 configuration shape is conceptually:
 
@@ -95,14 +91,6 @@ The v0 configuration shape is conceptually:
   "runtime_store": { "kind": "sqlite", "path": "runtime.sqlite" },
   "credential_replica_store": { "kind": "files", "directory": "credentials" },
   "blob_store": { "kind": "files", "directory": "blobs" },
-  "controller_auth": [
-    {
-      "authority_id": "controller-opaque",
-      "revision": 1,
-      "kind": "bearer_secret_file",
-      "secret_file": "controller.secret"
-    }
-  ],
   "runtime": {
     "tool_foreground_ms": 3000,
     "snapshot_every_events": 100,
@@ -184,11 +172,8 @@ and uses the built-in read-only handoff/history tools.
 These limits affect only provider context: public transcript history remains
 complete.
 
-Each controller credential maps to one immutable `authority_id`; a caller
-cannot select another authority in a header. Secret file contents are outside
-the JSON and never returned. Rotating transport authentication while retaining
-the same authority preserves owned sessions; changing authority does not adopt
-them.
+There is no `controller_auth` configuration and no controller-auth rotation
+route. Endpoint identity is the stable `endpoint_id` plus the process lock.
 
 A response-mode HTTP tool uses the HTTP response
 as its result, but a restart after its durable dispatch claim is ambiguous and
@@ -274,7 +259,7 @@ First success is `201 Created`; replay returns the same `201` and body:
 ```
 
 For create, the common replay-only mode performs the
-authority/subject-scoped collection receipt lookup:
+Endpoint-global collection receipt lookup:
 
 - a matching key and fingerprint returns the original status/body;
 - the same key with a different fingerprint returns `409 conflict`;
@@ -296,7 +281,7 @@ collision before committing the first event/receipt.
 ### List and read
 
 `GET /v1/sessions?limit=...&cursor=...` returns a bounded, stably ordered page
-of non-secret session summaries owned by the authenticated controller subject.
+of every non-secret session summary on this Endpoint.
 Ordering uses durable creation position, not ULID lexical order; `cursor` is
 opaque. The list is derived from Endpoint events and a rebuildable index, never
 a second mutable session authority. The `model` summary is the current
@@ -369,11 +354,9 @@ payload, and is returned in bounded UTF-8 chunks using `content_offset` and
 `next_content_offset`; each result then becomes part of the ordinary append-only
 transcript like any other tool result.
 
-List, read, mutation, and tool routes return the same safe not-found result for
-a missing session and a session owned by another authority/subject. The
-Endpoint-wide SSE omits every event outside the authenticated owner scope and
-never reveals whether another subject's session exists. Together these rules
-prevent an Endpoint-shared user from probing another subject's session IDs.
+List, read, mutation, and tool routes return not-found only when the session
+does not exist on this Endpoint. There is no per-caller owner filter. The
+Endpoint-wide SSE includes every public session event.
 
 Secret tool inputs/results and provider continuation bytes are never exposed
 accidentally by this summary. Dedicated result routes return only explicitly
@@ -441,10 +424,8 @@ for a later activation.
 ## 4. Endpoint events
 
 `GET /v1/events` returns the one Endpoint-wide `text/event-stream`. The route
-requires the same trusted controller authority and opaque `Zode-Subject` used
-for session reads and commands. It multiplexes public events for every session
-owned by that authority/subject; it is not opened for, filtered by, or owned by
-one session.
+does not authenticate. It multiplexes public events for every session on this
+Endpoint; it is not opened for, filtered by, or owned by one session.
 
 `Last-Event-ID` is an optional Endpoint-scoped durable global position. Every
 durable public frame identifies its owning session:
@@ -455,8 +436,8 @@ event: assistant_message_committed
 data: {"schema":"zode.event.v1","id":"42","session_id":"...","version":7,"kind":"assistant_message_committed","data":{...}}
 ```
 
-IDs can skip positions used by private storage facts or sessions outside the
-authenticated subject. Every eligible public event after the cursor appears
+IDs can skip positions used by private storage facts. Every public event after
+the cursor appears
 exactly once and in increasing Endpoint-global order. Subscribe/replay handoff
 and live publication cannot lose an event. Keepalive comments have no `id` and
 carry no state.
@@ -489,10 +470,13 @@ single stream remains attached.
 The former session-scoped `/v1/sessions/{session_id}/events` route is absent;
 there is no compatibility stream or second cursor authority. The public
 real-process anchor
-`e2e_endpoint_event_stream_multiplexes_owned_sessions_and_reconnects_once`
-creates two owned sessions plus an unowned session, proves one stream emits only
-the two owned sequences in Endpoint-global order, reconnects once with the last
-consumed ID, and observes no missed or duplicated durable terminal event.
+`e2e_endpoint_event_stream_multiplexes_sessions_and_reconnects_once`
+creates two sessions, proves one stream emits both sequences in Endpoint-global
+order, reconnects once with the last consumed ID, and observes no missed or
+duplicated durable terminal event. `e2e_endpoint_protocol_has_no_controller_auth`
+proves create, list, get, replica, and SSE work without `Authorization` or
+`Zode-Subject`. `e2e_endpoint_sessions_are_shared_across_callers` proves two
+callers see the same session list and can read each other's session.
 
 While a model stream is attached to a live client, Endpoint may also emit
 best-effort transient text frames. They have no `id`, are never persisted, and
@@ -646,9 +630,9 @@ overwrite the winner. There is no session/tool-ID completion route.
 
 ## 6. Identity, health, and capabilities
 
-- `GET /v1/identity` returns the stable opaque Endpoint-owned `endpoint_id`, protocol
-  version, and the authenticated controller's non-secret authority ID and
-  credential revision. It never lists other controller authorities.
+- `GET /v1/identity` returns the stable opaque Endpoint-owned `endpoint_id` and
+  protocol version. It does not return a controller authority or credential
+  revision.
 - `GET /v1/health` performs a bounded readiness check and never scans session
   history or acquires an unnecessary writer lock.
 - `GET /v1/capabilities` lists non-secret provider adapter kinds, outbound
@@ -656,7 +640,7 @@ overwrite the winner. There is no session/tool-ID completion route.
   credential schemas. Provider instances/models configured by Server are not
   Endpoint capabilities.
 
-`GET /v1/health` returns exactly the bounded controller-scoped readiness view:
+`GET /v1/health` returns exactly the bounded readiness view:
 
 ```json
 {
@@ -862,35 +846,24 @@ Required create/list identity E2Es prove Endpoint returns a valid ULID, a
 same-key create replay returns exactly that ULID and one initial event, a
 different-body same-key create conflicts, a caller-supplied `session_id` is
 rejected, list pagination survives restart without relying on ULID order, and
-two authenticated subjects can reuse a key while neither can list/read/stream/
-mutate the other's session. Replay-only lookup must return hit/conflict/miss
-without consulting current credential/readiness state or issuing a mutation.
+two callers can reuse a key only when the semantic body matches, and every
+caller can list/read/stream/mutate every session. Replay-only lookup must
+return hit/conflict/miss without consulting current credential/readiness state
+or issuing a mutation.
 
 Executable anchors are
 `e2e_create_generates_ulid_and_binds_idempotency_payload`,
 `e2e_create_receipt_lookup_precedes_current_admission`,
 `e2e_create_receipt_projection_rebuilds_from_verified_creation_event`,
 `e2e_conflicting_create_receipt_projection_fails_closed`,
-`e2e_concurrent_create_receipt_and_event_are_atomic`, and
-`e2e_session_ownership_safe_not_found_and_ordered_sse`, with the independent
-single-page list assertion in `e2e_session_list_is_subject_scoped`. Authority-
-scoped create receipts are anchored by
-`e2e_authority_subject_create_receipts_are_scoped`; the cross-authority access
-case `e2e_session_authority_ownership_isolates_list_read_message_and_sse` must
-be added and demonstrated red. The complete multi-page keyset/restart case must
-also be added and demonstrated red before list production is considered
-complete; a single-page ownership assertion does not cover that separate
-ordering decision.
+`e2e_concurrent_create_receipt_and_event_are_atomic`,
+`e2e_endpoint_protocol_has_no_controller_auth`, and
+`e2e_endpoint_sessions_are_shared_across_callers`. The complete multi-page
+keyset/restart case must also be added and demonstrated red before list
+production is considered complete.
 
-A controller-auth rotation E2E creates a session, loses the rotation response,
-recovers with the staged new secret, restarts Endpoint, and proves the unchanged
-authority/subject can list/read/message, resume the Endpoint SSE, and replay the
-original create key while the old secret is fenced.
-
-The executable anchor is
-`e2e_controller_auth_rotation_lost_response_fences_old_secret_and_survives_restart`;
-the adjacent control-store fault cases in `endpoint_control_e2e` freeze its
-filesystem authority, promotion, collision, receipt, and recovery boundaries.
+There is no controller-auth rotation contract. Process identity remains the
+Endpoint-owned `endpoint_id` and the exclusive process lock.
 
 Endpoint identity E2E proves the same Endpoint-owned `endpoint_id` is returned
 before and after process restart on the same stores and cannot be changed by a
@@ -899,21 +872,19 @@ controller request.
 The executable anchor is `e2e_identity_is_endpoint_owned_and_restart_stable`.
 
 Endpoint health is anchored by
-`e2e_endpoint_health_is_controller_authenticated_and_independent_of_active_session_work`:
-with a real provider/tool request held at a fixture barrier, a bearer-authenticated
-health request without `Zode-Subject` returns the bounded versioned ready response
-before that work is released, while missing or invalid controller authentication
-fails safely.
+`e2e_endpoint_health_is_controller_authenticated_and_independent_of_active_session_work`
+until that test is rewritten for listen-scope trust: with a real provider/tool
+request held at a fixture barrier, an unauthenticated health request returns
+the bounded versioned ready response before that work is released.
 
 Endpoint capabilities are anchored by
 `e2e_endpoint_capabilities_are_restart_stable_bounded_and_non_secret`: a real
 Endpoint configured with known adapters and a response-mode HTTP tool returns
-the deterministic controller-authenticated capability projection without
-`Zode-Subject`, remains identical across restart, matches the exact schema and
-the sorted values implied by that effective composition, omits
-`external_callback` while no real callback route/lifecycle is composed, stays
-within its public bound, and omits every fixture secret, path, URL, provider
-instance/model/profile, session ID, and history fact.
+the deterministic capability projection, remains identical across restart,
+matches the exact schema and the sorted values implied by that effective
+composition, omits `external_callback` while no real callback route/lifecycle
+is composed, stays within its public bound, and omits every fixture secret,
+path, URL, provider instance/model/profile, session ID, and history fact.
 An initial missing-route 404 is only shallow evidence. The E2E owner must retain
 the first mismatch after the smallest real health/capabilities route bootstrap
 and freeze that behavioral red before the complete handlers are implemented.

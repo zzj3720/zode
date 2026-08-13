@@ -1,6 +1,6 @@
 # Cloudflare Access ingress contract
 
-Status: authoritative v0 ingress-authentication and actor-isolation contract.
+Status: authoritative v0 ingress-authentication contract.
 `docs/server-api.md` owns application resources after ingress is accepted.
 
 ## 1. Decision
@@ -18,9 +18,10 @@ default, and distribution policy. Fine-grained application RBAC is explicitly
 out of scope; adding it later requires a new reviewed design and red E2Es.
 
 Provider profiles are therefore deployment-shared resources, not personal
-resources. Agent sessions remain isolated: Server derives a stable opaque
-Endpoint subject from the validated Access actor, and Endpoint enforces that
-subject on create, list, read, command, and SSE.
+resources. Agent sessions on one Endpoint are also shared: every admitted
+actor can list, read, stream, and mutate every session on an Endpoint the
+Server can reach. Server does not derive or forward an Endpoint subject, and
+Endpoint does not enforce caller identity.
 
 ## 2. Network topology
 
@@ -45,8 +46,9 @@ application to make tool callbacks work.
 Both origins should reach Server through Cloudflare Tunnel or an equivalent
 origin firewall arrangement that prevents direct public access. This network
 restriction is defense in depth, not a substitute for Server-side JWT or
-callback-bearer validation. Endpoint control routes remain separately
-authenticated and are not made public merely because Server uses Access.
+callback-bearer validation. Endpoint itself does not authenticate; it must
+not be exposed on a public address merely because Server uses Access. A
+remote Endpoint is reached only through an operator-added private path.
 
 ## 3. Access assertion verification
 
@@ -65,7 +67,7 @@ Production configuration contains:
 - one or more accepted Access application AUD tags;
 - a JWKS URL defaulting to
   `<issuer>/cdn-cgi/access/certs` and never discovered from token claims;
-- a restart-stable subject-derivation key reference and key version.
+- a restart-stable actor-derivation key reference and key version.
 
 Server derives the routing authority only from the validated request-target
 authority/`Host` matched against those two configured origins. It never trusts
@@ -77,7 +79,7 @@ On first initialization, Server records only the derivation key's non-secret
 version/fingerprint beside `server_authority_id`. A later startup with a
 different key or version fails readiness before serving management traffic or
 contacting an Endpoint. Key replacement is not ordinary rotation; it requires
-the explicit ownership migration described below.
+an explicit receipt-migration design before use.
 
 The verifier rejects a missing or ambiguous assertion and validates all of:
 
@@ -106,7 +108,7 @@ connection's revocation latency; deployments that need a shorter bound must
 shorten that Access duration. Immediate mid-connection revocation is not a Zode
 v0 guarantee.
 
-## 4. Access actor and Endpoint subject
+## 4. Access actor
 
 A validated application token becomes exactly one Access actor:
 
@@ -122,25 +124,23 @@ record.
 Server derives a bounded pseudonymous `access_actor_key` with a versioned HMAC
 over the exact issuer, actor kind, and actor identifier. Server-owned mutation
 receipts and OAuth attempts may persist only that pseudonymous key, never the
-raw `sub`, service-token client ID, email, JWT, or Access cookie. Separate HMAC
-domain labels derive the Endpoint subject under `server_authority_id`, so an
-operation receipt cannot be reused as a session credential.
+raw `sub`, service-token client ID, email, JWT, or Access cookie. That key is
+not forwarded to Endpoint and is not a session owner.
 
-AUD is deliberately excluded from subject derivation: recreating the Access
+AUD is deliberately excluded from actor-key derivation: recreating the Access
 application requires updating accepted AUD configuration but must not silently
-orphan existing Endpoint sessions. Changing the Access organization/issuer,
+orphan Server-owned receipts. Changing the Access organization/issuer,
 deleting and re-adding a human identity, recreating a service token, rotating
-the derivation key, or changing `server_authority_id` can change the subject and
-therefore requires an explicit ownership-migration design before use.
+the derivation key, or changing `server_authority_id` can change the actor key
+and therefore requires an explicit receipt-migration design before use.
 
 ## 5. Request authorization behavior
 
 After Access verification, Server applies only resource validity and product
 semantic checks; it has no local per-actor management grants. Concrete IDs are
 resolved inside the one Server authority and absent IDs return the normal safe
-not-found response. All Access actors can see the same Endpoint and provider
-management resources, but an Endpoint returns only sessions owned by the
-derived subject.
+not-found response. All Access actors can see the same Endpoint, provider
+management resources, and sessions on those Endpoints.
 
 Human browser mutations require JSON plus the configured same-origin
 `Origin`/Fetch-Metadata policy. Service-token clients use Cloudflare's standard
@@ -188,11 +188,12 @@ header bypass, database insertion, or `cfg(test)` auth path is allowed.
 Required red-before-fix scenarios include:
 
 - an accepted human assertion can use the complete management happy path;
-- two human `sub` values share management resources but cannot list, read,
-  stream, mutate, or collide idempotency receipts for each other's Endpoint
-  sessions;
-- a service-token assertion uses `common_name`, remains distinct from human
-  subjects, and can call the same public API;
+- two human `sub` values share management resources and share Endpoint
+  sessions: either can list, read, stream, and mutate a session the other
+  created (`e2e_two_actor_sessions_are_shared_on_one_endpoint`);
+- a service-token assertion uses `common_name`, remains distinct from a human
+  actor key for Server-owned receipts, and can call the same public API
+  including the same sessions;
 - missing, duplicate, forged, expired, not-yet-valid, wrong-issuer,
   wrong-audience, wrong-type, unsupported-algorithm, and malformed actor tokens
   all fail closed without reaching Endpoint;
@@ -203,11 +204,11 @@ Required red-before-fix scenarios include:
   assertion grant no access and no raw identity/JWT reaches logs or databases;
 - a long-lived SSE connection closes at assertion expiry and reconnects through
   the edge without missing or duplicating durable Endpoint events;
-- restart with the same subject key preserves actor/session access, while an
-  unapproved key change fails Server readiness before Endpoint contact;
+- restart with the same actor-derivation key preserves Server-owned receipts,
+  while an unapproved key change fails Server readiness before Endpoint contact;
 - replacing the accepted Access application AUD while retaining issuer,
   `server_authority_id`, derivation key, and human `sub` preserves the same
-  Endpoint subject and existing sessions;
+  actor key and existing Server-owned receipts;
 - the browser enters through the Access fixture with no Zode login screen,
   token input, login cookie, or user/grant settings;
 - provider OAuth callback remains Access-protected, while an external tool
