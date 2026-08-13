@@ -1,17 +1,26 @@
 mod config;
 
-use std::{env, io::Write, path::PathBuf, sync::Arc};
+use std::{
+    env,
+    future::{Future, IntoFuture},
+    io::Write,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use config::EndpointConfig;
 use zode::{
     api,
     control::ControlState,
     provider::{AimuxProvider, ProviderExecutionPolicy, ReplicaStore},
-    runtime::{Runtime, TimerArm},
+    runtime::{Runtime, TimerArm, TimerPort},
     storage::SqliteEventStore,
     timer::{SleepTimer, SystemClock},
     tools::HttpToolExecutor,
 };
+
+const ENDPOINT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct Cli {
@@ -204,7 +213,7 @@ async fn run(
         store,
         composition.control,
         composition.replicas,
-        runtime,
+        runtime.clone(),
         composition.health_body,
         composition.capabilities_body,
     );
@@ -214,6 +223,49 @@ async fn run(
     println!("ZODE_READY http://{address}");
     std::io::stdout().flush()?;
 
-    axum::serve(listener, api::router(state)).await?;
+    let shutdown_signal = arm_shutdown_signal()?;
+    tokio::pin!(shutdown_signal);
+    let (shutdown, shutdown_requested) = tokio::sync::oneshot::channel::<()>();
+    let serving = axum::serve(listener, api::router(state))
+        .with_graceful_shutdown(async {
+            let _ = shutdown_requested.await;
+        })
+        .into_future();
+    tokio::pin!(serving);
+
+    let result = tokio::select! {
+        result = &mut serving => result,
+        () = &mut shutdown_signal => {
+            // Stop HTTP admission first; then refuse new wakes before sleeps are dropped.
+            let _ = shutdown.send(());
+            runtime.shutdown().await;
+            match tokio::time::timeout(ENDPOINT_DRAIN_TIMEOUT, &mut serving).await {
+                Ok(result) => result,
+                Err(_) => Ok(()),
+            }
+        }
+    };
+    runtime.shutdown().await;
+    timer.shutdown();
+    result?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn arm_shutdown_signal() -> Result<impl Future<Output = ()>, std::io::Error> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn arm_shutdown_signal() -> Result<impl Future<Output = ()>, std::io::Error> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
 }

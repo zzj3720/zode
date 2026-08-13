@@ -35,6 +35,9 @@ Create does not wake; message and model-select wake after a non-replayed commit.
   that activation; credential revision changes may affect only a provider
   request not yet sent.
 - HTTP/SSE connection lifetime never owns or cancels an activation.
+- Process shutdown stops new wake/activation claims and must not append
+  `WaitExpired`. Outstanding waits stay durable for startup re-arm. In-flight
+  model requests may finish or be abandoned for the existing restart path.
 
 ## Atomic lifecycle boundaries
 

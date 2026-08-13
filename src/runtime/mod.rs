@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -303,6 +306,7 @@ pub struct Runtime {
     stream_observer: Arc<dyn ModelStreamObserver>,
     options: RuntimeOptions,
     session_locks: Mutex<HashMap<SessionKey, Arc<AsyncMutex<()>>>>,
+    shutting_down: AtomicBool,
 }
 
 impl Runtime {
@@ -356,7 +360,17 @@ impl Runtime {
             stream_observer,
             options: options.bounded(),
             session_locks: Mutex::new(HashMap::new()),
+            shutting_down: AtomicBool::new(false),
         })
+    }
+
+    /// Stops new activations; in-flight work may finish or be left for startup recovery.
+    pub async fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
     }
 
     pub fn stream_publisher(&self) -> Arc<RuntimeStreamPublisher> {
@@ -565,6 +579,10 @@ impl Runtime {
     /// Admit a due wait as `WaitExpired` when the durable wait is still
     /// current. Stale or replaced fires are ignored.
     pub async fn expire_wait(self: &Arc<Self>, arm: TimerArm) {
+        // Shutdown is process death: do not invent WaitExpired; the next start re-arms.
+        if self.is_shutting_down() {
+            return;
+        }
         match append_expired_timer(
             self.store.clone(),
             arm.owner.clone(),
@@ -595,6 +613,10 @@ impl Runtime {
         session_id: String,
         timer: crate::domain::WaitTimerIntent,
     ) {
+        // Shutdown drops sleeps without expiry; startup recovery re-arms durable waits.
+        if self.is_shutting_down() {
+            return;
+        }
         if let Err(error) = self.timer.arm(TimerArm {
             owner,
             session_id: session_id.clone(),
@@ -743,6 +765,13 @@ impl Runtime {
         session_id: String,
         mut ready: Option<oneshot::Sender<()>>,
     ) {
+        // New claims after shutdown belong to the next process's recovery.
+        if self.is_shutting_down() {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(());
+            }
+            return;
+        }
         let key = SessionKey {
             authority_id: owner.authority_id.clone(),
             subject: owner.subject.clone(),
@@ -763,6 +792,12 @@ impl Runtime {
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
             let _guard = lock.lock().await;
+            if runtime.is_shutting_down() {
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(());
+                }
+                return;
+            }
             let result = runtime
                 .activate(owner, session_id.clone(), &mut ready)
                 .await;
