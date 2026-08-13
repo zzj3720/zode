@@ -37,7 +37,10 @@ use crate::{
         DurablePayload, ProviderExecutionSelection, ToolCall, TranscriptMessage, TranscriptRole,
         MAX_PROVIDER_EXECUTION_OPTIONS_BYTES,
     },
-    runtime::{ModelError, ModelExecutor, ModelOutcome, ModelRequest},
+    runtime::{
+        ExecutionPolicyError, ExecutionPolicyPort, ModelError, ModelExecutor, ModelOutcome,
+        ModelRequest, ReplicaPort, ReplicaPortError, ReplicaProbe,
+    },
 };
 
 const REPLICA_SCHEMA: &str = "zode.auth-replica.record.v1";
@@ -403,6 +406,29 @@ impl ReplicaStore {
     }
 }
 
+impl ReplicaPort for ReplicaStore {
+    fn probe(
+        &self,
+        authority_id: &str,
+        profile_id: &str,
+        provider: &str,
+        minimum_revision: u64,
+    ) -> Result<ReplicaProbe, ReplicaPortError> {
+        let credential = self
+            .resolve(authority_id, profile_id, provider, minimum_revision)
+            .map_err(|error| match error {
+                ReplicaError::Invalid => ReplicaPortError::Invalid,
+                ReplicaError::Disabled => ReplicaPortError::Disabled,
+                ReplicaError::SecretUnavailable => ReplicaPortError::SecretUnavailable,
+                ReplicaError::Unavailable => ReplicaPortError::Unavailable,
+                _ => ReplicaPortError::Backend,
+            })?;
+        Ok(ReplicaProbe {
+            credential_schema: credential.credential_schema,
+        })
+    }
+}
+
 pub struct AimuxProvider {
     replicas: Arc<ReplicaStore>,
     policy: ProviderExecutionPolicy,
@@ -456,6 +482,20 @@ impl ProviderExecutionPolicy {
         descriptor: &ProviderExecutionSelection,
     ) -> Result<(), ProviderExecutionValidationError> {
         validate_provider_execution_descriptor(descriptor, self)
+    }
+}
+
+impl ExecutionPolicyPort for ProviderExecutionPolicy {
+    fn validate_descriptor(
+        &self,
+        descriptor: &ProviderExecutionSelection,
+    ) -> Result<(), ExecutionPolicyError> {
+        self.validate(descriptor)
+            .map_err(|_| ExecutionPolicyError::Invalid)
+    }
+
+    fn credential_schema(&self, adapter_kind: &str) -> Option<&'static str> {
+        credential_schema_for_adapter(adapter_kind)
     }
 }
 

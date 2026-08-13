@@ -14,6 +14,10 @@ Management Server code belongs under `server/`; browser code belongs under
 - The timer adapter implements a runtime-declared TimerPort. It must not
   append events, rehydrate sessions, cancel tools, or persist wait state.
   Runtime arms it only after the WaitSet/timer-intent transaction commits.
+- Session create, append-message, and model-select go through Runtime.
+  `ProviderExecutionPolicy` implements `ExecutionPolicyPort`; `ReplicaStore`
+  implements `ReplicaPort` for admission probes. HTTP does not construct
+  session event drafts or call store append APIs.
 - Do not add management Server discovery, registration, reverse connection,
   heartbeat, users, OAuth/profile authority, cross-Endpoint routing, mirror, or
   UI concerns anywhere under `src/`.

@@ -190,6 +190,8 @@ async fn run(
         composition.runtime_options,
         clock,
         timer.clone(),
+        Arc::new(composition.provider_policy.clone()),
+        composition.replicas.clone(),
     );
     let expire = runtime.clone();
     tokio::spawn(async move {
@@ -203,7 +205,6 @@ async fn run(
         composition.control,
         composition.replicas,
         runtime,
-        composition.provider_policy,
         composition.health_body,
         composition.capabilities_body,
     );

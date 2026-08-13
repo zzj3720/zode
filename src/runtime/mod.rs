@@ -9,20 +9,23 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
 
 mod callback;
+mod commands;
 mod commit;
 mod context;
 mod model;
 pub mod ports;
 
+pub use commands::session_command_id;
 pub use model::{ModelOutcome, ModelRequest, ModelTokenUsage};
 use model::{MAX_CONTEXT_HANDOFF_DOCUMENT_TOKENS, MAX_CONTEXT_HANDOFF_GENERATION_TOKENS};
 pub use ports::{
-    AppendResult, BlobPort, BlobStore, Clock, EventStore, ExternalCallbackLookup, ModelExecutor,
-    ModelPort, OwnedSessionRef, RehydrateError, SessionAppendResult, SessionCreate,
-    SessionCreateCommand, SessionCreateResult, SessionListCursor, SessionListItem, SessionListPage,
-    SnapshotRecord, StoreError, StorePort, StorePortError, TimerArm, TimerKey, TimerPort,
-    TimerPortError, ToolExecutor, ToolPort, VerifiedSessionState, MAX_OWNED_SESSION_SCAN_LIMIT,
-    MAX_SESSION_LIST_LIMIT, SNAPSHOT_ENCODING_JSON,
+    AppendResult, BlobPort, BlobStore, Clock, EventStore, ExecutionPolicyError,
+    ExecutionPolicyPort, ExternalCallbackLookup, ModelExecutor, ModelPort, OwnedSessionRef,
+    RehydrateError, ReplicaPort, ReplicaPortError, ReplicaProbe, SessionAppendResult,
+    SessionCreate, SessionCreateCommand, SessionCreateResult, SessionListCursor, SessionListItem,
+    SessionListPage, SnapshotRecord, StoreError, StorePort, StorePortError, TimerArm, TimerKey,
+    TimerPort, TimerPortError, ToolExecutor, ToolPort, VerifiedSessionState,
+    MAX_OWNED_SESSION_SCAN_LIMIT, MAX_SESSION_LIST_LIMIT, SNAPSHOT_ENCODING_JSON,
 };
 mod stream;
 mod transition;
@@ -234,6 +237,8 @@ pub enum RuntimeCommandError {
     Conflict,
     Invalid(&'static str),
     Backend,
+    IdempotencyReceiptNotFound,
+    AuthReplicaUnavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -292,6 +297,8 @@ pub struct Runtime {
     tools: Arc<dyn ToolExecutor>,
     clock: Arc<dyn Clock>,
     timer: Arc<dyn TimerPort>,
+    execution_policy: Arc<dyn ExecutionPolicyPort>,
+    replicas: Arc<dyn ReplicaPort>,
     stream_publisher: Arc<RuntimeStreamPublisher>,
     stream_observer: Arc<dyn ModelStreamObserver>,
     options: RuntimeOptions,
@@ -299,6 +306,7 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<dyn EventStore>,
         model: Arc<dyn ModelExecutor>,
@@ -306,6 +314,8 @@ impl Runtime {
         snapshot_every: Option<u64>,
         clock: Arc<dyn Clock>,
         timer: Arc<dyn TimerPort>,
+        execution_policy: Arc<dyn ExecutionPolicyPort>,
+        replicas: Arc<dyn ReplicaPort>,
     ) -> Arc<Self> {
         Self::new_with_options(
             store,
@@ -314,9 +324,12 @@ impl Runtime {
             RuntimeOptions::defaults(snapshot_every),
             clock,
             timer,
+            execution_policy,
+            replicas,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_options(
         store: Arc<dyn EventStore>,
         model: Arc<dyn ModelExecutor>,
@@ -324,6 +337,8 @@ impl Runtime {
         options: RuntimeOptions,
         clock: Arc<dyn Clock>,
         timer: Arc<dyn TimerPort>,
+        execution_policy: Arc<dyn ExecutionPolicyPort>,
+        replicas: Arc<dyn ReplicaPort>,
     ) -> Arc<Self> {
         let stream_publisher = RuntimeStreamPublisher::new(1_024);
         let stream_observer = Arc::new(BroadcastModelStreamObserver {
@@ -335,6 +350,8 @@ impl Runtime {
             tools,
             clock,
             timer,
+            execution_policy,
+            replicas,
             stream_publisher,
             stream_observer,
             options: options.bounded(),
@@ -348,17 +365,6 @@ impl Runtime {
 
     pub fn now_ms(&self) -> i64 {
         self.clock.now_ms()
-    }
-
-    /// Validate a session's configured adapter-tool selection against the
-    /// current runtime catalog.  The HTTP adapter calls this only after a
-    /// create receipt miss; receipt replay therefore never consults the
-    /// current catalog.
-    pub fn validate_tool_selection(&self, selected: &[String]) -> Result<(), RuntimeCommandError> {
-        self.tools
-            .definitions(selected)
-            .map(|_| ())
-            .map_err(|_| RuntimeCommandError::Invalid("tool_selection"))
     }
 
     /// Complete an external callback through the durable stream.  The

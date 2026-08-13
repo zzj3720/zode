@@ -1,13 +1,17 @@
 mod blob;
 mod clock;
+mod execution_policy;
 mod model;
+mod replica;
 mod store;
 mod timer;
 mod tool;
 
 pub use blob::{BlobPort, BlobStore};
 pub use clock::Clock;
+pub use execution_policy::{ExecutionPolicyError, ExecutionPolicyPort};
 pub use model::{ModelExecutor, ModelPort};
+pub use replica::{ReplicaPort, ReplicaPortError, ReplicaProbe};
 pub use store::{
     AppendResult, EventStore, ExternalCallbackLookup, OwnedSessionRef, RehydrateError,
     SessionAppendResult, SessionCreate, SessionCreateCommand, SessionCreateResult,

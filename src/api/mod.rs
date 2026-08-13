@@ -17,7 +17,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use zode_protocol::{
     encode_json_bounded, CapabilityTool as WireCapabilityTool, EndpointCapabilities,
@@ -32,20 +31,19 @@ use crate::{
         MAX_ROTATION_REQUEST_BYTES,
     },
     domain::{
-        ActiveWait, AsyncToolCallRecord, CompletionMode, DeliveryKind, DurablePayload, EventDraft,
-        EventRecord, ModelLimits, ProviderExecutionSelection, QueuedDelivery, SessionEvent,
-        SessionModelSelection, SessionOwner, SessionSelection, SessionState, ToolCall,
-        TranscriptMessage, MAX_ERROR_MESSAGE_BYTES, MAX_IDENTIFIER_BYTES,
+        ActiveWait, AsyncToolCallRecord, CompletionMode, DurablePayload, EventRecord, ModelLimits,
+        ProviderExecutionSelection, SessionEvent, SessionModelSelection, SessionOwner,
+        SessionSelection, SessionState, TranscriptMessage, MAX_ERROR_MESSAGE_BYTES,
+        MAX_IDENTIFIER_BYTES,
     },
     provider::{
-        credential_schema_for_adapter, ProviderExecutionPolicy, ReplicaError,
-        ReplicaInstallRequest, ReplicaMutation, ReplicaStore, ReplicaTombstoneRequest,
-        MAX_REPLICA_REQUEST_BYTES,
+        ReplicaError, ReplicaInstallRequest, ReplicaMutation, ReplicaStore,
+        ReplicaTombstoneRequest, MAX_REPLICA_REQUEST_BYTES,
     },
     runtime::{
-        CallbackCompletion, EventStore, RehydrateError, Runtime, RuntimeCommandError,
-        RuntimeStreamEvent, RuntimeStreamSubscription, SessionCreate, SessionCreateCommand,
-        SessionListCursor, StoreError, TransientModelEvent, MAX_SESSION_LIST_LIMIT,
+        session_command_id, CallbackCompletion, EventStore, RehydrateError, Runtime,
+        RuntimeCommandError, RuntimeStreamEvent, RuntimeStreamSubscription, SessionListCursor,
+        StoreError, TransientModelEvent, MAX_SESSION_LIST_LIMIT,
     },
 };
 
@@ -60,7 +58,6 @@ pub struct AppState {
     control: Arc<ControlState>,
     replicas: Arc<ReplicaStore>,
     runtime: Arc<Runtime>,
-    provider_policy: ProviderExecutionPolicy,
     health_body: Arc<Vec<u8>>,
     capabilities_body: Arc<Vec<u8>>,
 }
@@ -71,7 +68,6 @@ impl AppState {
         control: Arc<ControlState>,
         replicas: Arc<ReplicaStore>,
         runtime: Arc<Runtime>,
-        provider_policy: ProviderExecutionPolicy,
         health_body: Vec<u8>,
         capabilities_body: Vec<u8>,
     ) -> Self {
@@ -80,7 +76,6 @@ impl AppState {
             control,
             replicas,
             runtime,
-            provider_policy,
             health_body: Arc::new(health_body),
             capabilities_body: Arc::new(capabilities_body),
         }
@@ -264,23 +259,6 @@ struct ToolCancelRequest {
 #[serde(deny_unknown_fields)]
 struct ToolReconcileRequest {
     action: String,
-}
-
-struct ModelDeliverySpec {
-    command_id: String,
-    event_id: String,
-    delivery_id: String,
-    dedupe_key: String,
-    message_id: String,
-    content: String,
-    created_at_ms: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct CanonicalCreateRequest<'a> {
-    schema: &'static str,
-    path: &'static str,
-    selection: &'a SessionSelection,
 }
 
 #[derive(Debug, Serialize)]
@@ -751,73 +729,11 @@ async fn create_session(
     let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
     let replay_only = replay_only_mode(&headers).map_err(ApiError::from_service)?;
     let owner = SessionOwner::new(context.authority_id(), context.subject());
-    let semantic_request = CanonicalCreateRequest {
-        schema: "zode.session-create.v1",
-        path: "/v1/sessions",
-        selection: &selection,
-    };
-    let command = SessionCreateCommand::new(&owner, &idempotency_key, &semantic_request)
-        .map_err(ServiceError::store)
-        .map_err(ApiError::from_service)?;
-    let store = state.store.clone();
-    let replicas = state.replicas.clone();
-    let provider_policy = state.provider_policy.clone();
-    let runtime = state.runtime.clone();
-    let operation = run_blocking(move || {
-        let replay = store
-            .lookup_session_create(&owner, &command)
-            .map_err(ServiceError::store)?;
-        if replay_only {
-            return replay.ok_or(ServiceError::IdempotencyReceiptNotFound);
-        }
-        if let Some(replay) = replay {
-            return Ok(replay);
-        }
-        runtime
-            .validate_tool_selection(&selection.tools)
-            .map_err(|_| ServiceError::Invalid("invalid tool selection".into()))?;
-        if let Some(model) = selection.model.as_ref() {
-            provider_policy
-                .validate(&model.provider_execution)
-                .map_err(|_| ServiceError::Invalid("invalid provider execution".into()))?;
-            let credential = replicas
-                .resolve(
-                    &model.auth_authority_id,
-                    &model.auth_profile_id,
-                    &model.provider,
-                    model.auth_revision,
-                )
-                .map_err(|error| match error {
-                    ReplicaError::Disabled | ReplicaError::SecretUnavailable => {
-                        ServiceError::AuthReplicaUnavailable
-                    }
-                    ReplicaError::Invalid => {
-                        ServiceError::Invalid("invalid credential replica selection".into())
-                    }
-                    _ => ServiceError::Backend,
-                })?;
-            if credential_schema_for_adapter(&model.provider_execution.kind)
-                != Some(credential.credential_schema.as_str())
-            {
-                return Err(ServiceError::AuthReplicaUnavailable);
-            }
-        }
-        store
-            .create_session(&SessionCreate {
-                owner,
-                command,
-                created_at_ms: runtime.now_ms(),
-                selection,
-            })
-            .map_err(ServiceError::store)
-    })
-    .await
-    .map_err(ApiError::from_service)?;
-
-    state
+    let operation = state
         .runtime
-        .observe_commit(&operation.append, &operation.state)
-        .await;
+        .create_session(owner, idempotency_key, selection, replay_only)
+        .await
+        .map_err(api_error_from_runtime_session)?;
     Ok((
         StatusCode::CREATED,
         Json(CommandResponse {
@@ -910,134 +826,25 @@ async fn append_message(
             _ => ApiError::malformed(),
         })?;
     let owner = SessionOwner::new(context.authority_id(), context.subject());
-    let owner_digest = owner_digest(&owner.authority_id, &owner.subject);
-    let command_id = format!(
-        "message-{}",
-        semantic_digest(
-            "session.message.key",
-            &format!("{owner_digest}:{session_id}"),
-            &idempotency_key,
-        )
-    );
-    let message_id = request.message_id.unwrap_or_else(|| {
-        format!(
-            "message-{}",
-            semantic_digest(
-                "session.message.id",
-                &format!("{owner_digest}:{session_id}"),
-                &idempotency_key,
-            )
-        )
-    });
-    let event_id = format!(
-        "message-appended-{}",
-        semantic_digest("session.message.event", &command_id, &message_id)
-    );
-    let delivery_id = format!(
-        "delivery-{}",
-        semantic_digest("session.message.delivery", &command_id, &message_id)
-    );
-    let delivery_event_id = format!(
-        "delivery-queued-{}",
-        semantic_digest("session.message.delivery-event", &command_id, &message_id)
-    );
-    let delivery_dedupe_key = format!("delivery:{command_id}");
-    let created_at_ms = state.runtime.now_ms();
-    let store = state.store.clone();
-    let id = session_id.clone();
-    let key = idempotency_key.clone();
-    let runtime_owner = owner.clone();
-    let operation = run_blocking(move || {
-        let expected_message = TranscriptMessage {
-            message_id: message_id.clone(),
-            role: crate::domain::TranscriptRole::User,
-            content: request.content.clone(),
-            tool_call_id: None,
-            tool_calls: Vec::<ToolCall>::new(),
-            dedupe_key: Some(key.clone()),
-            source_queue_id: None,
-        };
-        let requested_delivery = DurablePayload::inline(json!({
-            "message_id": &message_id,
-            "content": &request.content,
-        }))
-        .ok()
-        .map(|payload| QueuedDelivery {
-            queue_id: 0,
-            delivery_id: delivery_id.clone(),
-            kind: DeliveryKind::UserInput,
-            payload,
-            dedupe_key: delivery_dedupe_key.clone(),
-            wake: true,
-            created_at_ms: Some(created_at_ms),
-            source_tool_call_id: None,
-            materialized_message_id: None,
-        });
-        if let Some(replay) = replay_message_command(
-            &*store,
-            &owner,
-            &id,
-            &command_id,
-            &expected_message,
-            requested_delivery.as_ref(),
-        )? {
-            return Ok(replay);
-        }
-        if replay_only {
-            return Err(ServiceError::IdempotencyReceiptNotFound);
-        }
-        let current = store
-            .rehydrate_owned(&owner, &id)
-            .map_err(ServiceError::rehydrate)?;
-        if current.selection.model.is_some() {
-            return enqueue_model_delivery(
-                &*store,
-                &owner,
-                &id,
-                current,
-                ModelDeliverySpec {
-                    command_id: command_id.clone(),
-                    event_id: delivery_event_id,
-                    delivery_id,
-                    dedupe_key: delivery_dedupe_key,
-                    message_id: message_id.clone(),
-                    content: request.content.clone(),
-                    created_at_ms,
-                },
-            );
-        }
-        let event = SessionEvent::MessageAppended {
-            message: expected_message,
-            wake_wait: true,
-        };
-        let appended = store
-            .append_owned(
-                &owner,
-                &id,
-                &current,
-                &command_id,
-                &[EventDraft::new(event_id, event)],
-            )
-            .map_err(ServiceError::store)?;
-        Ok((appended.append, appended.state.into_state()))
-    })
-    .await
-    .map_err(ApiError::from_service)?;
-
-    state
+    let (append, _) = state
         .runtime
-        .observe_commit(&operation.0, &operation.1)
-        .await;
-    if !operation.0.replayed {
-        state.runtime.wake(runtime_owner, session_id.clone());
-    }
+        .append_message(
+            owner,
+            session_id.clone(),
+            idempotency_key,
+            request.content,
+            request.message_id,
+            replay_only,
+        )
+        .await
+        .map_err(api_error_from_runtime_session)?;
     Ok((
         StatusCode::ACCEPTED,
         Json(CommandResponse {
             schema: "zode.command.v1",
             session_id,
             accepted: true,
-            version: operation.0.stream_version,
+            version: append.stream_version,
         }),
     ))
 }
@@ -1061,90 +868,24 @@ async fn select_model(
     let body: Value = serde_json::from_slice(&body).map_err(|_| ApiError::malformed())?;
     let model = parse_model_selection(body)?;
     let owner = SessionOwner::new(context.authority_id(), context.subject());
-    let command_id = session_command_id("model", &owner, &session_id, &idempotency_key);
-    let event_id = format!("model-selection-changed:{command_id}");
-    let store = state.store.clone();
-    let replicas = state.replicas.clone();
-    let provider_policy = state.provider_policy.clone();
-    let runtime_owner = owner.clone();
-    let id = session_id.clone();
-    let expected_model = model.clone();
-    let operation = run_blocking(move || {
-        let replay =
-            lookup_session_command(&*store, &owner, &id, &command_id, |event| match event {
-                SessionEvent::ModelSelectionChanged { selection } => {
-                    selection.model.as_ref() == Some(&expected_model)
-                }
-                _ => false,
-            })?;
-        if let Some(replay) = replay {
-            return Ok(replay);
-        }
-        if replay_only {
-            return Err(ServiceError::IdempotencyReceiptNotFound);
-        }
-        // Resolve ownership/existence before provider policy or replica state
-        // so a cross-owner or missing session cannot probe credential status.
-        let current = store
-            .rehydrate_owned(&owner, &id)
-            .map_err(ServiceError::rehydrate)?;
-        provider_policy
-            .validate(&model.provider_execution)
-            .map_err(|_| ServiceError::Invalid("invalid provider execution".into()))?;
-        let credential = replicas
-            .resolve(
-                &model.auth_authority_id,
-                &model.auth_profile_id,
-                &model.provider,
-                model.auth_revision,
-            )
-            .map_err(|error| match error {
-                ReplicaError::Disabled
-                | ReplicaError::SecretUnavailable
-                | ReplicaError::Unavailable => ServiceError::AuthReplicaUnavailable,
-                ReplicaError::Invalid => {
-                    ServiceError::Invalid("invalid credential replica selection".into())
-                }
-                _ => ServiceError::Backend,
-            })?;
-        if credential_schema_for_adapter(&model.provider_execution.kind)
-            != Some(credential.credential_schema.as_str())
-        {
-            return Err(ServiceError::AuthReplicaUnavailable);
-        }
-        let mut selection = current.selection.clone();
-        selection.model = Some(model);
-        let appended = store
-            .append_owned(
-                &owner,
-                &id,
-                &current,
-                &command_id,
-                &[EventDraft::new(
-                    event_id,
-                    SessionEvent::ModelSelectionChanged { selection },
-                )],
-            )
-            .map_err(ServiceError::store)?;
-        Ok((appended.append, appended.state.into_state()))
-    })
-    .await
-    .map_err(ApiError::from_service)?;
-
-    state
+    let (append, _) = state
         .runtime
-        .observe_commit(&operation.0, &operation.1)
-        .await;
-    if !operation.0.replayed {
-        state.runtime.wake(runtime_owner, session_id.clone());
-    }
+        .select_model(
+            owner,
+            session_id.clone(),
+            idempotency_key,
+            model,
+            replay_only,
+        )
+        .await
+        .map_err(api_error_from_runtime_session)?;
     Ok((
         StatusCode::ACCEPTED,
         Json(CommandResponse {
             schema: "zode.command.v1",
             session_id,
             accepted: true,
-            version: operation.0.stream_version,
+            version: append.stream_version,
         }),
     ))
 }
@@ -1326,6 +1067,24 @@ fn callback_bearer(headers: &HeaderMap) -> Option<String> {
     (!token.is_empty() && !token.chars().any(char::is_whitespace)).then(|| token.to_owned())
 }
 
+fn api_error_from_runtime_session(error: RuntimeCommandError) -> ApiError {
+    match error {
+        RuntimeCommandError::NotFound => ApiError::from_service(ServiceError::NotFound),
+        RuntimeCommandError::IdempotencyReceiptNotFound => {
+            ApiError::from_service(ServiceError::IdempotencyReceiptNotFound)
+        }
+        RuntimeCommandError::Conflict => {
+            ApiError::conflict("request conflicts with an existing command")
+        }
+        RuntimeCommandError::Invalid("payload_too_large") => ApiError::payload_too_large(),
+        RuntimeCommandError::Invalid(message) => ApiError::invalid(message),
+        RuntimeCommandError::AuthReplicaUnavailable => {
+            ApiError::from_service(ServiceError::AuthReplicaUnavailable)
+        }
+        RuntimeCommandError::Backend => ApiError::internal(),
+    }
+}
+
 fn api_error_from_runtime_tool(error: RuntimeCommandError) -> ApiError {
     match error {
         RuntimeCommandError::NotFound => ApiError::tool_not_found(),
@@ -1333,7 +1092,9 @@ fn api_error_from_runtime_tool(error: RuntimeCommandError) -> ApiError {
             ApiError::conflict("tool call conflicts with its current state")
         }
         RuntimeCommandError::Invalid(_) => ApiError::invalid("invalid tool call request"),
-        RuntimeCommandError::Backend => ApiError::internal(),
+        RuntimeCommandError::Backend
+        | RuntimeCommandError::IdempotencyReceiptNotFound
+        | RuntimeCommandError::AuthReplicaUnavailable => ApiError::internal(),
     }
 }
 
@@ -1344,198 +1105,9 @@ fn api_error_from_runtime_callback(error: RuntimeCommandError) -> ApiError {
             ApiError::conflict("callback conflicts with its terminal result")
         }
         RuntimeCommandError::Invalid(_) => ApiError::invalid("invalid callback request"),
-        RuntimeCommandError::Backend => ApiError::internal(),
-    }
-}
-
-fn enqueue_model_delivery(
-    store: &dyn EventStore,
-    owner: &SessionOwner,
-    session_id: &str,
-    mut current: SessionState,
-    spec: ModelDeliverySpec,
-) -> Result<(crate::runtime::AppendResult, SessionState), ServiceError> {
-    let payload = DurablePayload::inline(json!({
-        "message_id": &spec.message_id,
-        "content": &spec.content,
-    }))
-    .map_err(service_error_from_domain)?;
-
-    for _ in 0..16 {
-        let queue_id = current
-            .delivery_ack
-            .checked_add(current.delivery_queue.len() as u64 + 1)
-            .ok_or_else(|| ServiceError::Invalid("delivery queue is full".into()))?;
-        let delivery = QueuedDelivery {
-            queue_id,
-            delivery_id: spec.delivery_id.clone(),
-            kind: DeliveryKind::UserInput,
-            payload: payload.clone(),
-            dedupe_key: spec.dedupe_key.clone(),
-            wake: true,
-            created_at_ms: Some(spec.created_at_ms),
-            source_tool_call_id: None,
-            materialized_message_id: None,
-        };
-        let event = SessionEvent::DeliveryQueued {
-            delivery: delivery.clone(),
-        };
-        match store.append_owned(
-            owner,
-            session_id,
-            &current,
-            &spec.command_id,
-            &[EventDraft::new(spec.event_id.clone(), event)],
-        ) {
-            Ok(appended) => return Ok((appended.append, appended.state.into_state())),
-            Err(StoreError::OptimisticConcurrency { .. }) => {
-                current = store
-                    .rehydrate_owned(owner, session_id)
-                    .map_err(ServiceError::rehydrate)?;
-            }
-            Err(StoreError::CommandIdempotencyConflict { .. }) => {
-                if let Some(replay) =
-                    replay_queued_delivery(store, owner, session_id, &spec.command_id, &delivery)?
-                {
-                    return Ok(replay);
-                }
-                return Err(ServiceError::Conflict(
-                    "request conflicts with an existing command".into(),
-                ));
-            }
-            Err(error) => return Err(ServiceError::store(error)),
-        }
-    }
-
-    Err(ServiceError::Conflict(
-        "request could not be admitted concurrently".into(),
-    ))
-}
-
-fn replay_queued_delivery(
-    store: &dyn EventStore,
-    owner: &SessionOwner,
-    session_id: &str,
-    command_id: &str,
-    requested: &QueuedDelivery,
-) -> Result<Option<(crate::runtime::AppendResult, SessionState)>, ServiceError> {
-    let records = store
-        .read_stream_owned(owner, session_id, 0)
-        .map_err(ServiceError::read_store)?;
-    let events = records
-        .into_iter()
-        .filter(|record| record.command_id == command_id)
-        .collect::<Vec<_>>();
-    let Some(first) = events.first() else {
-        return Ok(None);
-    };
-    if events.len() != 1 {
-        return Err(ServiceError::Conflict(
-            "request conflicts with an existing command".into(),
-        ));
-    }
-    let SessionEvent::DeliveryQueued { delivery } = &first.event else {
-        return Err(ServiceError::Conflict(
-            "request conflicts with an existing command".into(),
-        ));
-    };
-    if !same_delivery_request(delivery, requested) {
-        return Err(ServiceError::Conflict(
-            "request conflicts with an existing command".into(),
-        ));
-    }
-    let state = store
-        .rehydrate_owned(owner, session_id)
-        .map_err(ServiceError::rehydrate)?;
-    let stream_version = events
-        .last()
-        .map(|record| record.stream_version)
-        .unwrap_or(state.stream_version);
-    Ok(Some((
-        crate::runtime::AppendResult {
-            stream_id: session_id.to_owned(),
-            command_id: command_id.to_owned(),
-            events,
-            stream_version,
-            replayed: true,
-        },
-        state,
-    )))
-}
-
-fn same_delivery_request(left: &QueuedDelivery, right: &QueuedDelivery) -> bool {
-    left.delivery_id == right.delivery_id
-        && left.kind == right.kind
-        && left.payload == right.payload
-        && left.dedupe_key == right.dedupe_key
-        && left.wake == right.wake
-        && left.source_tool_call_id == right.source_tool_call_id
-}
-
-/// Look up an already admitted message command before inspecting current
-/// session state. The same key and semantic request returns the original
-/// append; a different request conflicts without appending a new event.
-fn replay_message_command(
-    store: &dyn EventStore,
-    owner: &SessionOwner,
-    session_id: &str,
-    command_id: &str,
-    expected_message: &TranscriptMessage,
-    requested_delivery: Option<&QueuedDelivery>,
-) -> Result<Option<(crate::runtime::AppendResult, SessionState)>, ServiceError> {
-    let records = match store.read_stream_owned(owner, session_id, 0) {
-        Ok(records) => records,
-        Err(StoreError::SessionNotFound) => return Ok(None),
-        Err(error) => return Err(ServiceError::read_store(error)),
-    };
-    let events = records
-        .into_iter()
-        .filter(|record| record.command_id == command_id)
-        .collect::<Vec<_>>();
-    let Some(first) = events.first() else {
-        return Ok(None);
-    };
-    if events.len() != 1 {
-        return Err(ServiceError::Conflict(
-            "request conflicts with an existing command".into(),
-        ));
-    }
-    let matches = match &first.event {
-        SessionEvent::MessageAppended { message, .. } => message == expected_message,
-        SessionEvent::DeliveryQueued { delivery } => {
-            requested_delivery.is_some_and(|requested| same_delivery_request(delivery, requested))
-        }
-        _ => false,
-    };
-    if !matches {
-        return Err(ServiceError::Conflict(
-            "request conflicts with an existing command".into(),
-        ));
-    }
-    let state = store
-        .rehydrate_owned(owner, session_id)
-        .map_err(ServiceError::rehydrate)?;
-    let stream_version = events
-        .last()
-        .map(|record| record.stream_version)
-        .unwrap_or(state.stream_version);
-    Ok(Some((
-        crate::runtime::AppendResult {
-            stream_id: session_id.to_owned(),
-            command_id: command_id.to_owned(),
-            events,
-            stream_version,
-            replayed: true,
-        },
-        state,
-    )))
-}
-
-fn service_error_from_domain(error: crate::domain::DomainError) -> ServiceError {
-    match error {
-        crate::domain::DomainError::DurablePayloadTooLarge { .. }
-        | crate::domain::DomainError::TextTooLarge { .. } => ServiceError::PayloadTooLarge,
-        _ => ServiceError::Invalid("invalid message request".into()),
+        RuntimeCommandError::Backend
+        | RuntimeCommandError::IdempotencyReceiptNotFound
+        | RuntimeCommandError::AuthReplicaUnavailable => ApiError::internal(),
     }
 }
 
@@ -1792,64 +1364,6 @@ fn model_selection_from_request(model: CreateModelSelection) -> SessionModelSele
     }
 }
 
-fn session_command_id(kind: &str, owner: &SessionOwner, session_id: &str, key: &str) -> String {
-    semantic_digest(
-        &format!("session.{kind}.command"),
-        &format!(
-            "{}:{}:{}",
-            owner_digest(&owner.authority_id, &owner.subject),
-            session_id,
-            key
-        ),
-        key,
-    )
-}
-
-fn lookup_session_command<F>(
-    store: &dyn EventStore,
-    owner: &SessionOwner,
-    session_id: &str,
-    command_id: &str,
-    matches_request: F,
-) -> Result<Option<(crate::runtime::AppendResult, SessionState)>, ServiceError>
-where
-    F: Fn(&SessionEvent) -> bool,
-{
-    let records = match store.read_stream_owned(owner, session_id, 0) {
-        Ok(records) => records,
-        Err(StoreError::SessionNotFound) => return Ok(None),
-        Err(error) => return Err(ServiceError::read_store(error)),
-    };
-    let events = records
-        .into_iter()
-        .filter(|record| record.command_id == command_id)
-        .collect::<Vec<_>>();
-    let Some(first) = events.first() else {
-        return Ok(None);
-    };
-    if events.len() != 1 || !matches_request(&first.event) {
-        return Err(ServiceError::Conflict(
-            "request conflicts with an existing command".into(),
-        ));
-    }
-    let state = store
-        .rehydrate_owned(owner, session_id)
-        .map_err(ServiceError::rehydrate)?;
-    Ok(Some((
-        crate::runtime::AppendResult {
-            stream_id: session_id.to_owned(),
-            command_id: command_id.to_owned(),
-            stream_version: events
-                .last()
-                .map(|event| event.stream_version)
-                .unwrap_or(state.stream_version),
-            events,
-            replayed: true,
-        },
-        state,
-    )))
-}
-
 fn default_auth_revision() -> u64 {
     1
 }
@@ -2046,25 +1560,6 @@ fn rotation_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
         return Err(ApiError::malformed());
     }
     Ok(value.to_owned())
-}
-
-fn owner_digest(authority_id: &str, subject: &str) -> String {
-    digest_fields("zode.session-owner.v1", &[authority_id, subject])
-}
-
-fn semantic_digest(kind: &str, scope: &str, value: &str) -> String {
-    digest_fields(kind, &[scope, value])
-}
-
-fn digest_fields(kind: &str, fields: &[&str]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(kind.as_bytes());
-    digest.update([0]);
-    for field in fields {
-        digest.update((field.len() as u64).to_be_bytes());
-        digest.update(field.as_bytes());
-    }
-    format!("sha256:v1:{:x}", digest.finalize())
 }
 
 fn session_view(state: SessionState) -> Value {
