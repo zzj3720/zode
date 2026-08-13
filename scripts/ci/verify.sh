@@ -15,6 +15,7 @@ command -v pnpm >/dev/null 2>&1 || die 'pnpm is required (the repository pins pn
 command -v node >/dev/null 2>&1 || die 'node is required'
 
 printf '%s\n' '== static gates =='
+"$ROOT/scripts/ci/assert-endpoint-module-boundary.sh"
 cargo fmt --all -- --check
 cargo clippy --locked --test process_capture_e2e -- -D warnings
 node --check "$ROOT/web/e2e/support/harness.cjs"

@@ -1,6 +1,6 @@
-pub mod api;
 pub mod control;
 pub mod domain;
+pub mod http;
 pub mod provider;
 pub mod replicas;
 pub mod runtime;

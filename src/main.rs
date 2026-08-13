@@ -11,8 +11,8 @@ use std::{
 
 use config::EndpointConfig;
 use zode::{
-    api,
     control::ControlState,
+    http,
     provider::{AimuxProvider, ProviderExecutionPolicy},
     replicas::FileReplicaStore,
     runtime::{Runtime, TimerArm, TimerPort},
@@ -138,13 +138,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         credential_replica_directory.as_deref(),
     )?);
     let (adapter_kinds, allowed_origins, transport_retry) = config.provider_execution_policy();
-    let capabilities_body = api::build_capabilities_body_with_callback(
+    let capabilities_body = http::build_capabilities_body_with_callback(
         control.endpoint_id(),
         adapter_kinds.clone(),
         config.capability_tools(),
         true,
     )?;
-    let health_body = api::build_health_body(control.endpoint_id())?;
+    let health_body = http::build_health_body(control.endpoint_id())?;
     let provider_policy =
         ProviderExecutionPolicy::new(adapter_kinds, allowed_origins, transport_retry);
     let tool_specs = config.tool_specs();
@@ -209,7 +209,7 @@ async fn run(
         }
     });
     runtime.queue_startup_recovery().await?;
-    let state = api::AppState::new(
+    let state = http::AppState::new(
         composition.control,
         runtime.clone(),
         composition.health_body,
@@ -224,7 +224,7 @@ async fn run(
     let shutdown_signal = arm_shutdown_signal()?;
     tokio::pin!(shutdown_signal);
     let (shutdown, shutdown_requested) = tokio::sync::oneshot::channel::<()>();
-    let serving = axum::serve(listener, api::router(state))
+    let serving = axum::serve(listener, http::router(state))
         .with_graceful_shutdown(async {
             let _ = shutdown_requested.await;
         })

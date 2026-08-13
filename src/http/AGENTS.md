@@ -1,6 +1,6 @@
 # Endpoint HTTP and SSE adapter rules
 
-`src/api` is the passive device Endpoint adapter. It admits controller
+`src/http` is the passive device Endpoint adapter. It admits controller
 commands, renders Endpoint projections, and exposes the Endpoint-wide durable
 event stream. It
 is not the agent runtime, management Server, UI API, provider-auth authority, or
