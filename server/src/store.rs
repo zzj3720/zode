@@ -350,10 +350,6 @@ impl KeyMaterial {
         self.digest(b"access-actor-v1", &[kind.as_bytes(), actor.as_bytes()])
     }
 
-    pub(crate) fn endpoint_subject(&self, actor_key: &[u8; DIGEST_BYTES]) -> String {
-        format!("v1:{}", hex(actor_key))
-    }
-
     fn seal(&self, reference: &str, plaintext: &[u8]) -> Result<Vec<u8>, StoreError> {
         let cipher = XChaCha20Poly1305::new((&self.encryption).into());
         let mut nonce = [0_u8; NONCE_BYTES];
@@ -767,27 +763,6 @@ impl ControlStore {
         };
         transaction.commit().map_err(|_| StoreError::Internal)?;
         Ok(phase)
-    }
-
-    pub(crate) fn local_endpoint_bootstrap_phase(
-        &self,
-    ) -> Result<Option<LocalBootstrapPhase>, StoreError> {
-        let connection = self.connection()?;
-        let phase = connection
-            .query_row(
-                "SELECT phase FROM local_endpoint_bootstrap WHERE singleton = 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|_| StoreError::Internal)?;
-        phase
-            .map(|phase| match phase.as_str() {
-                "pending" => Ok(LocalBootstrapPhase::Pending),
-                "complete" => Ok(LocalBootstrapPhase::Complete),
-                _ => Err(StoreError::Integrity),
-            })
-            .transpose()
     }
 
     pub(crate) fn commit_local_endpoint(

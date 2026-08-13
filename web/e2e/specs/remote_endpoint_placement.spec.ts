@@ -142,8 +142,7 @@ function signAccessToken(privateKey: ReturnType<typeof generateKeyPairSync>["pri
       type: "app",
       iat: now,
       nbf: now - 1,
-      exp: now + 300,
-    }),
+      exp: now + 300}),
   );
   const unsigned = `${header}.${payload}`;
   const signer = createSign("RSA-SHA256");
@@ -171,10 +170,7 @@ async function startAccessFixture(): Promise<AccessFixture> {
             e: publicJwk.e,
             kid: "web-remote-endpoint-placement-key",
             use: "sig",
-            alg: "RS256",
-          },
-        ],
-      }),
+            alg: "RS256"}]}),
     );
   });
   const port = await listen(server);
@@ -194,8 +190,7 @@ async function startAccessFixture(): Promise<AccessFixture> {
           port: target.port,
           path: `${target.pathname}${target.search}`,
           method: incoming.method,
-          headers,
-        },
+          headers},
         (response) => {
           const responseHeaders: Record<string, string | string[] | undefined> = { ...response.headers };
           delete responseHeaders.connection;
@@ -224,8 +219,7 @@ async function startAccessFixture(): Promise<AccessFixture> {
             edge.close((error) => (error ? reject(error) : resolvePromise()));
           });
         }
-      },
-    };
+      }};
   }
   return {
     issuer,
@@ -236,16 +230,14 @@ async function startAccessFixture(): Promise<AccessFixture> {
       await new Promise<void>((resolvePromise, reject) => {
         server.close((error) => (error ? reject(error) : resolvePromise()));
       });
-    },
-  };
+    }};
 }
 
 function startChildProcess(binary: string, args: string[], readyPrefix: string): Promise<ReadyProcess> {
   const child = spawn(binary, args, {
     cwd: REPO_ROOT,
     env: { ...process.env, RUST_BACKTRACE: "0" },
-    stdio: ["ignore", "pipe", "pipe"],
-  }) as unknown as ChildProcessWithoutNullStreams;
+    stdio: ["ignore", "pipe", "pipe"]}) as unknown as ChildProcessWithoutNullStreams;
   let stdout = "";
   let stderr = "";
   let stopped = false;
@@ -327,8 +319,7 @@ function startChildProcess(binary: string, args: string[], readyPrefix: string):
             throw new Error("real Endpoint changed its URL across restart");
           }
           return replacement;
-        },
-      };
+        }};
       return readyProcess;
     })
     .catch(async (error) => {
@@ -352,28 +343,17 @@ function writeEndpointConfig(root: string, authorityId: string, secretFile: stri
       runtime_store: { kind: "sqlite", path: join(root, "endpoint.sqlite3") },
       credential_replica_store: { kind: "files", directory: credentials },
       blob_store: { kind: "files", directory: blobs },
-      controller_auth: [
-        {
-          authority_id: authorityId,
-          revision: 1,
-          kind: "bearer_secret_file",
-          secret_file: secretFile,
-        },
-      ],
       runtime: {
         tool_foreground_ms: 3_000,
         snapshot_every_events: 1_000,
         model_step_max_attempts: 1,
         model_retry_base_ms: 1,
-        model_retry_max_ms: 10,
-      },
+        model_retry_max_ms: 10},
       provider_execution: {
         adapter_kinds: ["openai_compatible"],
-        allowed_base_url_origins: ["http://127.0.0.1"],
-      },
+        allowed_base_url_origins: ["http://127.0.0.1"]},
       callback: { allowed_public_origins: ["http://127.0.0.1"] },
-      tools: [],
-    }, null, 2),
+      tools: []}, null, 2),
   );
   return configPath;
 }
@@ -414,9 +394,7 @@ function writeServerConfig(
       audiences: [ACCESS_AUDIENCE],
       jwks_url: jwksUrl,
       subject_key_file: subjectKey,
-      subject_key_version: 1,
-    },
-  };
+      subject_key_version: 1}};
   if (options.deployment === "all_in_one") {
     if (
       !options.endpointBinary ||
@@ -429,9 +407,7 @@ function writeServerConfig(
     config.local_endpoint = {
       executable: options.endpointBinary,
       config: options.localEndpointConfig,
-      listen: options.localListenAddress,
-      bootstrap_controller_secret_file: options.localBootstrapSecret,
-    };
+      listen: options.localListenAddress};
   }
   writeFileSync(path, jsonBody(config, null, 2));
   return { path, database, secrets };
@@ -473,18 +449,15 @@ async function startHarness(): Promise<Harness> {
         endpointBinary,
         localEndpointConfig: localConfig,
         localListenAddress: localListen,
-    localBootstrapSecret,
-      },
+    localBootstrapSecret},
     );
     cpSync(UI_ASSETS_DIRECTORY, join(root, "ui"), { recursive: true });
     remote = await startChildProcess(endpointBinary, ["--config", remoteConfig, "--listen", remoteListen], "ZODE_READY ");
     const identityResponse = await fetch(`${remote.baseUrl}/v1/identity`, {
       headers: {
         Authorization: `Bearer ${REMOTE_CONTROL_SECRET}`,
-        "Zode-Subject": "web-remote-endpoint-placement-identity",
-      },
-      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-    });
+        "Zode-Subject": "web-remote-endpoint-placement-identity"},
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)});
     const identityText = await identityResponse.text();
     assertSafeText(identityText, REMOTE_CONTROL_SECRET, "remote identity response");
     if (!identityResponse.ok) throw new Error("remote Endpoint identity probe failed");
@@ -502,8 +475,7 @@ async function startHarness(): Promise<Harness> {
       edge,
       server,
       remote,
-      remoteEndpointId: remoteIdentity.endpoint_id,
-    };
+      remoteEndpointId: remoteIdentity.endpoint_id};
   } catch (error) {
     await edge?.close().catch(() => undefined);
     await server?.stop().catch(() => undefined);
@@ -527,8 +499,7 @@ async function startServerOnlyHarness(): Promise<ServerOnlyHarness> {
     access = await startAccessFixture();
     cpSync(UI_ASSETS_DIRECTORY, join(root, "ui"), { recursive: true });
     const serverConfig = writeServerConfig(root, access.issuer, access.jwksUrl, {
-      deployment: "server_only",
-    });
+      deployment: "server_only"});
     server = await startChildProcess(serverBinary, ["--config", serverConfig.path], "ZODE_SERVER_READY ");
     edge = await access.startEdge(server.baseUrl);
     return { root, access, edge, server };
@@ -655,15 +626,12 @@ function captureFirstOccurrenceEvidence(
     base_url: "${SLOT_ENDPOINT_BASE_URL}",
     control_auth: {
       kind: parsedBody.control_auth?.kind,
-      secret: "${SLOT_ENDPOINT_CONTROL_SECRET}",
-    },
-  };
+      secret: "${SLOT_ENDPOINT_CONTROL_SECRET}"}};
   const requestHeaders = request.headers();
   const safeRequestHeaders = {
     "cf-access-jwt-assertion": "${SLOT_ACCESS_ASSERTION}",
     "content-type": requestHeaders["content-type"] ?? "application/json",
-    "idempotency-key": requestHeaders["idempotency-key"] ?? "",
-  };
+    "idempotency-key": requestHeaders["idempotency-key"] ?? ""};
   const safeResponseHeaders = Object.fromEntries(
     ["cache-control", "content-type", "location", "referrer-policy"]
       .map((name) => [name, response.headers()[name]])
@@ -672,21 +640,18 @@ function captureFirstOccurrenceEvidence(
   assertSafeText(responseBody, REMOTE_CONTROL_SECRET, "first-occurrence response");
   const safeResponseChunk = {
     offset_us: 0,
-    body_hex: Buffer.from(responseBody, "utf8").toString("hex"),
-  };
+    body_hex: Buffer.from(responseBody, "utf8").toString("hex")};
   const requestFingerprint = {
     method: request.method(),
     path: new URL(request.url()).pathname,
     headers: safeRequestHeaders,
-    body: safeBody,
-  };
+    body: safeBody};
   const responseFingerprint = {
     status: response.status(),
     headers: safeResponseHeaders,
     chunks: [safeResponseChunk],
     completed: true,
-    termination: "complete",
-  };
+    termination: "complete"};
   const evidence: JsonObject = {
     schema: "zode.http-incident-recording.v1",
     version: 1,
@@ -697,18 +662,15 @@ function captureFirstOccurrenceEvidence(
     secret_slots: [
       "SLOT_ACCESS_ASSERTION",
       "SLOT_ENDPOINT_BASE_URL",
-      "SLOT_ENDPOINT_CONTROL_SECRET",
-    ],
+      "SLOT_ENDPOINT_CONTROL_SECRET"],
     first_failure: {
       exchange_sequence: 0,
       status: response.status(),
-      safe_error: response.status() === 404 ? "missing_public_endpoint_route" : "observed_remote_endpoint_add_failure",
-    },
+      safe_error: response.status() === 404 ? "missing_public_endpoint_route" : "observed_remote_endpoint_add_failure"},
     canonical_fingerprint: {
       algorithm: "sha256",
       request: `sha256:${sha256(canonicalJson(requestFingerprint))}`,
-      response: `sha256:${sha256(canonicalJson(responseFingerprint))}`,
-    },
+      response: `sha256:${sha256(canonicalJson(responseFingerprint))}`},
     exchanges: [
       {
         sequence: 0,
@@ -718,19 +680,14 @@ function captureFirstOccurrenceEvidence(
           semantic_headers: safeRequestHeaders,
           raw_body: jsonBody(safeBody),
           canonical_json: safeBody,
-          body_sha256: `sha256:${sha256(jsonBody(safeBody))}`,
-        },
+          body_sha256: `sha256:${sha256(jsonBody(safeBody))}`},
         recorded_response: {
           status: response.status(),
           semantic_headers: safeResponseHeaders,
           chunks: [safeResponseChunk],
           completed: true,
           termination: "complete",
-          body_sha256: `sha256:${sha256(responseBody)}`,
-        },
-      },
-    ],
-  };
+          body_sha256: `sha256:${sha256(responseBody)}`}}]};
   evidence.whole_digest = cassetteDigest(evidence);
   const quarantineRoot = resolve(
     process.env.ZODE_RECORDING_QUARANTINE ?? join(process.cwd(), "target/test-recordings/quarantine"),
@@ -759,8 +716,7 @@ async function replayFirstFailure(
   const slots: Record<string, string> = {
     SLOT_ACCESS_ASSERTION: assertion,
     SLOT_ENDPOINT_BASE_URL: remoteBaseUrl,
-    SLOT_ENDPOINT_CONTROL_SECRET: REMOTE_CONTROL_SECRET,
-  };
+    SLOT_ENDPOINT_CONTROL_SECRET: REMOTE_CONTROL_SECRET};
   const exchange = cassette.exchanges[0] as JsonObject;
   const request = exchange.request as JsonObject;
   const filledHeaders = replaceSlots(request.semantic_headers, slots) as Record<string, string>;
@@ -768,8 +724,7 @@ async function replayFirstFailure(
   const response = await api.fetch(`${serverBaseUrl}${request.path}`, {
     method: request.method,
     headers: filledHeaders,
-    data: filledBody,
-  });
+    data: filledBody});
   const body = await response.text();
   assertSafeText(body, REMOTE_CONTROL_SECRET, "replayed response");
   const expectedBody = Buffer.concat(
@@ -898,10 +853,8 @@ async function createSession(page: Page, endpointId: string): Promise<{ endpoint
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "idempotency-key": key,
-        },
-        body: JSON.stringify({ tools: [] }),
-      });
+          "idempotency-key": key},
+        body: JSON.stringify({ tools: [] })});
       return { status: response.status, body: await response.text() };
     },
     { path: `/v1/endpoints/${endpointId}/sessions`, key: idempotencyKey },
@@ -965,8 +918,7 @@ function assertServerDoesNotPersistSessionState(
     `${harness.serverDatabase}-wal`,
     `${harness.serverDatabase}-shm`,
     `${harness.serverDatabase}-journal`,
-    ...walkFiles(harness.serverSecrets),
-  ].filter(statSafe);
+    ...walkFiles(harness.serverSecrets)].filter(statSafe);
   for (const sessionId of sessionIds) {
     if (serverOutput.stdout.includes(sessionId) || serverOutput.stderr.includes(sessionId)) {
       throw new Error("Server output contained an Endpoint-owned session ID");
@@ -996,8 +948,7 @@ function assertServerDoesNotPersistSessionState(
   const inspect = (database: string): ReturnType<typeof spawnSync> =>
     spawnSync(sqlite, ["-readonly", "-json", database, schemaQuery], {
       encoding: "utf8",
-      maxBuffer: 16 * 1024 * 1024,
-    });
+      maxBuffer: 16 * 1024 * 1024});
   let inspection = inspect(harness.serverDatabase);
   if (inspection.status !== 0) {
     inspection = inspect(`file:${harness.serverDatabase}?immutable=1`);
@@ -1026,15 +977,13 @@ async function assertSecretFreeBrowserSurface(
       .flatMap((element) => [
         element.textContent ?? "",
         element.getAttribute("aria-label") ?? "",
-        element.getAttribute("title") ?? "",
-      ])
+        element.getAttribute("title") ?? ""])
       .join("\n"),
   );
   const storage = await page.evaluate(() =>
     JSON.stringify({
       local: Object.fromEntries(Object.entries(localStorage)),
-      session: Object.fromEntries(Object.entries(sessionStorage)),
-    }),
+      session: Object.fromEntries(Object.entries(sessionStorage))}),
   );
   expect(renderedSurface.includes(secret)).toBe(false);
   expect(accessibleSurface.includes(secret)).toBe(false);
@@ -1118,13 +1067,11 @@ test("e2e_remote_endpoint_add_probe_and_endpoint_scoped_session_placement", asyn
 
     await openManagementPage(page, "Endpoints");
     const remoteCard = page.locator("article").filter({
-      has: page.getByRole("heading", { name: REMOTE_LABEL, exact: true }),
-    });
+      has: page.getByRole("heading", { name: REMOTE_LABEL, exact: true })});
     await expect(remoteCard).toBeVisible();
     const probeButton = remoteCard.getByRole("button", {
       name: "Refresh Endpoint status",
-      exact: true,
-    });
+      exact: true});
     const probeResponsePromise = page.waitForResponse(
       (response) => response.request().method() === "POST" && responsePath(response) === `/v1/endpoints/${harness.remoteEndpointId}/probe`,
     );

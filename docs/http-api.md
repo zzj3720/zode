@@ -715,64 +715,9 @@ the same effective Endpoint configuration and never returns configured
 provider origins, tool URLs, callback origins, model/profile instances, or
 secret-store metadata. A management Server records its own health observation.
 
-### Controller credential rotation
-
-`controller_authority_id` is a stable logical identity stored independently of
-its bearer secret. Rotation advances a monotonic credential revision without
-changing that identity or any session/receipt ownership scope:
-
-```http
-PUT /v1/controller-auth
-Idempotency-Key: controller-rotation-operation
-Authorization: Bearer current-controller-secret
-```
-
-```json
-{
-  "schema": "zode.controller-auth.rotate.v1",
-  "authority_id": "controller-opaque",
-  "revision": 2,
-  "secret": {
-    "encoding": "application/zode-secret-envelope",
-    "payload": "transport-protected-secret"
-  }
-}
-```
-
-The authenticated authority must match the body. Endpoint stages the secret,
-persists a keyed request fingerprint, atomically promotes revision 2, fences the
-older credential, and acknowledges only after revision 2 authenticates the
-same authority. Lower revisions are stale; same revision/different fingerprint
-conflicts. If the response is lost, the controller probes with the staged new
-secret first and otherwise retries the same operation with the old secret.
-Session list/read/mutation, Endpoint SSE, and same-key receipt replay remain
-accessible under the unchanged authority/subject after rotation and restart.
-
-The active authority manifest is the durable promotion fact. Its publication
-is also the authentication linearization point: a request admitted after that
-publication cannot authenticate with the previous secret, even if persisting a
-safe receipt or returning the rotation response later fails. Endpoint preserves
-each completed rotation's bounded, non-secret fingerprint and exact response as
-an immutable operation receipt scoped by controller authority, opaque subject,
-rotation command, and idempotency key. The current authority secret can
-therefore replay an older operation exactly and detect a same-key/different-body
-conflict after later rotations and restarts without re-running the mutation.
-The same key in another authority, subject, or command scope is independent and
-cannot discover, replay, or conflict with that receipt.
-
-Completed receipts do not accumulate in the recovery journal. That journal is
-a bounded recovery tail containing unresolved intents and, at most, the current
-promotion receipt. Older completed receipts move to their immutable
-direct-lookup facts after the active manifest and receipt are durable. Startup
-reconciles the manifest, recovery tail, and current receipt before readiness,
-but does not scan all historical receipts. Initial configured secrets may
-bootstrap only a jointly new runtime/control store; a missing initialization
-fact or partial controller state on an existing Endpoint fails closed instead
-of restoring an older configured secret.
-
 ## 7. Credential replicas
 
-Endpoint exposes a controller-authenticated provisioning surface, not a
+Endpoint exposes a listen-scoped provisioning surface, not a
 user-facing OAuth/profile management API:
 
 - `GET /v1/auth-replicas` lists installed non-secret replica metadata;
@@ -872,10 +817,10 @@ controller request.
 The executable anchor is `e2e_identity_is_endpoint_owned_and_restart_stable`.
 
 Endpoint health is anchored by
-`e2e_endpoint_health_is_controller_authenticated_and_independent_of_active_session_work`
-until that test is rewritten for listen-scope trust: with a real provider/tool
-request held at a fixture barrier, an unauthenticated health request returns
-the bounded versioned ready response before that work is released.
+`e2e_endpoint_health_is_controller_authenticated_and_independent_of_active_session_work`:
+with a real provider/tool request held at a fixture barrier, a health request
+without Authorization or Zode-Subject returns the bounded versioned ready
+response before that work is released.
 
 Endpoint capabilities are anchored by
 `e2e_endpoint_capabilities_are_restart_stable_bounded_and_non_secret`: a real

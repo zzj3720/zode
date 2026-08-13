@@ -4,8 +4,7 @@ const {
   createHash,
   createSign,
   generateKeyPairSync,
-  randomUUID,
-} = require('node:crypto');
+  randomUUID} = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
@@ -66,8 +65,7 @@ class SecretLeakFailure extends HarnessFailure {
   constructor(surface, label) {
     super('SECRET_DISCLOSURE', `secret marker detected in ${surface} (${label})`, {
       surface,
-      label,
-    });
+      label});
     this.name = 'SecretLeakFailure';
   }
 }
@@ -84,8 +82,7 @@ class SecretLedger {
       this.entries.set(`${entryLabel}:${this.entries.size}`, {
         label: entryLabel,
         value: entryValue,
-        derived,
-      });
+        derived});
     };
     addEntry(label, value);
     if (!derive) return;
@@ -148,8 +145,7 @@ function fsyncFileDescriptor(fd) {
     fs.fsyncSync(fd);
   } catch (error) {
     throw new HarnessFailure('RECORDING_FLUSH_FAILURE', 'recording bytes could not be durably flushed', {
-      cause: error instanceof Error ? error.message : String(error),
-    });
+      cause: error instanceof Error ? error.message : String(error)});
   }
 }
 
@@ -162,8 +158,7 @@ function fsyncDirectory(directory) {
   } catch (error) {
     throw new HarnessFailure('RECORDING_FLUSH_FAILURE', 'recording directory could not be durably flushed', {
       directory,
-      cause: error instanceof Error ? error.message : String(error),
-    });
+      cause: error instanceof Error ? error.message : String(error)});
   } finally {
     if (fd !== undefined) {
       try { fs.closeSync(fd); } catch {}
@@ -303,8 +298,7 @@ class StartupCapture {
       recording_id: this.recordingId,
       e2e_name: this.e2eName,
       role: this.role,
-      armed_at_unix_ms: Date.now(),
-    };
+      armed_at_unix_ms: Date.now()};
     writePrivateFile(this.armPath, `${JSON.stringify(arm, null, 2)}\n`);
     this.armed = true;
     return this;
@@ -313,8 +307,7 @@ class StartupCapture {
   assertArmed() {
     if (!this.armed || !fs.existsSync(this.armPath) || !fs.existsSync(this.configPath)) {
       throw new HarnessFailure('PROCESS_CAPTURE_NOT_ARMED', 'durable process capture must be armed before spawn', {
-        role: this.role,
-      });
+        role: this.role});
     }
     return true;
   }
@@ -325,8 +318,7 @@ class StartupCapture {
     if (phaseMarker) throw new SecretLeakFailure('startup observation phase', phaseMarker.label);
     if (!processHandle?.locatorPath) {
       throw new HarnessFailure('PROCESS_CAPTURE_OBSERVATION_FAILURE', 'real process has no locator for durable observation', {
-        role: this.role,
-      });
+        role: this.role});
     }
     let output;
     let readError;
@@ -343,8 +335,7 @@ class StartupCapture {
             return {
               stdout: stdoutExists ? readDurableBounded(stdoutPath, MAX_STARTUP_OUTPUT_BYTES) : Buffer.alloc(0),
               stderr: stderrExists ? readDurableBounded(stderrPath, MAX_STARTUP_OUTPUT_BYTES) : Buffer.alloc(0),
-              flush_status: stdoutExists && stderrExists ? 'ok' : stdoutExists || stderrExists ? 'failed' : 'not_available',
-            };
+              flush_status: stdoutExists && stderrExists ? 'ok' : stdoutExists || stderrExists ? 'failed' : 'not_available'};
           })();
         readError = undefined;
         break;
@@ -375,14 +366,12 @@ class StartupCapture {
     if (!output || output.flush_status !== 'ok') {
       throw new HarnessFailure('PROCESS_OUTPUT_FLUSH_FAILURE', 'process output was not durably flushed', {
         role: this.role,
-        flushStatus: output?.flush_status || 'not_available',
-      });
+        flushStatus: output?.flush_status || 'not_available'});
     }
     const bytes = Buffer.concat([output.stdout || Buffer.alloc(0), output.stderr || Buffer.alloc(0)]);
     if (bytes.length > MAX_STARTUP_TOTAL_BYTES) {
       throw new HarnessFailure('BOUND_EXCEEDED', 'process output exceeded its bounded quarantine size', {
-        role: this.role,
-      });
+        role: this.role});
     }
     const marker = this.ledger?.find(bytes);
     if (marker) throw new SecretLeakFailure('startup process output', marker.label);
@@ -403,15 +392,13 @@ class StartupCapture {
       process: {
         instance_id: processHandle.locator?.instance_id,
         pid: processHandle.locator?.pid,
-        process_group_id: processHandle.locator?.process_group_id,
-      },
+        process_group_id: processHandle.locator?.process_group_id},
       stdout_hex: Buffer.from(output.stdout || '').toString('hex'),
       stderr_hex: Buffer.from(output.stderr || '').toString('hex'),
       exit_status: {
         known: Boolean(knownExit),
         code: knownExit ? (child?.exitCode ?? stopExit?.code ?? null) : null,
-        signal: knownExit ? (child?.signalCode ?? stopExit?.signal ?? null) : null,
-      },
+        signal: knownExit ? (child?.signalCode ?? stopExit?.signal ?? null) : null},
       flush_status: output.flush_status,
       ...(stopResult ? {
         stop: {
@@ -419,10 +406,7 @@ class StartupCapture {
           reaped_pids: Array.isArray(stopResult.reaped_pids) ? stopResult.reaped_pids : [],
           leaked_pids: Array.isArray(stopResult.leaked_pids) ? stopResult.leaked_pids : [],
           timed_out: Boolean(stopResult.timed_out),
-          flush_status: stopResult.flush_status || 'not_available',
-        },
-      } : {}),
-    };
+          flush_status: stopResult.flush_status || 'not_available'}} : {})};
     replacePrivateJson(this.observationPath, observation);
     this.lastObservation = observation;
     return observation;
@@ -432,8 +416,7 @@ class StartupCapture {
     const recovered = {
       locatorPath,
       locator: locator || (locatorPath && processSeam?.readLocator(locatorPath)),
-      child: undefined,
-    };
+      child: undefined};
     return this.captureProcessObservation(recovered, { phase });
   }
 
@@ -441,8 +424,7 @@ class StartupCapture {
     if (process?.locatorPath && this.armed) {
       this.captureProcessObservation(process, {
         phase: 'failure',
-        stopResult: process.stopResult,
-      });
+        stopResult: process.stopResult});
     }
     const stdoutPath = process?.locatorPath ? `${process.locatorPath}.stdout.log` : undefined;
     const stderrPath = process?.locatorPath ? `${process.locatorPath}.stderr.log` : undefined;
@@ -469,8 +451,7 @@ class StartupCapture {
       reaped_pids: [],
       leaked_pids: [],
       timed_out: false,
-      flush_status: 'not_available',
-    };
+      flush_status: 'not_available'};
     const stopProof = stop.flush_status === 'ok'
       && !stop.timed_out
       && !(stop.leaked_pids || []).length
@@ -482,8 +463,7 @@ class StartupCapture {
       stdout: path.join(this.directory, 'stdout.log'),
       stderr: path.join(this.directory, 'stderr.log'),
       exit: path.join(this.directory, 'exit.json'),
-      termination: path.join(this.directory, 'termination.json'),
-    };
+      termination: path.join(this.directory, 'termination.json')};
     writePrivateFile(files.stdout, stdout);
     writePrivateFile(files.stderr, stderr);
     writeJsonPrivate(files.exit, { code: exit?.code ?? null, signal: exit?.signal ?? null });
@@ -505,8 +485,7 @@ class StartupCapture {
       config: {
         label: `${this.role}-config`,
         bytes_hex: this.configBytes.toString('hex'),
-        sha256: sha256(this.configBytes),
-      },
+        sha256: sha256(this.configBytes)},
       processes: [{
         name: this.role,
         stdout_hex: stdout.toString('hex'),
@@ -520,15 +499,11 @@ class StartupCapture {
           leaked_pids: Array.isArray(stop.leaked_pids) ? stop.leaked_pids : [],
           timed_out: Boolean(stop.timed_out),
           flush_status: stop.flush_status || 'not_available',
-          proof: stopProof,
-        },
-      }],
-    };
+          proof: stopProof}}]};
     const unsigned = { ...envelopeWithoutDigest, integrity_sha256: '' };
     const envelope = {
       ...envelopeWithoutDigest,
-      integrity_sha256: sha256(JSON.stringify(unsigned)),
-    };
+      integrity_sha256: sha256(JSON.stringify(unsigned))};
     const envelopePath = path.join(this.directory, 'capture.v1.json');
     writeJsonPrivate(envelopePath, envelope);
     return envelopePath;
@@ -679,8 +654,7 @@ async function startHttpServer(handler) {
         server.close((error) => (error ? reject(error) : resolve()));
       }), PROCESS_STOP_TIMEOUT_MS, 'fixture server did not stop within the bounded timeout');
       if (failures[0]) throw failures[0];
-    },
-  };
+    }};
 }
 
 function readRequestBody(request, maxBytes = 4 * 1024 * 1024, onChunk) {
@@ -732,8 +706,7 @@ function publicHeaders(headers) {
   for (const [name, value] of Object.entries(headers || {})) {
     if (![
       'accept', 'content-type', 'cache-control', 'forwarded', 'host', 'idempotency-key', 'last-event-id',
-      'origin', 'user-agent', 'x-forwarded-host',
-    ].includes(name.toLowerCase())) continue;
+      'origin', 'user-agent', 'x-forwarded-host'].includes(name.toLowerCase())) continue;
     result[name.toLowerCase()] = Array.isArray(value) ? value.join(', ') : String(value);
   }
   return result;
@@ -752,8 +725,7 @@ function redactedPath(rawPath, ledger) {
 
     const sensitiveMarkers = [
       'ticket', 'code', 'state', 'token', 'secret', 'authorization', 'assertion',
-      'bearer', 'credential', 'password', 'key',
-    ];
+      'bearer', 'credential', 'password', 'key'];
     const occurrences = new Map();
     const redactedQuery = rawQuery.split('&').map((pair) => {
       const equals = pair.indexOf('=');
@@ -789,8 +761,7 @@ function safeBody(body, ledger) {
   return {
     raw_base64: bytes.toString('base64'),
     ...(canonical === undefined ? {} : { canonical_json: canonical }),
-    sha256: sha256(bytes),
-  };
+    sha256: sha256(bytes)};
 }
 
 function decodeBase64Strict(value, label, maxBytes) {
@@ -916,8 +887,7 @@ async function requestRaw(target, {
   headers,
   body,
   timeoutMs = HTTP_TIMEOUT_MS,
-  disconnectAfterResponseBytes,
-}) {
+  disconnectAfterResponseBytes}) {
   return withTimeout(new Promise((resolve, reject) => {
     const started = process.hrtime.bigint();
     const request = http.request(target, { method, headers }, (response) => {
@@ -931,8 +901,7 @@ async function requestRaw(target, {
           status: response.statusCode || 502,
           headers: response.headers,
           chunks,
-          outcome: value,
-        });
+          outcome: value});
       };
       const disconnect = () => {
         finish('client_disconnected');
@@ -944,8 +913,7 @@ async function requestRaw(target, {
         responseBytes += bytes.length;
         chunks.push({
           offsetUs: Number(process.hrtime.bigint() - started) / 1_000,
-          data: bytes,
-        });
+          data: bytes});
         if (disconnectAfterResponseBytes !== undefined
           && responseBytes >= disconnectAfterResponseBytes) disconnect();
       });
@@ -985,8 +953,7 @@ class RecordingJournal {
       } catch (error) {
         throw new HarnessFailure('CAPTURE_SET_RELOAD_FAILURE', 'recovery root was not an existing regular directory', {
           rootDir,
-          cause: error instanceof Error ? error.message : String(error),
-        });
+          cause: error instanceof Error ? error.message : String(error)});
       }
       this.promotedDir = undefined;
       this.defaultCaptureSetId = undefined;
@@ -996,8 +963,7 @@ class RecordingJournal {
     this.promotedDir = ensureDirectory(path.join(rootDir, 'promoted'));
     this.defaultCaptureSetId = this.beginCaptureSet({
       e2eName: 'web-e2e-harness-run',
-      maxMembers: defaultMaxMembers,
-    });
+      maxMembers: defaultMaxMembers});
   }
 
   /**
@@ -1025,8 +991,7 @@ class RecordingJournal {
       sealed: false,
       firstFailureRecordingId: undefined,
       manifestPath: path.join(this.rootDir, `${id}.manifest.json`),
-      manifestAnchorPath: path.join(this.rootDir, `${id}.manifest.anchor.json`),
-    };
+      manifestAnchorPath: path.join(this.rootDir, `${id}.manifest.anchor.json`)};
     this.captureSets.set(id, captureSet);
     this._persistCaptureSet(captureSet, 'open');
     this.currentCaptureSetId = id;
@@ -1048,12 +1013,10 @@ class RecordingJournal {
           .sort(([left], [right]) => left.localeCompare(right)),
       ),
       active: [...captureSet.active].sort(),
-      ...(firstFailureRecordingId ? { first_failure_recording_id: firstFailureRecordingId } : {}),
-    };
+      ...(firstFailureRecordingId ? { first_failure_recording_id: firstFailureRecordingId } : {})};
     const manifest = {
       ...unsignedManifest,
-      integrity_sha256: sha256(JSON.stringify(unsignedManifest)),
-    };
+      integrity_sha256: sha256(JSON.stringify(unsignedManifest))};
     captureSet.sourceDigest = manifest.integrity_sha256;
     try {
       if (fs.existsSync(captureSet.manifestPath)) replacePrivateJson(captureSet.manifestPath, manifest);
@@ -1071,8 +1034,7 @@ class RecordingJournal {
       schema: 'zode.http-capture-set-anchor.v1',
       version: 1,
       capture_set_id: captureSet.id,
-      manifest_digest: manifestDigest,
-    };
+      manifest_digest: manifestDigest};
     try {
       if (fs.existsSync(captureSet.manifestAnchorPath)) {
         const existing = JSON.parse(fs.readFileSync(captureSet.manifestAnchorPath, 'utf8'));
@@ -1099,8 +1061,7 @@ class RecordingJournal {
       try { bootstrap = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch (error) {
         throw this._fail(new HarnessFailure('CAPTURE_SET_RELOAD_FAILURE', 'capture-set manifest could not be reloaded', {
           captureSetId,
-          cause: error instanceof Error ? error.message : String(error),
-        }));
+          cause: error instanceof Error ? error.message : String(error)}));
       }
       if (bootstrap.capture_set_id !== captureSetId || typeof bootstrap.e2e_name !== 'string'
         || !Number.isSafeInteger(bootstrap.max_members)
@@ -1117,8 +1078,7 @@ class RecordingJournal {
         sealed: bootstrap.state !== 'open',
         firstFailureRecordingId: bootstrap.first_failure_recording_id,
         manifestPath,
-        manifestAnchorPath: path.join(this.rootDir, `${captureSetId}.manifest.anchor.json`),
-      };
+        manifestAnchorPath: path.join(this.rootDir, `${captureSetId}.manifest.anchor.json`)};
       this.captureSets.set(captureSetId, captureSet);
     }
     let manifest;
@@ -1127,8 +1087,7 @@ class RecordingJournal {
     } catch (error) {
       throw this._fail(new HarnessFailure('CAPTURE_SET_RELOAD_FAILURE', 'capture-set manifest could not be reloaded', {
         captureSetId,
-        cause: error instanceof Error ? error.message : String(error),
-      }));
+        cause: error instanceof Error ? error.message : String(error)}));
     }
     const { integrity_sha256: manifestIntegrity, ...unsignedManifest } = manifest || {};
     if (typeof manifestIntegrity !== 'string' || !/^[0-9a-f]{64}$/u.test(manifestIntegrity)
@@ -1188,8 +1147,7 @@ class RecordingJournal {
         throw this._fail(new HarnessFailure('CAPTURE_SET_RELOAD_FAILURE', 'capture-set raw member schema was invalid', {
           captureSetId,
           recordingId,
-          cause: error instanceof Error ? error.message : String(error),
-        }));
+          cause: error instanceof Error ? error.message : String(error)}));
       }
       records.push({ ...record, recordingId, rawPath, rawDigest: manifest.member_digests[recordingId], captureSetId });
     }
@@ -1222,8 +1180,7 @@ class RecordingJournal {
       active: [...captureSet.active],
       state: manifest.state,
       firstFailureRecordingId: manifest.first_failure_recording_id,
-      sourceDigest: manifest.integrity_sha256,
-    };
+      sourceDigest: manifest.integrity_sha256};
   }
 
   _captureSet(id) {
@@ -1253,8 +1210,7 @@ class RecordingJournal {
       this.fatalError = error instanceof HarnessFailure
         ? error
         : new HarnessFailure('RECORDING_FLUSH_FAILURE', 'recording capture failed before durable flush', {
-          cause: error instanceof Error ? error.message : String(error),
-        });
+          cause: error instanceof Error ? error.message : String(error)});
     }
     for (const captureSet of this.captureSets.values()) captureSet.fatalError ||= this.fatalError;
     this.fatalBarrier.notify(this.fatalError);
@@ -1296,8 +1252,7 @@ class RecordingJournal {
         responseBytes: 0,
         outcome: undefined,
         captureSetId,
-        finished: false,
-      };
+        finished: false};
     }
     const captureSet = this._captureSet(captureSetId);
     if (captureSet.sealed) {
@@ -1338,8 +1293,7 @@ class RecordingJournal {
       outcome: undefined,
       startedAt: process.hrtime.bigint(),
       finished: false,
-      captureSetId,
-    };
+      captureSetId};
     try {
       this._append(context, {
         kind: 'request',
@@ -1349,8 +1303,7 @@ class RecordingJournal {
         method,
         path: requestPath,
         request_headers: requestHeaders || {},
-        request_body_base64: body.toString('base64'),
-      });
+        request_body_base64: body.toString('base64')});
       this.active.set(id, context);
       captureSet.active.add(id);
       this._persistCaptureSet(captureSet, 'open');
@@ -1368,8 +1321,7 @@ class RecordingJournal {
       requestPath,
       requestHeaders,
       requestBody: Buffer.alloc(0),
-      captureSetId,
-    });
+      captureSetId});
     context.requestBodyChunks = [];
     context.requestBytes = 0;
     return context;
@@ -1406,8 +1358,7 @@ class RecordingJournal {
       this._append(context, {
         kind: 'request_end',
         length: context.requestBody.length,
-        sha256: sha256(context.requestBody),
-      });
+        sha256: sha256(context.requestBody)});
     }
     return context.requestBody;
   }
@@ -1442,8 +1393,7 @@ class RecordingJournal {
     this._append(context, {
       kind: 'response_chunk',
       offset_us: offsetUs,
-      data_base64: bytes.toString('base64'),
-    });
+      data_base64: bytes.toString('base64')});
   }
 
   finish(context, outcome = 'completed') {
@@ -1468,11 +1418,8 @@ class RecordingJournal {
           headers: context.responseHeaders,
           chunks: context.responseChunks.map((chunk) => ({
             offset_us: chunk.offsetUs,
-            data_base64: chunk.data.toString('base64'),
-          })),
-          outcome,
-        },
-      };
+            data_base64: chunk.data.toString('base64')})),
+          outcome}};
       return context.record;
     }
     this._append(context, { kind: 'response_end', outcome });
@@ -1494,11 +1441,8 @@ class RecordingJournal {
           headers: context.responseHeaders,
           chunks: context.responseChunks.map((chunk) => ({
             offset_us: chunk.offsetUs,
-            data_base64: chunk.data.toString('base64'),
-          })),
-          outcome,
-        },
-      };
+            data_base64: chunk.data.toString('base64')})),
+          outcome}};
       const rawPath = path.join(this.rootDir, `${context.id}.raw.json`);
       const rawPayload = `${JSON.stringify(raw, null, 2)}\n`;
       const fd = fs.openSync(rawPath, 'wx', 0o600);
@@ -1566,14 +1510,12 @@ class RecordingJournal {
         e2eName: captureSet.e2eName,
         records: reloaded.records,
         firstFailureRecordingId: reloaded.firstFailureRecordingId,
-        sourceDigest: reloaded.sourceDigest,
-      };
+        sourceDigest: reloaded.sourceDigest};
     }
     if (captureSet.active.size) {
       throw new HarnessFailure('RECORDING_FLUSH_FAILURE', 'capture set has unflushed exchanges', {
         captureSetId,
-        active: [...captureSet.active],
-      });
+        active: [...captureSet.active]});
     }
     // Validate before sealing or rewriting the manifest.  A bogus first
     // occurrence must leave the durable raw members intact and cannot create a
@@ -1592,8 +1534,7 @@ class RecordingJournal {
       e2eName: captureSet.e2eName,
       records: reloaded.records,
       firstFailureRecordingId: reloaded.firstFailureRecordingId,
-      sourceDigest: reloaded.sourceDigest,
-    };
+      sourceDigest: reloaded.sourceDigest};
   }
 
   _safeExchange(record, sequence = record.recordingId) {
@@ -1610,11 +1551,8 @@ class RecordingJournal {
         headers: publicHeaders(record.response.headers),
         chunks: record.response.chunks.map((chunk) => ({
           offset_us: chunk.offset_us,
-          data_base64: redactBuffer(Buffer.from(chunk.data_base64, 'base64'), this.ledger).toString('base64'),
-        })),
-        outcome: record.response.outcome,
-      },
-    };
+          data_base64: redactBuffer(Buffer.from(chunk.data_base64, 'base64'), this.ledger).toString('base64')})),
+        outcome: record.response.outcome}};
   }
 
   _scanSafeEnvelope(envelope) {
@@ -1641,16 +1579,13 @@ class RecordingJournal {
       exchanges: [this._safeExchange(record, '000001')],
       synthetic_secret_slots: [...this.ledger.entries.values()]
         .filter((entry) => !entry.derived)
-        .map((entry) => `<secret:${entry.label}>`),
-    };
+        .map((entry) => `<secret:${entry.label}>`)};
     this._scanSafeEnvelope(envelopeWithoutDigest);
     return {
       envelope: {
         ...envelopeWithoutDigest,
-        integrity_sha256: sha256(JSON.stringify(envelopeWithoutDigest)),
-      },
-      record,
-    };
+        integrity_sha256: sha256(JSON.stringify(envelopeWithoutDigest))},
+      record};
   }
 
   prepareCaptureSetPromotion(captureSetId, { e2eName, classification, firstObserved, firstFailureRecordingId } = {}) {
@@ -1671,16 +1606,13 @@ class RecordingJournal {
       exchanges: captureSet.records.map((record, index) => this._safeExchange(record, String(index + 1).padStart(6, '0'))),
       synthetic_secret_slots: [...this.ledger.entries.values()]
         .filter((entry) => !entry.derived)
-        .map((entry) => `<secret:${entry.label}>`),
-    };
+        .map((entry) => `<secret:${entry.label}>`)};
     this._scanSafeEnvelope(envelopeWithoutDigest);
     return {
       captureSet,
       envelope: {
         ...envelopeWithoutDigest,
-        integrity_sha256: sha256(JSON.stringify(envelopeWithoutDigest)),
-      },
-    };
+        integrity_sha256: sha256(JSON.stringify(envelopeWithoutDigest))}};
   }
 
   async promote(record, options) {
@@ -1705,15 +1637,13 @@ class RecordingJournal {
     const captureSet = this._captureSet(captureSetId);
     if (!captureSet.sealed) {
       throw new HarnessFailure('CAPTURE_SET_NOT_FLUSHED', 'recovery promotion requires an already flushed capture set', {
-        captureSetId,
-      });
+        captureSetId});
     }
     if (options.e2eName !== undefined && options.e2eName !== captureSet.e2eName) {
       throw new HarnessFailure('CAPTURE_SET_RELOAD_FAILURE', 'recovery promotion cannot replace the flushed E2E owner', {
         captureSetId,
         expectedE2eName: captureSet.e2eName,
-        actualE2eName: options.e2eName,
-      });
+        actualE2eName: options.e2eName});
     }
     if (typeof options.replay !== 'function') {
       throw new HarnessFailure('REPLAY_PROOF_REQUIRED', 'recovery promotion requires a same-entry replay callback that returns complete results');
@@ -1741,13 +1671,11 @@ class RecordingJournal {
     try { stat = fs.lstatSync(resolved); } catch (error) {
       throw new HarnessFailure('RECOVERY_DESTINATION_INVALID', 'recovery promotion destination must already be a durable directory', {
         destinationDirectory: resolved,
-        cause: error instanceof Error ? error.message : String(error),
-      });
+        cause: error instanceof Error ? error.message : String(error)});
     }
     if (stat.isSymbolicLink() || !stat.isDirectory()) {
       throw new HarnessFailure('RECOVERY_DESTINATION_INVALID', 'recovery promotion destination must be a non-symlink directory', {
-        destinationDirectory: resolved,
-      });
+        destinationDirectory: resolved});
     }
     try {
       const rootReal = fs.realpathSync(this.rootDir);
@@ -1759,8 +1687,7 @@ class RecordingJournal {
       if (error instanceof HarnessFailure) throw error;
       throw new HarnessFailure('RECOVERY_DESTINATION_INVALID', 'recovery promotion destination could not be resolved', {
         destinationDirectory: resolved,
-        cause: error instanceof Error ? error.message : String(error),
-      });
+        cause: error instanceof Error ? error.message : String(error)});
     }
     return resolved;
   }
@@ -1799,8 +1726,7 @@ class RecordingJournal {
       cassettePath,
       envelope: prepared.envelope,
       replay,
-      ...(prepared.captureSet ? { captureSet: prepared.captureSet } : {}),
-    };
+      ...(prepared.captureSet ? { captureSet: prepared.captureSet } : {})};
   }
 
   _readCassette(cassetteOrPath) {
@@ -1811,8 +1737,7 @@ class RecordingJournal {
         : cassetteOrPath;
     } catch (error) {
       throw new HarnessFailure('CASSETTE_SCHEMA_FAILURE', 'cassette JSON could not be parsed', {
-        cause: error instanceof Error ? error.message : String(error),
-      });
+        cause: error instanceof Error ? error.message : String(error)});
     }
     const { integrity_sha256: integrity, ...unsigned } = cassette || {};
     if (!integrity || integrity !== sha256(JSON.stringify(unsigned))) {
@@ -1898,8 +1823,7 @@ class RecordingJournal {
         value: Object.freeze({ journal: this, envelopeDigest: cassette.integrity_sha256 }),
         enumerable: false,
         configurable: false,
-        writable: false,
-      });
+        writable: false});
       Object.freeze(results);
       return results;
     });
@@ -1927,21 +1851,18 @@ class RecordingJournal {
       this._readCassette(envelope);
     } catch (error) {
       throw new HarnessFailure('REPLAY_PROOF_INVALID', 'the replay callback changed the loaded capture-set envelope', {
-        cause: error instanceof Error ? error.message : String(error),
-      });
+        cause: error instanceof Error ? error.message : String(error)});
     }
     const expected = envelope.exchanges.map((exchange) => ({
       status: exchange.response.status,
       path: exchange.path,
       outcome: exchange.response.outcome,
-      chunks: exchange.response.chunks.length,
-    }));
+      chunks: exchange.response.chunks.length}));
     const actual = results.map((result) => ({
       status: result?.status,
       path: result?.path,
       outcome: result?.outcome,
-      chunks: result?.chunks,
-    }));
+      chunks: result?.chunks}));
     if (JSON.stringify(expected) !== JSON.stringify(actual)) {
       throw new HarnessFailure('REPLAY_MISMATCH', 'same-entry replay did not reproduce the complete capture-set exchange results');
     }
@@ -1951,8 +1872,7 @@ class RecordingJournal {
       source_digest: envelope.source_digest,
       exchange_count: actual.length,
       first_failure_recording_id: envelope.first_failure_recording_id || null,
-      response_fingerprint: sha256(JSON.stringify(actual)),
-    };
+      response_fingerprint: sha256(JSON.stringify(actual))};
   }
 
   _validateBoundReplayProof(prepared, proof) {
@@ -1969,8 +1889,7 @@ class RecordingJournal {
       status: exchange.response.status,
       path: exchange.path,
       outcome: exchange.response.outcome,
-      chunks: exchange.response.chunks.length,
-    }));
+      chunks: exchange.response.chunks.length}));
     if (proof.response_fingerprint !== sha256(JSON.stringify(expected))) {
       throw new HarnessFailure('REPLAY_PROOF_INVALID', 'replay response fingerprint did not match the loaded capture-set source');
     }
@@ -2026,8 +1945,7 @@ class RecordingJournal {
           expectedMethod: exchange.method,
           actualMethod: request.method,
           expectedPath: exchange.path,
-          actualPath: redactedPath(request.url, this.ledger),
-        });
+          actualPath: redactedPath(request.url, this.ledger)});
       }
       const expectedHeaders = normalizeHeaders(restoreHeaders(exchange.request_headers, this.ledger));
       const actualHeaders = normalizeHeaders(publicHeaders(request.headers));
@@ -2118,8 +2036,7 @@ class RecordingJournal {
           if (targetUs > elapsedUs) {
             await Promise.race([
               new Promise((resolve) => setTimeout(resolve, Math.ceil((targetUs - elapsedUs) / 1_000))),
-              closingSignal,
-            ]);
+              closingSignal]);
             if (closing) return;
           }
         }
@@ -2220,26 +2137,22 @@ class RecordingJournal {
           } catch (waitError) {
             error = new HarnessFailure('REPLAY_TERMINAL_TIMEOUT', 'replay handler did not reach a bounded terminal state', {
               activeHandlers,
-              cause: waitError instanceof Error ? waitError.message : String(waitError),
-            });
+              cause: waitError instanceof Error ? waitError.message : String(waitError)});
           }
         }
         if (!error && nextExchange !== (cassette.exchanges || []).length) {
           error = new HarnessFailure('REPLAY_UNCONSUMED_EXCHANGES', 'replay server closed before consuming the complete cassette', {
             consumed: nextExchange,
-            expected: cassette.exchanges?.length || 0,
-          });
+            expected: cassette.exchanges?.length || 0});
         }
         if (error) throw error;
-      },
-    };
+      }};
   }
 
   async startReplayEdge(cassetteOrPath, {
     timingMode = 'immediate',
     canonicalOrigin,
-    onDispatch,
-  } = {}) {
+    onDispatch} = {}) {
     if (canonicalOrigin === undefined) {
       throw new HarnessFailure('ORIGIN_INVALID', 'replay edge requires a canonical origin for exact Host restoration');
     }
@@ -2265,8 +2178,7 @@ class RecordingJournal {
           if (released) return;
           released = true;
           release();
-        },
-      };
+        }};
       return reservation;
     };
     let edge;
@@ -2292,8 +2204,7 @@ class RecordingJournal {
             boundary: 'replay-canonical-edge',
             journal: this,
             ledger: this.ledger,
-            canonicalOrigin,
-          }));
+            canonicalOrigin}));
         } finally {
           // Keep the edge reservation through proxyHttp's complete request
           // body read and replay response terminal.  A later browser request
@@ -2321,8 +2232,7 @@ class RecordingJournal {
         try { await edge.close(); } catch (closeError) { error = closeError; }
         try { await replayServer.finish(); } catch (replayError) { error ||= replayError; }
         if (error) throw error;
-      },
-    };
+      }};
   }
 
   async _replayExchange(exchange, { baseUrl, boundaryBaseUrls = {}, headers, timingMode }) {
@@ -2351,8 +2261,7 @@ class RecordingJournal {
       body: requestBody,
       timeoutMs: HTTP_TIMEOUT_MS,
       disconnectAfterResponseBytes:
-        exchange.response.outcome === 'client_disconnected' ? expectedBody.length : undefined,
-    });
+        exchange.response.outcome === 'client_disconnected' ? expectedBody.length : undefined});
     const expectedResponseHeaders = normalizeHeaders(restoreHeaders(exchange.response.headers, this.ledger));
     const actualResponseHeaders = normalizeHeaders(publicHeaders(response.headers));
     const responseHeaderNames = new Set([...Object.keys(expectedResponseHeaders), ...Object.keys(actualResponseHeaders)]);
@@ -2372,15 +2281,13 @@ class RecordingJournal {
       throw new HarnessFailure('REPLAY_MISMATCH', 'secret-safe cassette replay did not reproduce the public exchange', {
         expectedStatus: exchange.response.status,
         actualStatus: response.status,
-        path: exchange.path,
-      });
+        path: exchange.path});
     }
     if (response.outcome !== exchange.response.outcome) {
       throw new HarnessFailure('REPLAY_TERMINATION_MISMATCH', 'replay response termination differed from the captured exchange', {
         expected: exchange.response.outcome,
         actual: response.outcome,
-        path: exchange.path,
-      });
+        path: exchange.path});
     }
     return {
       status: response.status,
@@ -2389,16 +2296,14 @@ class RecordingJournal {
       // Proof summaries use the captured logical chunk count.  The byte
       // comparison above intentionally tolerates transport re-segmentation;
       // startReplayServer remains the exact chunk-boundary replay primitive.
-      chunks: expectedChunks.length,
-    };
+      chunks: expectedChunks.length};
   }
 
   assertFlushed() {
     this._healthy();
     if (this.active.size) {
       throw new HarnessFailure('RECORDING_FLUSH_FAILURE', 'recording capture closed with unflushed exchanges', {
-        active: [...this.active.keys()],
-      });
+        active: [...this.active.keys()]});
     }
   }
 
@@ -2461,12 +2366,10 @@ class RealProcess {
     startupCaptureRoot,
     startupConfigBytes,
     e2eName,
-    startupCapture,
-  }) {
+    startupCapture}) {
     if (!processSeam) {
       throw new HarnessFailure('HARNESS_PROCESS_SEAM_MISSING', 'browser harness process seam is unavailable', {
-        path: PROCESS_SEAM_PATH,
-      });
+        path: PROCESS_SEAM_PATH});
     }
     if (!binary || !fs.existsSync(binary)) {
       throw new HarnessFailure('HARNESS_BINARY_MISSING', `${name} binary is missing`, { name, binary });
@@ -2482,8 +2385,7 @@ class RealProcess {
         role: name,
         e2eName: e2eName || 'web-e2e-process-startup',
         configBytes: startupConfigBytes,
-        ledger,
-      });
+        ledger});
       startupCapture.arm();
     }
     if (!startupCapture || startupCapture.armed !== true) {
@@ -2505,8 +2407,7 @@ class RealProcess {
         secretMarkers: markers,
         detach: false,
         capture: startupCapture,
-        requireCapture: true,
-      });
+        requireCapture: true});
     } catch (error) {
       throw new HarnessFailure('PROCESS_START_FAILURE', `${name} could not start through the process seam`, { name });
     }
@@ -2520,8 +2421,7 @@ class RealProcess {
       logDir,
       locatorPath: started.locatorPath,
       locator: started.locator,
-      startupCapture,
-    });
+      startupCapture});
     try {
       startupCapture.captureProcessObservation(process, { phase: 'spawned' });
     } catch (error) {
@@ -2536,8 +2436,7 @@ class RealProcess {
       try {
         startupCapture.captureProcessObservation(process, {
           phase: 'exit',
-          stopResult: process.stopResult,
-        });
+          stopResult: process.stopResult});
       } catch (error) {
         process.captureError ||= error;
       }
@@ -2565,11 +2464,9 @@ class RealProcess {
               throw new HarnessFailure('PROCESS_EXITED_BEFORE_READY', `${name} exited before publishing readiness`, {
                 name,
                 exitCode: status.code,
-                signal: status.signal,
-              });
+                signal: status.signal});
             });
-          }),
-        ]);
+          })]);
       }
     } catch (error) {
       let stopError;
@@ -2621,14 +2518,12 @@ class RealProcess {
     stopResult = await processSeam.stopProcess({
       locatorPath: this.locatorPath,
       timeoutMs: PROCESS_STOP_TIMEOUT_MS,
-      secretMarkers: [...this.ledger.entries.values()].map((entry) => entry.value),
-    });
+      secretMarkers: [...this.ledger.entries.values()].map((entry) => entry.value)});
     this.stopResult = stopResult;
     try {
       this.startupCapture?.captureProcessObservation(this, {
         phase: 'stop',
-        stopResult,
-      });
+        stopResult});
     } catch (error) {
       this.captureError ||= error;
       throw error;
@@ -2637,8 +2532,7 @@ class RealProcess {
     if (stopResult.timed_out || stopResult.leaked_pids?.length) {
       throw new HarnessFailure('PROCESS_REAP_FAILURE', `${this.name} process group was not fully reaped`, {
         name: this.name,
-        leakedPids: stopResult.leaked_pids,
-      });
+        leakedPids: stopResult.leaked_pids});
     }
     if (stopResult.flush_status === 'secret_marker') {
       throw new SecretLeakFailure(`${this.name} process output`, 'process_output');
@@ -2646,8 +2540,7 @@ class RealProcess {
     if (stopResult.flush_status !== 'ok') {
       throw new HarnessFailure('PROCESS_OUTPUT_FLUSH_FAILURE', `${this.name} process output was not durably flushed`, {
         name: this.name,
-        flushStatus: stopResult.flush_status,
-      });
+        flushStatus: stopResult.flush_status});
     }
     if (this.locatorPath) {
       const stdoutPath = `${this.locatorPath}.stdout.log`;
@@ -2675,8 +2568,7 @@ async function proxyHttp({
   ledger,
   captureSetId,
   canonicalOrigin,
-  preserveIncomingHost = false,
-}) {
+  preserveIncomingHost = false}) {
   // Register the ingress before parsing the target, reading the body, or
   // deciding whether this request is admissible.  A malformed/aborted/bounded
   // request is still a first occurrence and must remain recoverable in the
@@ -2690,8 +2582,7 @@ async function proxyHttp({
       method: request.method,
       requestPath: request.url,
       requestHeaders: inboundHeaders,
-      captureSetId: captureSetId || journal.currentCaptureSetId,
-    });
+      captureSetId: captureSetId || journal.currentCaptureSetId});
   } catch {
     if (!response.headersSent) response.writeHead(503, { 'content-type': 'application/json' });
     if (!response.writableEnded) response.end(JSON.stringify({ error: { code: 'recording_unavailable', retryable: true } }));
@@ -2706,8 +2597,7 @@ async function proxyHttp({
       if (recording.responseStatus === undefined) {
         journal.responseStarted(recording, {
           status,
-          headers: { 'content-type': 'application/json' },
-        });
+          headers: { 'content-type': 'application/json' }});
       }
       journal.finish(recording, classification === 'BOUND_EXCEEDED' ? 'disconnected' : 'transport_error');
     } catch (flushError) {
@@ -2717,8 +2607,7 @@ async function proxyHttp({
     if (!response.headersSent) response.writeHead(status, { 'content-type': 'application/json' });
     response.end(JSON.stringify({ error: {
       code: classification === 'BOUND_EXCEEDED' ? 'request_body_too_large' : 'request_capture_failed',
-      retryable: false,
-    } }));
+      retryable: false} }));
   };
   try {
     requestBody = await readRequestBody(
@@ -3005,8 +2894,7 @@ async function startFakeProvider({ ledger, mode = 'default' }) {
       releaseVisualTool();
       await fixture.close();
     },
-    ledger,
-  };
+    ledger};
 }
 
 async function startRecordingProxy({ targetBaseUrl, journal, ledger, captureSetId }) {
@@ -3019,8 +2907,7 @@ async function startRecordingProxy({ targetBaseUrl, journal, ledger, captureSetI
     journal,
     ledger,
     captureSetId: captureSetId || journal.currentCaptureSetId,
-    canonicalOrigin: targetBaseUrl,
-  }).catch((error) => {
+    canonicalOrigin: targetBaseUrl}).catch((error) => {
     journal._fail(error);
     if (!response.writableEnded) response.end();
   }));
@@ -3054,8 +2941,7 @@ async function startAccessFixture({ ledger, journal, captureSetId, managementOri
         method: request.method,
         requestPath: request.url,
         requestHeaders: request.headers,
-        captureSetId: captureSetId || journal.currentCaptureSetId,
-      });
+        captureSetId: captureSetId || journal.currentCaptureSetId});
       await readRequestBody(request, MAX_RECORDING_REQUEST_BYTES, (chunk) => journal.ingressChunk(recording, chunk));
       journal.endIngress(recording);
     } catch (error) {
@@ -3076,8 +2962,7 @@ async function startAccessFixture({ ledger, journal, captureSetId, managementOri
     try {
       journal.responseStarted(recording, {
         status,
-        headers: { 'content-type': 'application/json', ...(notFound ? {} : { 'cache-control': 'no-store' }) },
-      });
+        headers: { 'content-type': 'application/json', ...(notFound ? {} : { 'cache-control': 'no-store' }) }});
       journal.chunk(recording, Buffer.from(body), 0);
       journal.finish(recording, 'completed');
     } catch (error) {
@@ -3102,8 +2987,7 @@ async function startAccessFixture({ ledger, journal, captureSetId, managementOri
       type: 'app',
       iat: now,
       nbf: now - 1,
-      exp: now + 300,
-    });
+      exp: now + 300});
     tokenNumber += 1;
     ledger.add(`access_assertion_${tokenNumber}`, token);
     return token;
@@ -3118,8 +3002,7 @@ async function startAccessFixture({ ledger, journal, captureSetId, managementOri
       while (requests.length < 1) await requestBarrier.wait();
     },
     jwksServer,
-    edge: undefined,
-  };
+    edge: undefined};
   access.startEdge = async (targetBaseUrl, { canonicalOrigin = managementOrigin, extraHeaders = {} } = {}) => {
     const edge = await startHttpServer((request, response) => {
       const assertion = issue();
@@ -3133,8 +3016,7 @@ async function startAccessFixture({ ledger, journal, captureSetId, managementOri
         journal,
         ledger,
         captureSetId: captureSetId || journal.currentCaptureSetId,
-        canonicalOrigin,
-      }).catch((error) => {
+        canonicalOrigin}).catch((error) => {
         journal._fail(error);
         if (!response.writableEnded) {
           response.writeHead(502, { 'content-type': 'application/json' });
@@ -3155,8 +3037,7 @@ async function startAccessFixture({ ledger, journal, captureSetId, managementOri
       journal,
       ledger,
       captureSetId: captureSetId || journal.currentCaptureSetId,
-      canonicalOrigin,
-    }).catch((error) => {
+      canonicalOrigin}).catch((error) => {
       journal._fail(error);
       if (!response.writableEnded) {
         response.writeHead(502, { 'content-type': 'application/json' });
@@ -3174,8 +3055,7 @@ function defaultEnv() {
   for (const key of [
     'OPENCODE_API_KEY', 'DEEPSEEK_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY',
     'ANTHROPIC_API_KEY', 'GOOGLE_API_KEY', 'GEMINI_API_KEY', 'MISTRAL_API_KEY',
-    'TOGETHER_API_KEY', 'XAI_API_KEY', 'GROQ_API_KEY', 'COHERE_API_KEY',
-  ]) delete env[key];
+    'TOGETHER_API_KEY', 'XAI_API_KEY', 'GROQ_API_KEY', 'COHERE_API_KEY']) delete env[key];
   return env;
 }
 
@@ -3202,40 +3082,26 @@ function endpointConfig({
   root,
   database,
   providerOrigin,
-  controllerSecret,
-  authorityId,
-  tools = [],
-}) {
+  tools = []}) {
   const credentials = ensureDirectory(path.join(root, 'credentials'));
   const blobs = ensureDirectory(path.join(root, 'blobs'));
-  const secretFile = writePrivateFile(path.join(root, 'controller.secret'), controllerSecret);
-  const controllerAuthorityId = resolveAuthorityId(authorityId, 'web-e2e-controller');
   return writeJsonPrivate(path.join(root, 'endpoint-config.json'), {
     schema: 'zode.config.v1',
     listen: '127.0.0.1:0',
     runtime_store: { kind: 'sqlite', path: database },
     credential_replica_store: { kind: 'files', directory: credentials },
     blob_store: { kind: 'files', directory: blobs },
-    controller_auth: [{
-      authority_id: controllerAuthorityId,
-      revision: 1,
-      kind: 'bearer_secret_file',
-      secret_file: secretFile,
-    }],
     runtime: {
       tool_foreground_ms: 100,
       model_step_max_attempts: 1,
       model_retry_base_ms: 1,
       model_retry_max_ms: 10,
-      snapshot_every_events: 1,
-    },
+      snapshot_every_events: 1},
     provider_execution: {
       adapter_kinds: ['openai_compatible'],
-      allowed_base_url_origins: [providerOrigin],
-    },
+      allowed_base_url_origins: [providerOrigin]},
     callback: { allowed_public_origins: [providerOrigin] },
-    tools,
-  });
+    tools});
 }
 
 async function buildUiAssets(directory, { ledger, sourceDirectory } = {}) {
@@ -3250,8 +3116,7 @@ async function buildUiAssets(directory, { ledger, sourceDirectory } = {}) {
         throw new HarnessFailure('UI_ASSETS_DIRECTORY_UNWIRED', 'configured UI release tree could not be materialized beside the Server config', {
           source,
           destination: directory,
-          cause: error instanceof Error ? error.message : String(error),
-        });
+          cause: error instanceof Error ? error.message : String(error)});
       }
     } else {
       ensureDirectory(directory);
@@ -3263,13 +3128,11 @@ async function buildUiAssets(directory, { ledger, sourceDirectory } = {}) {
         cwd: path.join(ROOT, 'web'),
         env: defaultEnv(),
         timeout: 120_000,
-        maxBuffer: 4 * 1024 * 1024,
-      });
+        maxBuffer: 4 * 1024 * 1024});
     } catch (error) {
       throw new HarnessFailure('UI_BUILD_FAILURE', 'Vite Plus did not produce the test-owned UI release tree', {
         directory,
-        cause: error instanceof Error ? error.message : String(error),
-      });
+        cause: error instanceof Error ? error.message : String(error)});
     }
   }
   const indexPath = path.join(directory, 'index.html');
@@ -3335,9 +3198,7 @@ function serverConfig({ root, issuer, jwksUrl, managementOrigin, callbackOrigin,
       audiences: ['zode-web-e2e-audience'],
       jwks_url: jwksUrl,
       subject_key_file: subjectKey,
-      subject_key_version: 1,
-    },
-  };
+      subject_key_version: 1}};
   return writeJsonPrivate(path.join(root, 'server-config.json'), config);
 }
 
@@ -3348,8 +3209,7 @@ function serverLogDir(runRoot, generation) {
 function startServerProcess({ runRoot, generation, startSpec }) {
   return RealProcess.start({
     ...startSpec,
-    logDir: serverLogDir(runRoot, generation),
-  });
+    logDir: serverLogDir(runRoot, generation)});
 }
 
 async function fetchJson(url, options = {}) {
@@ -3408,17 +3268,12 @@ class WebE2EHarness {
           boundaryBaseUrls: {
             'access-jwks-fixture': this.access.jwksServer.baseUrl,
             'provider-recording-proxy': this.providerProxy.baseUrl,
-            'callback-public-edge': this.callbackUrl,
-          },
-        }),
-      })),
-    });
+            'callback-public-edge': this.callbackUrl}})}))});
   }
 
   async serverReady() {
     const result = await fetchJson(`${this.managementUrl}/v1/system`, {
-      headers: { accept: 'application/json' },
-    });
+      headers: { accept: 'application/json' }});
     if (result.status !== 200 || result.body?.schema !== 'zode.system.v1') {
       throw new ProductBehaviorFailure(
         'SERVER_READY_BEHAVIOR_FAILURE',
@@ -3461,8 +3316,7 @@ class WebE2EHarness {
       restartedServer = await startServerProcess({
         runRoot: this.runRoot,
         generation: nextGeneration,
-        startSpec: this.serverStartSpec,
-      });
+        startSpec: this.serverStartSpec});
       restartedEdge = await this.access.startEdge(restartedServer.baseUrl, { canonicalOrigin: this.managementOrigin });
       restartedCallbackEdge = await this.access.startCallbackEdge(restartedServer.baseUrl, { canonicalOrigin: this.callbackOrigin });
       this.server = restartedServer;
@@ -3479,12 +3333,7 @@ class WebE2EHarness {
   }
 
   async endpointIdentity() {
-    const result = await fetchJson(`${this.endpoint.baseUrl}/v1/identity`, {
-      headers: {
-        authorization: `Bearer ${this.controllerSecret}`,
-        'zode-subject': 'web-e2e-subject',
-      },
-    });
+    const result = await fetchJson(`${this.endpoint.baseUrl}/v1/identity`);
     if (result.status !== 200 || result.body?.schema !== 'zode.identity.v1') {
       throw new ProductBehaviorFailure('ENDPOINT_IDENTITY_BEHAVIOR_FAILURE', 'real Endpoint identity barrier did not succeed', { status: result.status });
     }
@@ -3501,8 +3350,7 @@ class WebE2EHarness {
     const record = this.journal.first({
       boundary: 'management-access-edge',
       requestPath,
-      responseStatus,
-    });
+      responseStatus});
     if (!record) return { error, record: undefined };
     const promoted = await this.journal.promoteCaptureSet(record.captureSetId, {
       e2eName,
@@ -3515,12 +3363,9 @@ class WebE2EHarness {
           boundaryBaseUrls: {
             'access-jwks-fixture': this.access.jwksServer.baseUrl,
             'provider-recording-proxy': this.providerProxy.baseUrl,
-            'callback-public-edge': this.callbackUrl,
-          },
-        });
+            'callback-public-edge': this.callbackUrl}});
         return { ok: true, results: replay };
-      },
-    });
+      }});
     return { error, record, ...promoted, replay: promoted.replay?.results || promoted.replay };
   }
 
@@ -3534,8 +3379,7 @@ class WebE2EHarness {
       this.server,
       this.endpoint,
       this.providerProxy,
-      this.fakeProvider,
-    ];
+      this.fakeProvider];
     let firstError;
     for (const resource of closers) {
       if (!resource) continue;
@@ -3580,8 +3424,7 @@ async function createWebE2EHarness(options = {}) {
   const journal = new RecordingJournal({
     rootDir: quarantineRoot,
     ledger,
-    defaultMaxMembers: options.captureMaxMembers || 64,
-  });
+    defaultMaxMembers: options.captureMaxMembers || 64});
   let fakeProvider;
   let providerProxy;
   let access;
@@ -3600,19 +3443,15 @@ async function createWebE2EHarness(options = {}) {
       root: endpointRoot,
       database: path.join(endpointRoot, 'endpoint.sqlite3'),
       providerOrigin: providerProxy.baseUrl,
-      controllerSecret,
-      authorityId,
       tools: typeof options.endpointTools === 'function'
         ? options.endpointTools({ fakeProvider })
-        : (options.endpointTools || []),
-    });
+        : (options.endpointTools || [])});
     const uiMode = options.uiMode || process.env.ZODE_WEB_E2E_UI_MODE
       || (process.env.ZODE_UI_ASSETS_DIRECTORY ? 'assets' : 'api_only');
     const uiAssetsDirectory = uiMode === 'assets'
       ? await buildUiAssets(path.join(serverRoot, 'ui'), {
         ledger,
-        sourceDirectory: options.uiAssetsDirectory || process.env.ZODE_UI_ASSETS_DIRECTORY,
-      })
+        sourceDirectory: options.uiAssetsDirectory || process.env.ZODE_UI_ASSETS_DIRECTORY})
       : undefined;
     const serverConfigPath = serverConfig({
       root: serverRoot,
@@ -3622,8 +3461,7 @@ async function createWebE2EHarness(options = {}) {
       callbackOrigin,
       uiMode,
       uiAssetsDirectory,
-      authorityId,
-    });
+      authorityId});
     const startupCaptureRoot = path.join(quarantineRoot, 'startup');
     const startupE2eName = options.e2eName || 'web-e2e-harness-run';
     const env = defaultEnv();
@@ -3639,8 +3477,7 @@ async function createWebE2EHarness(options = {}) {
       ledger,
       startupCaptureRoot,
       startupConfigBytes: redactBuffer(fs.readFileSync(serverConfigPath), ledger),
-      e2eName: startupE2eName,
-    };
+      e2eName: startupE2eName};
     endpoint = await RealProcess.start({
       name: 'endpoint',
       binary: endpointBinary,
@@ -3652,14 +3489,12 @@ async function createWebE2EHarness(options = {}) {
       logDir: path.join(runRoot, 'logs'),
       startupCaptureRoot,
       startupConfigBytes: redactBuffer(fs.readFileSync(endpointConfigPath), ledger),
-      e2eName: startupE2eName,
-    });
+      e2eName: startupE2eName});
     const serverGeneration = 1;
     server = await startServerProcess({
       runRoot,
       generation: serverGeneration,
-      startSpec: serverStartSpec,
-    });
+      startSpec: serverStartSpec});
     edge = await access.startEdge(server.baseUrl, { canonicalOrigin: managementOrigin });
     callbackEdge = await access.startCallbackEdge(server.baseUrl, { canonicalOrigin: callbackOrigin });
     const harness = new WebE2EHarness({
@@ -3681,8 +3516,7 @@ async function createWebE2EHarness(options = {}) {
       controllerSecret,
       providerSecret,
       uiMode,
-      uiAssetsDirectory,
-    });
+      uiAssetsDirectory});
     // Positive public barriers are part of harness construction.  A stdout
     // line alone is not evidence that the management route and endpoint are
     // usable through their real boundaries.
@@ -3752,5 +3586,4 @@ module.exports = {
   createWebE2EHarness,
   proxyHttp,
   startAccessFixture,
-  startHttpServer,
-};
+  startHttpServer};

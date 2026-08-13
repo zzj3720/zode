@@ -26,7 +26,7 @@ use zode_protocol::{
 };
 
 use crate::{
-    control::{ControlAuthError, ControlRotationError, ControlState},
+    control::ControlState,
     domain::{
         ActiveWait, AsyncToolCallRecord, CompletionMode, DurablePayload, EventRecord, ModelLimits,
         ProviderExecutionSelection, SessionEvent, SessionModelSelection, SessionOwner,
@@ -382,28 +382,6 @@ impl ApiError {
         }
     }
 
-    fn from_control(error: ControlAuthError) -> Self {
-        match error {
-            ControlAuthError::Unauthenticated => Self {
-                status: StatusCode::UNAUTHORIZED,
-                code: "unauthenticated",
-                message: "authentication required".into(),
-                retryable: false,
-            },
-            ControlAuthError::Malformed => Self::malformed(),
-            ControlAuthError::PayloadTooLarge => Self::payload_too_large(),
-        }
-    }
-
-    fn from_rotation(error: ControlRotationError) -> Self {
-        match error {
-            ControlRotationError::Invalid => Self::invalid("invalid controller auth rotation"),
-            ControlRotationError::PayloadTooLarge => Self::payload_too_large(),
-            ControlRotationError::Conflict => Self::conflict("controller auth operation conflicts"),
-            ControlRotationError::Internal => Self::internal(),
-        }
-    }
-
     fn from_replica(error: ReplicaPortError) -> Self {
         match error {
             ReplicaPortError::Invalid => Self::invalid("invalid credential replica request"),
@@ -667,7 +645,6 @@ async fn append_message(
     headers: HeaderMap,
     request: Request,
 ) -> Result<(StatusCode, Json<CommandResponse>), ApiError> {
-
     let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
     let replay_only = replay_only_mode(&headers).map_err(ApiError::from_service)?;
     require_json_content_type(&headers)?;
@@ -709,7 +686,6 @@ async fn select_model(
     headers: HeaderMap,
     request: Request,
 ) -> Result<(StatusCode, Json<CommandResponse>), ApiError> {
-
     let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
     let replay_only = replay_only_mode(&headers).map_err(ApiError::from_service)?;
     require_json_content_type(&headers)?;
@@ -745,7 +721,6 @@ async fn read_tool_call(
     State(state): State<AppState>,
     Path((session_id, tool_call_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-
     if session_id.is_empty() || tool_call_id.is_empty() {
         return Err(ApiError::tool_not_found());
     }
@@ -765,7 +740,6 @@ async fn cancel_tool_call(
     headers: HeaderMap,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-
     let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
     require_json_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_SESSION_REQUEST_BYTES)
@@ -805,7 +779,6 @@ async fn reconcile_tool_call(
     headers: HeaderMap,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-
     let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
     require_json_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_SESSION_REQUEST_BYTES)
@@ -956,7 +929,6 @@ async fn stream_endpoint_events(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-
     let after = parse_last_event_id(&headers).map_err(ApiError::from_service)?;
     let owner = shared_session_owner();
     let (subscription, initial_records) = state
@@ -1316,24 +1288,6 @@ fn replay_only_mode(headers: &HeaderMap) -> Result<bool, ServiceError> {
 fn required_idempotency_key(headers: &HeaderMap) -> Result<String, ServiceError> {
     optional_idempotency_key(headers)?
         .ok_or_else(|| ServiceError::Invalid("Idempotency-Key header is required".into()))
-}
-
-fn rotation_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
-    let mut values = headers.get_all("idempotency-key").iter();
-    let Some(value) = values.next() else {
-        return Err(ApiError::malformed());
-    };
-    if values.next().is_some() {
-        return Err(ApiError::malformed());
-    }
-    if value.as_bytes().len() > 1_024 {
-        return Err(ApiError::payload_too_large());
-    }
-    let value = std::str::from_utf8(value.as_bytes()).map_err(|_| ApiError::malformed())?;
-    if value.is_empty() {
-        return Err(ApiError::malformed());
-    }
-    Ok(value.to_owned())
 }
 
 fn session_view(state: SessionState) -> Value {

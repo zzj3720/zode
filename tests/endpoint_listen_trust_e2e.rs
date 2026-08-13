@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 use support::{http_client, require_ulid, response_text, HttpRequestExt};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2e_endpoint_protocol_has_no_controller_auth()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn e2e_endpoint_protocol_has_no_controller_auth(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let database_path = test_database("listen-trust-no-auth")?;
     let mut server = TestServer::start(&database_path).await?;
     let client = http_client()?;
@@ -84,8 +84,8 @@ async fn e2e_endpoint_protocol_has_no_controller_auth()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2e_endpoint_sessions_are_shared_across_callers()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn e2e_endpoint_sessions_are_shared_across_callers(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let database_path = test_database("listen-trust-shared-sessions")?;
     let mut server = TestServer::start(&database_path).await?;
     let client = http_client()?;
@@ -142,8 +142,8 @@ async fn e2e_endpoint_sessions_are_shared_across_callers()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2e_two_actor_sessions_are_shared_on_one_endpoint()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn e2e_two_actor_sessions_are_shared_on_one_endpoint(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let database_path = test_database("listen-trust-two-actor")?;
     let mut server = TestServer::start(&database_path).await?;
     let client = http_client()?;

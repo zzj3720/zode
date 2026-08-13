@@ -207,8 +207,7 @@ export function captureBody(
   return {
     bodyHex: bytes.toString("hex"),
     bodySha256: `sha256:${digestBytes(bytes)}`,
-    canonicalJson,
-  };
+    canonicalJson};
 }
 
 export function normalizePath(path: string, dynamicIds: string[]): string {
@@ -268,8 +267,7 @@ function responseJson(response: ServerResponse, status: number, body: Json): voi
   response.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "content-length": bytes.byteLength,
-    "cache-control": "no-store",
-  });
+    "cache-control": "no-store"});
   response.end(bytes);
 }
 
@@ -278,8 +276,7 @@ function responseText(response: ServerResponse, status: number, contentType: str
   response.writeHead(status, {
     "content-type": contentType,
     "content-length": bytes.byteLength,
-    "cache-control": "no-store",
-  });
+    "cache-control": "no-store"});
   response.end(bytes);
 }
 
@@ -293,8 +290,7 @@ function actorClaims(actor: AccessActor, issuer: string): Json {
     type: "app",
     iat: now,
     nbf: now - 1,
-    exp: now + 300,
-  };
+    exp: now + 300};
 }
 
 async function startAccessFixture(): Promise<AccessFixture> {
@@ -311,8 +307,7 @@ async function startAccessFixture(): Promise<AccessFixture> {
       return;
     }
     responseJson(response, 200, {
-      keys: [{ ...publicJwk, kid, use: "sig", alg: "RS256" }],
-    });
+      keys: [{ ...publicJwk, kid, use: "sig", alg: "RS256" }]});
   });
   const baseUrl = await listen(server);
   const issuer = `${baseUrl}/`;
@@ -329,8 +324,7 @@ async function startAccessFixture(): Promise<AccessFixture> {
       signer.update(signingInput);
       return `${signingInput}.${signer.sign(privateKey).toString("base64url")}`;
     },
-    close: () => closeServer(server),
-  };
+    close: () => closeServer(server)};
 }
 
 function hopByHopHeaders(headers: Record<string, string | string[] | undefined>): Record<string, string | string[] | undefined> {
@@ -343,8 +337,7 @@ function hopByHopHeaders(headers: Record<string, string | string[] | undefined>)
     "te",
     "trailer",
     "transfer-encoding",
-    "upgrade",
-  ]) {
+    "upgrade"]) {
     delete result[name];
   }
   return result;
@@ -362,8 +355,7 @@ function semanticHeaders(
     "content-type",
     "idempotency-key",
     "last-event-id",
-    "location",
-  ]);
+    "location"]);
   const result: Record<string, string> = {};
   for (const [rawName, rawValue] of Object.entries(headers)) {
     const name = rawName.toLowerCase();
@@ -386,8 +378,7 @@ async function startAccessEdge(access: AccessFixture, actor: AccessActor, initia
     if (headers.referer) headers.referer = `${MANAGEMENT_ORIGIN}/`;
     const upstream = httpRequest(destination, {
       method: incoming.method,
-      headers,
-    }, (response) => {
+      headers}, (response) => {
       outgoing.writeHead(response.statusCode ?? 502, hopByHopHeaders(response.headers));
       response.pipe(outgoing);
     });
@@ -403,8 +394,7 @@ async function startAccessEdge(access: AccessFixture, actor: AccessActor, initia
     setTarget(nextTarget) {
       target = nextTarget;
     },
-    close: () => closeServer(server),
-  };
+    close: () => closeServer(server)};
 }
 
 async function startEndpointTransport(
@@ -485,8 +475,7 @@ async function startEndpointTransport(
       responseChunks: [],
       termination: "disconnect",
       responseCode: null,
-      completed: false,
-    };
+      completed: false};
   }
 
   function consumeRequest(actual: EndpointObservation): EndpointCassetteExchange | undefined {
@@ -515,8 +504,7 @@ async function startEndpointTransport(
     const expected = consumeRequest(observation);
     const upstream = httpRequest(destination, {
       method: incoming.method,
-      headers,
-    });
+      headers});
     let responseStarted = false;
     let settled = false;
     let clientClosed = false;
@@ -547,8 +535,7 @@ async function startEndpointTransport(
           sequence,
           bodyHex: safeChunk.bodyHex,
           bodySha256: safeChunk.bodySha256,
-          offsetMs: Math.max(0, (responseChunkTimes[sequence] ?? Date.now()) - responseStartedAt),
-        };
+          offsetMs: Math.max(0, (responseChunkTimes[sequence] ?? Date.now()) - responseStartedAt)};
       });
       observation.termination = completed ? "complete" : "disconnect";
       observation.completed = completed;
@@ -648,8 +635,7 @@ async function startEndpointTransport(
           responseChunks: observation.responseChunks.map((chunk) => ({ ...chunk })),
           termination: observation.termination,
           responseCode: observation.responseCode,
-          completed: observation.completed,
-        }));
+          completed: observation.completed}));
     },
     async flush() {
       if (pendingRequests === 0) return;
@@ -662,8 +648,7 @@ async function startEndpointTransport(
         throw safeError(`Endpoint cassette consumed ${replayIndex}/${replayExpected.length} exchanges`);
       }
     },
-    close: () => closeServer(server),
-  };
+    close: () => closeServer(server)};
 }
 
 async function startProviderFixture(): Promise<Provider> {
@@ -680,8 +665,7 @@ async function startProviderFixture(): Promise<Provider> {
       const body = [
         `data: ${json({ choices: [{ delta: { content: ASSISTANT_MARKER }, finish_reason: null }] })}\n\n`,
         `data: ${json({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`,
-        "data: [DONE]\n\n",
-      ].join("");
+        "data: [DONE]\n\n"].join("");
       responseText(response, 200, "text/event-stream", body);
     });
     request.resume();
@@ -700,8 +684,7 @@ async function startProviderFixture(): Promise<Provider> {
         });
       }
     },
-    close: () => closeServer(server),
-  };
+    close: () => closeServer(server)};
 }
 
 function childExecutable(name: string, fallback: string): string {
@@ -780,8 +763,7 @@ async function spawnReady(program: string, args: string[], prefix: string): Prom
     },
     close: async () => {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    },
-  };
+    }};
 }
 
 async function writeEndpointConfig(root: string, providerOrigin: string): Promise<{ config: string; database: string }> {
@@ -798,26 +780,17 @@ async function writeEndpointConfig(root: string, providerOrigin: string): Promis
     runtime_store: { kind: "sqlite", path: database },
     credential_replica_store: { kind: "files", directory: "credentials" },
     blob_store: { kind: "files", directory: "blobs" },
-    controller_auth: [{
-      authority_id: ENDPOINT_AUTHORITY,
-      revision: 1,
-      kind: "bearer_secret_file",
-      secret_file: "controller.secret",
-    }],
     runtime: {
       tool_foreground_ms: 100,
       model_step_max_attempts: 1,
       model_retry_base_ms: 1,
       model_retry_max_ms: 10,
-      snapshot_every_events: 1,
-    },
+      snapshot_every_events: 1},
     provider_execution: {
       adapter_kinds: ["openai_compatible"],
-      allowed_base_url_origins: [providerOrigin],
-    },
+      allowed_base_url_origins: [providerOrigin]},
     callback: { allowed_public_origins: [providerOrigin] },
-    tools: [],
-  }));
+    tools: []}));
   return { config, database };
 }
 
@@ -848,9 +821,7 @@ async function writeServerConfig(
       audiences: [ACCESS_AUDIENCE],
       jwks_url: access.jwksUrl,
       subject_key_file: subjectKey,
-      subject_key_version: 1,
-    },
-  }));
+      subject_key_version: 1}}));
   return config;
 }
 
@@ -916,8 +887,7 @@ function encodedMarkers(value: Buffer): string[] {
   return [
     value.toString("hex"),
     value.toString("base64url"),
-    value.toString("base64"),
-  ];
+    value.toString("base64")];
 }
 
 async function sessionMirrorMarkers(stack: TwoActorStack, sessionId: string): Promise<StoreMarker[]> {
@@ -943,8 +913,7 @@ async function sessionMirrorMarkers(stack: TwoActorStack, sessionId: string): Pr
     "session-acl-v1",
     "session-route-v1",
     "session-mirror-v1",
-    "zode.session-owner.v1",
-  ];
+    "zode.session-owner.v1"];
   const actorKeys = ["two-actor-human-a", "two-actor-human-b"].map((actor) =>
     lengthPrefixedHmac(subjectKey, "access-actor-v1", ["human", actor]),
   );
@@ -956,14 +925,11 @@ async function sessionMirrorMarkers(stack: TwoActorStack, sessionId: string): Pr
     ...actorSubjects.flatMap((subject) => [
       [subject, sessionId],
       [SERVER_AUTHORITY, subject, sessionId],
-      [sessionId, subject],
-    ]),
+      [sessionId, subject]]),
     ...actorKeys.flatMap((actorKey) => [
       [actorKey, sessionId],
       [SERVER_AUTHORITY, actorKey, sessionId],
-      [sessionId, actorKey],
-    ]),
-  ];
+      [sessionId, actorKey]])];
   for (const domain of domains) {
     for (const fields of fieldSets) {
       const value = lengthPrefixedHmac(subjectKey, domain, fields);
@@ -975,8 +941,7 @@ async function sessionMirrorMarkers(stack: TwoActorStack, sessionId: string): Pr
   const ownerDigests = actorSubjects.flatMap((subject) => [
     lengthPrefixedSha256("zode.session-owner.v1", [SERVER_AUTHORITY, subject]),
     lengthPrefixedSha256("zode.session-owner.v1", [SERVER_AUTHORITY, subject, sessionId]),
-    lengthPrefixedSha256("zode.session-owner.v1", [subject, SERVER_AUTHORITY, sessionId]),
-  ]);
+    lengthPrefixedSha256("zode.session-owner.v1", [subject, SERVER_AUTHORITY, sessionId])]);
   for (const value of ownerDigests) {
     addBytes(value);
     textValues.add(`sha256:v1:${value.toString("hex")}`);
@@ -1020,8 +985,7 @@ export async function createTwoActorStack(options: TwoActorStackOptions = {}): P
   const endpoint = await spawnReady(endpointBinary, [
     "--config", endpointConfig.config,
     "--database", endpointConfig.database,
-    "--listen", "127.0.0.1:0",
-  ], "ZODE_READY ");
+    "--listen", "127.0.0.1:0"], "ZODE_READY ");
   const endpointTransport = await startEndpointTransport(endpoint.baseUrl, options.replayEndpointExchanges);
   const serverRoots = [initialServerRoot];
   const initialServerDatabase = join(initialServerRoot, "server.sqlite3");
@@ -1046,8 +1010,7 @@ export async function createTwoActorStack(options: TwoActorStackOptions = {}): P
       initialServerRoot,
       serverRoots,
       endpointDatabase: endpointConfig.database,
-      subjectKey,
-    },
+      subjectKey},
     access,
     provider,
     endpoint,
@@ -1093,11 +1056,9 @@ export async function createTwoActorStack(options: TwoActorStackOptions = {}): P
         stack.server.stop(),
         endpoint.stop(),
         provider.close(),
-        access.close(),
-      ]);
+        access.close()]);
       await rm(root, { recursive: true, force: true });
-    },
-  };
+    }};
   return stack;
 }
 
@@ -1205,8 +1166,7 @@ function responseFingerprint(response: RecordedExchange["response"]): string {
     chunks: response.chunks.map(({ sequence, bodyHex, bodySha256 }) => ({ sequence, bodyHex, bodySha256 })),
     responseCode: response.responseCode,
     termination: response.termination,
-    completed: response.completed,
-  }))}`;
+    completed: response.completed}))}`;
 }
 
 function exactResponse(response: RecordedExchange["response"]): CassetteExactResponse {
@@ -1217,8 +1177,7 @@ function exactResponse(response: RecordedExchange["response"]): CassetteExactRes
     response_fingerprint: responseFingerprint(response),
     response_code: response.responseCode,
     termination: response.termination,
-    completed: response.completed,
-  };
+    completed: response.completed};
 }
 
 export function cassetteExactResponseMatches(
@@ -1286,8 +1245,7 @@ export function exchange(
       semanticHeaders: {},
       bodyHex: request.bodyHex,
       bodySha256: request.bodySha256,
-      canonicalJson: request.canonicalJson,
-    },
+      canonicalJson: request.canonicalJson},
     response: {
       status,
       semanticHeaders: {},
@@ -1297,9 +1255,7 @@ export function exchange(
       chunks: [{ sequence: 0, bodyHex: response.bodyHex, bodySha256: response.bodySha256, offsetMs: 0 }],
       termination: "complete",
       responseCode: findSafeCode(responseBody),
-      completed: true,
-    },
-  };
+      completed: true}};
 }
 
 export function firstObservedMessage(
@@ -1332,8 +1288,7 @@ export async function writeFirstFailureCassette(cassette: IncidentCassette): Pro
     const { whole_digest: _wholeDigest, ...withoutDigest } = cassette;
     const persisted = {
       ...withoutDigest,
-      whole_digest: `sha256:${digest(JSON.stringify(withoutDigest))}`,
-    };
+      whole_digest: `sha256:${digest(JSON.stringify(withoutDigest))}`};
     await handle.writeFile(`${JSON.stringify(persisted, null, 2)}\n`, "utf8");
   } finally {
     await handle.close();

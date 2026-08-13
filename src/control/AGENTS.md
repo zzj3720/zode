@@ -16,16 +16,12 @@ callers.
 ## Process lock
 
 - Bind the process-lifetime lock and the SQLite adapter to the same verified
-  canonical runtime path. Lock and state sidecars must be regular, single-link
-  files opened without following symlinks; runtime hardlinks fail closed.
-- Bootstrap controller state only while the runtime and its control sidecars
-  are jointly unclaimed. Persist an initialization fact binding the configured
-  authorities and revisions; after that point a missing identity, authority
-  state, manifest, journal fact, or initialization fact is corruption, never
-  permission to fall back to the original configured secret.
-- Bind the process-lifetime lock and the SQLite adapter to the same verified
-  canonical runtime path. Lock and state sidecars must be regular, single-link
-  files opened without following symlinks; runtime hardlinks fail closed.
+  canonical runtime path. Lock and identity sidecars must be regular,
+  single-link files opened without following symlinks; runtime hardlinks fail
+  closed.
+- Create the Endpoint-owned `endpoint_id` only while the runtime store is
+  jointly unclaimed. A missing identity sidecar on an existing store is
+  corruption, never permission to mint a replacement ID.
 
 ## Acceptance
 

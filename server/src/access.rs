@@ -33,17 +33,12 @@ const KEY_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 #[derive(Clone)]
 pub(crate) struct ActorContext {
     actor_key: [u8; 32],
-    endpoint_subject: String,
     assertion_expires_at_ms: i64,
 }
 
 impl ActorContext {
     pub(crate) fn actor_key(&self) -> &[u8; 32] {
         &self.actor_key
-    }
-
-    pub(crate) fn endpoint_subject(&self) -> &str {
-        &self.endpoint_subject
     }
 
     pub(crate) fn assertion_expiry_deadline(&self) -> Instant {
@@ -184,7 +179,6 @@ impl AccessVerifier {
         let assertion_expires_at_ms = expires_at_seconds.checked_mul(1_000).ok_or(())?;
         let actor_key = self.subject_keys.actor_key(kind, actor);
         Ok(ActorContext {
-            endpoint_subject: self.subject_keys.endpoint_subject(&actor_key),
             actor_key,
             assertion_expires_at_ms,
         })

@@ -3522,11 +3522,7 @@ async fn e2e_external_completion_first_wins_and_wakes_one_next_activation() -> T
         .await?;
     let unauthorized_code = unauthorized_status.status();
     let unauthorized_body = response_text(unauthorized_status).await?;
-    assert_eq!(
-        unauthorized_code,
-        StatusCode::OK,
-        "{unauthorized_body}"
-    );
+    assert_eq!(unauthorized_code, StatusCode::OK, "{unauthorized_body}");
     if !incident.is_replay() {
         incident.defer_failure(
             "public.tool_call_status",
@@ -4991,11 +4987,7 @@ async fn e2e_oversized_tool_output_uses_secret_safe_blob_reference() -> TestResu
         .await?;
     let unauthorized_status = unauthorized_response.status();
     let unauthorized_body = response_text(unauthorized_response).await?;
-    assert_eq!(
-        unauthorized_status,
-        StatusCode::OK,
-        "{unauthorized_body}"
-    );
+    assert_eq!(unauthorized_status, StatusCode::OK, "{unauthorized_body}");
     if !incident.is_replay() {
         incident.defer_failure(
             "public.tool_call_status",

@@ -113,26 +113,20 @@ const CASSETTE_REQUEST_SLOTS = [
   "SLOT_CANCEL_REQUEST_BODY",
   "SLOT_WAIT_TIMEOUT_REQUEST_BODY",
   "SLOT_UNKNOWN_OUTCOME_REQUEST_BODY",
-  "SLOT_MOBILE_ACTIVITY_REQUEST_BODY",
-];
+  "SLOT_MOBILE_ACTIVITY_REQUEST_BODY"];
 const CASSETTE_SLOT_MARKERS = [
   ...CASSETTE_SECRET_SLOTS,
-  ...CASSETTE_REQUEST_SLOTS,
-].flatMap((slot) => [slot, `{{${slot}}}`]);
+  ...CASSETTE_REQUEST_SLOTS].flatMap((slot) => [slot, `{{${slot}}}`]);
 const ROUTE_MISSING_PUBLIC_BODY = {
   error: {
     code: "route_not_found",
     message: "public route was not found",
-    retryable: false,
-  },
-} as const;
+    retryable: false}} as const;
 const RESOURCE_NOT_FOUND_PUBLIC_BODY = {
   error: {
     code: "not_found",
     message: "resource was not found",
-    retryable: false,
-  },
-} as const;
+    retryable: false}} as const;
 const execFile = promisify(execFileCallback);
 const STARTUP_OUTPUT_LIMIT = 128 * 1024;
 const STARTUP_EVIDENCE_ROOT = join(REPO_ROOT, "target", "test-recordings", "quarantine", "session-reconnect-exact-main-readiness-gap");
@@ -145,8 +139,7 @@ const SCENARIOS = {
   waitTimeout: "wait-timeout-session",
   unknown: "unknown-outcome-session",
   mobile: "mobile-activity-session",
-  safeReconcile: "safe-reconcile-session",
-} as const;
+  safeReconcile: "safe-reconcile-session"} as const;
 const suiteTopologyConsumptions: TopologyConsumption[] = [];
 let suiteExpectedSequences: number[] | undefined;
 let suiteSawShallow404 = false;
@@ -237,16 +230,14 @@ async function sqliteJson(database: string, sql: string): Promise<Json[]> {
   let result;
   try {
     result = await execFile(binary, ["-readonly", "-json", database, sql], {
-      maxBuffer: 16 * 1024 * 1024,
-    });
+      maxBuffer: 16 * 1024 * 1024});
   } catch (error) {
     // A stopped WAL owner may leave a read-only sqlite3 CLI unable to create
     // its shared-memory sidecar.  Immutable mode is sufficient for the
     // schema/database-list inspection; the caller still scans every sidecar
     // byte-for-byte and therefore does not hide a session mirror.
     result = await execFile(binary, ["-readonly", "-json", `file:${database}?immutable=1`, sql], {
-      maxBuffer: 16 * 1024 * 1024,
-    }).catch(() => {
+      maxBuffer: 16 * 1024 * 1024}).catch(() => {
       throw error;
     });
   }
@@ -291,9 +282,7 @@ async function inspectSqliteDatabase(database: string): Promise<{ storeFiles: st
     inspection: canonicalJson({
       database_list: databaseList.map(({ seq, name }) => ({ seq, name })),
       sqlite_schema: schemas,
-      columns,
-    }),
-  };
+      columns})};
 }
 
 function sha256(value: string | Buffer): string {
@@ -342,8 +331,7 @@ async function apiJson(
   const response = await fetch(`${baseUrl}${path}`, {
     ...init,
     headers,
-    signal: AbortSignal.timeout(10_000),
-  });
+    signal: AbortSignal.timeout(10_000)});
   const text = await response.text();
   let body: Json | null = null;
   try {
@@ -355,8 +343,7 @@ async function apiJson(
     status: response.status,
     body,
     bodyText: text,
-    contentType: response.headers.get("content-type") ?? "",
-  };
+    contentType: response.headers.get("content-type") ?? ""};
 }
 
 async function retainFailureEvidence(label: string, value: Json): Promise<string | undefined> {
@@ -465,8 +452,7 @@ class AccessFixture {
       sub: ACCESS_SUBJECT,
       type: "app",
       iat: now,
-      exp: now + 3600,
-    };
+      exp: now + 3600};
     const encode = (value: Json): string => Buffer.from(JSON.stringify(value)).toString("base64url");
     const signingInput = `${encode(header)}.${encode(claims)}`;
     const signer = createSign("RSA-SHA256");
@@ -622,8 +608,7 @@ class ReplayProvider {
       "content-length",
       "transfer-encoding",
       "connection",
-      "accept-encoding",
-    ]);
+      "accept-encoding"]);
     const actualHeaders = Object.entries(request.headers)
       .filter(([name]) => !ignoredTransportHeaders.has(name))
       .map(([name, value]) => [name.toLowerCase(), Array.isArray(value) ? value.join(",") : value ?? ""] as const)
@@ -631,8 +616,7 @@ class ReplayProvider {
     const resolvedExpected = expected
       .map(([name, value]) => [
         name,
-        value === "{{SLOT_PROVIDER_AUTHORIZATION}}" ? this.expectedProviderAuthorization : value,
-      ] as const)
+        value === "{{SLOT_PROVIDER_AUTHORIZATION}}" ? this.expectedProviderAuthorization : value] as const)
       .sort(([left], [right]) => left.localeCompare(right));
     if (canonicalJson(actualHeaders) !== canonicalJson(resolvedExpected)) {
       throw new Error(`cassette exchange ${exchange.sequence} request headers did not match exactly`);
@@ -682,8 +666,7 @@ class ReplayProvider {
         headers: replay.headers,
         complete: replay.complete,
         stream_error: replay.stream_error,
-        chunks: replay.chunks,
-      }),
+        chunks: replay.chunks}),
     )}`;
     if (replay.canonical_response_fingerprint !== responseFingerprint) {
       throw new Error(`cassette exchange ${exchange.sequence} response fingerprint is internally inconsistent`);
@@ -842,10 +825,7 @@ class ReplayProvider {
               index: 0,
               id: "safe-reconcile-tool-call",
               type: "function",
-              function: { name: TOOL, arguments: '{"mode":"safe"}' },
-            },
-          ],
-        }
+              function: { name: TOOL, arguments: '{"mode":"safe"}' }}]}
       : { content: "SAFE_RECONCILE_FINAL" };
     const finishReason = occurrence === 0 ? "tool_calls" : "stop";
     response.writeHead(200, { "content-type": "text/event-stream" });
@@ -926,8 +906,7 @@ class ReplayProvider {
       topologyId: this.topologyId,
       expectedSequences: [...expected],
       consumedSequences: [...consumed],
-      countsBySequence: new Map(this.countsBySequence),
-    });
+      countsBySequence: new Map(this.countsBySequence)});
   }
 
   scenarioCounts(): Map<string, number> {
@@ -1006,14 +985,12 @@ class EndpointBoundary {
           id: request.responseCurrentEventId ?? "",
           name: request.responseCurrentEventName,
           sessionId: request.responseCurrentSessionId,
-          messageId: request.responseCurrentMessageId,
-        });
+          messageId: request.responseCurrentMessageId});
       }
       if (request.responseCurrentEventId && request.responseCurrentEventName) {
         request.responseDurableEvents.push({
           id: request.responseCurrentEventId,
-          name: request.responseCurrentEventName,
-        });
+          name: request.responseCurrentEventName});
       }
       request.responseCurrentEventId = undefined;
       request.responseCurrentEventName = undefined;
@@ -1104,16 +1081,14 @@ class EndpointBoundary {
       responseEventIds: [],
       responseEventNames: [],
       responseDurableEvents: [],
-      responseFrames: [],
-    };
+      responseFrames: []};
     const upstream = httpRequest(
       {
         hostname: target.hostname,
         port: target.port,
         path: `${target.pathname}${target.search}`,
         method: request.method,
-        headers: forwardedHeaders,
-      },
+        headers: forwardedHeaders},
       (upstreamResponse) => {
         captured.status = upstreamResponse.statusCode;
         captured.responseContentType = Array.isArray(upstreamResponse.headers["content-type"])
@@ -1204,8 +1179,7 @@ class EndpointBoundary {
         if (released) return;
         released = true;
         releasePromise();
-      },
-    };
+      }};
     this.nextEventBodyHold = pending;
     return {
       received,
@@ -1213,8 +1187,7 @@ class EndpointBoundary {
       dispose: () => {
         if (this.nextEventBodyHold === pending) this.nextEventBodyHold = undefined;
         pending.release();
-      },
-    };
+      }};
   }
 
   async waitForEventRequest(
@@ -1251,8 +1224,7 @@ class EndpointBoundary {
             matched.matchedBrowserRequest = browserRequest;
             browserRequest.endpointRequest = matched;
             resolvePromise(matched);
-          },
-        });
+          }});
       }),
       15_000,
       `Endpoint boundary did not receive Last-Event-ID ${lastEventId || "<empty>"}; events=${JSON.stringify(this.eventRequests().map((request) => ({ last_event_id: request.lastEventId, matched: request.matchedBrowserRequest !== undefined, status: request.status, ids: request.responseEventIds })))}`,
@@ -1268,8 +1240,7 @@ class EndpointBoundary {
       resolve: (eventIds: string[]) => void;
     } = {
       request,
-      resolve: () => undefined,
-    };
+      resolve: () => undefined};
     const eventIds = new Promise<string[]>((resolvePromise) => {
       waiter.resolve = resolvePromise;
       this.eventIdWaiters.push(waiter);
@@ -1415,8 +1386,7 @@ class ReadyProcess {
     const child = spawn(binary, args, {
       cwd: REPO_ROOT,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env },
-    });
+      env: { ...process.env }});
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     const stdoutTotal = { value: 0 };
@@ -1453,8 +1423,7 @@ class ReadyProcess {
       return {
         child,
         baseUrl,
-        output: { stdoutChunks, stderrChunks, stdoutTotal, stderrTotal },
-      };
+        output: { stdoutChunks, stderrChunks, stdoutTotal, stderrTotal }};
     } catch (error) {
       child.kill("SIGKILL");
       throw error;
@@ -1483,8 +1452,7 @@ class ReadyProcess {
     };
     return {
       stdout: redact(ReadyProcess.boundedText(this.output.stdoutChunks, this.output.stdoutTotal)),
-      stderr: redact(ReadyProcess.boundedText(this.output.stderrChunks, this.output.stderrTotal)),
-    };
+      stderr: redact(ReadyProcess.boundedText(this.output.stderrChunks, this.output.stderrTotal))};
   }
 
   async stop(): Promise<void> {
@@ -1595,8 +1563,7 @@ class Topology {
     await cp(sourceUiAssetsDirectory, uiAssetsDirectory, {
       recursive: true,
       force: false,
-      errorOnExist: true,
-    });
+      errorOnExist: true});
     await makeCopiedDirectoryTreeRemovable(uiAssetsDirectory);
     const endpointSecret = `synthetic-controller-${randomUUID()}`;
     const providerSecret = `synthetic-provider-${randomUUID()}`;
@@ -1618,25 +1585,15 @@ class Topology {
         runtime_store: { kind: "sqlite", path: endpointDatabase },
         credential_replica_store: { kind: "files", directory: join(endpointRoot, "credentials") },
         blob_store: { kind: "files", directory: join(endpointRoot, "blobs") },
-        controller_auth: [
-          {
-            authority_id: CONTROLLER_AUTHORITY,
-            revision: 1,
-            kind: "bearer_secret_file",
-            secret_file: controllerSecretPath,
-          },
-        ],
         runtime: {
           tool_foreground_ms: 2_000,
           model_step_max_attempts: 2,
           model_retry_base_ms: 1,
           model_retry_max_ms: 10,
-          snapshot_every_events: 1,
-        },
+          snapshot_every_events: 1},
         provider_execution: {
           adapter_kinds: ["openai_compatible"],
-          allowed_base_url_origins: [new URL(provider.baseUrl).origin],
-        },
+          allowed_base_url_origins: [new URL(provider.baseUrl).origin]},
         tools: [
           {
             name: TOOL,
@@ -1645,18 +1602,13 @@ class Topology {
               type: "object",
               properties: { mode: { type: "string" } },
               required: ["mode"],
-              additionalProperties: false,
-            },
+              additionalProperties: false},
             completion_mode: "response",
             auto_wait_timeout_seconds: 1,
             recovery: {
               on_running_restart: "unknown_outcome",
-              retry_dispatch: safeReconcile ? "same_invocation_key_deduplicated" : "never",
-            },
-            adapter: { kind: "http", url: `${tools.baseUrl}/fixture_async` },
-          },
-        ],
-      }),
+              retry_dispatch: safeReconcile ? "same_invocation_key_deduplicated" : "never"},
+            adapter: { kind: "http", url: `${tools.baseUrl}/fixture_async` }}]}),
       { mode: 0o600 },
     );
     const serverDatabase = join(serverRoot, "control.sqlite3");
@@ -1679,9 +1631,7 @@ class Topology {
           audiences: [ACCESS_AUDIENCE],
           jwks_url: `${access.baseUrl}/jwks`,
           subject_key_file: subjectKeyPath,
-          subject_key_version: 1,
-        },
-      }),
+          subject_key_version: 1}}),
       { mode: 0o600 },
     );
     const endpointBinary = process.env.ZODE_ENDPOINT_BIN ?? resolve(REPO_ROOT, "target/debug/zode");
@@ -1745,8 +1695,7 @@ class Topology {
       `/sessions/${sessionId}`,
       `session:${sessionId}`,
       `session_id:${sessionId}`,
-      `/v1/endpoints/${this.endpointId}/sessions/${sessionId}`,
-    ]) {
+      `/v1/endpoints/${this.endpointId}/sessions/${sessionId}`]) {
       this.observedMarkers.push(fact);
     }
   }
@@ -1767,8 +1716,7 @@ class Topology {
       `cursor:${cursor}`,
       `event:${cursor}`,
       `last-event-id:${cursor}`,
-      `Last-Event-ID:${cursor}`,
-    ]) {
+      `Last-Event-ID:${cursor}`]) {
       if (fact !== cursor || cursor.length >= 8) this.observedMarkers.push(fact);
     }
   }
@@ -1793,8 +1741,7 @@ class Topology {
       `/v1/endpoints/${this.endpointId}/probe`,
       {
         method: "POST",
-        headers: { "Idempotency-Key": `browser-unreachable-${randomUUID()}` },
-      },
+        headers: { "Idempotency-Key": `browser-unreachable-${randomUUID()}` }},
     );
     if (response.status === 404) {
       if (!isExactRouteMissingPublicBody(response.body)) {
@@ -1848,8 +1795,7 @@ class Topology {
     const dedicatedSecretFiles = new Set([subjectKeyPath, ...secretStoreFiles].map((path) => resolve(path)));
     const files = new Set<string>([
       ...(await filesUnder(serverRoot)),
-      ...sqliteInspection.storeFiles,
-    ]);
+      ...sqliteInspection.storeFiles]);
     const inspectionBytes = Buffer.from(sqliteInspection.inspection, "utf8");
     for (const secret of this.knownSecrets) {
       if (containsMarker(inspectionBytes, secret)) {
@@ -1907,9 +1853,7 @@ class Topology {
         body: JSON.stringify({
           label: "Browser lifecycle fixture endpoint",
           base_url: this.endpointBoundary.baseUrl,
-          control_auth: { kind: "bearer", secret: this.endpointSecret },
-        }),
-      }),
+          control_auth: { kind: "bearer", secret: this.endpointSecret }})}),
       201,
       "Endpoint registration",
     );
@@ -1922,9 +1866,7 @@ class Topology {
           kind: "openai_compatible",
           base_url: `${this.provider.baseUrl}/v1`,
           models: [MODEL, REPLAY_HISTORY_MODEL],
-          options: {},
-        }),
-      }),
+          options: {}})}),
       200,
       "Provider descriptor",
     );
@@ -1938,9 +1880,7 @@ class Topology {
           label: "Browser lifecycle fixture profile",
           api_key: providerSecret,
           make_default: true,
-          sharing: { mode: "selected", endpoint_ids: [this.endpointId] },
-        }),
-      }),
+          sharing: { mode: "selected", endpoint_ids: [this.endpointId] }})}),
       201,
       "Provider profile",
     );
@@ -1995,8 +1935,7 @@ class Topology {
       () => this.provider.close(),
       () => this.tools.close(),
       () => this.access.close(),
-      () => rm(this.root, { recursive: true, force: true }),
-    ]) {
+      () => rm(this.root, { recursive: true, force: true })]) {
       try {
         await cleanup();
       } catch (error) {
@@ -2015,8 +1954,7 @@ async function bootstrap(page: Page, topology: Topology): Promise<void> {
   page.on("requestfailed", (request) => failedRequests.push(`${request.method()} ${request.url()}: ${request.failure()?.errorText ?? "unknown"}`));
   await page.context().setExtraHTTPHeaders({
     "Cf-Access-Jwt-Assertion": topology.accessAssertion,
-    [REQUEST_ID_HEADER]: topology.sseRequestId,
-  });
+    [REQUEST_ID_HEADER]: topology.sseRequestId});
   const response = await page.goto(`${topology.server.baseUrl}/`, { waitUntil: "domcontentloaded" });
   await classifyBrowser404(response, "management UI root");
   try {
@@ -2029,11 +1967,9 @@ async function bootstrap(page: Page, topology: Topology): Promise<void> {
       title: document.title,
       body: document.body?.innerText.slice(0, 4000) ?? "",
       scripts: [...document.scripts].map((script) => script.src),
-      appHtml: document.querySelector("#app")?.innerHTML.slice(0, 4000) ?? "",
-      }))),
+      appHtml: document.querySelector("#app")?.innerHTML.slice(0, 4000) ?? ""}))),
       pageErrors,
-      failedRequests,
-    };
+      failedRequests};
     throw new Error(`${error instanceof Error ? error.message : String(error)}; browser_diagnostics=${JSON.stringify(diagnostics)}`);
   }
   await expect(page.getByRole("button", { name: "Log in" })).toHaveCount(0);
@@ -2043,8 +1979,7 @@ async function bootstrap(page: Page, topology: Topology): Promise<void> {
 async function bootstrapServerSystem(page: Page, topology: Topology): Promise<void> {
   await page.context().setExtraHTTPHeaders({
     "Cf-Access-Jwt-Assertion": topology.accessAssertion,
-    [REQUEST_ID_HEADER]: topology.sseRequestId,
-  });
+    [REQUEST_ID_HEADER]: topology.sseRequestId});
   const response = await page.goto(`${topology.server.baseUrl}/v1/system`, { waitUntil: "domcontentloaded" });
   if (response === null || response.status() !== 200) {
     throw new Error(`browser Server positive barrier failed with status ${response?.status() ?? "<missing>"}`);
@@ -2067,9 +2002,7 @@ async function browserPublicJson(
         method: "GET",
         headers: {
           Accept: "application/json",
-          "Cf-Access-Jwt-Assertion": assertion,
-        },
-      });
+          "Cf-Access-Jwt-Assertion": assertion}});
       const bodyText = await response.text();
       let body: Json | null = null;
       try {
@@ -2081,8 +2014,7 @@ async function browserPublicJson(
         status: response.status,
         body,
         bodyText,
-        contentType: response.headers.get("content-type") ?? "",
-      };
+        contentType: response.headers.get("content-type") ?? ""};
     },
     { url: `${baseUrl}${path}`, assertion: accessAssertion },
   ) as Promise<BrowserPublicResponse>;
@@ -2141,11 +2073,9 @@ function fixtureModelSelection(topology: Topology, model = MODEL): Json {
       revision: topology.descriptorRevision,
       kind: "openai_compatible",
       base_url: `${topology.provider.baseUrl}/v1`,
-      options: {},
-    },
+      options: {}},
     auth_profile_id: topology.profileId,
-    minimum_auth_revision: topology.profileRevision,
-  };
+    minimum_auth_revision: topology.profileRevision};
 }
 
 async function seedDurableReplayHistory(
@@ -2164,10 +2094,8 @@ async function seedDurableReplayHistory(
           method: "PUT",
           headers: {
             "content-type": "application/json",
-            "Idempotency-Key": `browser-replay-history-${index}-${randomUUID()}`,
-          },
-          body: JSON.stringify(fixtureModelSelection(topology, expectedModel)),
-        },
+            "Idempotency-Key": `browser-replay-history-${index}-${randomUUID()}`},
+          body: JSON.stringify(fixtureModelSelection(topology, expectedModel))},
       ),
       202,
       `browser durable replay history selection ${index}`,
@@ -2219,10 +2147,8 @@ async function seedEndpointReplayHistory(
           method: "POST",
           headers: {
             "content-type": "application/json",
-            "Idempotency-Key": `browser-endpoint-replay-history-${index}-${randomUUID()}`,
-          },
-          body: JSON.stringify({ tools: [] }),
-        },
+            "Idempotency-Key": `browser-endpoint-replay-history-${index}-${randomUUID()}`},
+          body: JSON.stringify({ tools: [] })},
       ),
       201,
       `browser Endpoint replay history session ${index}`,
@@ -2243,10 +2169,8 @@ async function seedEndpointReplayHistory(
           method: "POST",
           headers: {
             "content-type": "application/json",
-            "Idempotency-Key": `browser-endpoint-replay-history-message-${index}-${randomUUID()}`,
-          },
-          body: JSON.stringify({ message_id: messageId, content }),
-        },
+            "Idempotency-Key": `browser-endpoint-replay-history-message-${index}-${randomUUID()}`},
+          body: JSON.stringify({ message_id: messageId, content })},
       ),
       202,
       `browser Endpoint replay history message ${index}`,
@@ -2266,8 +2190,7 @@ async function seedEndpointReplayHistory(
           )?.id ?? "",
       {
         timeout: 15_000,
-        message: "the live Endpoint stream did not publish the replay-history tail",
-      },
+        message: "the live Endpoint stream did not publish the replay-history tail"},
     )
     .toMatch(/^[0-9]+$/);
   const tailEventId = topology.endpointBoundary
@@ -2294,13 +2217,10 @@ async function createSessionWithKeyboard(
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "Idempotency-Key": `browser-session-${randomUUID()}`,
-      },
+        "Idempotency-Key": `browser-session-${randomUUID()}`},
       body: JSON.stringify({
         model: fixtureModelSelection(topology),
-        tools: [TOOL],
-      }),
-    }),
+        tools: [TOOL]})}),
     201,
     "browser lifecycle session creation",
   );
@@ -2308,8 +2228,7 @@ async function createSessionWithKeyboard(
   if (!/^[A-Z0-9]+$/.test(sessionId)) throw new Error("public session creation omitted a canonical session_id");
   await beforeOpen?.(sessionId);
   await page.goto(`${topology.server.baseUrl}/endpoints/${topology.endpointId}/sessions/${sessionId}`, {
-    waitUntil: "domcontentloaded",
-  });
+    waitUntil: "domcontentloaded"});
   await expect(page).toHaveURL(new RegExp(`/endpoints/${topology.endpointId}/sessions/${sessionId}$`));
   await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible();
   topology.recordSession(sessionId);
@@ -2337,8 +2256,7 @@ async function sendMessageWithKeyboard(
       prompt,
       observed_value: await composer.inputValue().catch(() => "<unavailable>"),
       browser_url: page.url(),
-      browser_body: (await page.locator("body").innerText()).slice(0, 4_000),
-    });
+      browser_body: (await page.locator("body").innerText()).slice(0, 4_000)});
     throw new Error(
       `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}`,
     );
@@ -2385,8 +2303,7 @@ async function holdNextBrowserMessageResponse(page: Page): Promise<BrowserRespon
     dispose: async () => {
       release();
       await page.unroute(pattern, handler);
-    },
-  };
+    }};
 }
 
 function observeEventRequests(page: Page, topology?: Topology): BrowserSseRequest[] {
@@ -2406,8 +2323,7 @@ function observeEventRequests(page: Page, topology?: Topology): BrowserSseReques
       path,
       endpointId: match[1],
       requestId: headers[REQUEST_ID_HEADER] ?? "",
-      lastEventId: headers["last-event-id"] ?? "",
-    };
+      lastEventId: headers["last-event-id"] ?? ""};
     requests.push(observed);
     byPlaywrightRequest.set(request, observed);
     topology?.recordCursor(observed.lastEventId);
@@ -2547,8 +2463,7 @@ async function recordSseResponseMarkers(
         browserRequests.map((request) => ({
           requestId: request.requestId,
           lastEventId: request.lastEventId,
-          status: request.status,
-        })),
+          status: request.status})),
       )}; endpoint=${JSON.stringify(topology.endpointBoundary.debugRequests().slice(-12))}`,
     );
   }
@@ -2663,8 +2578,7 @@ test.describe("session reconnect and runtime states", () => {
     await bootstrapServerSystem(page, topology);
     const resourcePath = `/v1/endpoints/${randomUUID()}`;
     const serverResource = await apiJson(topology.server.baseUrl, topology.accessAssertion, resourcePath, {
-      headers: { Accept: "application/json" },
-    });
+      headers: { Accept: "application/json" }});
     const browserResource = await browserPublicJson(
       page,
       topology.server.baseUrl,
@@ -2676,8 +2590,7 @@ test.describe("session reconnect and runtime states", () => {
     assertExactResourceNotFound(browserResource, "browser resource not_found");
 
     const serverRoute = await apiJson(topology.server.baseUrl, topology.accessAssertion, ROUTE_MISSING_PATH, {
-      headers: { Accept: "application/json" },
-    });
+      headers: { Accept: "application/json" }});
     const browserRoute = await browserPublicJson(
       page,
       topology.server.baseUrl,
@@ -2708,8 +2621,7 @@ test.describe("session reconnect and runtime states", () => {
     await expect
       .poll(() => browserSse.status ?? 0, {
         timeout: 15_000,
-        message: "server-store-scan did not receive a 200 browser SSE response",
-      })
+        message: "server-store-scan did not receive a 200 browser SSE response"})
       .toBe(200);
     const eventIds = await topology.endpointBoundary.waitForResponseEventIds(
       endpointSse,
@@ -2725,8 +2637,7 @@ test.describe("session reconnect and runtime states", () => {
       `${topology.serverDatabase}-wal`,
       `${topology.serverDatabase}-shm`,
       `${topology.serverDatabase}-journal`,
-      join(topology.root, "server", "subject.key"),
-    ];
+      join(topology.root, "server", "subject.key")];
     let missingTarget: string | undefined;
     let originalBytes: Buffer | undefined;
     for (const candidate of candidates) {
@@ -2754,8 +2665,7 @@ test.describe("session reconnect and runtime states", () => {
   });
 
   test("e2e_browser_session_admission_is_separate_from_completion_and_last_event_id_reconnect_replaces_provisional_final", async ({
-    page,
-  }) => {
+    page}) => {
     if (topology === undefined) throw new Error("test topology did not start");
     const testTopology = topology;
     const sseRequests = observeEventRequests(page, topology);
@@ -2794,8 +2704,7 @@ test.describe("session reconnect and runtime states", () => {
           browser_url: page.url(),
           browser_body: (await page.locator("body").innerText()).slice(0, 4_000),
           endpoint_boundary: topology.endpointBoundary.debugRequests(),
-          provider_requests: topology.provider.debugRequests(),
-        });
+          provider_requests: topology.provider.debugRequests()});
         throw new Error(
           `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}`,
         );
@@ -2831,8 +2740,7 @@ test.describe("session reconnect and runtime states", () => {
     const replayRequestId = topology.nextSseRequestId();
     await page.context().setExtraHTTPHeaders({
       "Cf-Access-Jwt-Assertion": topology.accessAssertion,
-      [REQUEST_ID_HEADER]: replayRequestId,
-    });
+      [REQUEST_ID_HEADER]: replayRequestId});
     await page.reload({ waitUntil: "domcontentloaded" });
     const initialEndpointRequest = await withTimeout(
       replayBodyHold.received,
@@ -2874,8 +2782,7 @@ test.describe("session reconnect and runtime states", () => {
           browser_body: (await page.locator("body").innerText()).slice(0, 4000),
           session_snapshot: sessionSnapshot.body,
           provider_requests: topology.provider.debugRequests(),
-          endpoint_boundary: topology.endpointBoundary.debugRequests(),
-        });
+          endpoint_boundary: topology.endpointBoundary.debugRequests()});
         throw new Error(
           `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}; browser_body=${JSON.stringify((await page.locator("body").innerText()).slice(0, 4000))}; session_snapshot=${JSON.stringify(sessionSnapshot.body)}; provider_requests=${JSON.stringify(topology.provider.debugRequests())}; endpoint_boundary=${JSON.stringify(topology.endpointBoundary.debugRequests())}`,
         );
@@ -2885,8 +2792,7 @@ test.describe("session reconnect and runtime states", () => {
           () => initialEndpointRequest.responseEventNames.includes("assistant_message_delta"),
           {
             timeout: 15_000,
-            message: "the fenced Endpoint-wide SSE did not carry the provisional assistant delta",
-          },
+            message: "the fenced Endpoint-wide SSE did not carry the provisional assistant delta"},
         )
         .toBe(true);
       const deliveryEndpointRequest = initialEndpointRequest;
@@ -2899,8 +2805,7 @@ test.describe("session reconnect and runtime states", () => {
             ),
           {
             timeout: 15_000,
-            message: "Endpoint replay never interleaved post-fence transient progress",
-          },
+            message: "Endpoint replay never interleaved post-fence transient progress"},
         )
         .toBeGreaterThanOrEqual(0);
       const provisionalFrameIndex = deliveryEndpointRequest.responseFrames.findIndex(
@@ -2917,8 +2822,7 @@ test.describe("session reconnect and runtime states", () => {
             ),
           {
             timeout: 15_000,
-            message: "Endpoint replay did not expose the seeded durable history tail",
-          },
+            message: "Endpoint replay did not expose the seeded durable history tail"},
         )
         .toBeGreaterThanOrEqual(0);
       const replayTailFrameIndex = deliveryEndpointRequest.responseFrames.findIndex(
@@ -2931,8 +2835,7 @@ test.describe("session reconnect and runtime states", () => {
       await expect
         .poll(() => deliveryEndpointRequest.responseEventIds.at(-1) ?? "", {
           timeout: 15_000,
-          message: "Endpoint stream did not expose a durable cursor before refresh",
-        })
+          message: "Endpoint stream did not expose a durable cursor before refresh"})
         .toMatch(/^[0-9]+$/);
       const initialEventIds = [...deliveryEndpointRequest.responseEventIds];
       topology.recordEventIds(initialEventIds);
@@ -2945,8 +2848,7 @@ test.describe("session reconnect and runtime states", () => {
       const reloadRequestId = topology.nextSseRequestId();
       await page.context().setExtraHTTPHeaders({
         "Cf-Access-Jwt-Assertion": topology.accessAssertion,
-        [REQUEST_ID_HEADER]: reloadRequestId,
-      });
+        [REQUEST_ID_HEADER]: reloadRequestId});
       await page.reload({ waitUntil: "domcontentloaded" });
       await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible();
       const reloadedBrowserRequest = await waitForBrowserSseRequest(
@@ -2978,10 +2880,8 @@ test.describe("session reconnect and runtime states", () => {
             method: "PUT",
             headers: {
               "content-type": "application/json",
-              "Idempotency-Key": `browser-reconnect-cursor-barrier-${randomUUID()}`,
-            },
-            body: JSON.stringify(fixtureModelSelection(topology, REPLAY_HISTORY_MODEL)),
-          },
+              "Idempotency-Key": `browser-reconnect-cursor-barrier-${randomUUID()}`},
+            body: JSON.stringify(fixtureModelSelection(topology, REPLAY_HISTORY_MODEL))},
         ),
         202,
         "browser reconnect cursor consumption barrier",
@@ -2998,8 +2898,7 @@ test.describe("session reconnect and runtime states", () => {
               .some((eventId) => !eventIdsBeforeModelPut.has(eventId)),
           {
             timeout: 15_000,
-            message: "model selection did not publish a durable event before the outage snapshot",
-          },
+            message: "model selection did not publish a durable event before the outage snapshot"},
         )
         .toBe(true);
 
@@ -3013,8 +2912,7 @@ test.describe("session reconnect and runtime states", () => {
       const resumedRequestId = topology.nextSseRequestId();
       await page.context().setExtraHTTPHeaders({
         "Cf-Access-Jwt-Assertion": topology.accessAssertion,
-        [REQUEST_ID_HEADER]: resumedRequestId,
-      });
+        [REQUEST_ID_HEADER]: resumedRequestId});
       await topology.server.restart();
       await expect
         .poll(
@@ -3027,8 +2925,7 @@ test.describe("session reconnect and runtime states", () => {
               )?.lastEventId ?? "",
           {
             timeout: 15_000,
-            message: "browser did not reconnect the Endpoint SSE with Last-Event-ID",
-          },
+            message: "browser did not reconnect the Endpoint SSE with Last-Event-ID"},
         )
         .toMatch(/^[0-9]+$/);
       const resumedCursor = sseRequests
@@ -3083,13 +2980,11 @@ test.describe("session reconnect and runtime states", () => {
                 (message) => message.role === "assistant" && message.content === "DURABLE_FINAL",
               ).length,
               idle:
-                response.body?.active_activation === null && response.body?.active_model_round === null,
-            };
+                response.body?.active_activation === null && response.body?.active_model_round === null};
           },
           {
             timeout: 15_000,
-            message: "second attempt did not commit its unique durable final",
-          },
+            message: "second attempt did not commit its unique durable final"},
         )
         .toEqual({ status: 200, final: 1, idle: true });
 
@@ -3122,8 +3017,7 @@ test.describe("session reconnect and runtime states", () => {
       const endpointRestartRequestId = topology.nextSseRequestId();
       await page.context().setExtraHTTPHeaders({
         "Cf-Access-Jwt-Assertion": topology.accessAssertion,
-        [REQUEST_ID_HEADER]: endpointRestartRequestId,
-      });
+        [REQUEST_ID_HEADER]: endpointRestartRequestId});
       await topology.endpoint.restart();
       await expect
         .poll(
@@ -3138,8 +3032,7 @@ test.describe("session reconnect and runtime states", () => {
               )?.lastEventId ?? "",
           {
             timeout: 15_000,
-            message: "Endpoint restart did not resume the Endpoint stream after its durable final",
-          },
+            message: "Endpoint restart did not resume the Endpoint stream after its durable final"},
         )
         .toMatch(/^[0-9]+$/);
       const endpointRestartCursor = sseRequests
@@ -3226,8 +3119,7 @@ test.describe("session reconnect and runtime states", () => {
             ?.lastEventId ?? "",
         {
           timeout: 15_000,
-          message: "Server outage recovery did not resume the Endpoint stream from a browser cursor",
-        },
+          message: "Server outage recovery did not resume the Endpoint stream from a browser cursor"},
       )
       .toMatch(/^[0-9]+$/);
     const resumedCursor = sseRequests
@@ -3284,8 +3176,7 @@ test.describe("session reconnect and runtime states", () => {
     expect(cancelResponse.status()).toBe(200);
     expect((await cancelResponse.json() as { status?: string }).status).toBe("cancelled");
     const cancelledRow = page.getByRole("listitem", {
-      name: new RegExp(`${TOOL}.*cancelled`, "i"),
-    });
+      name: new RegExp(`${TOOL}.*cancelled`, "i")});
     await expect(cancelledRow).toBeVisible();
     await expect(cancelledRow.getByRole("button", { name: "Retry dispatch" })).toHaveCount(0);
     await recordSseResponseMarkers(topology, sseRequests, cancelSessionId, "cancel runtime state");
@@ -3297,8 +3188,7 @@ test.describe("session reconnect and runtime states", () => {
     await topology.endpoint.stop();
     await topology.assertEndpointUnreachableBarrier();
     await expect(page.getByText(/Endpoint (unreachable|unavailable)/i)).toBeVisible({
-      timeout: 30_000,
-    });
+      timeout: 30_000});
     await expect(page.getByText(/Server unavailable/i)).toHaveCount(0);
     await expect(page.getByText(/Waiting.*deadline/i)).toBeVisible();
     await expect(page.getByText(/timed out/i)).toHaveCount(0);
@@ -3318,8 +3208,7 @@ test.describe("session reconnect and runtime states", () => {
     await topology.endpoint.stop();
     await topology.assertEndpointUnreachableBarrier();
     await expect(page.getByText(/Endpoint (unreachable|unavailable)/i)).toBeVisible({
-      timeout: 30_000,
-    });
+      timeout: 30_000});
     await expect(page.getByText(/Server unavailable/i)).toHaveCount(0);
     await expect(runningUnknownRow).toContainText(/running/i);
     await expect(page.getByText("Agent failed", { exact: true })).toHaveCount(0);
@@ -3399,8 +3288,7 @@ test.describe("session reconnect and runtime states", () => {
           );
           return JSON.stringify({
             projection: response.body,
-            provider: topology!.provider.debugRequests(),
-          });
+            provider: topology!.provider.debugRequests()});
         },
         { timeout: 15_000, message: "safe reconcile completion did not wake a final model round" },
       )
@@ -3411,8 +3299,7 @@ test.describe("session reconnect and runtime states", () => {
     expect(toolRequests).toHaveLength(2);
     expect(toolRequests.map((request) => request.tool_call_id)).toEqual([
       "safe-reconcile-tool-call",
-      "safe-reconcile-tool-call",
-    ]);
+      "safe-reconcile-tool-call"]);
     expect(toolRequests.map((request) => request.tool_name)).toEqual([TOOL, TOOL]);
     expect(toolRequests.map((request) => request.input)).toEqual([{ mode: "safe" }, { mode: "safe" }]);
 
@@ -3444,8 +3331,7 @@ test.describe("session reconnect and runtime states", () => {
       .filter({ hasText: "PRE_TOOL" });
     await expect(durableAssistant).toHaveCount(1, {
       timeout: 15_000,
-      message: `assistant tool-call completion did not become durable; observed=${JSON.stringify(topology.endpointBoundary.debugRequests())}`,
-    });
+      message: `assistant tool-call completion did not become durable; observed=${JSON.stringify(topology.endpointBoundary.debugRequests())}`});
     try {
       expect(await page.locator("article.message-provisional").count()).toBe(0);
     } catch (error) {
@@ -3456,8 +3342,7 @@ test.describe("session reconnect and runtime states", () => {
         browser_body: (await page.locator("body").innerText()).slice(0, 4_000),
         session_id: sessionId,
         endpoint_boundary: topology.endpointBoundary.debugRequests(),
-        provider_requests: topology.provider.debugRequests(),
-      });
+        provider_requests: topology.provider.debugRequests()});
       throw new Error(
         `${error instanceof Error ? error.message : String(error)}; evidence_path=${evidencePath ?? "unavailable"}`,
       );
@@ -3478,13 +3363,11 @@ test.describe("session reconnect and runtime states", () => {
     await topology.endpoint.stop();
     await topology.assertEndpointUnreachableBarrier();
     await expect(page.getByText(/Endpoint (unreachable|unavailable)/i)).toBeVisible({
-      timeout: 30_000,
-    });
+      timeout: 30_000});
     await topology.endpoint.restart();
     const unknownOutcomeRow = page.getByRole("listitem", {
       name: `${TOOL}, unknown outcome`,
-      exact: true,
-    });
+      exact: true});
     await expect(unknownOutcomeRow).toBeVisible({ timeout: 15_000 });
     await expect(unknownOutcomeRow).toContainText(/Unable to determine tool outcome/i);
     await expect(page.getByText(/Waiting.*deadline|Wait timed out/i)).toHaveCount(0);

@@ -204,7 +204,7 @@ replication is `docs/auth-replication.md`; ingress identity is
   Endpoint record/client. Do not link or instantiate Endpoint runtime state in
   the Server process.
 - `all_in_one` requires explicit `local_endpoint.executable`, `.config`,
-  `.listen`, and `.bootstrap_controller_secret_file` fields as defined in
+  `.listen` fields as defined in
   `docs/architecture.md`. Resolve paths relative to the Server config; reject
   PATH/sibling executable guessing, non-loopback or port-zero private listeners,
   a missing object in all-in-one, and an object present in server-only. The one

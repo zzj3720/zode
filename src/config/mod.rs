@@ -28,7 +28,7 @@ const MAX_CONTEXT_HANDOFF_DOCUMENT_TOKENS: u64 = 60 * 1024;
 const MAX_CONTEXT_HANDOFF_GENERATION_TOKENS: u64 = 256 * 1024;
 const MAX_AUTO_WAIT_TIMEOUT_SECONDS: u64 = 600;
 const MAX_NAME_BYTES: usize = 128;
-const MAX_AUTHORITY_ID_BYTES: usize = 64;
+
 const MAX_DESCRIPTION_BYTES: usize = 8 * 1024;
 const MAX_INPUT_SCHEMA_BYTES: usize = 64 * 1024;
 const MAX_LIST_ITEMS: usize = 1_024;
@@ -67,8 +67,6 @@ pub(crate) struct EndpointConfig {
     #[serde(default)]
     blob_store: Option<FileStoreConfig>,
     #[serde(default)]
-    controller_auth: Vec<ControllerAuthConfig>,
-    #[serde(default)]
     runtime: RuntimeConfig,
     #[serde(default)]
     provider_execution: Option<ProviderExecutionConfig>,
@@ -90,15 +88,6 @@ struct RuntimeStoreConfig {
 struct FileStoreConfig {
     kind: String,
     directory: PathBuf,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ControllerAuthConfig {
-    authority_id: String,
-    revision: u64,
-    kind: String,
-    secret_file: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -250,19 +239,6 @@ impl EndpointConfig {
         }
     }
 
-    pub(crate) fn controller_auth_specs(&self) -> Vec<zode::control::ControllerAuthSpec> {
-        self.controller_auth
-            .iter()
-            .map(|auth| {
-                zode::control::ControllerAuthSpec::new(
-                    auth.authority_id.clone(),
-                    auth.revision,
-                    auth.secret_file.clone(),
-                )
-            })
-            .collect()
-    }
-
     pub(crate) fn credential_replica_directory(&self) -> Option<&Path> {
         self.credential_replica_store
             .as_ref()
@@ -378,7 +354,6 @@ impl EndpointConfig {
             },
             credential_replica_store: None,
             blob_store: None,
-            controller_auth: Vec::new(),
             runtime: RuntimeConfig::default(),
             provider_execution: None,
             callback: None,
@@ -428,7 +403,6 @@ impl EndpointConfig {
             validate_file_store(store, base, "blob_store")?;
         }
 
-        validate_controller_auth(base, &mut self.controller_auth)?;
         validate_runtime(&self.runtime)?;
         if let Some(execution) = &mut self.provider_execution {
             validate_provider_execution(execution)?;
@@ -450,7 +424,6 @@ impl EndpointConfig {
             self.blob_store
                 .as_ref()
                 .map(|store| store.directory.as_path()),
-            &self.controller_auth,
         )
     }
 }
@@ -623,42 +596,6 @@ fn absolute_normalized_path(path: &Path) -> Result<PathBuf, ConfigError> {
         }
     }
     Ok(normalized)
-}
-
-fn validate_controller_auth(
-    base: &Path,
-    values: &mut [ControllerAuthConfig],
-) -> Result<(), ConfigError> {
-    if values.len() > MAX_LIST_ITEMS {
-        return Err(ConfigError::Invalid("controller_auth has too many entries"));
-    }
-    let mut authorities = HashSet::new();
-    for value in &mut *values {
-        validate_name(&value.authority_id)?;
-        if value.authority_id.len() > MAX_AUTHORITY_ID_BYTES {
-            return Err(ConfigError::Invalid(
-                "controller_auth.authority_id is too long",
-            ));
-        }
-        validate_bounded_string(&value.kind, MAX_KIND_BYTES, "controller auth kind")?;
-        if value.kind != "bearer_secret_file" {
-            return Err(ConfigError::Invalid(
-                "controller_auth.kind must be bearer_secret_file",
-            ));
-        }
-        if value.revision == 0 {
-            return Err(ConfigError::Invalid(
-                "controller_auth.revision must be positive",
-            ));
-        }
-        if !authorities.insert(&value.authority_id) {
-            return Err(ConfigError::Invalid(
-                "controller_auth has duplicate authority_id",
-            ));
-        }
-        value.secret_file = resolve_path(base, &value.secret_file, "controller_auth.secret_file")?;
-    }
-    Ok(())
 }
 
 fn validate_runtime(runtime: &RuntimeConfig) -> Result<(), ConfigError> {
@@ -923,7 +860,6 @@ fn validate_store_identity(
     runtime_store: &Path,
     credential_store: Option<&Path>,
     blob_store: Option<&Path>,
-    authorities: &[ControllerAuthConfig],
 ) -> Result<(), ConfigError> {
     let store_paths = [credential_store, blob_store]
         .into_iter()
@@ -945,22 +881,7 @@ fn validate_store_identity(
     let protected = [
         path_with_suffix(runtime_store, ".endpoint.lock"),
         path_with_suffix(runtime_store, ".endpoint-id"),
-        path_with_suffix(runtime_store, ".controller-auth"),
     ];
-    let mut secret_paths: Vec<PathBuf> = Vec::with_capacity(authorities.len());
-    for authority in authorities {
-        let path = &authority.secret_file;
-        if paths_overlap(path, runtime_store)
-            || store_paths.iter().any(|store| paths_overlap(path, store))
-            || protected.iter().any(|sidecar| paths_overlap(path, sidecar))
-            || secret_paths.iter().any(|other| paths_overlap(path, other))
-        {
-            return Err(ConfigError::Invalid(
-                "controller auth secret files must have distinct identities",
-            ));
-        }
-        secret_paths.push(path.to_path_buf());
-    }
     if store_paths.iter().any(|store| {
         protected
             .iter()

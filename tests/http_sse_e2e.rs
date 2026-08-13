@@ -59,7 +59,10 @@ async fn e2e_endpoint_event_stream_multiplexes_sessions_and_reconnects_once(
         .await?;
     assert_eq!(replay.status(), StatusCode::OK);
     let replayed = read_sse_events(replay, 2).await?;
-    assert_eq!(replayed, vec![initial_events[1].clone(), initial_events[2].clone()]);
+    assert_eq!(
+        replayed,
+        vec![initial_events[1].clone(), initial_events[2].clone()]
+    );
 
     let removed_session_stream = client
         .get(server.url(&format!("/v1/sessions/{first_session}/events")))
@@ -234,8 +237,8 @@ async fn e2e_create_generates_ulid_and_binds_idempotency_payload(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2e_session_list_is_shared_across_callers()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn e2e_session_list_is_shared_across_callers(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let database_path = test_database("session-list-shared")?;
     let mut server = TestServer::start(&database_path).await?;
     let client = http_client()?;
@@ -1483,7 +1486,10 @@ async fn e2e_session_missing_is_not_found_and_existing_is_shared(
         .await?;
     assert_eq!(cross.status(), StatusCode::OK);
 
-    let sse = client.get(server.url("/v1/events")).send_with_timeout().await?;
+    let sse = client
+        .get(server.url("/v1/events"))
+        .send_with_timeout()
+        .await?;
     assert_eq!(sse.status(), StatusCode::OK);
     let message = client
         .post(server.url(&format!("/v1/sessions/{session_a}/messages")))

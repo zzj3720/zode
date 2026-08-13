@@ -1,14 +1,10 @@
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{ErrorKind, Read, Write},
-    path::Path,
+    io::ErrorKind,
     process::Stdio,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use getrandom::fill as fill_random;
-use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -21,13 +17,12 @@ use tokio::{
 use crate::{
     catalog::{Catalog, EndpointProbe},
     config::{Deployment, LocalEndpointConfig, ServerConfig},
-    store::{hex, ControlStore, LocalBootstrapPhase, LocalEndpointCommit, StoreError},
+    store::{hex, ControlStore, LocalEndpointCommit, StoreError},
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const SECRET_BYTES: usize = 32;
 
 #[derive(Debug, Error)]
 pub(crate) enum LocalEndpointError {
@@ -54,14 +49,6 @@ pub(crate) struct LocalEndpointSupervisor {
     stderr: JoinHandle<()>,
 }
 
-struct Secret(Vec<u8>);
-
-impl Drop for Secret {
-    fn drop(&mut self) {
-        self.0.fill(0);
-    }
-}
-
 pub(crate) async fn compose(
     config: &ServerConfig,
     store: Arc<ControlStore>,
@@ -81,38 +68,16 @@ pub(crate) async fn compose(
         b"local-endpoint-control-secret-ref-v1",
         &[config.server_authority_id().as_bytes()],
     ));
-    let bootstrap_exists = store
-        .local_endpoint_bootstrap_phase()
-        .map_err(map_store_authority)?
-        .is_some();
-    let secret = match store
-        .load_endpoint_secret(&secret_ref)
-        .map_err(map_store_authority)?
-    {
-        Some(secret) => Secret(secret),
-        None if !bootstrap_exists => {
-            let mut random = [0_u8; SECRET_BYTES];
-            fill_random(&mut random).map_err(|_| LocalEndpointError::Authority)?;
-            let generated = Secret(hex(&random).into_bytes());
-            random.fill(0);
-            store
-                .stage_endpoint_secret(&secret_ref, &generated.0)
-                .map_err(map_store_authority)?;
-            generated
-        }
-        None => return Err(LocalEndpointError::Authority),
-    };
     let fingerprint = keys.digest(
-        b"local-endpoint-controller-secret-v1",
-        &[config.server_authority_id().as_bytes(), &secret.0],
+        b"local-endpoint-identity-v1",
+        &[
+            config.server_authority_id().as_bytes(),
+            local.origin().as_bytes(),
+        ],
     );
-    let phase = store
+    store
         .begin_local_endpoint_bootstrap(&fingerprint)
         .map_err(map_store_authority)?;
-    if phase == LocalBootstrapPhase::Pending {
-        ensure_seed(local.bootstrap_controller_secret_file(), &secret.0)?;
-    }
-    let bearer = std::str::from_utf8(&secret.0).map_err(|_| LocalEndpointError::Authority)?;
 
     let occupied = endpoint_address_occupied(local).await?;
     let mut supervisor = if occupied {
@@ -120,16 +85,7 @@ pub(crate) async fn compose(
     } else {
         Some(LocalEndpointSupervisor::start(local).await?)
     };
-    let result = probe_and_commit(
-        config,
-        local,
-        &store,
-        &catalog,
-        &fingerprint,
-        &secret_ref,
-        bearer,
-    )
-    .await;
+    let result = probe_and_commit(config, local, &store, &catalog, &fingerprint, &secret_ref).await;
     match result {
         Ok(endpoint_id) => Ok(AllInOneComposition {
             local_endpoint_id: Some(endpoint_id),
@@ -164,10 +120,9 @@ async fn probe_and_commit(
     catalog: &Catalog,
     fingerprint: &[u8; 32],
     secret_ref: &str,
-    bearer: &str,
 ) -> Result<String, LocalEndpointError> {
     let probe = catalog
-        .probe_local_endpoint(&local.origin(), bearer)
+        .probe_local_endpoint(&local.origin(), "")
         .await
         .map_err(|_| LocalEndpointError::Identity)?;
     validate_probe(config, &probe)?;
@@ -318,106 +273,6 @@ fn terminate(pid: u32) -> Result<(), LocalEndpointError> {
 #[cfg(not(unix))]
 fn terminate(_pid: u32) -> Result<(), LocalEndpointError> {
     Err(LocalEndpointError::Process)
-}
-
-fn ensure_seed(path: &Path, secret: &[u8]) -> Result<(), LocalEndpointError> {
-    let parent = path.parent().ok_or(LocalEndpointError::Configuration)?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or(LocalEndpointError::Configuration)?;
-    let pending = parent.join(format!(".{name}.zode-server-pending"));
-    for _ in 0..2 {
-        if let Some(existing) = read_private(path, secret.len() + 1)? {
-            if existing.len() == secret.len() && bool::from(existing.as_slice().ct_eq(secret)) {
-                remove_matching_pending(&pending, parent, secret)?;
-                return Ok(());
-            }
-            return Err(LocalEndpointError::Authority);
-        }
-        ensure_private_candidate(&pending, secret)?;
-        match fs::hard_link(&pending, path) {
-            Ok(()) => {
-                sync_directory(parent)?;
-                fs::remove_file(&pending).map_err(|_| LocalEndpointError::Authority)?;
-                return sync_directory(parent);
-            }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-            Err(_) => return Err(LocalEndpointError::Authority),
-        }
-    }
-    Err(LocalEndpointError::Authority)
-}
-
-fn ensure_private_candidate(path: &Path, secret: &[u8]) -> Result<(), LocalEndpointError> {
-    if let Some(existing) = read_private(path, secret.len() + 1)? {
-        return if existing.len() == secret.len() && bool::from(existing.as_slice().ct_eq(secret)) {
-            Ok(())
-        } else {
-            Err(LocalEndpointError::Authority)
-        };
-    }
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|_| LocalEndpointError::Authority)?;
-    file.write_all(secret)
-        .map_err(|_| LocalEndpointError::Authority)?;
-    file.sync_all().map_err(|_| LocalEndpointError::Authority)
-}
-
-fn remove_matching_pending(
-    path: &Path,
-    parent: &Path,
-    secret: &[u8],
-) -> Result<(), LocalEndpointError> {
-    let Some(existing) = read_private(path, secret.len() + 1)? else {
-        return Ok(());
-    };
-    if existing.len() != secret.len() || !bool::from(existing.as_slice().ct_eq(secret)) {
-        return Err(LocalEndpointError::Authority);
-    }
-    fs::remove_file(path).map_err(|_| LocalEndpointError::Authority)?;
-    sync_directory(parent)
-}
-
-fn sync_directory(path: &Path) -> Result<(), LocalEndpointError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| LocalEndpointError::Authority)
-}
-
-fn read_private(path: &Path, max_bytes: usize) -> Result<Option<Vec<u8>>, LocalEndpointError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(LocalEndpointError::Authority),
-    };
-    if !metadata.file_type().is_file() {
-        return Err(LocalEndpointError::Authority);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(LocalEndpointError::Authority);
-        }
-    }
-    let file = File::open(path).map_err(|_| LocalEndpointError::Authority)?;
-    let mut bytes = Vec::with_capacity(max_bytes);
-    file.take(max_bytes as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| LocalEndpointError::Authority)?;
-    if bytes.len() >= max_bytes {
-        return Err(LocalEndpointError::Authority);
-    }
-    Ok(Some(bytes))
 }
 
 fn unix_millis() -> Result<i64, LocalEndpointError> {

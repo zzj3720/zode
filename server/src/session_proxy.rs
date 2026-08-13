@@ -85,7 +85,6 @@ pub(crate) struct ProxyJson {
 
 struct EndpointTarget {
     record: EndpointRecord,
-    authorization: HeaderValue,
 }
 
 struct CreatePolicy {
@@ -651,29 +650,15 @@ impl SessionProxy {
         validate_path_identifier(endpoint_id)?;
         let store = Arc::clone(&self.store);
         let endpoint_id = endpoint_id.to_owned();
-        let (record, mut secret) = tokio::task::spawn_blocking(move || {
-            let record = store
+        let record = tokio::task::spawn_blocking(move || {
+            store
                 .get_endpoint(&endpoint_id)?
-                .ok_or(StoreError::Integrity)?;
-            let secret = store
-                .load_endpoint_secret(&record.secret_ref)?
-                .ok_or(StoreError::Integrity)?;
-            Ok::<_, StoreError>((record, secret))
+                .ok_or(StoreError::Integrity)
         })
         .await
         .map_err(|_| SessionProxyError::Internal)?
         .map_err(|_| SessionProxyError::NotFound)?;
-        let authorization = {
-            let secret_text =
-                std::str::from_utf8(&secret).map_err(|_| SessionProxyError::Internal)?;
-            HeaderValue::from_str(&format!("Bearer {secret_text}"))
-                .map_err(|_| SessionProxyError::Internal)?
-        };
-        secret_bytes_clear(&mut secret);
-        Ok(EndpointTarget {
-            record,
-            authorization,
-        })
+        Ok(EndpointTarget { record })
     }
 
     async fn endpoint_record(
@@ -724,7 +709,10 @@ impl SessionProxy {
         url: url::Url,
         details: JsonRequest<'_>,
     ) -> Result<EndpointJson, SessionProxyError> {
-        let mut request = self.client.request(method, url).timeout(Duration::from_secs(10));
+        let mut request = self
+            .client
+            .request(method, url)
+            .timeout(Duration::from_secs(10));
         if let Some(idempotency_key) = details.idempotency_key {
             request = request.header("idempotency-key", idempotency_key);
         }
@@ -940,8 +928,4 @@ fn valid_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
-fn secret_bytes_clear(bytes: &mut [u8]) {
-    bytes.fill(0);
 }

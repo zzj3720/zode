@@ -8,8 +8,7 @@ const {
   RealProcess,
   proxyHttp,
   createWebE2EHarness,
-  startHttpServer,
-} = require("../support/harness.cjs");
+  startHttpServer} = require("../support/harness.cjs");
 const { openManagement } = require("../support/radix.cjs");
 
 const E2E_NAME = "e2e_browser_provider_descriptor_stale_selection_recovers_before_session";
@@ -47,23 +46,18 @@ function assertCassetteIdentity() {
       expect.objectContaining({
         boundary: "management-access-edge",
         method: "POST",
-        response: expect.objectContaining({ status: 400 }),
-      }),
-    ]),
+        response: expect.objectContaining({ status: 400 })})]),
   );
   expect(endpointCassette.exchanges).toEqual(
     expect.arrayContaining([
       expect.objectContaining({
         boundary: "server-endpoint-control",
         method: "POST",
-        response: expect.objectContaining({ status: 404 }),
-      }),
+        response: expect.objectContaining({ status: 404 })}),
       expect.objectContaining({
         boundary: "server-endpoint-control",
         method: "POST",
-        response: expect.objectContaining({ status: 422 }),
-      }),
-    ]),
+        response: expect.objectContaining({ status: 422 })})]),
   );
 }
 
@@ -147,15 +141,12 @@ async function advanceDescriptor(adminPage, harness, rotatedProviderProxy) {
         headers: {
           accept: "application/json",
           "content-type": "application/json",
-          "idempotency-key": crypto.randomUUID(),
-        },
+          "idempotency-key": crypto.randomUUID()},
         body: JSON.stringify({
           kind: "openai_compatible",
           base_url: baseUrl,
           models: [model],
-          options: {},
-        }),
-      });
+          options: {}})});
       return { status: response.status, body: await response.json() };
     },
     { provider: PROVIDER, baseUrl: `${rotatedProviderProxy.baseUrl}/v1`, model: UPDATED_MODEL },
@@ -180,8 +171,7 @@ async function startRotatedProviderProxy(harness) {
     baseUrl: `http://127.0.0.1:${address.port}`,
     async close() {
       await new Promise((resolve) => server.close(resolve));
-    },
-  };
+    }};
   harness.rotatedProviderProxy = proxy;
   return proxy;
 }
@@ -212,14 +202,12 @@ async function startEndpointControlProxy(
         ...(endpointSubject() ? { "zode-subject": endpointSubject() } : {}),
         ...(replayOnly
           ? { "zode-idempotency-mode": "replay-only" }
-          : {}),
-      },
+          : {})},
       boundary: "server-endpoint-control",
       journal: harness.journal,
       ledger: harness.ledger,
       captureSetId: captureSetId() || harness.journal.currentCaptureSetId,
-      canonicalOrigin: harness.endpoint.baseUrl,
-    });
+      canonicalOrigin: harness.endpoint.baseUrl});
     return (streaming ? harness.journal.withRecordingDisabled(forward) : forward()).finally(() => {
       if (streaming) return;
       activeRequests -= 1;
@@ -250,8 +238,7 @@ async function startReplayEndpoint(harness, providerProxy) {
   for (const staleSidecar of [
     "endpoint.sqlite3.endpoint.lock",
     "endpoint.sqlite3.server-owner",
-    path.join("credentials", ".endpoint.lock"),
-  ]) {
+    path.join("credentials", ".endpoint.lock")]) {
     fs.rmSync(path.join(replayRoot, staleSidecar), { force: true });
   }
   const credentials = path.join(replayRoot, "credentials");
@@ -259,12 +246,11 @@ async function startReplayEndpoint(harness, providerProxy) {
   fs.mkdirSync(credentials, { recursive: true, mode: 0o700 });
   fs.mkdirSync(blobs, { recursive: true, mode: 0o700 });
   const config = JSON.parse(fs.readFileSync(sourceConfigPath, "utf8"));
-  const secretFile = path.join(replayRoot, "controller.secret");
   config.listen = "127.0.0.1:0";
   config.runtime_store.path = path.join(replayRoot, "endpoint.sqlite3");
   config.credential_replica_store.directory = credentials;
   config.blob_store.directory = blobs;
-  config.controller_auth[0].secret_file = secretFile;
+  if (config.controller_auth) delete config.controller_auth;
   config.provider_execution.allowed_base_url_origins = [new URL(providerProxy.baseUrl).origin];
   const configPath = path.join(replayRoot, "endpoint-config.json");
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
@@ -282,8 +268,7 @@ async function startReplayEndpoint(harness, providerProxy) {
     "TOGETHER_API_KEY",
     "XAI_API_KEY",
     "GROQ_API_KEY",
-    "COHERE_API_KEY",
-  ]) delete env[key];
+    "COHERE_API_KEY"]) delete env[key];
   return RealProcess.start({
     name: "endpoint",
     binary: process.env.ZODE_ENDPOINT_BIN || path.join(__dirname, "../../../target/debug/zode"),
@@ -295,8 +280,7 @@ async function startReplayEndpoint(harness, providerProxy) {
     logDir: path.join(replayRoot, "logs"),
     startupCaptureRoot: path.join(harness.journal.rootDir, "endpoint-stale-replay-startup"),
     startupConfigBytes: Buffer.from(JSON.stringify(config)),
-    e2eName: E2E_NAME,
-  });
+    e2eName: E2E_NAME});
 }
 
 async function restartEndpointWithProviderOrigin(harness, providerProxy, e2eName) {
@@ -321,8 +305,7 @@ async function restartEndpointWithProviderOrigin(harness, providerProxy, e2eName
     "TOGETHER_API_KEY",
     "XAI_API_KEY",
     "GROQ_API_KEY",
-    "COHERE_API_KEY",
-  ]) delete env[key];
+    "COHERE_API_KEY"]) delete env[key];
   const rotated = await RealProcess.start({
     name: "endpoint",
     binary: process.env.ZODE_ENDPOINT_BIN || path.join(__dirname, "../../../target/debug/zode"),
@@ -334,8 +317,7 @@ async function restartEndpointWithProviderOrigin(harness, providerProxy, e2eName
     logDir: path.join(harness.runRoot, "logs", "endpoint-rotation"),
     startupCaptureRoot: path.join(harness.journal.rootDir, "endpoint-rotation-startup"),
     startupConfigBytes: Buffer.from(JSON.stringify(config)),
-    e2eName,
-  });
+    e2eName});
   harness.endpoint = rotated;
   await harness.endpointIdentity();
 }
@@ -355,8 +337,7 @@ test(E2E_NAME, async ({ browser, page }) => {
     e2eName: E2E_NAME,
     uiMode: "assets",
     includeServerOrigins: true,
-    authorityId: "web-e2e-server",
-  });
+    authorityId: "web-e2e-server"});
   const recordingDisabled = !captureRequested;
   if (recordingDisabled) {
     await harness.journal.waitForIdle();
@@ -418,8 +399,7 @@ test(E2E_NAME, async ({ browser, page }) => {
       throw new ProductBehaviorFailure(CLASSIFICATION, FIRST_OBSERVED, {
         status: response.status(),
         path: new URL(response.url()).pathname,
-        observedNotice: "Check the requested values and try again.",
-      });
+        observedNotice: "Check the requested values and try again."});
     }
 
     await expect(page.getByRole("status")).toHaveText(
@@ -458,8 +438,7 @@ test(E2E_NAME, async ({ browser, page }) => {
       );
       if (!firstFailure) throw new Error("stale descriptor capture contained no 400 session-create exchange");
       const capture = harness.journal.flushCaptureSet(failureCaptureSetId, {
-        firstFailureRecordingId: firstFailure.recordingId,
-      });
+        firstFailureRecordingId: firstFailure.recordingId});
       expect(capture.sourceDigest).toMatch(/^[0-9a-f]{64}$/u);
       for (const record of records) expect(fs.statSync(record.rawPath).mode & 0o777).toBe(0o600);
       const endpointRecords = recordsFor(harness, endpointFailureCaptureSetId);
@@ -475,8 +454,7 @@ test(E2E_NAME, async ({ browser, page }) => {
       );
       if (!endpointFailure) throw new Error("stale descriptor control capture contained no 422 session exchange");
       const endpointCapture = harness.journal.flushCaptureSet(endpointFailureCaptureSetId, {
-        firstFailureRecordingId: endpointFailure.recordingId,
-      });
+        firstFailureRecordingId: endpointFailure.recordingId});
       expect(endpointCapture.sourceDigest).toMatch(/^[0-9a-f]{64}$/u);
       for (const record of endpointRecords) expect(fs.statSync(record.rawPath).mode & 0o777).toBe(0o600);
       if (captureRequested && primaryError?.classification === CLASSIFICATION) {
@@ -496,10 +474,7 @@ test(E2E_NAME, async ({ browser, page }) => {
               harness.journal.replay(envelope, {
                 baseUrl: endpointControlProxy.baseUrl,
                 boundaryBaseUrls: {
-                  "server-endpoint-control": endpointControlProxy.baseUrl,
-                },
-              }),
-          });
+                  "server-endpoint-control": endpointControlProxy.baseUrl}})});
         } finally {
           await replayEndpoint?.stop().catch(() => undefined);
           endpointControlProxy.setReplayOnly(0);
