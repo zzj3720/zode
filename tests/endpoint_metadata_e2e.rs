@@ -719,8 +719,7 @@ fn incident_document(
                 .map(|value| {
                     vec![json!({
                         "name": "authorization",
-                        "value": value,
-                    })]
+                        "value": value})]
                 })
                 .unwrap_or_default();
             let mut request = json!({
@@ -730,8 +729,7 @@ fn incident_document(
                 "zode_subject_present": false,
                 "raw_body_hex": hex_encode(&request_body),
                 "canonical_json": null,
-                "raw_body_sha256": sha256_hex(&request_body),
-            });
+                "raw_body_sha256": sha256_hex(&request_body)});
             request["fingerprint"] = Value::String(value_fingerprint(&request));
             let mut response = json!({
                 "status": exchange.response.status,
@@ -741,18 +739,15 @@ fn incident_document(
                 "chunks": exchange.response.chunks.iter().enumerate().map(|(sequence, chunk)| json!({
                     "sequence": sequence,
                     "at_us": chunk.at_us,
-                    "bytes_hex": hex_encode(&chunk.bytes),
-                })).collect::<Vec<_>>(),
+                    "bytes_hex": hex_encode(&chunk.bytes)})).collect::<Vec<_>>(),
                 "outcome": exchange.response.outcome,
-                "raw_body_sha256": sha256_hex(&exchange.response.body),
-            });
+                "raw_body_sha256": sha256_hex(&exchange.response.body)});
             response["fingerprint"] = Value::String(value_fingerprint(&response));
             json!({
                 "sequence": sequence,
                 "phase": exchange.phase,
                 "request": request,
-                "response": response,
-            })
+                "response": response})
         })
         .collect::<Vec<_>>();
     let response_fingerprint = exchanges
@@ -770,11 +765,9 @@ fn incident_document(
         "first_seen_failure": {
             "boundary": "endpoint.metadata_read",
             "safe_error": reason,
-            "response_fingerprint": response_fingerprint,
-        },
+            "response_fingerprint": response_fingerprint},
         "exchanges": exchanges,
-        "whole_sha256": "",
-    });
+        "whole_sha256": ""});
     refresh_whole_digest(&mut recording)?;
     Ok(recording)
 }
@@ -961,8 +954,7 @@ async fn e2e_endpoint_health_is_controller_authenticated_and_independent_of_acti
             ("session history", "health-active-provider-marker".to_owned()),
             ("provider instance", "fixture-provider".to_owned()),
             ("model instance", "fixture-model".to_owned()),
-            ("profile instance", "profile-e2e".to_owned()),
-        ];
+            ("profile instance", "profile-e2e".to_owned())];
         let validation = validate_health(&valid.response, &endpoint_id)
             .and_then(|()| assert_observation_omits(&valid.response, &forbidden));
         if let Err(reason) = validation {
@@ -976,16 +968,15 @@ async fn e2e_endpoint_health_is_controller_authenticated_and_independent_of_acti
 
         for (phase, bearer) in [
             ("health.missing_controller", None),
-            ("health.invalid_controller", Some(WRONG_CONTROLLER_SECRET)),
-        ] {
-            let rejected = metadata_probe(&client, &current.url(""), phase, path, bearer).await;
-            let validation = validate_auth_rejection(&rejected.response)
-                .and_then(|()| assert_observation_omits(&rejected.response, &forbidden));
+            ("health.invalid_controller", Some(WRONG_CONTROLLER_SECRET))] {
+            let open = metadata_probe(&client, &current.url(""), phase, path, bearer).await;
+            let validation = validate_health(&open.response, &endpoint_id)
+                .and_then(|()| assert_observation_omits(&open.response, &forbidden));
             if let Err(reason) = validation {
                 deferred_mismatch = Some((
-                    "retain the first health authentication mismatch while a provider stream is held",
+                    "retain the first unauthenticated health mismatch while a provider stream is held",
                     reason,
-                    vec![rejected],
+                    vec![open],
                 ));
                 return Ok(());
             }
@@ -1185,15 +1176,15 @@ async fn e2e_endpoint_capabilities_are_restart_stable_bounded_and_non_secret() -
                 Some(WRONG_CONTROLLER_SECRET),
             ),
         ] {
-            let rejected = metadata_probe(&client, &current.url(""), phase, path, bearer).await;
-            let validation = validate_auth_rejection(&rejected.response)
-                .and_then(|()| assert_observation_omits(&rejected.response, &forbidden));
+            let open = metadata_probe(&client, &current.url(""), phase, path, bearer).await;
+            let validation = validate_capabilities(&open.response, &endpoint_id)
+                .and_then(|()| assert_observation_omits(&open.response, &forbidden));
             if let Err(reason) = validation {
                 return contract_failure(
                     CAPABILITIES_E2E,
-                    "retain the first capability authentication mismatch",
+                    "retain the first unauthenticated capability mismatch",
                     reason,
-                    std::slice::from_ref(&rejected),
+                    std::slice::from_ref(&open),
                     None,
                 );
             }

@@ -945,27 +945,12 @@ pub fn write_endpoint_config(
         .ok_or_else(|| IoError::other("temporary database has no parent directory"))?;
     fs::create_dir_all(root.join("credentials"))?;
     fs::create_dir_all(root.join("blobs"))?;
-    let controller_secret = root.join("controller.secret");
-    fs::write(&controller_secret, TEST_CONTROLLER_SECRET)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&controller_secret)?.permissions();
-        permissions.set_mode(0o600);
-        fs::set_permissions(&controller_secret, permissions)?;
-    }
     let config = json!({
         "schema": "zode.config.v1",
         "listen": "127.0.0.1:0",
         "runtime_store": {"kind": "sqlite", "path": database},
         "credential_replica_store": {"kind": "files", "directory": "credentials"},
         "blob_store": {"kind": "files", "directory": "blobs"},
-        "controller_auth": [{
-            "authority_id": TEST_CONTROLLER_AUTHORITY,
-            "revision": 1,
-            "kind": "bearer_secret_file",
-            "secret_file": "controller.secret"
-        }],
         "runtime": {
             "tool_foreground_ms": 100,
             "model_step_max_attempts": max_attempts,

@@ -8,13 +8,12 @@ independently running Endpoint. The wire fields remain owned by
 ## Handshake matrix
 
 Server admission probes `/v1/identity` and `/v1/capabilities` through the same
-authenticated HTTP path used for a real Endpoint catalog create. It validates
+HTTP path used for a real Endpoint catalog create. It validates
 the two v1 DTOs and negotiates one exact protocol version before writing a
 catalog row. Unknown JSON fields are additive metadata and are ignored within
 v1; required semantic changes use a new schema/protocol and are rejected
-without a catalog row. These metadata probes carry the controller bearer but
-never a session `Zode-Subject`; a subject-bearing probe is rejected by the
-matrix fixture. There is no silent downgrade.
+without a catalog row. These metadata probes do not send a controller bearer
+or `Zode-Subject`. There is no silent downgrade.
 
 | Wire variant | Expected admission | Durable assertion |
 | --- | --- | --- |
@@ -33,9 +32,8 @@ The real-process gate is
 `server/tests/access_ingress_e2e.rs::e2e_server_endpoint_protocol_compatibility_matrix`.
 It starts one real Endpoint, places only a test-owned local HTTP compatibility
 proxy in front of it, and starts a fresh real Server for every row. The proxy
-changes only the selected JSON response. It also rejects the forbidden
-`Zode-Subject` metadata-probe header so the test freezes the controller-scoped
-probe contract, and normalizes connection framing for the local hop. Each
+changes only the selected JSON response. It normalizes connection framing for
+the local hop. Each
 assertion still traverses the public Server Access/catalog route and the
 Endpoint's HTTP identity and capability routes.
 

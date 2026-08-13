@@ -571,30 +571,8 @@ function probeHeaders(role, secret) {
   return value ? { authorization: `Bearer ${value}` } : {};
 }
 
-function endpointControllerSecret(instance) {
-  try {
-    const value = readFileSync(instance.endpoint_secret_path, "utf8").trim();
-    if (value) return value;
-  } catch {
-    // The Server-generated bootstrap is intentionally consumed by Endpoint.
-  }
-  // Once initialized, Endpoint keeps the active controller credential in its
-  // private, run-owned control sidecar.  Read only the single driver-issued
-  // current revision; never scan outside this instance or emit the secret.
-  const directory = join(instance.persistent_directory, "endpoint.sqlite3.controller-auth");
-  let entries;
-  try {
-    const directoryStat = statOrNull(directory);
-    if (!directoryStat || directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) return "";
-    entries = readdirSync(directory).filter((name) => /^current-[a-f0-9]{64}-1\.secret$/.test(name));
-  } catch {
-    return "";
-  }
-  if (entries.length !== 1) return "";
-  const path = join(directory, entries[0]);
-  const secretStat = statOrNull(path);
-  if (!secretStat || secretStat.isSymbolicLink() || !secretStat.isFile() || (secretStat.mode & 0o077) !== 0) return "";
-  try { return readFileSync(path, "utf8").trim(); } catch { return ""; }
+function endpointControllerSecret(_instance) {
+  return "";
 }
 
 async function probeInstance(instance) {
@@ -899,7 +877,6 @@ function endpointConfig(instance, endpointPort, secretPath, persistent) {
       adapter_kinds: ["openai_compatible"],
       allowed_base_url_origins: providerOrigins,
     },
-    controller_auth: [{ authority_id: persistent.authority_id, revision: 1, kind: "bearer_secret_file", secret_file: secretPath }],
   };
 }
 
@@ -922,7 +899,6 @@ function serverConfig(instance, serverPort, uiPath, endpointPath, endpointConfig
       executable: relative(instance.server_config_directory, endpointPath),
       config: relative(instance.server_config_directory, endpointConfigPath),
       listen: `127.0.0.1:${endpointPort}`,
-      bootstrap_controller_secret_file: relative(instance.server_config_directory, endpointSecretPath),
     },
     ui_mode: "assets",
     ui_assets_directory: relative(instance.server_config_directory, uiPath),

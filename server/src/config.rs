@@ -67,7 +67,6 @@ pub(crate) struct LocalEndpointConfig {
     executable: PathBuf,
     config: PathBuf,
     listen: String,
-    bootstrap_controller_secret_file: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -77,8 +76,6 @@ struct EndpointPreflightConfig {
     runtime_store: EndpointStorePath,
     credential_replica_store: Option<EndpointStoreDirectory>,
     blob_store: Option<EndpointStoreDirectory>,
-    #[serde(default)]
-    controller_auth: Vec<EndpointControllerAuth>,
 }
 
 #[derive(Deserialize)]
@@ -91,14 +88,6 @@ struct EndpointStorePath {
 struct EndpointStoreDirectory {
     kind: String,
     directory: PathBuf,
-}
-
-#[derive(Deserialize)]
-struct EndpointControllerAuth {
-    authority_id: String,
-    revision: u64,
-    kind: String,
-    secret_file: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -506,14 +495,10 @@ impl LocalEndpointConfig {
         format!("http://{}", self.listen_addr())
     }
 
-    pub(crate) fn bootstrap_controller_secret_file(&self) -> &Path {
-        &self.bootstrap_controller_secret_file
-    }
-
     fn validate_and_resolve(
         &mut self,
         server_base: &Path,
-        server_authority_id: &str,
+        _server_authority_id: &str,
         public_listen: SocketAddr,
         control_database: &Path,
         secret_directory: &Path,
@@ -561,27 +546,6 @@ impl LocalEndpointConfig {
             .config
             .parent()
             .ok_or(ConfigError::Invalid("local_endpoint.config is invalid"))?;
-        self.bootstrap_controller_secret_file = resolve_path(
-            endpoint_base,
-            &self.bootstrap_controller_secret_file,
-            "local_endpoint.bootstrap_controller_secret_file is invalid",
-        )?;
-        let parent = self
-            .bootstrap_controller_secret_file
-            .parent()
-            .ok_or(ConfigError::Invalid(
-                "local_endpoint.bootstrap_controller_secret_file is invalid",
-            ))?;
-        if !fs::symlink_metadata(parent)
-            .map_err(ConfigError::Read)?
-            .file_type()
-            .is_dir()
-        {
-            return Err(ConfigError::Invalid(
-                "local_endpoint bootstrap parent is not a directory",
-            ));
-        }
-
         let endpoint = read_endpoint_preflight(&self.config)?;
         if endpoint.schema != "zode.config.v1"
             || endpoint.runtime_store.kind != "sqlite"
@@ -598,25 +562,6 @@ impl LocalEndpointConfig {
                 "local_endpoint.config has an incompatible store schema",
             ));
         }
-        let matching = endpoint
-            .controller_auth
-            .iter()
-            .filter(|entry| entry.authority_id == server_authority_id)
-            .collect::<Vec<_>>();
-        if matching.len() != 1
-            || matching[0].revision != 1
-            || matching[0].kind != "bearer_secret_file"
-            || resolve_path(
-                endpoint_base,
-                &matching[0].secret_file,
-                "local Endpoint controller secret path is invalid",
-            )? != self.bootstrap_controller_secret_file
-        {
-            return Err(ConfigError::Invalid(
-                "local Endpoint controller bootstrap entry does not match Server authority",
-            ));
-        }
-
         let runtime_store = resolve_path(
             endpoint_base,
             &endpoint.runtime_store.path,
@@ -648,7 +593,6 @@ impl LocalEndpointConfig {
             Some(runtime_store.as_path()),
             credential_store.as_deref(),
             blob_store.as_deref(),
-            Some(self.bootstrap_controller_secret_file.as_path()),
         ];
         if endpoint_paths.into_iter().flatten().any(|path| {
             paths_overlap(path, control_database) || paths_overlap(path, secret_directory)

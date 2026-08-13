@@ -114,12 +114,11 @@ as a harness failure and does not fabricate an HTTP incident.
 
 Consumers that exercise Server-to-Endpoint authority distribution may pass
 `createWebE2EHarness({ authorityId: 'web-e2e-shared-authority' })`. The bounded
-test-only value is written to both the Endpoint controller-auth entry and the
-Server `server_authority_id`; omitting it preserves the historical defaults
-(`web-e2e-controller` and `web-e2e-server`). When supplied, the harness
-exposes the selected value as `harness.authorityId` for request payloads;
-otherwise that property is undefined because the defaults are intentionally
-independent.
+test-only value is written to Server `server_authority_id`; omitting it
+preserves the historical default (`web-e2e-server`). When supplied, the
+harness exposes the selected value as `harness.authorityId` for request
+payloads; otherwise that property is undefined because the defaults are
+intentionally independent. There is no Endpoint controller-auth entry.
 
 Navigation-scoped evidence uses `RecordingJournal.beginCaptureSet` before the
 browser action; management HTML/assets, `/v1/system`, and the JWKS fixture are

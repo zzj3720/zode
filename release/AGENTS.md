@@ -112,11 +112,10 @@ ownership locks and catalog would conflict with the active release.  The
 candidate's persistent state is discarded with that instance after promotion
 or failed staging.
 
-The driver may use the existing Access assertion and Endpoint controller-auth
-configuration supplied by the local test channel.  It must never emit their
-values or persist them in manifests, release pointers, ordinary logs, or
-health JSON.  Production Server/Endpoint processes do not import the test
-process seam or write locator files; the driver derives a test-owned Endpoint
-locator only after validating the Server's known direct child by PID/parent,
-exact installed argv/config/listen, executable digest, listener, and
-authenticated identity/capabilities evidence.
+The driver may use the existing Access assertion supplied by the local test
+channel.  It must never emit that value or persist it in manifests, release
+pointers, ordinary logs, or health JSON.  Production Server/Endpoint
+processes do not import the test process seam or write locator files; the
+driver derives a test-owned Endpoint locator only after validating the
+Server's known direct child by PID/parent, exact installed argv/config/listen,
+executable digest, listener, and identity/capabilities evidence.

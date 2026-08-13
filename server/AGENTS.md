@@ -16,10 +16,10 @@ replication is `docs/auth-replication.md`; ingress identity is
 - Consume Endpoint only through its versioned HTTP/SSE protocol. Do not import
   Endpoint domain reducers, SQLite rows, actor handles, or private handlers to
   make runtime decisions.
-- Server owns Access assertion verification, Endpoint catalog/control-auth
-  references, provider execution descriptors, provider login/profile/default/
+- Server owns Access assertion verification, Endpoint catalog records,
+  provider execution descriptors, provider login/profile/default/
   refresh authority, sharing policy, distribution operations, Endpoint-scoped
-  proxying, and UI API.
+  proxying, and UI API. It does not store an Endpoint control bearer.
 - Server does not execute provider model streams. Endpoint runs aimux and calls
   providers directly. Server may contain provider-specific auth/login/refresh
   adapters, but not a competing model-execution adapter.
@@ -49,29 +49,22 @@ replication is `docs/auth-replication.md`; ingress identity is
   identity. Never persist or log raw Access JWTs/cookies, human subjects,
   service-token client IDs, email, or arbitrary identity claims. Human browser
   mutations also enforce the documented same-origin checks.
-- Bind the subject-derivation key version/fingerprint to
+- Bind the actor-derivation key version/fingerprint to
   `server_authority_id`. An unexpected key change fails readiness before public
-  bind or Endpoint contact; it never silently changes ownership subjects.
+  bind or Endpoint contact; it never silently changes Server-owned receipts.
 
 ## Endpoint client and session proxy
 
 - Forward each session mutation's `Idempotency-Key` unchanged. Endpoint owns the
   command receipt; Server must not create a second session-command journal.
   Crash/retry obtains the original Endpoint result through that receipt.
-- Derive one stable opaque Endpoint subject from the validated Access actor and
-  configured controller authority. Forward it in trusted controller
-  context on every session list/read/mutation request and the Endpoint-wide SSE;
-  browser input cannot choose it, and Server stores no session ACL. Use a restart-stable keyed
-  pseudonymous derivation, never raw email/name; key rotation needs explicit
-  ownership migration.
+- Do not derive or forward an Endpoint subject. Do not send an Endpoint
+  control bearer. Server stores no session ACL. Every admitted Access actor
+  sees every session on an Endpoint the Server can reach.
 - Endpoint owns `endpoint_id`; Server uses that exact value as its catalog key
   and never allocates a second device ID. Verify it and required capabilities
   before create. Address updates cannot bind an existing record to another
   Endpoint.
-- Controller authority is stable logical identity, independent from its bearer.
-  Rotate through a durable staged operation, prove the new credential reaches
-  the same Endpoint/authority, then promote it; session ownership and
-  Endpoint receipt scopes must survive rotation.
 - Resolve Server's versioned non-secret provider execution descriptor once and
   forward it in the concrete session model selection. Endpoint reports adapter
   support and outbound policy; do not require users to duplicate provider base
@@ -211,7 +204,7 @@ replication is `docs/auth-replication.md`; ingress identity is
   Endpoint record/client. Do not link or instantiate Endpoint runtime state in
   the Server process.
 - `all_in_one` requires explicit `local_endpoint.executable`, `.config`,
-  `.listen`, and `.bootstrap_controller_secret_file` fields as defined in
+  `.listen` fields as defined in
   `docs/architecture.md`. Resolve paths relative to the Server config; reject
   PATH/sibling executable guessing, non-loopback or port-zero private listeners,
   a missing object in all-in-one, and an object present in server-only. The one

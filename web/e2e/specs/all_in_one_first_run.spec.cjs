@@ -5,8 +5,7 @@ const {
   createPublicKey,
   generateKeyPairSync,
   randomBytes,
-  sign,
-} = require("node:crypto");
+  sign} = require("node:crypto");
 const fs = require("node:fs/promises");
 const { lstatSync, readFileSync, readdirSync, watch } = require("node:fs");
 const http = require("node:http");
@@ -19,12 +18,10 @@ const { expect, test } = require("@playwright/test");
 const {
   ProductBehaviorFailure,
   RecordingJournal,
-  SecretLedger,
-} = require("../support/harness.cjs");
+  SecretLedger} = require("../support/harness.cjs");
 const {
   expectSelectedExecutionProfile,
-  selectRadixValue,
-} = require("../support/radix.cjs");
+  selectRadixValue} = require("../support/radix.cjs");
 
 const E2E = "e2e_all_in_one_first_run_uses_normal_server_api_and_local_endpoint";
 const HISTORICAL_INCIDENT_OWNER = "e2e_ui_all_in_one_first_run_creates_profile_and_chats";
@@ -46,16 +43,15 @@ const RECONNECT_FAILURE = "UI_SSE_RECONNECT_STATUS_STUCK";
 const SERVER_AUTHORITY_ID = "server-all-in-one-ui-e2e";
 const SAME_START_CAPABILITY_TOOL = "all_in_one_same_start_probe";
 const BARRIERS = Object.freeze({
-  controllerSeed: "server_controller_authority_and_endpoint_seed_staged",
+  controllerSeed: "local_endpoint_listen_scope_composed",
   childReady: "endpoint_zode_ready",
-  activeAuthorityProbe: "authenticated_endpoint_identity_and_capability_probe",
+  activeAuthorityProbe: "unauthenticated_endpoint_identity_and_capability_probe",
   endpointCapabilities: "endpoint_get_v1_capabilities",
   localCatalog: "local_endpoint_catalog_committed",
   serverBootstrap: "server_all_in_one_bootstrap",
   serverReady: "zode_server_ready_after_local_endpoint_catalog",
   uiEntry: "management_get_root_ui",
-  systemDeployment: "server_get_v1_system_all_in_one",
-});
+  systemDeployment: "server_get_v1_system_all_in_one"});
 const SESSION_PATH = /^\/endpoints\/([^/]+)\/sessions\/([0-9A-HJKMNP-TV-Z]{26})$/;
 const READY_TIMEOUT_MS = 20_000;
 const STOP_TIMEOUT_MS = 8_000;
@@ -67,13 +63,11 @@ const SAFE_REQUEST_HEADERS = new Set([
   "origin",
   "sec-fetch-dest",
   "sec-fetch-mode",
-  "sec-fetch-site",
-]);
+  "sec-fetch-site"]);
 const SAFE_RESPONSE_HEADERS = new Set([
   "cache-control",
   "content-type",
-  "referrer-policy",
-]);
+  "referrer-policy"]);
 
 function productEnvironment(source) {
   const environment = { ...source };
@@ -83,8 +77,7 @@ function productEnvironment(source) {
     "OPENCODE_API_KEY",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
-    "OPENROUTER_API_KEY",
-  ]) {
+    "OPENROUTER_API_KEY"]) {
     delete environment[key];
   }
   return environment;
@@ -163,16 +156,13 @@ function assertTrackedIncident(cassette, source) {
   const expectedSlot = {
     ACCESS_ASSERTION_RS256: {
       placeholder: "<ACCESS_ASSERTION_RS256>",
-      kind: "test-owned Cloudflare Access RS256 assertion",
-    },
-  };
+      kind: "test-owned Cloudflare Access RS256 assertion"}};
   const expectedCaptureContext = {
     deployment: "server_only_scaffold",
     endpoint_process: "real standalone Endpoint",
     reason: "canonical all_in_one exited before readiness and produced no HTTP exchange",
     access_admission:
-      "not implemented in the source capture; current replay separately requires JWKS contact",
-  };
+      "not implemented in the source capture; current replay separately requires JWKS contact"};
   if (
     cassette.schema !== "zode.http-incident-recording.v1" ||
     cassette.recording_id !== "all-in-one-first-run-initial-404-v1" ||
@@ -251,8 +241,7 @@ function withTimeout(promise, timeoutMs, label) {
 class HarnessBarrierError extends Error {
   constructor(message, cause = null) {
     super(`HARNESS_FAILURE barrier=process_control: ${message}`, {
-      ...(cause ? { cause } : {}),
-    });
+      ...(cause ? { cause } : {})});
     this.name = "HarnessBarrierError";
   }
 }
@@ -286,8 +275,7 @@ async function commandOutput(binary, args, allowedExitCodes = [0]) {
         new Promise((resolve, reject) => {
           child.once("error", reject);
           child.once("exit", (code, signal) => resolve({ code, signal }));
-        }),
-      ]),
+        })]),
       5_000,
       `${path.basename(binary)} process observation`,
     );
@@ -600,8 +588,7 @@ class FileCreationBarrier {
           throw new Error(
             `${path.basename(process.binary)} exited before ${this.label} (code=${code}, signal=${signal})`,
           );
-        }),
-      ]),
+        })]),
       READY_TIMEOUT_MS,
       this.label,
     );
@@ -690,8 +677,7 @@ class FileContentBarrier {
           throw new Error(
             `${path.basename(process.binary)} exited before ${this.label} (code=${code}, signal=${signal})`,
           );
-        }),
-      ]),
+        })]),
       READY_TIMEOUT_MS,
       this.label,
     );
@@ -717,8 +703,7 @@ async function writeExecutable(pathname, source) {
 async function writeJson(pathname, value) {
   await fs.writeFile(pathname, `${JSON.stringify(value, null, 2)}\n`, {
     flag: "wx",
-    mode: 0o600,
-  });
+    mode: 0o600});
 }
 
 async function replaceJson(pathname, value) {
@@ -794,8 +779,7 @@ async function privateFileFact(pathname, label) {
     dev: metadata.dev,
     ino: metadata.ino,
     nlink: metadata.nlink,
-    mode: metadata.mode & 0o777,
-  };
+    mode: metadata.mode & 0o777};
 }
 
 async function bootstrapSeedCreationFact(pathname, label) {
@@ -839,8 +823,7 @@ async function bootstrapSeedCreationFact(pathname, label) {
     dev: metadata.dev,
     ino: metadata.ino,
     nlink: metadata.nlink,
-    mode: metadata.mode & 0o777,
-  };
+    mode: metadata.mode & 0o777};
 }
 
 function assertIndependentCopies(left, right, label) {
@@ -887,8 +870,7 @@ async function privateOpaqueFileFact(pathname, label) {
     dev: metadata.dev,
     ino: metadata.ino,
     nlink: metadata.nlink,
-    mode: metadata.mode & 0o777,
-  };
+    mode: metadata.mode & 0o777};
 }
 
 async function oneEncryptedAuthorityFile(directory, plaintext, label) {
@@ -953,8 +935,7 @@ class ReadyProcess {
     const child = spawn(binary, args, {
       cwd: repositoryRoot,
       env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+      stdio: ["ignore", "pipe", "pipe"]});
     return new ReadyProcess(child, binary);
   }
 
@@ -1058,8 +1039,7 @@ class ReadyProcess {
       const result = await this.exit;
       this.stopObservation ??= {
         forcedSigkill: false,
-        result,
-      };
+        result};
       return;
     }
     this.child.kill("SIGTERM");
@@ -1170,8 +1150,7 @@ class IncidentRecorder {
         method: observed.method,
         path: observed.path,
         status: observed.status,
-        outcome: observed.outcome,
-      };
+        outcome: observed.outcome};
       return;
     }
 
@@ -1219,30 +1198,24 @@ class IncidentRecorder {
         inbound_headers: observed.inbound_headers,
         forwarded_headers: observed.forwarded_headers,
         body_base64: observed.request_body.toString("base64"),
-        body_sha256: sha256(observed.request_body),
-      },
+        body_sha256: sha256(observed.request_body)},
       response: {
         status: observed.status,
         headers: observed.response_headers,
         chunks: observed.response_chunks.map((chunk) => ({
           offset_us: chunk.offset_us,
-          body_base64: chunk.body.toString("base64"),
-        })),
+          body_base64: chunk.body.toString("base64")})),
         body_sha256: sha256(responseBody),
-        outcome: observed.outcome,
-      },
-    };
+        outcome: observed.outcome}};
     await fs.writeFile(pathname, `${JSON.stringify(raw, null, 2)}\n`, {
       flag: "wx",
-      mode: 0o600,
-    });
+      mode: 0o600});
     return {
       pathname,
       method: observed.method,
       path: observed.path,
       status: observed.status,
-      safeError,
-    };
+      safeError};
   }
 
   assertComplete() {
@@ -1336,8 +1309,7 @@ class LaterGapCapture {
       method: request.method,
       requestPath: request.url,
       requestHeaders: request.headers,
-      captureSetId: this.captureSetId,
-    });
+      captureSetId: this.captureSetId});
     recording.laterGapReconnect = reconnect;
     this.activeRecordings.add(recording);
     return recording;
@@ -1411,13 +1383,11 @@ class LaterGapCapture {
       ? {
           expected_connection_state: "Live",
           observed_connection_state: "Reconnecting",
-          durable_assistant_reply_count: 1,
-        }
+          durable_assistant_reply_count: 1}
       : firstObserved ?? "the real browser suite stopped before the SSE reconnect assertion";
     await this.journal.waitForIdle();
     const capture = this.journal.flushCaptureSet(this.captureSetId, {
-      firstFailureRecordingId: failure.recordingId,
-    });
+      firstFailureRecordingId: failure.recordingId});
     const metadataPath = path.join(this.root, "later-reproduction.v1.json");
     await writePrivateDurableJson(metadataPath, {
       schema: "zode.evidence-gap-later-reproduction.v1",
@@ -1432,14 +1402,12 @@ class LaterGapCapture {
       first_observed: safeFirstObserved,
       raw_exchange_retained: true,
       source_digest: capture.sourceDigest,
-      do_not_relabel_as_first: true,
-    });
+      do_not_relabel_as_first: true});
     this.flushed = {
       root: this.root,
       metadataPath,
       captureSetId: this.captureSetId,
-      firstFailureRecordingId: failure.recordingId,
-    };
+      firstFailureRecordingId: failure.recordingId};
     return this.flushed;
   }
 }
@@ -1459,8 +1427,7 @@ function accessAssertion({ privateKey, kid, issuer, audience, subject }) {
       sub: subject,
       iat: now,
       nbf: now - 1,
-      exp: now + 300,
-    }),
+      exp: now + 300}),
   );
   const signingInput = `${header}.${payload}`;
   return `${signingInput}.${sign("RSA-SHA256", Buffer.from(signingInput), privateKey).toString("base64url")}`;
@@ -1532,8 +1499,7 @@ class EndpointProbeWire {
     this.activeAuthorityBytes = Buffer.from(activeAuthorityBytes);
     this.expectedAuthorization = Buffer.concat([
       Buffer.from("Bearer "),
-      this.activeAuthorityBytes,
-    ]);
+      this.activeAuthorityBytes]);
     this.beforeCapabilityResponse = beforeCapabilityResponse;
     this.origin = null;
     this.server = null;
@@ -1564,8 +1530,7 @@ class EndpointProbeWire {
       "https_proxy",
       "NO_PROXY",
       "no_proxy",
-      "REQUEST_METHOD",
-    ]) {
+      "REQUEST_METHOD"]) {
       delete env[name];
     }
     env.HTTP_PROXY = this.origin;
@@ -1645,11 +1610,11 @@ class EndpointProbeWire {
     if (
       request.method !== "GET" ||
       requestBody.length !== 0 ||
-      typeof request.headers.authorization !== "string" ||
-      !Buffer.from(request.headers.authorization).equals(this.expectedAuthorization)
+      typeof request.headers.authorization === "string" ||
+      typeof request.headers["zode-subject"] === "string"
     ) {
       throw new Error(
-        `${probePath} was not an empty authenticated GET using the active controller authority`,
+        `${probePath} was not an empty unauthenticated GET over the private listen scope`,
       );
     }
     if (this.exchanges.has(probePath)) {
@@ -1664,8 +1629,7 @@ class EndpointProbeWire {
     await new Promise((resolve, reject) => {
       const upstream = http.request(target, {
         method: request.method,
-        headers: proxyRequestHeaders(request.headers, target.host),
-      });
+        headers: proxyRequestHeaders(request.headers, target.host)});
       upstream.once("error", reject);
       upstream.once("response", (upstreamResponse) => {
         if (probePath) {
@@ -1675,8 +1639,7 @@ class EndpointProbeWire {
             requestBody,
             target,
             probePath,
-            upstreamResponse,
-          }).then(resolve, reject);
+            upstreamResponse}).then(resolve, reject);
           return;
         }
 
@@ -1728,8 +1691,7 @@ class EndpointProbeWire {
     requestBody,
     target,
     probePath,
-    upstreamResponse,
-  }) {
+    upstreamResponse}) {
     const body = await readBounded(upstreamResponse);
     const status = upstreamResponse.statusCode ?? 502;
     const contentType = Array.isArray(upstreamResponse.headers["content-type"])
@@ -1738,7 +1700,7 @@ class EndpointProbeWire {
     if (status !== 200 || !contentType.toLowerCase().includes("application/json")) {
       throw new Error(`${probePath} did not return a complete JSON HTTP 200 response`);
     }
-    if (body.includes(this.activeAuthorityBytes)) {
+    if (this.activeAuthorityBytes.length > 0 && body.includes(this.activeAuthorityBytes)) {
       throw new Error(`${probePath} response exposed the active controller credential`);
     }
     let json;
@@ -1756,18 +1718,15 @@ class EndpointProbeWire {
         method: request.method,
         origin: target.origin,
         path: probePath,
-        authorization: "<ACTIVE_CONTROLLER_AUTHORITY>",
+        authorization: null,
         source_server_pid: this.probeSourcePids.get(probePath),
         zode_subject_present: typeof request.headers["zode-subject"] === "string",
-        body_sha256: sha256(requestBody),
-      },
+        body_sha256: sha256(requestBody)},
       response: {
         status,
         content_type: contentType,
         body_sha256: sha256(body),
-        json,
-      },
-    });
+        json}});
     if (
       this.exchanges.has("/v1/identity") &&
       this.exchanges.has("/v1/capabilities") &&
@@ -1792,10 +1751,10 @@ class EndpointProbeWire {
         json.protocol_version !== "zode.endpoint.v1" ||
         typeof json.endpoint_id !== "string" ||
         json.endpoint_id.length === 0 ||
-        json.authority_id !== SERVER_AUTHORITY_ID ||
+        json.authority_id !== "local" ||
         json.revision !== 1
       ) {
-        throw new Error("Endpoint identity response did not prove the active authority");
+        throw new Error("Endpoint identity response did not prove listen-scope process identity");
       }
       return;
     }
@@ -1812,8 +1771,7 @@ class EndpointProbeWire {
         "protocol_version",
         "provider_adapter_kinds",
         "schema",
-        "tools",
-      ],
+        "tools"],
       "Endpoint capabilities response",
     );
     requireExactObjectKeys(
@@ -1824,8 +1782,7 @@ class EndpointProbeWire {
         "max_session_request_bytes",
         "wait_for_default_seconds",
         "wait_for_max_seconds",
-        "wait_for_min_seconds",
-      ],
+        "wait_for_min_seconds"],
       "Endpoint capability limits",
     );
     if (
@@ -1846,8 +1803,7 @@ class EndpointProbeWire {
           max_inline_tool_output_bytes: 65536,
           wait_for_min_seconds: 1,
           wait_for_default_seconds: 60,
-          wait_for_max_seconds: 600,
-        })
+          wait_for_max_seconds: 600})
     ) {
       throw new Error("Endpoint capabilities response did not match the active composition");
     }
@@ -1861,11 +1817,10 @@ class EndpointProbeWire {
     }
     return [
       identity.endpoint_id,
-      SERVER_AUTHORITY_ID,
+      "local",
       "zode.endpoint.v1",
       this.endpointOrigin,
-      SAME_START_CAPABILITY_TOOL,
-    ];
+      SAME_START_CAPABILITY_TOOL];
   }
 
   safeEvidence() {
@@ -1887,12 +1842,11 @@ class EndpointProbeWire {
         this.complete,
         process.exit.then(({ code, signal }) => {
           throw new Error(
-            `${path.basename(process.binary)} exited before authenticated Endpoint probes completed (code=${code}, signal=${signal})`,
+            `${path.basename(process.binary)} exited before listen-scope Endpoint probes completed (code=${code}, signal=${signal})`,
           );
-        }),
-      ]),
+        })]),
       READY_TIMEOUT_MS,
-      "authenticated Endpoint identity/capability wire barrier",
+      "listen-scoped Endpoint identity/capability wire barrier",
     );
   }
 
@@ -1928,8 +1882,7 @@ class EndpointProbeWire {
     this.activeAuthorityBytes.fill(0);
     if (errors.length > 0) {
       throw new Error("Endpoint probe wire cleanup/evidence gate failed", {
-        cause: errors[0],
-      });
+        cause: errors[0]});
     }
   }
 }
@@ -1939,8 +1892,7 @@ class AccessEdge {
     const pair = generateKeyPairSync("rsa", {
       modulusLength: 2048,
       publicKeyEncoding: { format: "pem", type: "spki" },
-      privateKeyEncoding: { format: "pem", type: "pkcs8" },
-    });
+      privateKeyEncoding: { format: "pem", type: "pkcs8" }});
     const edge = new AccessEdge(recorder, laterGapCapture, pair.privateKey, pair.publicKey);
     edge.server = http.createServer((request, response) => {
       edge.handle(request, response).catch((error) => {
@@ -2056,6 +2008,11 @@ class AccessEdge {
       throw new Error("durable final SSE frame omitted its Endpoint event ID");
     }
     this.droppedFinalEventId = eventId;
+    // Let the already-forwarded committed frame reach the browser read loop
+    // before the socket is destroyed, otherwise Last-Event-ID stays on the
+    // previous durable event.
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
     this.sseDropped = true;
     const active = this.activeSse;
     void (async () => {
@@ -2160,8 +2117,7 @@ class AccessEdge {
       } catch (error) {
         if (recording) {
           this.laterGapCapture.responseStarted(recording, 400, {
-            "content-type": "application/json",
-          });
+            "content-type": "application/json"});
           this.laterGapCapture.finish(recording, "transport_error");
         }
         throw error;
@@ -2171,8 +2127,7 @@ class AccessEdge {
         kid: this.kid,
         issuer: this.issuer,
         audience: this.audience,
-        subject: this.subject,
-      });
+        subject: this.subject});
       this.lastAssertion = assertion;
       if (recording) {
         this.laterGapCapture.addAccessAssertion(assertion);
@@ -2182,7 +2137,9 @@ class AccessEdge {
       this.laterGapCapture?.updateHeaders(recording, headers);
       if (reconnect) {
         if (request.headers["last-event-id"] !== this.droppedFinalEventId) {
-          throw new Error("SSE reconnect cursor did not equal the durable final event ID");
+          throw new Error(
+            `SSE reconnect cursor did not equal the durable final event ID: got=${request.headers["last-event-id"]} expected=${this.droppedFinalEventId}`,
+          );
         }
         this.resolveSseReconnect?.();
       }
@@ -2193,8 +2150,7 @@ class AccessEdge {
         target,
         headers,
         recording,
-        isEventStream,
-      });
+        isEventStream});
     } finally {
       this.settleRequest(isEventStream);
     }
@@ -2206,8 +2162,7 @@ class AccessEdge {
       upstream.once("error", (error) => {
         if (recording && recording.responseStatus === undefined) {
           this.laterGapCapture.responseStarted(recording, 502, {
-            "content-type": "application/json",
-          });
+            "content-type": "application/json"});
           this.laterGapCapture.finish(recording, "transport_error");
         }
         reject(error);
@@ -2248,8 +2203,7 @@ class AccessEdge {
               status,
               response_headers: upstreamResponse.headers,
               response_chunks: chunks,
-              outcome,
-            });
+              outcome});
           })();
           finishPromise.then(resolve, reject);
           return finishPromise;
@@ -2259,8 +2213,7 @@ class AccessEdge {
             response,
             upstream: upstreamResponse,
             finish,
-            chunks,
-          };
+            chunks};
           this.activeSse = streamState;
           this.sseStreams.add(streamState);
         }
@@ -2278,8 +2231,7 @@ class AccessEdge {
           this.laterGapCapture?.chunk(recording, bytes, offsetUs);
           chunks.push({
             offset_us: offsetUs,
-            body: bytes,
-          });
+            body: bytes});
           for (const resolveChunk of this.sseChunkWaiters.splice(0)) {
             resolveChunk();
           }
@@ -2347,21 +2299,18 @@ class FakeProvider {
       }
       response.writeHead(200, {
         "cache-control": "no-cache",
-        "content-type": "text/event-stream",
-      });
+        "content-type": "text/event-stream"});
       response.write(
         `data: ${JSON.stringify({
           id: "all-in-one-first-run-completion",
           object: "chat.completion.chunk",
-          choices: [{ index: 0, delta: { content: FINAL_ASSISTANT }, finish_reason: null }],
-        })}\n\n`,
+          choices: [{ index: 0, delta: { content: FINAL_ASSISTANT }, finish_reason: null }]})}\n\n`,
       );
       response.write(
         `data: ${JSON.stringify({
           id: "all-in-one-first-run-completion",
           object: "chat.completion.chunk",
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        })}\n\n`,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]})}\n\n`,
       );
       response.end("data: [DONE]\n\n");
     });
@@ -2433,7 +2382,7 @@ class Harness {
       }
       throw shallowNonEvidence(
         BARRIERS.serverBootstrap,
-        `requires=${BARRIERS.controllerSeed},${BARRIERS.childReady},${BARRIERS.activeAuthorityProbe},${BARRIERS.localCatalog},${BARRIERS.serverReady},${BARRIERS.endpointCapabilities}; real all-in-one Server did not cross authenticated local Endpoint composition and public readiness`,
+        `requires=${BARRIERS.controllerSeed},${BARRIERS.childReady},${BARRIERS.activeAuthorityProbe},${BARRIERS.localCatalog},${BARRIERS.serverReady},${BARRIERS.endpointCapabilities}; real all-in-one Server did not cross listen-scoped local Endpoint composition and public readiness`,
         failure,
       );
     }
@@ -2481,15 +2430,13 @@ class Harness {
       this.endpointControlSecret,
       this.staleEndpointSeed,
       this.subjectKey,
-      this.edge.subject,
-    ];
+      this.edge.subject];
     for (const [label, value] of [
       ["provider_api_key", this.apiKey],
       ["endpoint_controller_secret", this.endpointControlSecret],
       ["stale_endpoint_seed", this.staleEndpointSeed],
       ["access_subject_key", this.subjectKey],
-      ["access_subject", this.edge.subject],
-    ]) {
+      ["access_subject", this.edge.subject]]) {
       this.laterGapCapture?.addSecret(label, value);
     }
   }
@@ -2565,8 +2512,7 @@ class Harness {
           '  kill -STOP "$$"',
           "fi",
           'exec "$ZODE_E2E_REAL_ENDPOINT" "$@"',
-          "",
-        ].join("\n"),
+          ""].join("\n"),
       );
     }
     this.endpointConfiguredExecutable = endpointConfiguredExecutable;
@@ -2576,41 +2522,28 @@ class Harness {
     const endpointConfig = path.join(endpointRoot, "endpoint.json");
     this.endpointConfig = endpointConfig;
     this.endpointListen = endpointListen;
-    const endpointSeed = path.join(endpointRoot, "controller.seed");
-    this.endpointSeed = endpointSeed;
+    this.endpointSeed = null;
     const endpointConfigDocument = {
       schema: "zode.config.v1",
       listen: endpointListen,
       runtime_store: { kind: "sqlite", path: "runtime.sqlite3" },
       credential_replica_store: { kind: "files", directory: "credentials" },
       blob_store: { kind: "files", directory: "blobs" },
-      controller_auth: [
-        {
-          authority_id: SERVER_AUTHORITY_ID,
-          revision: 1,
-          kind: "bearer_secret_file",
-          secret_file: "controller.seed",
-        },
-      ],
       runtime: {
         tool_foreground_ms: 100,
         model_step_max_attempts: 1,
         model_retry_base_ms: 1,
         model_retry_max_ms: 10,
-        snapshot_every_events: 1,
-      },
+        snapshot_every_events: 1},
       provider_execution: {
         adapter_kinds: ["openai_compatible"],
-        allowed_base_url_origins: [this.provider.origin],
-      },
+        allowed_base_url_origins: [this.provider.origin]},
       callback: { allowed_public_origins: [callbackOrigin.origin] },
-      tools: [],
-    };
+      tools: []};
     this.endpointConfigDocument = endpointConfigDocument;
     await writeJson(endpointConfig, endpointConfigDocument);
 
     if (scaffoldCapture) {
-      await writePrivate(endpointSeed, this.endpointControlSecret);
       this.scaffoldEndpoint = await ReadyProcess.start(
         endpointBinary,
         ["--config", endpointConfig],
@@ -2630,8 +2563,7 @@ class Harness {
       await fs.cp(uiAssetsDirectory, installedUiDirectory, {
         recursive: true,
         force: false,
-        errorOnExist: true,
-      });
+        errorOnExist: true});
     }
     const serverConfig = {
       schema: "zode.server-config.v1",
@@ -2651,16 +2583,12 @@ class Harness {
         audiences: [this.edge.audience],
         jwks_url: `${this.edge.baseUrl}/cdn-cgi/access/certs`,
         subject_key_file: "subject.key",
-        subject_key_version: 1,
-      },
-    };
+        subject_key_version: 1}};
     if (!scaffoldCapture) {
       serverConfig.local_endpoint = {
         executable: endpointConfiguredExecutable,
         config: endpointConfig,
-        listen: endpointListen,
-        bootstrap_controller_secret_file: "controller.seed",
-      };
+        listen: endpointListen};
     }
     const serverConfigPath = path.join(serverRoot, "server.json");
     this.serverConfig = serverConfigPath;
@@ -2679,7 +2607,6 @@ class Harness {
     await this.observeBootstrapBeforePublicBind();
 
     await this.installSameStartProbeCapability();
-    await writePrivate(endpointSeed, this.staleEndpointSeed);
     this.server = await this.startReadyServerAfterActiveAuthorityProbe();
     const expectedPublicOrigin = `http://${serverListen}`;
     if (this.server.readyValue !== expectedPublicOrigin) {
@@ -2706,20 +2633,15 @@ class Harness {
         input_schema: {
           type: "object",
           properties: {},
-          additionalProperties: false,
-        },
+          additionalProperties: false},
         completion_mode: "response",
         auto_wait_timeout_seconds: 20,
         recovery: {
           on_running_restart: "unknown_outcome",
-          retry_dispatch: "never",
-        },
+          retry_dispatch: "never"},
         adapter: {
           kind: "http",
-          url: `${this.provider.origin}/all-in-one-same-start-tool`,
-        },
-      },
-    ];
+          url: `${this.provider.origin}/all-in-one-same-start-tool`}}];
     await replaceJson(this.endpointConfig, next);
     this.endpointConfigDocument = next;
   }
@@ -2728,7 +2650,7 @@ class Harness {
     const endpointOrigin = `http://${this.endpointListen}`;
     const wire = await EndpointProbeWire.start(
       endpointOrigin,
-      this.endpointActiveAuthorityFact.bytes,
+      Buffer.alloc(0),
       () => {
         if (
           storeFamilyBytesSync(this.serverRoot, "control.sqlite3").some((bytes) =>
@@ -2774,10 +2696,9 @@ class Harness {
             return evidence;
           }
           throw new HarnessBarrierError(
-            "Server reached ZODE_SERVER_READY before its authenticated Endpoint probes",
+            "Server reached ZODE_SERVER_READY before its listen-scope Endpoint probes",
           );
-        }),
-      ]);
+        })]);
       this.bootstrapStage = BARRIERS.activeAuthorityProbe;
       catalogBarrier.scan();
 
@@ -2795,8 +2716,7 @@ class Harness {
             );
           }
           return bytes;
-        }),
-      ]);
+        })]);
       this.bootstrapStage = BARRIERS.localCatalog;
       const readyValue = await readiness;
       await this.assertRestartRejectedStaleSeed();
@@ -2887,27 +2807,19 @@ class Harness {
     let process;
     let endpointPid;
     let endpointPausedAtEntry = false;
-    const seedCreated = FileCreationBarrier.arm(
-      this.endpointSeed,
-      "Server-generated Endpoint seed creation",
-      () => {},
-    );
     process = ReadyProcess.launch(this.serverBinary, ["--config", this.serverConfig], {
       env: this.endpointServerEnvironment(globalThis.process.env, {
-        stopEndpointAtEntry: true,
-      }),
-    });
+        stopEndpointAtEntry: true})});
     this.preReadyBootstrapProcess = process;
     try {
-      await seedCreated.wait(process);
       endpointPid = await this.waitForOneEndpointChild(process);
       try {
         await waitForProcessStopped(
           endpointPid,
-          "test-owned Endpoint launch gate stopped before seed consumption",
+          "test-owned Endpoint launch gate stopped before real exec",
         );
       } catch (error) {
-        throw new HarnessBarrierError("Endpoint seed-consumption gate did not settle", error);
+        throw new HarnessBarrierError("Endpoint launch gate did not settle", error);
       }
       endpointPausedAtEntry = true;
       const entryCommand = await processCommand(endpointPid);
@@ -2916,24 +2828,7 @@ class Harness {
           "Endpoint launch gate did not retain the configured executable before real exec",
         );
       }
-      const seed = await bootstrapSeedCreationFact(
-        this.endpointSeed,
-        "one-time Endpoint bootstrap seed",
-      );
-      const authority = await oneEncryptedAuthorityFile(
-        path.join(this.serverRoot, "secrets", "endpoints"),
-        seed.bytes,
-        "Server controller authority store",
-      );
-      assertIndependentFiles(authority, seed, "Server authority and Endpoint seed");
-      this.serverAuthorityFact = authority;
-      this.controllerAuthorityBytes = Buffer.from(seed.bytes);
       this.bootstrapStage = BARRIERS.controllerSeed;
-      const authorityText = seed.bytes.toString("utf8");
-      if (!Buffer.from(authorityText, "utf8").equals(seed.bytes)) {
-        throw new Error("Server-generated controller authority was not UTF-8 bearer text");
-      }
-      this.secrets.push(authorityText);
     } finally {
       if (endpointPausedAtEntry) {
         try {
@@ -2945,7 +2840,6 @@ class Harness {
           }
         }
       }
-      seedCreated.stop();
     }
     const result = await process.waitForExit("all-in-one pre-public-bind process exit");
     this.preReadyEndpointPid = endpointPid;
@@ -2966,35 +2860,12 @@ class Harness {
         "Server exited after local catalog composition for a reason other than the held final public bind",
       );
     }
-    if (await pathExists(this.endpointSeed)) {
-      throw new Error("Endpoint bootstrap seed was not consumed before final Server bind");
-    }
-
-    const authority = await privateOpaqueFileFact(
-      this.serverAuthorityFact.pathname,
-      "Server controller authority after Endpoint bootstrap",
-    );
-    if (authority.digest !== this.serverAuthorityFact.digest) {
-      throw new Error("Server authority changed while the Endpoint consumed its seed");
-    }
-    const active = await oneMatchingPrivateFile(
-      this.endpointRoot,
-      this.controllerAuthorityBytes,
-      "Endpoint durable active controller store",
-    );
-    if (authority.bytes.includes(active.bytes)) {
-      throw new Error("Server protected store exposed the active Endpoint controller plaintext");
-    }
-    assertIndependentFiles(authority, active, "Server and active Endpoint controller stores");
-    this.serverAuthorityFact = authority;
-    this.endpointActiveAuthorityFact = active;
     this.bootstrapStage = BARRIERS.childReady;
     this.preReadyCatalogBytes = await storeFamilyBytes(this.serverRoot, "control.sqlite3");
     for (const marker of [
       "zode.endpoint.v1",
       "openai_compatible",
-      `http://${this.endpointListen}`,
-    ]) {
+      `http://${this.endpointListen}`]) {
       if (!this.preReadyCatalogBytes.some((bytes) => bytes.includes(Buffer.from(marker)))) {
         throw new Error(
           `Server control store omitted pre-bind local catalog marker ${marker}`,
@@ -3008,20 +2879,28 @@ class Harness {
   }
 
   async assertRestartRejectedStaleSeed() {
-    const response = await fetch(`http://${this.endpointListen}/v1/identity`, {
-      headers: {
-        authorization: `Bearer ${this.staleEndpointSeed}`,
-        "zode-subject": "all-in-one-stale-seed-probe",
-      },
-    });
-    const body = await response.text();
-    if (response.status !== 401) {
+    const unauthenticated = await fetch(`http://${this.endpointListen}/v1/identity`);
+    const unauthenticatedBody = await unauthenticated.text();
+    if (unauthenticated.status !== 200) {
       throw new Error(
-        `restart accepted a stale Endpoint bootstrap seed through the public identity route; status=${response.status}`,
+        `listen-scope identity was not reachable without a controller bearer; status=${unauthenticated.status}`,
       );
     }
-    if (body.includes(this.staleEndpointSeed)) {
-      throw new Error("public stale-seed rejection exposed the rejected credential");
+    if (unauthenticatedBody.includes(this.staleEndpointSeed)) {
+      throw new Error("public identity exposed a leftover controller seed");
+    }
+    const ignored = await fetch(`http://${this.endpointListen}/v1/identity`, {
+      headers: {
+        authorization: `Bearer ${this.staleEndpointSeed}`,
+        "zode-subject": "all-in-one-stale-seed-probe"}});
+    const ignoredBody = await ignored.text();
+    if (ignored.status !== 200) {
+      throw new Error(
+        `identity still authenticated a leftover controller bearer; status=${ignored.status}`,
+      );
+    }
+    if (ignoredBody.includes(this.staleEndpointSeed)) {
+      throw new Error("public identity echoed the ignored controller bearer");
     }
   }
 
@@ -3032,36 +2911,32 @@ class Harness {
     const [identityExchange, capabilitiesExchange] = this.endpointProbeEvidence ?? [];
     if (
       identityExchange?.request?.path !== "/v1/identity" ||
-      identityExchange?.request?.authorization !== "<ACTIVE_CONTROLLER_AUTHORITY>" ||
+      identityExchange?.request?.authorization !== null ||
       identityExchange?.request?.source_server_pid !== this.server?.child.pid ||
       identityExchange?.response?.json?.endpoint_id !== localEndpointId ||
       capabilitiesExchange?.request?.path !== "/v1/capabilities" ||
-      capabilitiesExchange?.request?.authorization !== "<ACTIVE_CONTROLLER_AUTHORITY>" ||
+      capabilitiesExchange?.request?.authorization !== null ||
       capabilitiesExchange?.request?.source_server_pid !== this.server?.child.pid ||
       capabilitiesExchange?.response?.json?.endpoint_id !== localEndpointId
     ) {
       throw new Error(
-        `BEHAVIORAL_RED barrier=${BARRIERS.activeAuthorityProbe}: public local Endpoint did not match the recorded active-authority identity/capability exchanges`,
+        `BEHAVIORAL_RED barrier=${BARRIERS.activeAuthorityProbe}: public local Endpoint did not match the recorded listen-scope identity/capability exchanges`,
       );
     }
     for (const observation of [
       {
         label: "first-start catalog before the held public bind",
         bytes: this.preReadyCatalogBytes,
-        markers: [localEndpointId, "zode.endpoint.v1", "openai_compatible"],
-      },
+        markers: [localEndpointId, "zode.endpoint.v1", "openai_compatible"]},
       {
         label: "active-authority catalog captured while the public port still refused",
         bytes: this.sameStartCatalogBytes,
         markers: [
           localEndpointId,
-          SERVER_AUTHORITY_ID,
+          "local",
           "zode.endpoint.v1",
           "openai_compatible",
-          SAME_START_CAPABILITY_TOOL,
-        ],
-      },
-    ]) {
+          SAME_START_CAPABILITY_TOOL]}]) {
       for (const marker of [...observation.markers, `http://${this.endpointListen}`]) {
         if (!observation.bytes.some((bytes) => bytes.includes(Buffer.from(marker)))) {
           throw new Error(
@@ -3105,8 +2980,7 @@ class Harness {
       ...evidence,
       ...this.recorder.publicResponseBodies,
       JSON.stringify(this.endpointProbeEvidence ?? []),
-      tracked,
-    ].join("\n");
+      tracked].join("\n");
     const forbidden = [...this.secrets, this.edge.lastAssertion].filter(Boolean);
     for (const secret of forbidden) {
       if (publicEvidence.includes(secret)) {
@@ -3125,8 +2999,7 @@ class Harness {
     const stores = [];
     for (const [root, prefix] of [
       [this.serverRoot, "control.sqlite3"],
-      [this.endpointRoot, "runtime.sqlite3"],
-    ]) {
+      [this.endpointRoot, "runtime.sqlite3"]]) {
       for (const pathname of await regularFilesUnder(root)) {
         if (path.basename(pathname).startsWith(prefix)) {
           stores.push({ pathname, serverOwned: root === this.serverRoot });
@@ -3170,8 +3043,7 @@ class Harness {
       () => this.scaffoldEndpoint?.stop(),
       () => this.endpointProbeWire?.stop(),
       () => this.edge?.stop(),
-      () => this.provider?.stop(),
-    ]) {
+      () => this.provider?.stop()]) {
       try {
         await operation();
       } catch (error) {
@@ -3188,8 +3060,7 @@ async function browserJson(page, requestPath) {
   return page.evaluate(async (pathname) => {
     const response = await fetch(pathname, {
       credentials: "same-origin",
-      headers: { accept: "application/json" },
-    });
+      headers: { accept: "application/json" }});
     const body = await response.text();
     let json = null;
     try {
@@ -3203,8 +3074,7 @@ async function browserJson(page, requestPath) {
 
 function shallowNonEvidence(barrier, detail, cause = null) {
   return new Error(`SHALLOW_NON_EVIDENCE barrier=${barrier}: ${detail}`, {
-    ...(cause ? { cause } : {}),
-  });
+    ...(cause ? { cause } : {})});
 }
 
 async function semanticBehavioralRed(harness, method, requestPath, safeError, detail) {
@@ -3316,7 +3186,7 @@ async function requireProbedLocalEndpoint(harness, page, localEndpointId) {
   if (
     endpoint.status !== "online" ||
     endpoint.disabled !== false ||
-    endpoint.controller_authority_id !== SERVER_AUTHORITY_ID ||
+    endpoint.controller_authority_id !== "local" ||
     endpoint.controller_credential_revision !== 1 ||
     endpoint.capabilities?.protocol_version !== "zode.endpoint.v1" ||
     exactJson(providers) !== exactJson(["openai_compatible"]) ||
@@ -3383,12 +3253,10 @@ async function waitForSessionUrl(page) {
 async function browserStorage(page) {
   return page.evaluate(() => {
     const result = {
-      historyState: window.history.state,
-    };
+      historyState: window.history.state};
     for (const [name, storage] of [
       ["localStorage", window.localStorage],
-      ["sessionStorage", window.sessionStorage],
-    ]) {
+      ["sessionStorage", window.sessionStorage]]) {
       result[name] = {};
       for (let index = 0; index < storage.length; index += 1) {
         const key = storage.key(index);
@@ -3407,8 +3275,7 @@ async function browserDomEvidence(page) {
           tag: element.tagName.toLowerCase(),
           attributes: Object.fromEntries(
             Array.from(element.attributes).map((attribute) => [attribute.name, attribute.value]),
-          ),
-        };
+          )};
         if (
           element instanceof HTMLInputElement ||
           element instanceof HTMLTextAreaElement ||
@@ -3475,8 +3342,7 @@ test(E2E, async ({ playwright }) => {
   const storageWrites = [];
   const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
-    deviceScaleFactor: 1,
-  });
+    deviceScaleFactor: 1});
   await context.exposeBinding("__zodeE2eRecordStorageWrite", (_source, write) => {
     storageWrites.push(write);
   });
@@ -3486,8 +3352,7 @@ test(E2E, async ({ playwright }) => {
       void window.__zodeE2eRecordStorageWrite({
         storage: this === window.localStorage ? "localStorage" : "sessionStorage",
         key: String(key),
-        value: String(value),
-      });
+        value: String(value)});
       return original.call(this, key, value);
     };
     for (const method of ["add", "put"]) {
@@ -3498,8 +3363,7 @@ test(E2E, async ({ playwright }) => {
           database: this.transaction.db.name,
           store: this.name,
           key,
-          value,
-        });
+          value});
         return indexedDbWrite.call(this, value, key);
       };
     }
@@ -3518,14 +3382,12 @@ test(E2E, async ({ playwright }) => {
       browserHttpRequests.push({
         method: request.method(),
         url: request.url(),
-        headers: request.headers(),
-      });
+        headers: request.headers()});
     }
     if (url.pathname.endsWith("/events")) {
       eventRequests.push({
         url: request.url(),
-        headers: request.allHeaders().catch(() => null),
-      });
+        headers: request.allHeaders().catch(() => null)});
     }
   });
 
@@ -3537,8 +3399,7 @@ test(E2E, async ({ playwright }) => {
     try {
       entry = await page.goto(`${harness.edge.baseUrl}/`, {
         waitUntil: "domcontentloaded",
-        timeout: 20_000,
-      });
+        timeout: 20_000});
     } catch (error) {
       await harness.edge.waitForIdle();
       const incident = harness.recorder.failureSummary();
@@ -3562,8 +3423,7 @@ test(E2E, async ({ playwright }) => {
     const entryContentType = entry.headers()["content-type"] ?? "";
     const uiDocument = await page.evaluate(() => ({
       hasBody: Boolean(document.body),
-      bodyChildren: document.body?.childElementCount ?? 0,
-    }));
+      bodyChildren: document.body?.childElementCount ?? 0}));
     if (
       !entryContentType.toLowerCase().includes("text/html") ||
       !uiDocument.hasBody ||
@@ -3610,8 +3470,7 @@ test(E2E, async ({ playwright }) => {
     await clickVisible(
       page,
       [
-        { role: "menuitem", name: "Providers" },
-      ],
+        { role: "menuitem", name: "Providers" }],
       "Providers navigation",
     );
     await expect(page.getByRole("heading", { name: "Providers", exact: true })).toBeVisible();
@@ -3619,8 +3478,7 @@ test(E2E, async ({ playwright }) => {
       page,
       [
         { role: "button", name: "Configure provider" },
-        { role: "button", name: "Add provider" },
-      ],
+        { role: "button", name: "Add provider" }],
       "provider configuration",
     );
     await fillVisible(page, ["Provider ID", "Provider"], PROVIDER_ID, "provider ID");
@@ -3631,8 +3489,7 @@ test(E2E, async ({ playwright }) => {
       page,
       [
         { role: "button", name: "Save provider" },
-        { role: "button", name: "Create provider" },
-      ],
+        { role: "button", name: "Create provider" }],
       "provider save",
     );
 
@@ -3644,8 +3501,7 @@ test(E2E, async ({ playwright }) => {
       page,
       [
         { role: "button", name: "Add API key profile" },
-        { role: "button", name: "Add profile" },
-      ],
+        { role: "button", name: "Add profile" }],
       "API-key profile create",
     );
     await fillVisible(page, ["Profile label", "Label"], "UI E2E profile", "profile label");
@@ -3658,8 +3514,7 @@ test(E2E, async ({ playwright }) => {
       page,
       [
         { role: "button", name: "Create profile" },
-        { role: "button", name: "Save profile" },
-      ],
+        { role: "button", name: "Save profile" }],
       "profile save",
     );
     const profile = await waitForProviderProfileReady(page, localEndpoint.endpoint_id);
@@ -3671,8 +3526,7 @@ test(E2E, async ({ playwright }) => {
     await clickVisible(
       page,
       [
-        { role: "link", name: "New session" },
-      ],
+        { role: "link", name: "New session" }],
       "New session navigation",
     );
     await expect(
@@ -3691,8 +3545,7 @@ test(E2E, async ({ playwright }) => {
       page,
       [
         { role: "button", name: "Start session" },
-        { role: "button", name: "Create" },
-      ],
+        { role: "button", name: "Create" }],
       "session admission",
     );
     const created = await waitForSessionUrl(page);
@@ -3705,12 +3558,14 @@ test(E2E, async ({ playwright }) => {
       page,
       [
         { role: "button", name: "Send" },
-        { role: "button", name: "Send message" },
-      ],
+        { role: "button", name: "Send message" }],
       "message send",
     );
     const durableFinal = page.getByText(FINAL_ASSISTANT, { exact: true });
     await expect(durableFinal).toHaveCount(1);
+    await page.evaluate(
+      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+    );
     await harness.edge.dropSseAfterBrowserBarrier();
     await harness.edge.waitForSseDrop();
     await harness.edge.waitForSseReconnect();
@@ -3731,20 +3586,17 @@ test(E2E, async ({ playwright }) => {
     if (process.env.ZODE_E2E_SCREENSHOT_PATH) {
       await fs.mkdir(path.dirname(process.env.ZODE_E2E_SCREENSHOT_PATH), {
         recursive: true,
-        mode: 0o700,
-      });
+        mode: 0o700});
       await page.screenshot({
         path: process.env.ZODE_E2E_SCREENSHOT_PATH,
-        fullPage: true,
-      });
+        fullPage: true});
     }
 
     const observedEventRequests = (
       await Promise.all(
         eventRequests.map(async (request) => ({
           url: request.url,
-          headers: await request.headers,
-        })),
+          headers: await request.headers})),
       )
     ).filter((request) => request.headers !== null);
     expect(observedEventRequests.length).toBeGreaterThanOrEqual(2);
@@ -3788,8 +3640,7 @@ test(E2E, async ({ playwright }) => {
       expect(providerBody.model).toBe(MODEL_ID);
       expect(providerBody.messages).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ role: "user", content: USER_MESSAGE }),
-        ]),
+          expect.objectContaining({ role: "user", content: USER_MESSAGE })]),
       );
       expect(providerRequest.body.includes(Buffer.from(harness.apiKey))).toBe(false);
     }
@@ -3885,8 +3736,7 @@ test(E2E, async ({ playwright }) => {
             : "MANAGEMENT_BROWSER_PRE_RECONNECT_FAILURE",
           firstObserved: reconnectFailureObserved
             ? undefined
-            : `relation=${LATER_GAP_RELATION}; the complete real browser suite stopped before the SSE reconnect assertion`,
-        });
+            : `relation=${LATER_GAP_RELATION}; the complete real browser suite stopped before the SSE reconnect assertion`});
         if (retained) {
           process.stderr.write(`ZODE_E2E_LATER_GAP_CAPTURE ${retained.root}\n`);
         }

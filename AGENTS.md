@@ -137,10 +137,10 @@ Keep separate hexagonal graphs rather than a linear monolith:
   versioned protocol. It neither imports Endpoint storage/domain internals to
   make runtime decisions nor persists session IDs, events, projections, routes,
   or cursors.
-- Endpoint persists only a controller authority plus opaque subject as session
-  ownership scope. Server derives that subject from the validated Access actor
-  on every proxy request; Endpoint does not import an Access or Server identity
-  model and Server does not keep a session ACL.
+- Endpoint has one session namespace. It does not authenticate callers or
+  persist a session owner. Server does not derive or forward an Endpoint
+  subject and does not keep a session ACL. Access actors who can reach Server
+  share every session on the Endpoints Server can reach.
 - Web UI consumes only Server API types. It imports no Endpoint client, runtime
   reducer, provider adapter, or credential code.
 - Endpoint, Server, and all-in-one `main` functions are composition roots only.
@@ -215,9 +215,9 @@ Endpoint provider execution and complete aimux stream conversion are owned by
 `server/AGENTS.md` and `docs/auth-replication.md`. Secrets remain outside
 session/control event stores, snapshots, public HTTP/SSE, and UI.
 
-Server Endpoint-control credentials, Endpoint controller-auth credentials, and
-provider credential authority/replicas use their dedicated protected stores;
-none may enter ordinary SQLite rows or request/response telemetry.
+Provider credential authority and Endpoint replicas use their dedicated
+protected stores; none may enter ordinary SQLite rows or request/response
+telemetry. There is no Endpoint controller-auth credential.
 
 ## Management ingress identity
 
@@ -232,8 +232,8 @@ Server validates the `Cf-Access-Jwt-Assertion` signature, pinned issuer,
 configured audience, time claims, token type, and actor shape against the
 configured JWKS. Human identity comes only from `sub`; service-token identity
 comes only from `common_name` when `sub` is empty. Derive and persist only
-versioned pseudonymous actor/Endpoint-subject keys, never raw JWTs, Access
-cookies, emails, human subjects, or service-token client IDs.
+versioned pseudonymous actor keys for Server-owned receipts, never raw JWTs,
+Access cookies, emails, human subjects, or service-token client IDs.
 
 Keep the Access-protected management origin separate from the public external-
 tool callback origin. The callback origin exposes only the bounded Endpoint-
@@ -336,10 +336,9 @@ Endpoint surface stays execution-focused:
 
 - identity, bounded health, and non-secret capabilities;
 - create/read a session, select an explicit provider/model/profile revision,
-  append messages, and stream all subject-visible session events through one
-  Endpoint-wide SSE;
+  append messages, and stream all session events through one Endpoint-wide SSE;
 - read/cancel/reconcile tool calls and accept opaque-ID callback completion;
-- install/read/tombstone controller-authenticated credential replicas.
+- install/read/tombstone credential replicas.
 
 Endpoint has no user-facing OAuth, profile-default, sharing-policy, device
 registration, or UI route. Server owns those resources plus Endpoint inventory,
@@ -347,7 +346,7 @@ stateless Endpoint-scoped session/callback proxying, and UI delivery as defined
 in `docs/server-api.md`.
 
 Endpoint SSE is one durable ordered Endpoint-wide view of committed runtime
-events for the authenticated authority/subject. Each frame carries its
+events. Each frame carries its
 `session_id`; session lifecycle never owns a connection or cursor. Server
 forwards the UI's Endpoint `Last-Event-ID` without storing a cursor or
 allocating a second event identity. Reconnect may not miss committed events or

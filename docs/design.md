@@ -35,7 +35,7 @@ deferred until a concrete controller-initiated bidirectional use case cannot be
 served by HTTP commands plus SSE.
 
 The user-approved runtime review for this version adopts Cue's durable
-session ownership, delivery, async-tool, wait, and session-isolation behavior;
+session delivery, async-tool, wait, and listen-scope trust behavior;
 Dimi's bounded model-step retry and provider/async lifecycle scenarios; and
 pi-ai/Dimi's provider-specific execution construction behind aimux. Endpoint's
 model-round boundary and semantic crash checkpoints are defined directly by
@@ -147,8 +147,7 @@ Event names may evolve, but generic JSON patch events are forbidden.
 
 Every mutating HTTP command has:
 
-- an authenticated controller authority and opaque subject scope;
-- a stable command scope;
+- a stable command scope on this Endpoint;
 - an `Idempotency-Key` command ID;
 - a versioned canonical fingerprint of its semantic request;
 - a target stream and expected stream version where applicable.
@@ -165,38 +164,35 @@ Raw canonical bodies and secrets never enter command receipts, events,
 operation journals, or result metadata. Repair reuses the original stored
 digest and never recreates it from events.
 
-Collection-level session creation uses one scope per controller
-authority/subject. Endpoint generates the session ULID before append; clients
-cannot supply it. A key reused with the same create fingerprint replays the
-original ULID and outcome. A key reused with a different create body returns
-`409` and performs no work.
+Collection-level session creation uses one Endpoint-global scope. Endpoint
+generates the session ULID before append; clients cannot supply it. A key
+reused with the same create fingerprint replays the original ULID and outcome.
+A key reused with a different create body returns `409` and performs no work.
 
-### Session admission, ownership, and create receipts
+### Session admission and create receipts
 
 Session admission has one authoritative order; HTTP handlers and storage
 adapters must not each invent a partial version of it:
 
-1. authenticate the controller and obtain its stable authority plus bounded
-   opaque subject;
-2. decode a versioned request and compute the command digest and canonical
+1. decode a versioned request and compute the command digest and canonical
    semantic fingerprint before any ULID, clock value, replica lookup, or other
    effect is allocated;
-3. query the authority/subject-scoped collection receipt projection;
-4. return replay, conflict, or replay-only miss immediately when that lookup
+2. query the Endpoint-global collection receipt projection;
+3. return replay, conflict, or replay-only miss immediately when that lookup
    decides the command;
-5. only for a normal receipt miss, validate the current tool, provider
+4. only for a normal receipt miss, validate the current tool, provider
    descriptor, outbound-policy, and required replica state;
-6. generate the ULID and creation time, construct one `SessionCreated` event,
+5. generate the ULID and creation time, construct one `SessionCreated` event,
    and ask the runtime store to atomically recheck the receipt and either
    commit that first event or return the winner of a concurrent create.
 
-`SessionCreated` fixes the session ID, immutable owner authority/subject,
-creation time, and initial credential-free selection. The raw idempotency key
-and raw canonical request are not event fields. The event envelope carries a
-versioned, domain-separated digest of `(authority, subject, create command,
-Idempotency-Key)` and the pre-ULID request fingerprint. Consequently two
-concurrent candidates for one logical create have the same fingerprint even
-when they generated different unused ULIDs.
+`SessionCreated` fixes the session ID, creation time, and initial
+credential-free selection. It does not record a caller owner. The raw
+idempotency key and raw canonical request are not event fields. The event
+envelope carries a versioned digest of `(create command, Idempotency-Key)`
+and the pre-ULID request fingerprint. Consequently two concurrent candidates
+for one logical create have the same fingerprint even when they generated
+different unused ULIDs.
 
 The collection receipt index is a projection, not another authority table. It
 maps the scoped command digest to the verified version-1 creation event and can
@@ -211,20 +207,17 @@ a creation-event fact.
 The application-facing storage seam is behavior-oriented rather than generic
 CRUD. Conceptually it provides:
 
-- `lookup_session_create(scope, command_digest, request_fingerprint)` returning
+- `lookup_session_create(command_digest, request_fingerprint)` returning
   miss, replay, or conflict without allocating or consulting current policy;
 - `commit_session_create(...)` atomically returning created, replay, conflict,
   or local ULID collision;
-- owner-scoped list, rehydrate, append, and event-read operations sharing one
-  verified owner gate.
+- Endpoint-global list, rehydrate, append, and event-read operations.
 
-The owner/list projection records durable creation position and current stream
+The list projection records durable creation position and current stream
 head. Pagination uses `(creation_global_position, session_id)` keyset order and
-an opaque versioned cursor bound to route and owner scope; it never sorts by
-ULID or keeps process-local page state. Public missing and cross-owner
-read/message/SSE paths map to the same safe not-found result. Internal runtime
-workers may address a known claimed session directly, but the HTTP adapter has
-no unscoped session lookup escape hatch.
+an opaque versioned cursor bound to the route; it never sorts by ULID or keeps
+process-local page state. Public missing sessions return not-found. There is
+no cross-owner path.
 
 The session-admission decisions above are frozen through these exact
 real-process Endpoint E2E anchors. Core rows guide the first usable session
@@ -234,16 +227,15 @@ an unrelated corruption or migration fixture.
 
 | Decision | Executable anchor | Delivery gate |
 | --- | --- | --- |
-| Controller authority and bounded subject are established before any scoped lookup | `e2e_invalid_controller_auth_and_subject_fail_before_lookup` | core anchor exists |
+| Endpoint protocol has no controller bearer or subject; create/list/get/SSE work without those headers | `e2e_endpoint_protocol_has_no_controller_auth` | required red against the previous auth contract |
+| Every session on one Endpoint is visible to every caller; two Access actors share sessions through Server | `e2e_endpoint_sessions_are_shared_across_callers` and `e2e_two_actor_sessions_are_shared_on_one_endpoint` | required red against the previous isolation contract |
 | Endpoint alone allocates the ULID; canonical create identity is independent of candidate ULIDs; caller IDs fail without side effects | `e2e_create_generates_ulid_and_binds_idempotency_payload` and `e2e_caller_supplied_session_id_has_no_list_side_effect` | core anchors exist |
 | Receipt hit/conflict/replay-only miss returns before current provider, tool, outbound-policy, replica, clock, ULID, or event effects | `e2e_create_receipt_lookup_precedes_current_admission` | anchor green |
 | Concurrent equal creates atomically select one creation event and return byte-identical canonical `201` results | `e2e_concurrent_create_receipt_and_event_are_atomic` | core anchor exists |
 | The create-receipt projection rebuilds from the verified creation event and exact replay survives restart | `e2e_create_receipt_projection_rebuilds_from_verified_creation_event` | anchor green; projection-repair implementation already present |
 | One scoped create digest resolving to multiple verified streams is corruption and never chooses a winner | `e2e_conflicting_create_receipt_projection_fails_closed` | anchor green; verified projection repair fails closed before READY |
-| Subject ownership under one authority covers list/read/message with existence-safe failures, filters the Endpoint-wide SSE, and independently scopes create keys | `e2e_session_ownership_safe_not_found_and_ordered_sse`, `e2e_session_list_is_subject_scoped`, and `e2e_endpoint_event_stream_multiplexes_owned_sessions_and_reconnects_once` | Endpoint-wide real-process anchor is green in the current candidate; exact-main and fixed-install acceptance remain pending |
-| Authority ownership with the same opaque subject independently scopes create receipts and blocks cross-authority list/read/message while filtering Endpoint SSE | `e2e_authority_subject_create_receipts_are_scoped` plus `e2e_session_authority_ownership_isolates_list_read_message_and_sse` | receipt anchor exists; access-hardening anchor required red |
-| List uses owner-bound opaque keyset pagination by durable creation position and resumes identically after restart | `e2e_session_list_keyset_is_owner_bound_and_restart_stable` | functional follow-up; required red before pagination implementation |
-| History without the supported immutable owner fact cannot be claimed, repaired, or migrated to a guessed owner | `e2e_ownerless_session_history_fails_closed` | anchor green; startup fails closed without migration |
+| Endpoint-wide SSE multiplexes every public session and reconnects without gaps or duplicates | `e2e_endpoint_event_stream_multiplexes_sessions_and_reconnects_once` | existing multiplex/reconnect path remains; owner filtering is removed with the listen-trust change |
+| List uses opaque keyset pagination by durable creation position and resumes identically after restart | `e2e_session_list_keyset_is_restart_stable` | functional follow-up; required red before pagination implementation |
 
 An eventful command commits one non-empty event batch atomically. A unique
 no-change command may commit an explicit ignored fact when retaining its

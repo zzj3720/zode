@@ -229,15 +229,12 @@ const SHALLOW_NON_EVIDENCE_SOURCES = Object.freeze([
     first_observed_outcome: Object.freeze({
       sequence: 1,
       status: 404,
-      safe_error: "management_ui_bootstrap_not_found",
-    }),
+      safe_error: "management_ui_bootstrap_not_found"}),
     recorded_response: Object.freeze({
       status: 404,
-      body_sha256: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    }),
+      body_sha256: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}),
     target_status: 200,
-    cassette_digest: "sha256:31b9d43c4d650a23f7090088a47900aa19e560dfd478962ede0235c9e5921f3f",
-  }),
+    cassette_digest: "sha256:31b9d43c4d650a23f7090088a47900aa19e560dfd478962ede0235c9e5921f3f"}),
   Object.freeze({
     cassette: "browser-access-reentry-first-failure.v1.json",
     owner: "e2e_browser_access_reentry_stops_mutations_and_uses_management_origin",
@@ -245,24 +242,19 @@ const SHALLOW_NON_EVIDENCE_SOURCES = Object.freeze([
     first_observed_outcome: Object.freeze({
       sequence: 1,
       status: 404,
-      safe_error: "management_ui_bootstrap_not_found",
-    }),
+      safe_error: "management_ui_bootstrap_not_found"}),
     recorded_response: Object.freeze({
       status: 404,
-      body_sha256: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    }),
+      body_sha256: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}),
     target_status: 200,
-    cassette_digest: "sha256:24d486e36f1feeb09d17663a3a585b577d8a70aa8bd03b97c988ce8a21dc6633",
-  }),
-] as const);
+    cassette_digest: "sha256:24d486e36f1feeb09d17663a3a585b577d8a70aa8bd03b97c988ce8a21dc6633"})] as const);
 const SHALLOW_CLASSIFICATION_DIGEST =
   "sha256:9e1c9e774168dbfd347e7d7336cb8712881324af5ded206214e0e3b51679f82c";
 
 function annotateNonEvidence(testInfo: TestInfo, classification: string, description: string): void {
   testInfo.annotations.push({
     type: "failure-classification",
-    description: `${classification}; evidence_status=non_evidence_only; ${description}`,
-  });
+    description: `${classification}; evidence_status=non_evidence_only; ${description}`});
 }
 
 function sha256(value: string | Buffer): string {
@@ -296,8 +288,7 @@ async function loadShallowClassification(): Promise<ShallowNonEvidenceFixture> {
     boundary: "browser->management-origin",
     shallow_404_is_non_evidence: true,
     readiness_is_non_evidence: true,
-    continue_only_after_status: 200,
-  });
+    continue_only_after_status: 200});
   expect(fixture.sources).toEqual(SHALLOW_NON_EVIDENCE_SOURCES);
   expect(fixture.whole_digest).toBe(SHALLOW_CLASSIFICATION_DIGEST);
   expect(fixture.whole_digest).toBe(cassetteDigest(withoutDigest));
@@ -355,8 +346,7 @@ async function loadCassette(path: string, expected: ShallowNonEvidenceSource): P
   expect(firstExchange.request.semantic_headers).toEqual(
     firstExchange.request.semantic_headers.map((header) => ({
       name: header.name.toLowerCase(),
-      value: header.value,
-    })),
+      value: header.value})),
   );
   expect(new Set(firstExchange.request.semantic_headers.map((header) => header.name)).size).toBe(
     firstExchange.request.semantic_headers.length,
@@ -379,7 +369,7 @@ async function loadCassette(path: string, expected: ShallowNonEvidenceSource): P
   );
 
   const serialized = JSON.stringify(cassette);
-  expect(serialized).not.toMatch(/eyJ[a-zA-Z0-9_-]{20,}/);
+  expect(serialized).not.toMatch(/eyJ[a-zA-Z0-9_-]{20}/);
   expect(serialized).not.toMatch(/-----BEGIN|access[_-]?token|refresh[_-]?token/i);
   for (const exchange of cassette.exchanges) {
     expect(exchange.request.raw_body_hex).toBe("");
@@ -405,8 +395,7 @@ function signAccessJwt(keys: SigningKey, mode: AccessMode): SignedAssertion {
     email: ACCESS_EMAIL,
     type: "app",
     nbf: now - 30,
-    exp: expiresAt,
-  };
+    exp: expiresAt};
   const encodedHeader = base64Url(JSON.stringify({ alg: "RS256", kid: ACCESS_KID, typ: "JWT" }));
   const encodedPayload = base64Url(JSON.stringify(payload));
   const signingInput = `${encodedHeader}.${encodedPayload}`;
@@ -415,8 +404,7 @@ function signAccessJwt(keys: SigningKey, mode: AccessMode): SignedAssertion {
   signer.end();
   return {
     token: `${signingInput}.${signer.sign(keys.privateKey).toString("base64url")}`,
-    expiresAtMs: expiresAt * 1000,
-  };
+    expiresAtMs: expiresAt * 1000};
 }
 
 let accessFixtureIssuer = "";
@@ -459,8 +447,7 @@ function canonicalRequestSemanticHeaders(
       const values = Array.isArray(rawValue) ? rawValue : [rawValue];
       return values.map((value) => ({
         name,
-        value: name === "cf-access-jwt-assertion" ? "${ACCESS_ASSERTION}" : value,
-      }));
+        value: name === "cf-access-jwt-assertion" ? "${ACCESS_ASSERTION}" : value}));
     })
     .sort((left, right) => left.name.localeCompare(right.name));
 }
@@ -552,8 +539,7 @@ async function forwardRequest(
         port: target.port,
         path: `${target.pathname}${target.search}`,
         method: request.method,
-        headers,
-      },
+        headers},
       (targetResponse: IncomingMessage) => {
         const chunks: Buffer[] = [];
         const responseChunks: ResponseChunk[] = [];
@@ -562,8 +548,7 @@ async function forwardRequest(
           chunks.push(bytes);
           responseChunks.push({
             offset_us: Math.round((performance.now() - startedAt) * 1000),
-            body_hex: bytes.toString("hex"),
-          });
+            body_hex: bytes.toString("hex")});
         });
         targetResponse.on("end", () => {
           resolveForward({
@@ -572,8 +557,7 @@ async function forwardRequest(
             body: Buffer.concat(chunks),
             chunks: responseChunks,
             completed: true,
-            termination: "complete",
-          });
+            termination: "complete"});
         });
         targetResponse.on("aborted", () => {
           resolveForward({
@@ -582,8 +566,7 @@ async function forwardRequest(
             body: Buffer.concat(chunks),
             chunks: responseChunks,
             completed: false,
-            termination: "upstream_aborted",
-          });
+            termination: "upstream_aborted"});
         });
       },
     );
@@ -624,8 +607,7 @@ async function forwardStreamingRequest(
         port: target.port,
         path: `${target.pathname}${target.search}`,
         method: request.method,
-        headers,
-      },
+        headers},
       (targetResponse: IncomingMessage) => {
         const responseHeaders = responseHeaderSubset(targetResponse.headers);
         onOpen(targetResponse.statusCode ?? 502, responseHeaders);
@@ -752,8 +734,7 @@ class AccessEdgeFixture {
         this.sseClosed,
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error("ACCESS_ASSERTION_EXPIRY_SSE_NOT_CLOSED")), 8_000);
-        }),
-      ]);
+        })]);
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -846,8 +827,7 @@ class AccessEdgeFixture {
         method: request.method ?? "GET",
         requestPath: request.url ?? "/",
         requestHeaders: request.headers,
-        captureSetId: this.captureSetId,
-      });
+        captureSetId: this.captureSetId});
       this.ingressByRequest.set(request, context);
       return context;
     } catch (error) {
@@ -905,8 +885,7 @@ class AccessEdgeFixture {
       this.captureJournal.updateIngressHeaders(context, requestHeaders);
       this.captureJournal.responseStarted(context, {
         status: exchange.responseStatus || 502,
-        headers: exchange.responseHeaders,
-      });
+        headers: exchange.responseHeaders});
       for (const chunk of exchange.responseChunks) {
         this.captureJournal.chunk(context, Buffer.from(chunk.body_hex, "hex"), chunk.offset_us);
       }
@@ -970,8 +949,7 @@ class AccessEdgeFixture {
       responseChunks: [],
       responseCompleted: false,
       responseTermination: "pending",
-      responseBodySha256: "",
-    };
+      responseBodySha256: ""};
     this.exchanges.push(exchange);
     if (ingress) this.ingressByExchange.set(exchange, ingress);
     if (isMutation(request)) this.mutationExchanges.push(exchange);
@@ -1004,8 +982,7 @@ class AccessEdgeFixture {
       exchange.responseStatus = 200;
       exchange.responseHeaders = {
         "content-type": "text/html; charset=utf-8",
-        "cache-control": "no-store",
-      };
+        "cache-control": "no-store"};
       exchange.responseChunks = [{ offset_us: 0, body_hex: Buffer.from(html).toString("hex") }];
       exchange.responseCompleted = true;
       exchange.responseTermination = "complete";
@@ -1031,8 +1008,7 @@ class AccessEdgeFixture {
     const forwardedRequest = {
       method: request.method,
       url: request.url,
-      headers: request.headers,
-    } as IncomingMessage;
+      headers: request.headers} as IncomingMessage;
     exchange.requestSemanticHeaders = canonicalRequestSemanticHeaders(
       forwardHeaders(request, { "cf-access-jwt-assertion": assertion }, body),
     );
@@ -1043,8 +1019,7 @@ class AccessEdgeFixture {
         eventIds: [] as string[],
         assertionExpiresAtMs: signedAssertion.expiresAtMs,
         openedAtMs: 0,
-        closedAtMs: 0,
-      });
+        closedAtMs: 0});
       this.sseExchanges.push(sseExchange);
       this.forwardedAssertionCountValue += 1;
       let opened = false;
@@ -1200,18 +1175,10 @@ async function writeProcessConfigs(root: string, edge: AccessEdgeFixture): Promi
     listen: "127.0.0.1:0",
     runtime_store: { kind: "sqlite", path: join(root, "endpoint.sqlite") },
     credential_replica_store: { kind: "files", directory: replicaDir },
-    controller_auth: [{
-      authority_id: "access-entry-e2e-server",
-      revision: 1,
-      kind: "bearer_secret_file",
-      secret_file: controllerSecretPath,
-    }],
     provider_execution: {
       adapter_kinds: ["openai_compatible"],
-      allowed_base_url_origins: ["http://127.0.0.1"],
-    },
-    callback: { allowed_public_origins: [callbackOrigin] },
-  };
+      allowed_base_url_origins: ["http://127.0.0.1"]},
+    callback: { allowed_public_origins: [callbackOrigin] }};
   await writeJson(endpointConfigPath, endpointConfig);
 
   const configuredTemplate = process.env.ZODE_ACCESS_SERVER_CONFIG;
@@ -1225,8 +1192,7 @@ async function writeProcessConfigs(root: string, edge: AccessEdgeFixture): Promi
     await writeJson(serverConfigPath, {
       ...template,
       ui_mode: "assets",
-      ui_assets_directory: uiAssetsDirectoryFromConfig,
-    });
+      ui_assets_directory: uiAssetsDirectoryFromConfig});
   } else {
     await writeJson(serverConfigPath, {
       schema: "zode.server-config.v1",
@@ -1244,9 +1210,7 @@ async function writeProcessConfigs(root: string, edge: AccessEdgeFixture): Promi
         audiences: [ACCESS_AUDIENCE],
         jwks_url: edge.jwksUrl(),
         subject_key_file: subjectKey,
-        subject_key_version: 1,
-      },
-    });
+        subject_key_version: 1}});
   }
   return { endpoint: endpointConfigPath, server: serverConfigPath, controllerSecret };
 }
@@ -1279,10 +1243,8 @@ async function seedAccessSession(
         ...(body ? { "content-type": "application/json" } : {}),
         ...(method === "POST" || method === "PUT"
           ? { "idempotency-key": `access-entry-seed-${randomUUID()}` }
-          : {}),
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
+          : {})},
+      body: body ? JSON.stringify(body) : undefined});
     const responseBody = await response.json().catch(() => ({})) as Record<string, any>;
     return { status: response.status, body: responseBody };
   };
@@ -1291,14 +1253,11 @@ async function seedAccessSession(
     headers: {
       accept: "application/json",
       "content-type": "application/json",
-      "idempotency-key": `access-expiry-endpoint-${randomUUID()}`,
-    },
+      "idempotency-key": `access-expiry-endpoint-${randomUUID()}`},
     body: JSON.stringify({
       label: "Access expiry Endpoint",
       base_url: endpointOrigin,
-      control_auth: { kind: "bearer", secret: controllerSecret },
-    }),
-  });
+      control_auth: { kind: "bearer", secret: controllerSecret }})});
   if (!endpointResponse.ok) {
     throw new ReadinessNonEvidence();
   }
@@ -1308,8 +1267,7 @@ async function seedAccessSession(
     kind: "openai_compatible",
     base_url: "http://127.0.0.1/v1",
     models: [modelName],
-    options: {},
-  });
+    options: {}});
   if (provider.status !== 200) throw new ReadinessNonEvidence();
   const profile = await managementJson(
     "POST",
@@ -1319,8 +1277,7 @@ async function seedAccessSession(
       label: "Access entry profile",
       api_key: controllerSecret,
       make_default: true,
-      sharing: { mode: "selected", endpoint_ids: [endpoint.endpoint_id] },
-    },
+      sharing: { mode: "selected", endpoint_ids: [endpoint.endpoint_id] }},
   );
   if (profile.status !== 201 || typeof profile.body.auth_profile_id !== "string") {
     throw new ReadinessNonEvidence();
@@ -1358,13 +1315,10 @@ async function seedAccessSession(
           revision: provider.body.revision,
           kind: provider.body.kind,
           base_url: provider.body.base_url,
-          options: provider.body.options,
-        },
+          options: provider.body.options},
         auth_profile_id: profile.body.auth_profile_id,
-        minimum_auth_revision: profile.body.revision,
-      },
-      tools: [],
-    },
+        minimum_auth_revision: profile.body.revision},
+      tools: []},
   );
   if (session.status !== 201 || typeof session.body.session_id !== "string") {
     throw new ReadinessNonEvidence();
@@ -1421,8 +1375,7 @@ class TestStack {
           logDir: join(root, "logs"),
           startupCaptureRoot,
           startupConfigBytes: await readFile(configs.endpoint),
-          e2eName,
-        });
+          e2eName});
       }
       const serverCwd = join(root, "server-cwd");
       await mkdir(serverCwd, { recursive: true, mode: 0o700 });
@@ -1437,8 +1390,7 @@ class TestStack {
         logDir: join(root, "logs"),
         startupCaptureRoot,
         startupConfigBytes: await readFile(configs.server),
-        e2eName,
-      });
+        e2eName});
       const serverOrigin = server.baseUrl;
       if (!serverOrigin) throw new ReadinessNonEvidence();
       accessEdge.setTarget(serverOrigin);
@@ -1465,8 +1417,7 @@ class TestStack {
             capture_set_id: captureSetId,
             first_observed: "real-process or test setup did not reach the assertion-expiry path",
             raw_exchange_retained: Boolean(flushed.records?.length),
-            source_digest: flushed.sourceDigest ?? null,
-          }, null, 2)}\n`,
+            source_digest: flushed.sourceDigest ?? null}, null, 2)}\n`,
           { mode: 0o600 },
         );
       } catch {
@@ -1513,13 +1464,11 @@ class TestStack {
       ? this.journal.first({
           boundary: "management-access-edge",
           requestPath: firstSse.path,
-          responseStatus: firstSse.responseStatus,
-        })
+          responseStatus: firstSse.responseStatus})
       : undefined;
     try {
       const flushed = this.journal.flushCaptureSet(this.captureSetId, {
-        firstFailureRecordingId: firstFailure?.recordingId,
-      });
+        firstFailureRecordingId: firstFailure?.recordingId});
       await writeFile(
         join(this.captureRoot, "later-gap-metadata.json"),
         `${JSON.stringify({
@@ -1532,8 +1481,7 @@ class TestStack {
           capture_set_id: this.captureSetId,
           first_observed: firstFailure ? "management SSE remained open beyond Access assertion exp" : "no typed red observed",
           raw_exchange_retained: Boolean(firstFailure),
-          source_digest: flushed.sourceDigest ?? null,
-        }, null, 2)}\n`,
+          source_digest: flushed.sourceDigest ?? null}, null, 2)}\n`,
         { mode: 0o600 },
       );
     } catch (error) {
@@ -1554,8 +1502,7 @@ async function replayRetainedFirst404(
   if (!exchange) throw new Error(`cassette ${source.cassette} has no replay exchange`);
   const response = await page.goto(stack.managementUrl(source.path), {
     waitUntil: "commit",
-    timeout: 12_000,
-  });
+    timeout: 12_000});
   expect(stack.access.forwardedAssertionCount()).toBeGreaterThan(0);
   if (!response) throw new Error(`retained replay returned no response for ${source.cassette}`);
   expect(new URL(response.url()).origin).toBe(stack.access.origin);
@@ -1611,8 +1558,7 @@ async function assertNoZodeAuthSurface(page: Page, context: BrowserContext): Pro
   expect(cookies.filter((cookie) => /^(zode|zode[-_]|zode.*(login|auth|session))/i.test(cookie.name))).toHaveLength(0);
   const storage = await page.evaluate(() => ({
     local: Object.entries(localStorage),
-    session: Object.entries(sessionStorage),
-  }));
+    session: Object.entries(sessionStorage)}));
   const serialized = JSON.stringify(storage);
   expect(serialized).not.toMatch(/cf_access|cf-authorization|access[_-]?jwt|access[_-]?token|refresh[_-]?token|password|secret/i);
 }
@@ -1628,7 +1574,7 @@ async function assertReentryPage(page: Page, context: BrowserContext, stack: Tes
   await expect.poll(() => page.url()).not.toContain(stack.callback.origin);
   expect(new URL(page.url()).pathname + new URL(page.url()).search).toBe(expectedPath);
   await assertNoZodeAuthSurface(page, context);
-  expect(page.url()).not.toMatch(/eyJ[a-zA-Z0-9_-]{20,}|access[_-]?token|refresh[_-]?token/i);
+  expect(page.url()).not.toMatch(/eyJ[a-zA-Z0-9_-]{20}|access[_-]?token|refresh[_-]?token/i);
   expect(navigationCount).toBeGreaterThan(0);
 }
 
@@ -1744,8 +1690,7 @@ test.describe("Access entry and re-entry", () => {
   test("e2e_access_retained_first_404_replay_is_shallow_non_evidence", async ({ page }, testInfo) => {
     const cassettes = new Map([
       ["management-entry-first-failure.v1.json", entryCassette],
-      ["browser-access-reentry-first-failure.v1.json", reentryCassette],
-    ]);
+      ["browser-access-reentry-first-failure.v1.json", reentryCassette]]);
     const retainedFirst404Paths: string[] = [];
     for (const source of shallowClassification.sources) {
       const cassette = cassettes.get(source.cassette);
@@ -1866,12 +1811,10 @@ test.describe("Access entry and re-entry", () => {
         const firstFailure = stack.journal.first({
           boundary: "management-access-edge",
           responseStatus: 401,
-          captureSetId,
-        });
+          captureSetId});
         if (!firstFailure) throw new Error("Access re-entry capture contained no HTTP 401 exchange");
         const capture = stack.journal.flushCaptureSet(captureSetId, {
-          firstFailureRecordingId: firstFailure.recordingId,
-        });
+          firstFailureRecordingId: firstFailure.recordingId});
         expect(capture.sourceDigest).toMatch(/^[0-9a-f]{64}$/u);
         for (const record of capture.records ?? []) {
           if (record.rawPath) {
@@ -1887,9 +1830,7 @@ test.describe("Access entry and re-entry", () => {
             destinationDirectory: INCIDENT_DIRECTORY,
             replay: (envelope) => stack.journal.replay(envelope, {
               baseUrl: stack.managementUrl(),
-              boundaryBaseUrls: { "management-access-edge": stack.managementUrl() },
-            }),
-          });
+              boundaryBaseUrls: { "management-access-edge": stack.managementUrl() }})});
           primaryError = new ProductBehaviorFailure(
             SESSION_ACCESS_REENTRY_CLASSIFICATION,
             `${SESSION_ACCESS_REENTRY_FIRST_OBSERVED}; cassette=${promoted.cassettePath}`,
@@ -2007,8 +1948,7 @@ test.describe("Access entry and re-entry", () => {
           SSE_ACCESS_REENTRY_FIRST_OBSERVED,
           {
             cause: error instanceof Error ? error.message : String(error),
-            sse_statuses: stack.access.sseExchanges.map((exchange) => exchange.responseStatus),
-          },
+            sse_statuses: stack.access.sseExchanges.map((exchange) => exchange.responseStatus)},
         );
       }
       const unauthorized = stack.access.sseExchanges.find((exchange) => exchange.responseStatus === 401);
@@ -2028,8 +1968,7 @@ test.describe("Access entry and re-entry", () => {
           {
             cause: error instanceof Error ? error.message : String(error),
             unauthorized_status: unauthorized.responseStatus,
-            navigation_count: navigationUrls.length,
-          },
+            navigation_count: navigationUrls.length},
         );
       }
       await expect.poll(() => navigationUrls.length).toBeGreaterThan(navigationCountBefore401);
@@ -2074,11 +2013,9 @@ test.describe("Access entry and re-entry", () => {
           boundary: "management-access-edge",
           requestPath: unauthorizedPath,
           responseStatus: 401,
-          captureSetId,
-        });
+          captureSetId});
         const capture = stack.journal.flushCaptureSet(captureSetId, {
-          firstFailureRecordingId: firstFailure?.recordingId,
-        });
+          firstFailureRecordingId: firstFailure?.recordingId});
         await writeFile(
           join(stack.captureRoot, "sse-401-reentry-first-occurrence.json"),
           `${JSON.stringify({
@@ -2092,8 +2029,7 @@ test.describe("Access entry and re-entry", () => {
             recording_id: firstFailure?.recordingId ?? null,
             capture_set_id: captureSetId,
             raw_exchange_retained: Boolean(firstFailure),
-            source_digest: capture.sourceDigest ?? null,
-          }, null, 2)}\n`,
+            source_digest: capture.sourceDigest ?? null}, null, 2)}\n`,
           { mode: 0o600 },
         );
         for (const record of capture.records ?? []) {
@@ -2117,8 +2053,7 @@ test.describe("Access entry and re-entry", () => {
     expect((await page.locator("body").innerText()).toLowerCase()).not.toContain("zode management");
 
     const managementApi = await context.request.get(stack.callbackUrl("/v1/system"), {
-      headers: { "cf-access-jwt-assertion": "${ACCESS_ASSERTION}" },
-    });
+      headers: { "cf-access-jwt-assertion": "${ACCESS_ASSERTION}" }});
     expect(managementApi.status()).not.toBe(200);
     expect(managementApi.headers()["content-type"] ?? "").not.toContain("text/html");
     expect(await managementApi.text()).not.toContain("zode management");

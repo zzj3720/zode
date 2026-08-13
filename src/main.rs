@@ -128,7 +128,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let control = Arc::new(ControlState::open(
         config.runtime_store_path(),
         config.credential_replica_directory(),
-        config.controller_auth_specs(),
     )?);
     let database_path = control.runtime_store_path().to_path_buf();
     let listen_addr = config.listen_addr()?;

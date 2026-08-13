@@ -17,8 +17,7 @@ const require = createRequire(import.meta.url);
 const {
   RecordingJournal,
   SecretLedger,
-  proxyHttp,
-} = require("../support/harness.cjs") as {
+  proxyHttp} = require("../support/harness.cjs") as {
   RecordingJournal: new (options: {
     rootDir: string;
     ledger: SecretLedgerContract;
@@ -215,8 +214,7 @@ const SECRET_MARKERS = [
   ...(process.env.ZODE_E2E_SECRET_MARKERS ?? "")
     .split(",")
     .map((marker) => marker.trim())
-    .filter(Boolean),
-];
+    .filter(Boolean)];
 
 function jsonArgs(name: string, fallback: string[] | null): string[] {
   const raw = process.env[name];
@@ -319,10 +317,7 @@ class AccessFixture {
             ...(this.publicKey.export({ format: "jwk" }) as Record<string, string>),
             kid: this.kid,
             use: "sig",
-            alg: "RS256",
-          },
-        ],
-      });
+            alg: "RS256"}]});
       this.journal?.record({
         boundary: "access-jwks-fixture",
         method: request.method,
@@ -332,12 +327,10 @@ class AccessFixture {
         responseStatus: 200,
         responseHeaders: { "cache-control": "no-store", "content-type": "application/json" },
         responseChunks: [{ offsetUs: 0, data: Buffer.from(responseBody) }],
-        captureSetId: this.captureSetId,
-      });
+        captureSetId: this.captureSetId});
       response.writeHead(200, {
         "cache-control": "no-store",
-        "content-type": "application/json",
-      });
+        "content-type": "application/json"});
       response.end(responseBody);
     });
     this.issuer = "";
@@ -378,8 +371,7 @@ class AccessFixture {
         type: "app",
         iat: now,
         nbf: now - 1,
-        exp: now + 300,
-      }),
+        exp: now + 300}),
     );
     const input = `${header}.${claims}`;
     const token = `${input}.${base64Url(sign("RSA-SHA256", Buffer.from(input), this.privateKey))}`;
@@ -436,8 +428,7 @@ class AccessFixture {
         journal: this.journal,
         ledger: this.ledger,
         captureSetId: this.captureSetId,
-        canonicalOrigin: this.managementOrigin,
-      });
+        canonicalOrigin: this.managementOrigin});
       return;
     }
     const body = await requestBody(request);
@@ -458,8 +449,7 @@ class AccessFixture {
         port: target.port,
         path: `${target.pathname}${target.search}`,
         method: request.method,
-        headers,
-      },
+        headers},
       (upstreamResponse) => {
         response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
         upstreamResponse.pipe(response);
@@ -501,8 +491,7 @@ class ReadyChild {
   ): Promise<ReadyChild> {
     const child = spawn(executable, args, {
       env: { ...process.env, ...environment },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+      stdio: ["ignore", "pipe", "pipe"]});
     // Retain only the Server's bounded typed startup code. Provider/OAuth
     // bodies and arbitrary stderr never become Playwright failure output.
     let startupFailure = "";
@@ -568,8 +557,7 @@ class ReadyChild {
       exited,
       new Promise<void>((_, reject) =>
         setTimeout(() => reject(new Error("child process did not stop")), HTTP_TIMEOUT),
-      ),
-    ]);
+      )]);
     this.lines.close();
   }
 }
@@ -604,8 +592,7 @@ class OAuthProviderFixture {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ mode }),
-      signal: timeoutSignal(),
-    });
+      signal: timeoutSignal()});
     if (!response.ok) {
       throw new Error("OAuth fixture mode change failed");
     }
@@ -614,8 +601,7 @@ class OAuthProviderFixture {
   async releaseRefresh(): Promise<void> {
     const response = await fetch(`${this.origin}/control/release-refresh`, {
       method: "POST",
-      signal: timeoutSignal(),
-    });
+      signal: timeoutSignal()});
     if (!response.ok) {
       throw new Error("OAuth fixture held refresh release failed");
     }
@@ -771,10 +757,8 @@ async function materializeProcessConfigs(
           audiences: ["zode-web-oauth-refresh-e2e"],
           jwks_url: access.jwksUrl,
           subject_key_file: subjectKey,
-          subject_key_version: 1,
-        },
-        provider_auth_adapters: [oauthAdapterConfig(provider)],
-      }),
+          subject_key_version: 1},
+        provider_auth_adapters: [oauthAdapterConfig(provider)]}),
     );
   }
 
@@ -787,14 +771,10 @@ async function materializeProcessConfigs(
   } else if (configuredEndpoint) {
     await writePrivateFile(endpointPath, await readFile(resolve(REPO_ROOT, configuredEndpoint), "utf8"));
   } else {
-    const endpointSecrets = resolve(root, "endpoint-secrets");
     const replicas = resolve(root, "endpoint-replicas");
     const blobs = resolve(root, "endpoint-blobs");
-    const controllerSecret = resolve(endpointSecrets, "controller.secret");
-    await mkdir(endpointSecrets, { recursive: true, mode: 0o700 });
     await mkdir(replicas, { recursive: true, mode: 0o700 });
     await mkdir(blobs, { recursive: true, mode: 0o700 });
-    await writePrivateFile(controllerSecret, `oauth-refresh-browser-controller-${randomUUID()}`);
     await writePrivateFile(
       endpointPath,
       JSON.stringify({
@@ -803,35 +783,14 @@ async function materializeProcessConfigs(
         runtime_store: { kind: "sqlite", path: resolve(root, "endpoint.sqlite") },
         credential_replica_store: { kind: "files", directory: replicas },
         blob_store: { kind: "files", directory: blobs },
-        controller_auth: [{
-          authority_id: "oauth-refresh-browser-server",
-          revision: 1,
-          kind: "bearer_secret_file",
-          secret_file: controllerSecret,
-        }],
         provider_execution: {
           adapter_kinds: ["openai_compatible"],
-          allowed_base_url_origins: [provider.origin],
-        },
+          allowed_base_url_origins: [provider.origin]},
         callback: { allowed_public_origins: [provider.origin] },
-        tools: [],
-      }),
+        tools: []}),
     );
   }
-  const endpointConfig = JSON.parse(await readFile(endpointPath, "utf8")) as {
-    controller_auth?: Array<{ kind?: unknown; secret_file?: unknown }>;
-  };
-  const controller = endpointConfig.controller_auth?.find(
-    (candidate) =>
-      candidate.kind === "bearer_secret_file" && typeof candidate.secret_file === "string",
-  );
-  if (!controller || typeof controller.secret_file !== "string") {
-    throw new Error("OAuth browser harness Endpoint config omitted controller auth");
-  }
-  const controllerSecret = (
-    await readFile(resolve(dirname(endpointPath), controller.secret_file), "utf8")
-  ).trim();
-  return { server: serverPath, endpoint: endpointPath, controllerSecret };
+  return { server: serverPath, endpoint: endpointPath, controllerSecret: "" };
 }
 
 function oauthAdapterConfig(
@@ -846,8 +805,7 @@ function oauthAdapterConfig(
     client_id: "zode-oauth-browser-e2e",
     client_secret_file: null,
     scopes: ["models.execute"],
-    refresh_recovery: refreshRecovery,
-  };
+    refresh_recovery: refreshRecovery};
 }
 
 class ZodeBrowserHarness {
@@ -893,13 +851,11 @@ class ZodeBrowserHarness {
             "target/test-recordings/quarantine",
             `provider-descriptor-${Date.now()}-${randomUUID()}`,
           ),
-          ledger: ledger as SecretLedgerContract,
-        })
+          ledger: ledger as SecretLedgerContract})
       : undefined;
     const captureSetId = journal?.beginCaptureSet({
       e2eName: options.recordE2EName as string,
-      maxMembers: 16,
-    });
+      maxMembers: 16});
     const access = await AccessFixture.start({ ledger, journal, captureSetId });
     const configs = await materializeProcessConfigs(tempRoot, provider, access);
     const environment = {};
@@ -924,8 +880,7 @@ class ZodeBrowserHarness {
     const configuredOrigin = process.env.ZODE_MANAGEMENT_ORIGIN;
     const managementOrigin = normalizeOrigin(configuredOrigin ?? edgeOrigin);
     const browserContext = await browser.newContext({
-      baseURL: managementOrigin,
-    });
+      baseURL: managementOrigin});
     return new ZodeBrowserHarness(
       browserContext,
       endpoint,
@@ -955,10 +910,7 @@ class ZodeBrowserHarness {
       idempotencyKey: `oauth-distribution-endpoint-${randomUUID()}`,
       body: {
         label: "OAuth distribution Endpoint",
-        base_url: this.endpoint.origin,
-        control_auth: { kind: "bearer", secret: this.controllerSecret },
-      },
-    });
+        base_url: this.endpoint.origin }});
     expect(registered.status, registered.text).toBe(201);
     const endpointId = jsonObject(registered.value, "registered OAuth Endpoint").endpoint_id;
     if (typeof endpointId !== "string" || endpointId.length === 0) {
@@ -986,20 +938,17 @@ class ZodeBrowserHarness {
     const record = this.journal.first({
       boundary: "management-access-edge",
       requestPath,
-      responseStatus: status,
-    });
+      responseStatus: status});
     if (!record) {
       throw new Error("provider descriptor failure exchange was not retained");
     }
     if (process.env.ZODE_CAPTURE_FIRST_OCCURRENCE !== "1") {
       const flushed = this.journal.flushCaptureSet(this.captureSetId, {
-        firstFailureRecordingId: record.recordingId,
-      }) as { records?: Array<{ recordingId: string; rawPath?: string }> };
+        firstFailureRecordingId: record.recordingId}) as { records?: Array<{ recordingId: string; rawPath?: string }> };
       return {
         rawPath: flushed.records?.find(
           (candidate) => candidate.recordingId === record.recordingId,
-        )?.rawPath,
-      };
+        )?.rawPath};
     }
     const promoted = await this.journal.promoteCaptureSet(this.captureSetId, {
       e2eName,
@@ -1011,17 +960,14 @@ class ZodeBrowserHarness {
         const results = await this.journal?.replay(envelope, {
           baseUrl: this.managementOrigin,
           boundaryBaseUrls: {
-            "access-jwks-fixture": new URL(this.access.jwksUrl).origin,
-          },
-        });
+            "access-jwks-fixture": new URL(this.access.jwksUrl).origin}});
         const reproduced = results?.some(
           (result) =>
             result.path === requestPath &&
             result.status === status,
         );
         return { ok: reproduced === true, results };
-      },
-    });
+      }});
     return { cassettePath: promoted.cassettePath };
   }
 
@@ -1034,9 +980,7 @@ class ZodeBrowserHarness {
     return this.journal.replay(cassettePath, {
       baseUrl: this.managementOrigin,
       boundaryBaseUrls: {
-        "access-jwks-fixture": new URL(this.access.jwksUrl).origin,
-      },
-    });
+        "access-jwks-fixture": new URL(this.access.jwksUrl).origin}});
   }
 
   async restartServer(
@@ -1098,8 +1042,7 @@ function installBrowserAudit(page: Page): BrowserAudit {
     navigations: [],
     consoleMessages: [],
     consoleValueJobs: [],
-    pageErrors: [],
-  };
+    pageErrors: []};
   page.on("framenavigated", (frame) => {
     if (frame === page.mainFrame()) {
       audit.navigations.push(frame.url());
@@ -1125,8 +1068,7 @@ function installBrowserAudit(page: Page): BrowserAudit {
       url: request.url(),
       headers: { ...headers },
       referer: headers.referer ?? "",
-      postData: request.postData() ?? "",
-    };
+      postData: request.postData() ?? ""};
     audit.requests.push(observation);
     const requestUrl = new URL(request.url());
     if (request.method() === "GET" && requestUrl.pathname.endsWith("/authorize")) {
@@ -1242,8 +1184,7 @@ async function pageDomSurface(page: Page): Promise<string> {
           ? [
               document.body?.innerText ?? "",
               document.documentElement?.textContent ?? "",
-              document.documentElement?.outerHTML ?? "",
-            ].join("\n")
+              document.documentElement?.outerHTML ?? ""].join("\n")
           : root.innerHTML;
       const elements = root.querySelectorAll("*");
       for (let elementIndex = 0; elementIndex < elements.length; elementIndex += 1) {
@@ -1290,8 +1231,7 @@ async function pageBrowserStorageSurface(page: Page): Promise<string[]> {
       String(history.length),
       ...performance
         .getEntriesByType("navigation")
-        .map((entry) => entry.name),
-    ];
+        .map((entry) => entry.name)];
     if (typeof caches !== "undefined") {
       for (const name of await caches.keys()) {
         surface.push(name);
@@ -1360,8 +1300,7 @@ async function pageBrowserStorageSurface(page: Page): Promise<string[]> {
 async function openProviders(page: Page, managementOrigin: string): Promise<void> {
   const response = await page.goto(`${managementOrigin}/providers`, {
     waitUntil: "domcontentloaded",
-    timeout: HTTP_TIMEOUT,
-  });
+    timeout: HTTP_TIMEOUT});
   if (response) {
     assertManagementOrigin(response.url(), managementOrigin, "providers page");
   }
@@ -1374,8 +1313,7 @@ async function openProviders(page: Page, managementOrigin: string): Promise<void
   }
   expect(response?.status()).toBeLessThan(400);
   await expect(page.getByRole("heading", { name: /providers/i }).first()).toBeVisible({
-    timeout: HTTP_TIMEOUT,
-  });
+    timeout: HTTP_TIMEOUT});
 }
 
 async function startOAuthAttempt(
@@ -1441,8 +1379,7 @@ async function assertNoTicketBeforeExplicitClick(page: Page, audit: BrowserAudit
     session: JSON.stringify(sessionStorage),
     history: JSON.stringify(history.state),
     historyLength: history.length,
-    referrer: document.referrer,
-  }));
+    referrer: document.referrer}));
   const browserStorage = await pageBrowserStorageSurface(page);
   const cookies = await page.context().cookies();
   const requestContainsTicket = (request: RequestObservation): boolean =>
@@ -1502,8 +1439,7 @@ async function redeemWithExplicitLocationReplaceButton(
   expect(navigation.searchParams.has("ticket")).toBe(false);
   expect(navigationUrl).not.toBe(before.url);
   await expect(page.getByRole("heading", { name: /fixture provider authorization/i })).toBeVisible({
-    timeout: HTTP_TIMEOUT,
-  });
+    timeout: HTTP_TIMEOUT});
   // A real top-level browser navigation happened only after the explicit
   // button click. Keeping the same history entry is the observable contract
   // of location.replace, rather than a mock or an in-app route transition.
@@ -1556,8 +1492,7 @@ async function finishProviderDecision(
     expect(callback.searchParams.has("error")).toBe(true);
   }
   await expect(page.getByRole("heading", { name: /fixture provider authorization/i })).toHaveCount(0, {
-    timeout: HTTP_TIMEOUT,
-  });
+    timeout: HTTP_TIMEOUT});
   await expect(page.getByText(expectedUiText).first()).toBeVisible({ timeout: HTTP_TIMEOUT });
   await assertTicketNotExposed(page, audit, managementOrigin, ticket);
   assertOAuthManagementOrigins(audit, managementOrigin);
@@ -1575,8 +1510,7 @@ async function assertTicketNotExposed(
     local: JSON.stringify(localStorage),
     session: JSON.stringify(sessionStorage),
     history: JSON.stringify(history.state),
-    referrer: document.referrer,
-  }));
+    referrer: document.referrer}));
   const browserStorage = await pageBrowserStorageSurface(page);
   const cookies = await page.context().cookies();
   const ticketRequests = audit.requests.filter(
@@ -1729,8 +1663,7 @@ async function assertRefreshUnknownFencedUi(page: Page): Promise<void> {
     );
   }
   await expect(page.getByRole("button", { name: /relog ?in|log in again/i }).first()).toBeVisible({
-    timeout: HTTP_TIMEOUT,
-  });
+    timeout: HTTP_TIMEOUT});
 }
 
 async function waitForSafeUiState(page: Page, pattern: RegExp): Promise<void> {
@@ -1747,8 +1680,7 @@ async function assertSecretMarkersAbsent(page: Page, context: BrowserContext, au
     window.name,
     JSON.stringify(history.state),
     String(history.length),
-    ...performance.getEntriesByType("navigation").map((entry) => entry.name),
-  ]);
+    ...performance.getEntriesByType("navigation").map((entry) => entry.name)]);
   const browserSurface = [
     domSurface,
     ...urlAndHistorySurface,
@@ -1761,9 +1693,7 @@ async function assertSecretMarkersAbsent(page: Page, context: BrowserContext, au
       request.url,
       request.referer,
       request.postData,
-      ...Object.entries(request.headers).map(([name, value]) => `${name}=${value}`),
-    ]),
-  ];
+      ...Object.entries(request.headers).map(([name, value]) => `${name}=${value}`)])];
   if (browserSurface.some((surface) => SECRET_MARKERS.some((marker) => surface.includes(marker)))) {
     throw new Error("a provider secret marker crossed the browser boundary");
   }
@@ -1787,8 +1717,7 @@ function assertIncidentCassetteContract(
     safe_error: "missing_public_provider_route",
     response_fingerprint: INCIDENT_RESPONSE_FINGERPRINT,
     classification: "PRODUCT_ROUTE_MISSING_SHALLOW_404",
-    non_evidence: true,
-  });
+    non_evidence: true});
   expect(cassette.exchanges).toHaveLength(1);
   const exchange = cassette.exchanges[0];
   if (!exchange) {
@@ -1802,28 +1731,23 @@ function assertIncidentCassetteContract(
     raw_body_hex: "",
     canonical_json: null,
     body_sha256: EMPTY_BODY_SHA256,
-    fingerprint: INCIDENT_REQUEST_FINGERPRINT,
-  });
+    fingerprint: INCIDENT_REQUEST_FINGERPRINT});
   expect(exchange.recorded_response).toEqual({
     status: 404,
     semantic_headers: [],
     body_hex: "",
     body_sha256: EMPTY_BODY_SHA256,
     outcome: "complete",
-    fingerprint: INCIDENT_RESPONSE_FINGERPRINT,
-  });
+    fingerprint: INCIDENT_RESPONSE_FINGERPRINT});
   expect(exchange.contract).toEqual({
     status: 404,
-    kind: "missing_public_provider_route",
-  });
+    kind: "missing_public_provider_route"});
   expect(cassette.expected_after_fix).toEqual({
     status: 200,
-    safe_outcome: "management_ui_bootstrapped",
-  });
+    safe_outcome: "management_ui_bootstrapped"});
   expect(cassette.replay_policy).toEqual({
     shallow_404_is_non_evidence: true,
-    continue_only_after_status: 200,
-  });
+    continue_only_after_status: 200});
 
   if (verifyPinnedDigest) {
     const { whole_digest: recordedDigest, ...withoutDigest } = cassette;
@@ -1852,23 +1776,18 @@ function assertOfflineReplayContractRejectsMutations(cassette: IncidentCassette)
       label: "request semantic header",
       apply: (clone) => {
         clone.exchanges[0]!.request.semantic_headers = [
-          { name: "x-replay-contract-mutation", value: "changed" },
-        ];
-      },
-    },
+          { name: "x-replay-contract-mutation", value: "changed" }];
+      }},
     {
       label: "request path/query",
       apply: (clone) => {
         clone.exchanges[0]!.request.path = `${INCIDENT_PATH}?replay_contract_mutation=1`;
-      },
-    },
+      }},
     {
       label: "exchange sequence",
       apply: (clone) => {
         clone.exchanges[0]!.sequence = 2;
-      },
-    },
-  ];
+      }}];
 
   for (const mutation of mutations) {
     const clone = cloneIncidentCassette(cassette);
@@ -1891,8 +1810,7 @@ async function replayFirstBrowserFailure(page: Page, managementOrigin: string): 
   const exchange = assertIncidentCassetteContract(cassette);
   const response = await page.goto(`${managementOrigin}${exchange.request.path}`, {
     waitUntil: "commit",
-    timeout: HTTP_TIMEOUT,
-  });
+    timeout: HTTP_TIMEOUT});
   if (response) {
     assertManagementOrigin(response.url(), managementOrigin, "first-failure replay");
   }
@@ -1922,15 +1840,12 @@ async function configureOAuthProvider(page: Page, provider: OAuthProviderFixture
         method: "PUT",
         headers: {
           "content-type": "application/json",
-          "idempotency-key": "oauth-browser-provider-descriptor",
-        },
+          "idempotency-key": "oauth-browser-provider-descriptor"},
         body: JSON.stringify({
           kind: "openai_compatible",
           base_url: baseUrl,
           models: ["oauth-browser-model"],
-          options: {},
-        }),
-      });
+          options: {}})});
       return { status: response.status, body: await response.text() };
     },
     { providerId: OAUTH_PROVIDER_ID, baseUrl: provider.origin },
@@ -1964,8 +1879,7 @@ async function browserApi(
         body:
           requestOptions.body === undefined
             ? undefined
-            : JSON.stringify(requestOptions.body),
-      });
+            : JSON.stringify(requestOptions.body)});
       const text = await response.text();
       let value: JsonValue | null = null;
       try {
@@ -2011,9 +1925,7 @@ async function runOAuthAttemptThroughPublicBrowser(
         sharing: options.sharing ?? { mode: "none", endpoint_ids: [] },
         ...(options.replaceAuthProfileId === undefined
           ? {}
-          : { replace_auth_profile_id: options.replaceAuthProfileId }),
-      },
-    },
+          : { replace_auth_profile_id: options.replaceAuthProfileId })}},
   );
   expect(attemptResponse.status, attemptResponse.text).toBe(201);
   const attempt = jsonObject(attemptResponse.value, "OAuth attempt");
@@ -2038,8 +1950,7 @@ async function runOAuthAttemptThroughPublicBrowser(
   const historyLength = await page.evaluate(() => history.length);
   await page.evaluate((url) => location.replace(url), authorizeUrl);
   await expect(page.getByRole("heading", { name: /fixture provider authorization/i })).toBeVisible({
-    timeout: HTTP_TIMEOUT,
-  });
+    timeout: HTTP_TIMEOUT});
   const providerUrl = new URL(page.url());
   expect(providerUrl.origin).toBe(harness.provider.origin);
   expect(providerUrl.pathname).toBe("/oauth/authorize");
@@ -2056,10 +1967,8 @@ async function runOAuthAttemptThroughPublicBrowser(
     ),
     page
       .getByRole("button", {
-        name: options.decision === "approve" ? /approve|allow/i : /cancel/i,
-      })
-      .click(),
-  ]);
+        name: options.decision === "approve" ? /approve|allow/i : /cancel/i})
+      .click()]);
 
   await expect
     .poll(
@@ -2086,8 +1995,7 @@ async function createOAuthProfileThroughPublicBrowser(
     mode: "oauth_success",
     decision: "approve",
     replaceAuthProfileId,
-    expectedStatus: "succeeded",
-  });
+    expectedStatus: "succeeded"});
   const profile = (await readOAuthProfiles(page)).find(
     (candidate) => candidate.id === completed.profileId,
   );
@@ -2129,8 +2037,7 @@ async function readOAuthProfiles(page: Page): Promise<PublicOAuthProfile[]> {
         id: item.auth_profile_id,
         revision: item.revision,
         refreshState: item.refresh_state,
-        allowedActions: item.allowed_actions,
-      };
+        allowedActions: item.allowed_actions};
     }
     throw new Error("OAuth profile projection was invalid");
   });
@@ -2150,8 +2057,7 @@ const FORBIDDEN_PROVIDER_LIST_FIELDS = [
   "common_name",
   "email",
   "subject",
-  "actor",
-] as const;
+  "actor"] as const;
 
 function assertEmptyProviderListProjection(value: JsonValue): void {
   expect(value).toEqual({ schema: "zode.providers.v1", providers: [] });
@@ -2216,8 +2122,7 @@ function assertProviderDescriptor(
     base_url: providerBaseUrl,
     models: ["descriptor-model-a", "descriptor-model-b"],
     model_limits: {},
-    options: { organization: "descriptor-org" },
-  });
+    options: { organization: "descriptor-org" }});
   const serialized = JSON.stringify(value);
   for (const forbidden of FORBIDDEN_PROVIDER_LIST_FIELDS) {
     expect(serialized).not.toContain(`"${forbidden}"`);
@@ -2248,8 +2153,7 @@ test.describe("Server provider-list foundation", () => {
         if (error instanceof RouteMissingFoundationRed) {
           testInfo.annotations.push({
             type: "failure-classification",
-            description: `${error.stage}:${error.classification}`,
-          });
+            description: `${error.stage}:${error.classification}`});
         }
         throw error;
       } finally {
@@ -2267,21 +2171,18 @@ test.describe("Server provider-list foundation", () => {
       const cassette = await findProviderDescriptorCassette();
       const provider = await OAuthProviderFixture.start();
       const harness = await ZodeBrowserHarness.start(browser, provider, {
-        recordE2EName: PROVIDER_DESCRIPTOR_E2E,
-      });
+        recordE2EName: PROVIDER_DESCRIPTOR_E2E});
       const page = await harness.context.newPage();
       const providerBaseUrl = "https://models.descriptor-roundtrip.test/v1";
       const requestBody = {
         kind: "openai_compatible",
         base_url: providerBaseUrl,
         models: ["descriptor-model-a", "descriptor-model-b"],
-        options: { organization: "descriptor-org" },
-      };
+        options: { organization: "descriptor-org" }};
       try {
         const system = await page.goto(`${harness.managementOrigin}/v1/system`, {
           waitUntil: "commit",
-          timeout: HTTP_TIMEOUT,
-        });
+          timeout: HTTP_TIMEOUT});
         expect(system?.status()).toBe(200);
         const mutation = await page.evaluate(
           async ({ path, body }) => {
@@ -2289,14 +2190,11 @@ test.describe("Server provider-list foundation", () => {
               method: "PUT",
               headers: {
                 "content-type": "application/json",
-                "idempotency-key": "provider-descriptor-roundtrip",
-              },
-              body: JSON.stringify(body),
-            });
+                "idempotency-key": "provider-descriptor-roundtrip"},
+              body: JSON.stringify(body)});
             return {
               status: response.status,
-              text: await response.text(),
-            };
+              text: await response.text()};
           },
           { path: PROVIDER_DESCRIPTOR_PATH, body: requestBody },
         );
@@ -2332,10 +2230,8 @@ test.describe("Server provider-list foundation", () => {
               method: "PUT",
               headers: {
                 "content-type": "application/json",
-                "idempotency-key": "provider-descriptor-roundtrip",
-              },
-              body: JSON.stringify(body),
-            });
+                "idempotency-key": "provider-descriptor-roundtrip"},
+              body: JSON.stringify(body)});
             return { status: response.status, text: await response.text() };
           },
           { path: PROVIDER_DESCRIPTOR_PATH, body: requestBody },
@@ -2345,8 +2241,7 @@ test.describe("Server provider-list foundation", () => {
 
         const list = await page.evaluate(async () => {
           const response = await fetch("/v1/providers", {
-            headers: { accept: "application/json" },
-          });
+            headers: { accept: "application/json" }});
           return { status: response.status, value: await response.json() };
         });
         expect(list.status).toBe(200);
@@ -2361,21 +2256,16 @@ test.describe("Server provider-list foundation", () => {
                 base_url: providerBaseUrl,
                 models: ["descriptor-model-a", "descriptor-model-b"],
                 model_limits: {},
-                options: { organization: "descriptor-org" },
-              },
+                options: { organization: "descriptor-org" }},
               auth_methods: ["api_key"],
               default_profile_id: null,
               auth_status: "unconfigured",
-              auth_profile_count: 0,
-            },
-          ],
-        });
+              auth_profile_count: 0}]});
 
         await harness.restartServer();
         const restarted = await page.evaluate(async () => {
           const response = await fetch("/v1/providers", {
-            headers: { accept: "application/json" },
-          });
+            headers: { accept: "application/json" }});
           return { status: response.status, value: await response.json() };
         });
         expect(restarted).toEqual(list);
@@ -2451,8 +2341,7 @@ test.describe("OAuth refresh public operation boundary", () => {
       try {
         const system = await page.goto(`${harness.managementOrigin}/v1/system`, {
           waitUntil: "commit",
-          timeout: HTTP_TIMEOUT,
-        });
+          timeout: HTTP_TIMEOUT});
         expect(system?.status()).toBe(200);
         const endpointId = await harness.registerEndpoint(page);
         await configureOAuthProvider(page, provider);
@@ -2464,8 +2353,7 @@ test.describe("OAuth refresh public operation boundary", () => {
             mode: "oauth_success",
             decision: "approve",
             expectedStatus: "succeeded",
-            sharing: { mode: "selected", endpoint_ids: [endpointId] },
-          },
+            sharing: { mode: "selected", endpoint_ids: [endpointId] }},
         );
 
         const replicaState = async (): Promise<string> => {
@@ -2499,15 +2387,11 @@ test.describe("OAuth refresh public operation boundary", () => {
                   revision: 1,
                   kind: "openai_compatible",
                   base_url: provider.origin,
-                  options: {},
-                },
+                  options: {}},
                 model: "oauth-browser-model",
                 auth_profile_id: completed.profileId,
-                minimum_auth_revision: 1,
-              },
-              tools: [],
-            },
-          },
+                minimum_auth_revision: 1},
+              tools: []}},
         );
         expect(created.status, created.text).toBe(201);
         const sessionId = jsonObject(created.value, "OAuth credential session").session_id;
@@ -2521,8 +2405,7 @@ test.describe("OAuth refresh public operation boundary", () => {
             {
               method: "POST",
               idempotencyKey: `oauth-distributed-message-${randomUUID()}`,
-              body: { content },
-            },
+              body: { content }},
           );
           expect(message.status, message.text).toBe(202);
           await expect
@@ -2559,8 +2442,7 @@ test.describe("OAuth refresh public operation boundary", () => {
           `/v1/auth-profiles/${encodeURIComponent(completed.profileId)}/refresh-operations`,
           {
             method: "POST",
-            idempotencyKey: `oauth-distributed-refresh-${randomUUID()}`,
-          },
+            idempotencyKey: `oauth-distributed-refresh-${randomUUID()}`},
         );
         expect(accepted.status, accepted.text).toBe(202);
         const operationId = jsonObject(accepted.value, "distributed OAuth refresh").operation_id;
@@ -2605,8 +2487,7 @@ test.describe("OAuth refresh public operation boundary", () => {
       try {
         const system = await page.goto(`${harness.managementOrigin}/v1/system`, {
           waitUntil: "commit",
-          timeout: HTTP_TIMEOUT,
-        });
+          timeout: HTTP_TIMEOUT});
         expect(system?.status()).toBe(200);
         await configureOAuthProvider(page, provider);
         const profile = await createOAuthProfileThroughPublicBrowser(
@@ -2622,8 +2503,7 @@ test.describe("OAuth refresh public operation boundary", () => {
           `/v1/auth-profiles/${encodeURIComponent(profile.id)}/refresh-operations`,
           {
             method: "POST",
-            idempotencyKey: `oauth-held-refresh-${randomUUID()}`,
-          },
+            idempotencyKey: `oauth-held-refresh-${randomUUID()}`},
         );
         void admission.then(
           () => {
@@ -2640,8 +2520,7 @@ test.describe("OAuth refresh public operation boundary", () => {
         await expect
           .poll(() => admissionSettled, {
             timeout: 2_000,
-            message: "HTTP 202 must follow durable admission without waiting for provider completion",
-          })
+            message: "HTTP 202 must follow durable admission without waiting for provider completion"})
           .toBe(true);
         const accepted = await admission;
         expect(accepted.status, accepted.text).toBe(202);
@@ -2708,8 +2587,7 @@ test.describe("OAuth refresh public operation boundary", () => {
       try {
         const system = await page.goto(`${harness.managementOrigin}/v1/system`, {
           waitUntil: "commit",
-          timeout: HTTP_TIMEOUT,
-        });
+          timeout: HTTP_TIMEOUT});
         expect(system?.status()).toBe(200);
         await configureOAuthProvider(page, provider);
         const profile = await createOAuthProfileThroughPublicBrowser(
@@ -2724,8 +2602,7 @@ test.describe("OAuth refresh public operation boundary", () => {
           `/v1/auth-profiles/${encodeURIComponent(profile.id)}/refresh-operations`,
           {
             method: "POST",
-            idempotencyKey: `oauth-in-process-refresh-${randomUUID()}`,
-          },
+            idempotencyKey: `oauth-in-process-refresh-${randomUUID()}`},
         );
         expect(accepted.status, accepted.text).toBe(202);
         const operation = jsonObject(accepted.value, "in-process refresh");
@@ -2777,8 +2654,7 @@ test.describe("OAuth refresh public operation boundary", () => {
       try {
         const system = await page.goto(`${harness.managementOrigin}/v1/system`, {
           waitUntil: "commit",
-          timeout: HTTP_TIMEOUT,
-        });
+          timeout: HTTP_TIMEOUT});
         expect(system?.status()).toBe(200);
         await configureOAuthProvider(page, provider);
         let profile = await createOAuthProfileThroughPublicBrowser(
@@ -2793,8 +2669,7 @@ test.describe("OAuth refresh public operation boundary", () => {
           `/v1/auth-profiles/${encodeURIComponent(profile.id)}/refresh-operations`,
           {
             method: "POST",
-            idempotencyKey: `oauth-idempotent-refresh-${randomUUID()}`,
-          },
+            idempotencyKey: `oauth-idempotent-refresh-${randomUUID()}`},
         );
         expect(lostResponse.status, lostResponse.text).toBe(202);
         const lostOperation = jsonObject(lostResponse.value, "response-loss refresh");
@@ -2850,8 +2725,7 @@ test.describe("OAuth refresh public operation boundary", () => {
           `/v1/auth-profiles/${encodeURIComponent(profile.id)}/refresh-operations`,
           {
             method: "POST",
-            idempotencyKey: `oauth-unknown-refresh-${randomUUID()}`,
-          },
+            idempotencyKey: `oauth-unknown-refresh-${randomUUID()}`},
         );
         expect(unknownResponse.status, unknownResponse.text).toBe(202);
         const unknownOperation = jsonObject(unknownResponse.value, "unknown refresh");
@@ -2889,8 +2763,7 @@ test.describe("OAuth refresh public operation boundary", () => {
           `/v1/auth-profiles/${encodeURIComponent(profile.id)}/refresh-operations`,
           {
             method: "POST",
-            idempotencyKey: `oauth-blocked-refresh-${randomUUID()}`,
-          },
+            idempotencyKey: `oauth-blocked-refresh-${randomUUID()}`},
         );
         expect(blocked.status, blocked.text).toBe(409);
         const blockedError = jsonObject(
@@ -2904,8 +2777,7 @@ test.describe("OAuth refresh public operation boundary", () => {
           mode: "oauth_failed",
           decision: "approve",
           replaceAuthProfileId: profile.id,
-          expectedStatus: "failed",
-        });
+          expectedStatus: "failed"});
         fenced = (await readOAuthProfiles(page)).find(
           (candidate) => candidate.id === profile.id,
         );
@@ -2920,8 +2792,7 @@ test.describe("OAuth refresh public operation boundary", () => {
             mode: "oauth_success",
             decision: "cancel",
             replaceAuthProfileId: profile.id,
-            expectedStatus: "cancelled",
-          },
+            expectedStatus: "cancelled"},
         );
         fenced = (await readOAuthProfiles(page)).find(
           (candidate) => candidate.id === profile.id,
@@ -2962,8 +2833,7 @@ test.describe("OAuth refresh public operation boundary", () => {
       try {
         const system = await page.goto(`${harness.managementOrigin}/v1/system`, {
           waitUntil: "commit",
-          timeout: HTTP_TIMEOUT,
-        });
+          timeout: HTTP_TIMEOUT});
         expect(system?.status()).toBe(200);
         await configureOAuthProvider(page, provider);
         const profile = await createOAuthProfileThroughPublicBrowser(
@@ -3077,8 +2947,7 @@ test.describe("OAuth and refresh browser boundary", () => {
           .poll(() => harness.authRefreshProjectionFailures, { timeout: HTTP_TIMEOUT })
           .toBe(3);
         await expect(page.getByRole("status").filter({ hasText: "Credentials refreshed" })).toBeVisible({
-          timeout: HTTP_TIMEOUT,
-        });
+          timeout: HTTP_TIMEOUT});
         profile = await reloadProvidersAndReadProfile(page, harness.managementOrigin, PROFILE_LABEL);
         expect(profile.id).toBe(fencedProfileId);
         expect(profile.revision).toBeGreaterThan(previousRevision);
@@ -3182,18 +3051,15 @@ test.describe("OAuth and refresh browser boundary", () => {
             cassette: "oauth_refresh_relogin_first_browser_failure.v1.json",
             ticket_mints: audit.ticketMints.length,
             ticket_redemptions: audit.ticketRedemptions.length,
-            refresh_requests: (await provider.state()).refresh_count,
-          }),
+            refresh_requests: (await provider.state()).refresh_count}),
           "utf8",
         ),
-        contentType: "application/json",
-      });
+        contentType: "application/json"});
     } catch (error) {
       if (error instanceof RouteMissingFoundationRed) {
         testInfo.annotations.push({
           type: "failure-classification",
-          description: `${error.stage}:${error.classification}`,
-        });
+          description: `${error.stage}:${error.classification}`});
       }
       throw error;
     } finally {

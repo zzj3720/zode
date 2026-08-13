@@ -1478,8 +1478,7 @@ fn normalize_public_transcript(state: &Value, label: &str) -> TestResult<Vec<Val
                         .ok_or_else(|| Error::other(format!("{label} omitted tool name")))?;
                     Ok(json!({
                         "tool_call_id": tool_call_id,
-                        "tool_name": tool_name,
-                    }))
+                        "tool_name": tool_name}))
                 })
                 .collect::<TestResult<Vec<_>>>()?;
             Ok(json!({
@@ -1487,8 +1486,7 @@ fn normalize_public_transcript(state: &Value, label: &str) -> TestResult<Vec<Val
                 "role": role,
                 "content": content,
                 "tool_call_id": tool_call_id,
-                "tool_calls": tool_calls,
-            }))
+                "tool_calls": tool_calls}))
         })
         .collect()
 }
@@ -1562,7 +1560,7 @@ async fn e2e_runtime_commits_honor_snapshot_cadence_and_restart() -> TestResult<
         transcript_sequence,
         Some(vec![
             ("user", "snapshot cadence user"),
-            ("assistant", "snapshot cadence assistant"),
+            ("assistant", "snapshot cadence assistant")
         ]),
         "snapshot cadence GET did not expose the complete transcript"
     );
@@ -1948,7 +1946,7 @@ async fn e2e_concurrent_inputs_preserve_both_assistant_rounds() -> TestResult<()
             ("user", "input A"),
             ("assistant", "assistant A"),
             ("user", "input B"),
-            ("assistant", "assistant B"),
+            ("assistant", "assistant B")
         ]),
         "transcript did not preserve the complete input/assistant order"
     );
@@ -2400,9 +2398,6 @@ async fn e2e_restart_reconciles_failed_attempt_after_prior_activation_exhaustion
     let database = TempDatabase::new("field-failed-attempt-recovery")?;
     let mut model = ModelFixture::start(Vec::new()).await?;
     let config = config_file(&database, &model.provider_url(), None, 3)?;
-    let mut config_value: Value = serde_json::from_slice(&fs::read(&config)?)?;
-    config_value["controller_auth"][0]["authority_id"] = json!(FIELD_RECOVERY_AUTHORITY);
-    fs::write(&config, serde_json::to_vec_pretty(&config_value)?)?;
 
     // Bootstrap only the test-owned control sidecars.  The database itself is
     // then replaced with the immutable, secret-safe field observation fixture.
@@ -2617,7 +2612,7 @@ async fn e2e_restart_rebuilds_conversation_from_latest_durable_facts() -> TestRe
         wire_dialogue(&rebuilt_wire)?,
         vec![
             ("user".to_owned(), "input A".to_owned()),
-            ("user".to_owned(), "input B".to_owned()),
+            ("user".to_owned(), "input B".to_owned())
         ],
         "restart did not rebuild from all latest durable facts"
     );
@@ -2638,7 +2633,7 @@ async fn e2e_restart_rebuilds_conversation_from_latest_durable_facts() -> TestRe
         Some(vec![
             ("user", "input A"),
             ("user", "input B"),
-            ("assistant", "assistant rebuilt from A and B"),
+            ("assistant", "assistant rebuilt from A and B")
         ]),
         "recovery transcript did not preserve A and B exactly once before one fresh final"
     );

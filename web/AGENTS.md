@@ -118,6 +118,6 @@ screenshots/traces on failure without secrets.
 
 Required paths are the all-in-one first run, remote Endpoint addition, provider
 profile login/sharing/rotation/removal, Access entry/re-entry with no Zode
-login screen, two-actor session isolation, Endpoint-generated session create/
+login screen, two-actor shared sessions, Endpoint-generated session create/
 chat/reconnect, async tool/wait/unknown-outcome states, Endpoint disconnect,
 accessibility, and secret non-disclosure listed in `docs/ui.md`.

@@ -15,20 +15,19 @@ use support::{
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2e_endpoint_event_stream_multiplexes_owned_sessions_and_reconnects_once(
+async fn e2e_endpoint_event_stream_multiplexes_sessions_and_reconnects_once(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let database_path = test_database("endpoint-wide-events")?;
     let mut server = TestServer::start(&database_path).await?;
     let client = http_client()?;
-    let subject = "endpoint-stream-owner";
-    let other_subject = "endpoint-stream-other-owner";
 
     let (first_session, _) =
-        create_subject_session(&client, &server, subject, "endpoint-stream-first").await?;
-    let (_hidden_session, _) =
-        create_subject_session(&client, &server, other_subject, "endpoint-stream-hidden").await?;
+        create_subject_session(&client, &server, "caller-a", "endpoint-stream-first").await?;
+    let (second_session, _) =
+        create_subject_session(&client, &server, "caller-b", "endpoint-stream-second").await?;
 
-    let initial_stream = authenticated_as(client.get(server.url("/v1/events")), subject)
+    let initial_stream = client
+        .get(server.url("/v1/events"))
         .header("Last-Event-ID", "0")
         .send_with_timeout()
         .await?;
@@ -39,58 +38,36 @@ async fn e2e_endpoint_event_stream_multiplexes_owned_sessions_and_reconnects_onc
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("text/event-stream")));
 
-    let (second_session, _) =
-        create_subject_session(&client, &server, subject, "endpoint-stream-second").await?;
-    let initial_events = read_sse_events(initial_stream, 2).await?;
+    let (third_session, _) =
+        create_subject_session(&client, &server, "caller-a", "endpoint-stream-third").await?;
+    let initial_events = read_sse_events(initial_stream, 3).await?;
     assert_eq!(initial_events[0].event, "session_created");
     assert_eq!(initial_events[0].data["session_id"], first_session);
     assert_eq!(initial_events[1].event, "session_created");
     assert_eq!(initial_events[1].data["session_id"], second_session);
+    assert_eq!(initial_events[2].event, "session_created");
+    assert_eq!(initial_events[2].data["session_id"], third_session);
     let first_id = initial_events[0].id.parse::<u64>()?;
     let second_id = initial_events[1].id.parse::<u64>()?;
-    assert_eq!(
-        second_id,
-        first_id + 2,
-        "unowned event position was not filtered"
-    );
+    let third_id = initial_events[2].id.parse::<u64>()?;
+    assert!(first_id < second_id && second_id < third_id);
 
-    let replay = authenticated_as(client.get(server.url("/v1/events")), subject)
+    let replay = client
+        .get(server.url("/v1/events"))
         .header("Last-Event-ID", &initial_events[0].id)
         .send_with_timeout()
         .await?;
     assert_eq!(replay.status(), StatusCode::OK);
-    let replayed = read_sse_events(replay, 1).await?;
-    assert_eq!(replayed, vec![initial_events[1].clone()]);
-
-    let resumed = authenticated_as(client.get(server.url("/v1/events")), subject)
-        .header("Last-Event-ID", &initial_events[1].id)
-        .send_with_timeout()
-        .await?;
-    assert_eq!(resumed.status(), StatusCode::OK);
-    let _ = create_subject_session(
-        &client,
-        &server,
-        other_subject,
-        "endpoint-stream-hidden-after-reconnect",
-    )
-    .await?;
-    let (third_session, _) =
-        create_subject_session(&client, &server, subject, "endpoint-stream-third").await?;
-    let resumed_events = read_sse_events(resumed, 1).await?;
-    assert_eq!(resumed_events[0].event, "session_created");
-    assert_eq!(resumed_events[0].data["session_id"], third_session);
+    let replayed = read_sse_events(replay, 2).await?;
     assert_eq!(
-        resumed_events[0].id.parse::<u64>()?,
-        second_id + 2,
-        "reconnected Endpoint stream exposed or lost another subject's position"
+        replayed,
+        vec![initial_events[1].clone(), initial_events[2].clone()]
     );
 
-    let removed_session_stream = authenticated_as(
-        client.get(server.url(&format!("/v1/sessions/{first_session}/events"))),
-        subject,
-    )
-    .send_with_timeout()
-    .await?;
+    let removed_session_stream = client
+        .get(server.url(&format!("/v1/sessions/{first_session}/events")))
+        .send_with_timeout()
+        .await?;
     assert_eq!(removed_session_stream.status(), StatusCode::NOT_FOUND);
 
     server.stop().await?;
@@ -260,23 +237,20 @@ async fn e2e_create_generates_ulid_and_binds_idempotency_payload(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2e_session_list_is_subject_scoped() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-{
-    let database_path = test_database("session-list-ownership")?;
+async fn e2e_session_list_is_shared_across_callers(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let database_path = test_database("session-list-shared")?;
     let mut server = TestServer::start(&database_path).await?;
     let client = http_client()?;
-    let subject_a = "round1-list-subject-a";
-    let subject_b = "round1-list-subject-b";
     let (session_a, _) =
-        create_subject_session(&client, &server, subject_a, "list-create-a").await?;
+        create_subject_session(&client, &server, "caller-a", "list-create-a").await?;
     let (session_b, _) =
-        create_subject_session(&client, &server, subject_b, "list-create-b").await?;
-    let missing = "00000000000000000000000000";
+        create_subject_session(&client, &server, "caller-b", "list-create-b").await?;
 
-    let (status, body) = list_subject_sessions(&client, &server, subject_a).await?;
-    assert_list_contains_only(status, &body, subject_a, &session_a, &session_b, missing)?;
-    let (status, body) = list_subject_sessions(&client, &server, subject_b).await?;
-    assert_list_contains_only(status, &body, subject_b, &session_b, &session_a, missing)?;
+    let (status, body) = list_subject_sessions(&client, &server, "caller-a").await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains(&session_a), "{body}");
+    assert!(body.contains(&session_b), "{body}");
 
     server.stop().await?;
     Ok(())
@@ -1491,53 +1465,47 @@ async fn e2e_concurrent_create_receipt_and_event_are_atomic(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2e_session_ownership_safe_not_found_and_ordered_sse(
+async fn e2e_session_missing_is_not_found_and_existing_is_shared(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let database_path = test_database("ownership-safe-not-found")?;
+    let database_path = test_database("session-missing-and-shared")?;
     let mut server = TestServer::start(&database_path).await?;
     let client = http_client()?;
-    let subject_a = "round1-subject-a";
-    let subject_b = "round1-subject-b";
-    let (session_a, _) = create_subject_session(&client, &server, subject_a, "ownership-a").await?;
-    let (session_b, _) = create_subject_session(&client, &server, subject_b, "ownership-b").await?;
+    let (session_a, _) = create_subject_session(&client, &server, "caller-a", "shared-a").await?;
+    let (session_b, _) = create_subject_session(&client, &server, "caller-b", "shared-b").await?;
     let missing = "00000000000000000000000000";
-    assert!(support::is_crockford_ulid(missing));
-    let database_marker = database_path.path().to_string_lossy().to_string();
-    let markers = [
-        session_a.as_str(),
-        session_b.as_str(),
-        missing,
-        database_marker.as_str(),
-    ];
 
-    for (subject, cross_id) in [
-        (subject_a, session_b.as_str()),
-        (subject_b, session_a.as_str()),
-    ] {
-        for resource in [OwnershipResource::Read, OwnershipResource::Message] {
-            assert_subject_safe_not_found(
-                &client, &server, subject, cross_id, missing, resource, &markers,
-            )
-            .await?;
-        }
-    }
-
-    let own_sse = authenticated_as(client.get(server.url("/v1/events")), subject_a)
+    let missing_read = client
+        .get(server.url(&format!("/v1/sessions/{missing}")))
         .send_with_timeout()
         .await?;
-    assert_eq!(own_sse.status(), StatusCode::OK);
+    assert_eq!(missing_read.status(), StatusCode::NOT_FOUND);
 
-    let own_message = authenticated_as(
-        client.post(server.url(&format!("/v1/sessions/{session_a}/messages"))),
-        subject_a,
-    )
-    .header("Idempotency-Key", "ownership-own-message-a")
-    .json(&json!({"content": "owned message"}))
-    .send_with_timeout()
-    .await?;
-    assert_eq!(own_message.status(), StatusCode::ACCEPTED);
-    let events = read_sse_events(own_sse, 2).await?;
-    let _ = assert_two_ordered_session_events(&events, &session_a)?;
+    let cross = client
+        .get(server.url(&format!("/v1/sessions/{session_b}")))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(cross.status(), StatusCode::OK);
+
+    let sse = client
+        .get(server.url("/v1/events"))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(sse.status(), StatusCode::OK);
+    let message = client
+        .post(server.url(&format!("/v1/sessions/{session_a}/messages")))
+        .header("Idempotency-Key", "shared-message-a")
+        .header("Content-Type", "application/json")
+        .json(&json!({"content": "shared message"}))
+        .send_with_timeout()
+        .await?;
+    assert_eq!(message.status(), StatusCode::ACCEPTED);
+    let events = read_sse_events(sse, 3).await?;
+    assert!(events.iter().any(|event| {
+        event.event == "session_created" && event.data["session_id"] == session_a
+    }));
+    assert!(events.iter().any(|event| {
+        event.event == "session_created" && event.data["session_id"] == session_b
+    }));
     server.stop().await?;
     Ok(())
 }

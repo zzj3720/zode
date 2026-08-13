@@ -98,7 +98,6 @@ Conceptual Endpoint command:
 ```http
 PUT /v1/auth-replicas/profile-opaque
 Idempotency-Key: distribution-operation-opaque
-Authorization: Bearer endpoint-control-secret
 Content-Type: application/json
 ```
 
@@ -118,10 +117,12 @@ Content-Type: application/json
 }
 ```
 
-The request is protected by authenticated TLS. An additional envelope
-encrypted to the Endpoint identity key is recommended when traffic may
-cross a terminating relay. The raw request body is never logged or retained as
-an idempotency receipt.
+The request is protected by the reachability of the Endpoint listen address
+and, when the hop leaves the host, by operator TLS or another extra layer. An
+additional envelope encrypted to the Endpoint identity key is recommended when
+traffic may cross a terminating relay. The raw request body is never logged or
+retained as an idempotency receipt. Endpoint does not require a controller
+bearer.
 
 The credential schema is adapter-specific. The shipped OpenAI-compatible
 adapter accepts `openai-compatible.api-key.v1`; the native Anthropic Messages
@@ -129,13 +130,14 @@ adapter accepts `anthropic.api-key.v1`. Endpoint rejects a session before
 provider admission when the selected adapter and installed replica schema do
 not match, and never substitutes an ambient environment credential.
 
-The authenticated authority plus `profile-opaque` path identifies one replica
+The request `authority_id` plus `profile-opaque` path identifies one replica
 resource. Its first accepted install binds the profile to the request's
 provider type. A later request cannot rebind that profile by changing
 `provider`, whether it reuses the original `Idempotency-Key` or supplies a new
 one. Receipts are looked up by authority, profile resource, and operation key;
 provider remains inside the keyed request fingerprint so an altered replay
-conflicts.
+conflicts. That `authority_id` is the Server writer identity for the profile,
+not an Endpoint HTTP credential.
 
 Endpoint processes an install as one staged operation:
 

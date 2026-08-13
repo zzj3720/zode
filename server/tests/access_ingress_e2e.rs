@@ -9,11 +9,9 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc, Arc, Condvar, Mutex,
-    },
+        mpsc, Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 use axum::{extract::State, http::StatusCode, routing::get, Router};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
@@ -38,7 +36,6 @@ const INCIDENT_CASSETTE_PATH: &str =
 const INCIDENT_SOURCE_CASSETTE_PATH: &str =
     "tests/fixtures/incidents/access-ingress-auth-boundary-first-404.v1.json";
 const SUBJECT_KEY: &[u8; 32] = b"access-e2e-subject-key-slot-0001";
-const CATALOG_CONTROLLER_AUTHORITY: &str = "access-catalog-controller";
 const CATALOG_CONTROLLER_SECRET: &str = "access-catalog-controller-secret-e2e";
 const CATALOG_DIRECT_SUBJECT: &str = "access-catalog-direct-probe-subject";
 const CATALOG_ENDPOINT_LABEL: &str = "Access Catalog Endpoint";
@@ -80,8 +77,7 @@ const IDENTITY_MARKERS: &[&str] = &[
     "unknown-kid-human",
     "unknown-kid@example.invalid",
     "unknown-fail-human",
-    "unknown-fail@example.invalid",
-];
+    "unknown-fail@example.invalid"];
 
 // These are test-only fixtures. They are never written to the Server config,
 // sent to the Server, or included in a failure message.
@@ -345,8 +341,7 @@ fn e2e_system_and_endpoint_catalog_bootstrap_through_access() -> TestResult {
         HUMAN_SUB,
         SERVICE_NAME,
         HUMAN_EMAIL,
-        endpoint_proxy.base_url.as_str(),
-    ];
+        endpoint_proxy.base_url.as_str()];
 
     let scenario_result = (|| -> TestResult {
         let system = catalog_request(
@@ -563,8 +558,7 @@ fn e2e_server_control_database_path_swap_cannot_cross_catalog_ownership() -> Tes
         CATALOG_CONTROLLER_SECRET,
         CATALOG_DIRECT_SUBJECT,
         HUMAN_SUB,
-        HUMAN_EMAIL,
-    ];
+        HUMAN_EMAIL];
     let create = catalog_request(
         &server.base_url,
         "POST",
@@ -680,8 +674,7 @@ fn e2e_server_endpoint_protocol_compatibility_matrix() -> TestResult {
         CATALOG_CONTROLLER_SECRET,
         CATALOG_DIRECT_SUBJECT,
         HUMAN_SUB,
-        HUMAN_EMAIL,
-    ];
+        HUMAN_EMAIL];
 
     let matrix_result = (|| -> TestResult {
         for (case_index, case) in protocol_matrix_cases().iter().enumerate() {
@@ -788,74 +781,60 @@ enum ProtocolMatrixVariant {
     UnsupportedCapabilitiesSchema,
     EndpointIdMismatch,
     CapabilityLimitsMismatch,
-    ZeroRevision,
-}
+    ZeroRevision}
 
 #[derive(Clone, Copy)]
 enum MatrixExpectation {
     Accepted { revision: u64 },
-    Rejected,
-}
+    Rejected}
 
 struct ProtocolMatrixCase {
     name: &'static str,
     variant: ProtocolMatrixVariant,
-    expected: MatrixExpectation,
-}
+    expected: MatrixExpectation}
 
 fn protocol_matrix_cases() -> &'static [ProtocolMatrixCase] {
     &[
         ProtocolMatrixCase {
             name: "v1-baseline",
             variant: ProtocolMatrixVariant::Baseline,
-            expected: MatrixExpectation::Accepted { revision: 1 },
-        },
+            expected: MatrixExpectation::Accepted { revision: 1 }},
         ProtocolMatrixCase {
             name: "v1-unknown-identity-field",
             variant: ProtocolMatrixVariant::UnknownIdentityField,
-            expected: MatrixExpectation::Accepted { revision: 1 },
-        },
+            expected: MatrixExpectation::Accepted { revision: 1 }},
         ProtocolMatrixCase {
             name: "v1-unknown-capabilities-field",
             variant: ProtocolMatrixVariant::UnknownCapabilitiesField,
-            expected: MatrixExpectation::Accepted { revision: 1 },
-        },
+            expected: MatrixExpectation::Accepted { revision: 1 }},
         ProtocolMatrixCase {
             name: "v1-credential-revision-two",
             variant: ProtocolMatrixVariant::CredentialRevisionTwo,
-            expected: MatrixExpectation::Accepted { revision: 2 },
-        },
+            expected: MatrixExpectation::Accepted { revision: 2 }},
         ProtocolMatrixCase {
             name: "unsupported-protocol",
             variant: ProtocolMatrixVariant::UnsupportedProtocol,
-            expected: MatrixExpectation::Rejected,
-        },
+            expected: MatrixExpectation::Rejected},
         ProtocolMatrixCase {
             name: "unsupported-identity-schema",
             variant: ProtocolMatrixVariant::UnsupportedIdentitySchema,
-            expected: MatrixExpectation::Rejected,
-        },
+            expected: MatrixExpectation::Rejected},
         ProtocolMatrixCase {
             name: "unsupported-capabilities-schema",
             variant: ProtocolMatrixVariant::UnsupportedCapabilitiesSchema,
-            expected: MatrixExpectation::Rejected,
-        },
+            expected: MatrixExpectation::Rejected},
         ProtocolMatrixCase {
             name: "endpoint-id-mismatch",
             variant: ProtocolMatrixVariant::EndpointIdMismatch,
-            expected: MatrixExpectation::Rejected,
-        },
+            expected: MatrixExpectation::Rejected},
         ProtocolMatrixCase {
             name: "capability-limits-mismatch",
             variant: ProtocolMatrixVariant::CapabilityLimitsMismatch,
-            expected: MatrixExpectation::Rejected,
-        },
+            expected: MatrixExpectation::Rejected},
         ProtocolMatrixCase {
             name: "zero-credential-revision",
             variant: ProtocolMatrixVariant::ZeroRevision,
-            expected: MatrixExpectation::Rejected,
-        },
-    ]
+            expected: MatrixExpectation::Rejected}]
 }
 
 #[test]
@@ -954,8 +933,7 @@ fn e2e_record_access_ingress_initial_404_cassette() -> TestResult {
         .map(|secret| IncidentSecretSlot {
             name: secret.slot.clone(),
             kind: secret.kind.clone(),
-            semantic_sha256: secret.semantic_sha256.clone(),
-        })
+            semantic_sha256: secret.semantic_sha256.clone()})
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -972,11 +950,9 @@ fn e2e_record_access_ingress_initial_404_cassette() -> TestResult {
             status: first.recorded_response.status,
             safe_error: "empty_router_http_404".to_owned(),
             response_fingerprint: first.recorded_response.fingerprint.clone(),
-            observed_jwks_requests,
-        },
+            observed_jwks_requests},
         exchanges,
-        envelope_sha256: String::new(),
-    };
+        envelope_sha256: String::new()};
     cassette.envelope_sha256 = incident_envelope_digest(&cassette)?;
     let restricted = temp
         .path()
@@ -1279,8 +1255,7 @@ fn check_incident_contract(
                 Ok(actual) if actual == expected => {}
                 _ => failures.push(format!(
                     "{label}: /v1/system body did not match zode.system.v1 server_only contract"
-                )),
-            }
+                ))}
         }
         ContractKind::SafeUnauthorized => check_safe_unauthorized(label, response, failures),
         ContractKind::NotFound => {}
@@ -1333,8 +1308,7 @@ fn check_safe_unauthorized(label: &str, response: &HttpResponse, failures: &mut 
                     "common_name",
                     "email",
                     "subject",
-                    "rsa",
-                ]
+                    "rsa"]
                 .iter()
                 .any(|detail| value.contains(detail))
             })
@@ -1371,8 +1345,7 @@ fn assert_response_secret_free(response: &[u8], secrets: &[SecretValue]) -> Test
     for marker in IDENTITY_MARKERS.iter().copied().chain([
         std::str::from_utf8(SUBJECT_KEY).unwrap_or(""),
         "MIIEpAIBAAKCAQEA",
-        "MIIEpQIBAAKCAQEA",
-    ]) {
+        "MIIEpQIBAAKCAQEA"]) {
         if !marker.is_empty()
             && response
                 .windows(marker.len())
@@ -1395,22 +1368,19 @@ fn assert_response_secret_free(response: &[u8], secrets: &[SecretValue]) -> Test
 }
 
 struct QuarantineCapture {
-    root: PathBuf,
-}
+    root: PathBuf}
 
 struct PublicArrivalGate {
     address: SocketAddr,
     base_url: String,
     state: Arc<(Mutex<PublicGateState>, Condvar)>,
     stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
-}
+    join: Option<JoinHandle<()>>}
 
 struct PublicGateState {
     arrived: usize,
     forwarded: usize,
-    released: bool,
-}
+    released: bool}
 
 impl PublicArrivalGate {
     fn start(upstream_base_url: &str, expected: usize) -> TestResult<Self> {
@@ -1429,8 +1399,7 @@ impl PublicArrivalGate {
             Mutex::new(PublicGateState {
                 arrived: 0,
                 forwarded: 0,
-                released: false,
-            }),
+                released: false}),
             Condvar::new(),
         ));
         let stop = Arc::new(AtomicBool::new(false));
@@ -1452,8 +1421,7 @@ impl PublicArrivalGate {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(POLL_INTERVAL);
                     }
-                    Err(_) => break,
-                }
+                    Err(_) => break}
             }
             for worker in workers {
                 let _ = worker.join();
@@ -1464,8 +1432,7 @@ impl PublicArrivalGate {
             base_url: format!("http://{address}"),
             state,
             stop,
-            join: Some(join),
-        })
+            join: Some(join)})
     }
 
     fn wait_for_arrivals(&self, expected: usize) -> TestResult<bool> {
@@ -1547,8 +1514,7 @@ struct CountingProxy {
     changed: Arc<(Mutex<()>, Condvar)>,
     protocol_matrix_variant: Arc<Mutex<Option<ProtocolMatrixVariant>>>,
     stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
-}
+    join: Option<JoinHandle<()>>}
 
 impl CountingProxy {
     fn start(upstream_base_url: &str) -> TestResult<Self> {
@@ -1599,8 +1565,7 @@ impl CountingProxy {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(POLL_INTERVAL);
                     }
-                    Err(_) => break,
-                }
+                    Err(_) => break}
             }
             for worker in workers {
                 let _ = worker.join();
@@ -1613,8 +1578,7 @@ impl CountingProxy {
             changed,
             protocol_matrix_variant,
             stop,
-            join: Some(join),
-        })
+            join: Some(join)})
     }
 
     fn start_protocol_matrix(upstream_base_url: &str) -> TestResult<Self> {
@@ -2141,31 +2105,27 @@ struct IncidentCase {
     method: &'static str,
     path: &'static str,
     contract: ContractKind,
-    concurrent_group: Option<&'static str>,
-}
+    concurrent_group: Option<&'static str>}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContractKind {
     System,
     SafeUnauthorized,
-    NotFound,
-}
+    NotFound}
 
 impl ContractKind {
     fn name(self) -> &'static str {
         match self {
             Self::System => "system",
             Self::SafeUnauthorized => "safe_unauthorized",
-            Self::NotFound => "not_found",
-        }
+            Self::NotFound => "not_found"}
     }
 
     fn status(self) -> u16 {
         match self {
             Self::System => 200,
             Self::SafeUnauthorized => 401,
-            Self::NotFound => 404,
-        }
+            Self::NotFound => 404}
     }
 }
 
@@ -2181,16 +2141,14 @@ struct IncidentCassette {
     secret_slots: Vec<IncidentSecretSlot>,
     first_observed_outcome: IncidentFailure,
     exchanges: Vec<IncidentExchange>,
-    envelope_sha256: String,
-}
+    envelope_sha256: String}
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, Ord, PartialEq, PartialOrd)]
 #[serde(deny_unknown_fields)]
 struct IncidentSecretSlot {
     name: String,
     kind: String,
-    semantic_sha256: String,
-}
+    semantic_sha256: String}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -2199,8 +2157,7 @@ struct IncidentFailure {
     status: u16,
     safe_error: String,
     response_fingerprint: String,
-    observed_jwks_requests: usize,
-}
+    observed_jwks_requests: usize}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -2211,8 +2168,7 @@ struct IncidentExchange {
     concurrent_group: Option<String>,
     request: IncidentRequest,
     recorded_response: IncidentResponse,
-    contract: IncidentContract,
-}
+    contract: IncidentContract}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -2224,8 +2180,7 @@ struct IncidentRequest {
     raw_body_hex: String,
     canonical_json: Option<Value>,
     body_sha256: String,
-    fingerprint: String,
-}
+    fingerprint: String}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -2236,34 +2191,29 @@ struct IncidentResponse {
     body_hex: String,
     body_sha256: String,
     outcome: String,
-    fingerprint: String,
-}
+    fingerprint: String}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct IncidentContract {
     status: u16,
-    kind: String,
-}
+    kind: String}
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct IncidentHeader {
     name: String,
-    value: String,
-}
+    value: String}
 
 struct RawHttpExchange {
     request: Vec<u8>,
-    response: Vec<u8>,
-}
+    response: Vec<u8>}
 
 struct RawRequestShape {
     method: String,
     path: String,
     headers: Vec<IncidentHeader>,
-    body: Vec<u8>,
-}
+    body: Vec<u8>}
 
 fn incident_cases() -> Vec<IncidentCase> {
     vec![
@@ -2272,268 +2222,229 @@ fn incident_cases() -> Vec<IncidentCase> {
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::System,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "service-valid",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::System,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "missing-assertion",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "duplicate-assertion",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "malformed-assertion",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "forged-signature",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "expired-beyond-skew",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "future-nbf-beyond-skew",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "wrong-issuer",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "missing-issuer",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "non-string-issuer",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "wrong-audience",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "missing-audience",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "non-string-audience",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "unsupported-algorithm",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "missing-kid",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "missing-type",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "wrong-type",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "missing-exp",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "non-numeric-exp",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "non-numeric-nbf",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "missing-subject",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "ambiguous-actor",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "empty-actor",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "non-string-subject",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "custom-identity-headers",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "unknown-kid-singleflight",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::System,
-            concurrent_group: Some("unknown-kid-singleflight"),
-        },
+            concurrent_group: Some("unknown-kid-singleflight")},
         IncidentCase {
             slot: "unknown-kid-fail-closed",
             method: "GET",
             path: "/v1/system",
             contract: ContractKind::SafeUnauthorized,
-            concurrent_group: Some("unknown-kid-fail-closed"),
-        },
+            concurrent_group: Some("unknown-kid-fail-closed")},
         IncidentCase {
             slot: "no-user-route-login",
             method: "GET",
             path: "/v1/login",
             contract: ContractKind::NotFound,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "no-user-route-logout",
             method: "POST",
             path: "/v1/logout",
             contract: ContractKind::NotFound,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "no-user-route-users",
             method: "GET",
             path: "/v1/users",
             contract: ContractKind::NotFound,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "no-user-route-workspaces",
             method: "GET",
             path: "/v1/workspaces",
             contract: ContractKind::NotFound,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "no-user-route-roles",
             method: "GET",
             path: "/v1/roles",
             contract: ContractKind::NotFound,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "no-user-route-grants",
             method: "GET",
             path: "/v1/grants",
             contract: ContractKind::NotFound,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "no-user-route-current-user",
             method: "GET",
             path: "/v1/current-user",
             contract: ContractKind::NotFound,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "no-user-route-principal",
             method: "GET",
             path: "/v1/principal",
             contract: ContractKind::NotFound,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "no-user-route-invite",
             method: "POST",
             path: "/v1/invite",
             contract: ContractKind::NotFound,
-            concurrent_group: None,
-        },
+            concurrent_group: None},
         IncidentCase {
             slot: "no-user-route-account",
             method: "GET",
             path: "/v1/account",
             contract: ContractKind::NotFound,
-            concurrent_group: None,
-        },
-    ]
+            concurrent_group: None}]
 }
 
 fn incident_cassette_path() -> PathBuf {
@@ -2770,16 +2681,14 @@ fn claim_object(value: &mut Value) -> TestResult<&mut Map<String, Value>> {
 struct RequestMaterial {
     wire_headers: Vec<IncidentHeader>,
     semantic_headers: Vec<IncidentHeader>,
-    secret_values: Vec<SecretValue>,
-}
+    secret_values: Vec<SecretValue>}
 
 #[derive(Clone)]
 struct SecretValue {
     slot: String,
     value: String,
     kind: String,
-    semantic_sha256: String,
-}
+    semantic_sha256: String}
 
 fn request_material_for_case(
     case: IncidentCase,
@@ -2829,8 +2738,7 @@ fn request_material_for_case(
                     "x-zode-subject",
                     "SLOT_CUSTOM_ZODE_SUBJECT",
                     "custom-header-subject-marker",
-                ),
-            ] {
+                )] {
                 add_secret_header(
                     &mut wire_headers,
                     &mut semantic_headers,
@@ -2864,8 +2772,7 @@ fn request_material_for_case(
     Ok(RequestMaterial {
         wire_headers,
         semantic_headers,
-        secret_values,
-    })
+        secret_values})
 }
 
 fn add_secret_header(
@@ -2878,18 +2785,15 @@ fn add_secret_header(
 ) {
     wire_headers.push(IncidentHeader {
         name: name.to_owned(),
-        value: value.clone(),
-    });
+        value: value.clone()});
     semantic_headers.push(IncidentHeader {
         name: name.to_owned(),
-        value: format!("{{{{{slot}}}}}"),
-    });
+        value: format!("{{{{{slot}}}}}")});
     secret_values.push(SecretValue {
         slot: slot.to_owned(),
         value,
         kind: String::new(),
-        semantic_sha256: String::new(),
-    });
+        semantic_sha256: String::new()});
 }
 
 fn slot_suffix(value: &str) -> String {
@@ -2914,8 +2818,7 @@ fn secret_slot_semantics(
     if slot.starts_with("SLOT_CUSTOM_") {
         let semantic = json!({
             "kind": "custom_identity_header",
-            "slot": slot,
-        });
+            "slot": slot});
         return Ok((
             "custom_identity_header".to_owned(),
             sha256_hex(&serde_json::to_vec(&semantic)?),
@@ -2924,8 +2827,7 @@ fn secret_slot_semantics(
     if value == "not-a-jwt" {
         let semantic = json!({
             "kind": "malformed_access_assertion",
-            "shape": "not_jwt",
-        });
+            "shape": "not_jwt"});
         return Ok((
             "access_assertion".to_owned(),
             sha256_hex(&serde_json::to_vec(&semantic)?),
@@ -2954,8 +2856,7 @@ fn secret_slot_semantics(
         "header": header,
         "claims": claims,
         "signature_role": access_signature_role(value),
-        "signature_present": !signature.is_empty(),
-    });
+        "signature_present": !signature.is_empty()});
     Ok((
         "access_assertion".to_owned(),
         sha256_hex(&serde_json::to_vec(&semantic)?),
@@ -3026,8 +2927,7 @@ fn sanitize_time_claim(value: &mut Value, claim: &str, now: i64) {
         "exp" => "SLOT_VALID_FUTURE_EXP",
         "nbf" if number > now + 600 => "SLOT_FUTURE_NBF_BEYOND_SKEW",
         "nbf" => "SLOT_PAST_NBF",
-        _ => "SLOT_TIME_CLAIM",
-    };
+        _ => "SLOT_TIME_CLAIM"};
     *value = Value::String(format!("{{{{{classification}}}}}"));
 }
 
@@ -3077,8 +2977,7 @@ fn base64url_decode(value: &str) -> TestResult<Vec<u8>> {
             b'0'..=b'9' => byte - b'0' + 52,
             b'-' => 62,
             b'_' => 63,
-            _ => return Err(io::Error::other("Access assertion used invalid base64url").into()),
-        };
+            _ => return Err(io::Error::other("Access assertion used invalid base64url").into())};
         accumulator = (accumulator << 6) | u32::from(digit);
         bits += 6;
         if bits >= 8 {
@@ -3130,9 +3029,7 @@ fn write_server_config_with_ui(
             "audiences": [AUDIENCE],
             "jwks_url": fixture.jwks_url(),
             "subject_key_file": subject_key_file,
-            "subject_key_version": 1,
-        },
-    });
+            "subject_key_version": 1}});
     let path = root.join("server.json");
     fs::write(&path, serde_json::to_vec(&config)?)?;
     Ok(path)
@@ -3258,12 +3155,7 @@ fn write_catalog_endpoint_config(root: &Path) -> TestResult<PathBuf> {
             "kind": "files",
             "directory": "blobs"
         },
-        "controller_auth": [{
-            "authority_id": CATALOG_CONTROLLER_AUTHORITY,
-            "revision": 1,
-            "kind": "bearer_secret_file",
-            "secret_file": "controller.secret"
-        }],
+
         "runtime": {
             "tool_foreground_ms": 100,
             "snapshot_every_events": 8,
@@ -3293,13 +3185,10 @@ fn catalog_endpoint_identity(base_url: &str) -> TestResult<Value> {
         &[
             IncidentHeader {
                 name: "Authorization".to_owned(),
-                value: format!("Bearer {CATALOG_CONTROLLER_SECRET}"),
-            },
+                value: format!("Bearer {CATALOG_CONTROLLER_SECRET}")},
             IncidentHeader {
                 name: "Zode-Subject".to_owned(),
-                value: CATALOG_DIRECT_SUBJECT.to_owned(),
-            },
-        ],
+                value: CATALOG_DIRECT_SUBJECT.to_owned()}],
         &[],
     )?;
     assert_raw_markers_absent(
@@ -3317,7 +3206,7 @@ fn catalog_endpoint_identity(base_url: &str) -> TestResult<Value> {
     let identity: Value = serde_json::from_slice(&response.body)?;
     if identity["schema"] != "zode.identity.v1"
         || identity["protocol_version"] != "zode.endpoint.v1"
-        || identity["authority_id"] != CATALOG_CONTROLLER_AUTHORITY
+        || identity["authority_id"] != "local"
         || identity["revision"] != 1
         || identity["endpoint_id"].as_str().is_none_or(str::is_empty)
     {
@@ -3337,19 +3226,16 @@ fn catalog_request(
 ) -> TestResult<HttpResponse> {
     let mut headers = vec![IncidentHeader {
         name: "Cf-Access-Jwt-Assertion".to_owned(),
-        value: assertion.to_owned(),
-    }];
+        value: assertion.to_owned()}];
     if let Some(key) = idempotency_key {
         headers.push(IncidentHeader {
             name: "Idempotency-Key".to_owned(),
-            value: key.to_owned(),
-        });
+            value: key.to_owned()});
     }
     if body.is_some() {
         headers.push(IncidentHeader {
             name: "Content-Type".to_owned(),
-            value: "application/json".to_owned(),
-        });
+            value: "application/json".to_owned()});
     }
     let raw = raw_http_request_with_body(base_url, method, path, &headers, body.unwrap_or(&[]))?;
     assert_raw_markers_absent(&raw.response, forbidden)?;
@@ -3417,8 +3303,7 @@ fn assert_endpoint_list(
         Some(_) => Err(io::Error::other(format!(
             "{label} did not expose exactly one catalog record"
         ))
-        .into()),
-    }
+        .into())}
 }
 
 fn assert_endpoint_record(label: &str, record: &Value, endpoint_id: &str) -> TestResult<()> {
@@ -3437,7 +3322,7 @@ fn assert_endpoint_record_with_revision(
         || record["kind"] != "remote"
         || record["status"] != "online"
         || record["disabled"] != false
-        || record["controller_authority_id"] != CATALOG_CONTROLLER_AUTHORITY
+        || record["controller_authority_id"] != "local"
         || record["controller_credential_revision"] != expected_revision
         || record["capabilities"]["protocol_version"] != "zode.endpoint.v1"
         || !record["capabilities"]["providers"]
@@ -3513,8 +3398,7 @@ fn assert_catalog_capture_safe(
             ("catalog Server stdout", server.stdout.as_slice()),
             ("catalog Server stderr", server.stderr.as_slice()),
             ("catalog Endpoint stdout", endpoint.stdout.as_slice()),
-            ("catalog Endpoint stderr", endpoint.stderr.as_slice()),
-        ] {
+            ("catalog Endpoint stderr", endpoint.stderr.as_slice())] {
             scan_dynamic_bytes(label, bytes, assertion, &mut failures);
         }
         scan_tree_dynamic(server_root, assertion, &mut failures)?;
@@ -3528,8 +3412,7 @@ fn assert_catalog_capture_safe(
         ("catalog Server stdout", server.stdout.as_slice()),
         ("catalog Server stderr", server.stderr.as_slice()),
         ("catalog Endpoint stdout", endpoint.stdout.as_slice()),
-        ("catalog Endpoint stderr", endpoint.stderr.as_slice()),
-    ] {
+        ("catalog Endpoint stderr", endpoint.stderr.as_slice())] {
         scan_dynamic_bytes(label, bytes, CATALOG_CONTROLLER_SECRET, &mut failures);
     }
     for entry in fs::read_dir(server_root)? {
@@ -3704,16 +3587,14 @@ fn raw_http_request_with_body(
     stream.read_to_end(&mut bytes)?;
     Ok(RawHttpExchange {
         request: request_bytes,
-        response: bytes,
-    })
+        response: bytes})
 }
 
 #[derive(Debug)]
 struct HttpResponse {
     status: u16,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
+    body: Vec<u8>}
 
 fn parse_http_response(bytes: &[u8]) -> TestResult<HttpResponse> {
     let header_end = bytes
@@ -3755,8 +3636,7 @@ fn parse_http_response(bytes: &[u8]) -> TestResult<HttpResponse> {
     Ok(HttpResponse {
         status,
         headers,
-        body,
-    })
+        body})
 }
 
 fn sanitize_exchange(
@@ -3780,9 +3660,7 @@ fn sanitize_exchange(
         recorded_response: response,
         contract: IncidentContract {
             status: case.contract.status(),
-            kind: case.contract.name().to_owned(),
-        },
-    })
+            kind: case.contract.name().to_owned()}})
 }
 
 fn parse_raw_request(bytes: &[u8]) -> TestResult<RawRequestShape> {
@@ -3817,15 +3695,13 @@ fn parse_raw_request(bytes: &[u8]) -> TestResult<RawRequestShape> {
         let value = value.trim();
         headers.push(IncidentHeader {
             name,
-            value: value.to_owned(),
-        });
+            value: value.to_owned()});
     }
     Ok(RawRequestShape {
         method: method.to_owned(),
         path: path.to_owned(),
         headers,
-        body: bytes[header_end + 4..].to_vec(),
-    })
+        body: bytes[header_end + 4..].to_vec()})
 }
 
 fn canonicalize_captured_request(
@@ -3857,8 +3733,7 @@ fn canonicalize_captured_request(
                 })?;
             Ok(IncidentHeader {
                 name: header.name.clone(),
-                value: format!("{{{{{}}}}}", secret.slot),
-            })
+                value: format!("{{{{{}}}}}", secret.slot)})
         })
         .collect::<TestResult<Vec<_>>>()?;
     if semantic_headers != material.semantic_headers {
@@ -3893,8 +3768,7 @@ fn make_incident_request(
         raw_body_hex: hex_encode(&body),
         canonical_json,
         body_sha256: sha256_hex(&body),
-        fingerprint: String::new(),
-    };
+        fingerprint: String::new()};
     request.fingerprint = incident_request_fingerprint(&request)?;
     Ok(request)
 }
@@ -3906,8 +3780,7 @@ fn incident_response(response: &HttpResponse) -> TestResult<IncidentResponse> {
         .filter(|(name, _)| matches!(name.as_str(), "content-type" | "cache-control" | "vary"))
         .map(|(name, value)| IncidentHeader {
             name: name.clone(),
-            value: value.clone(),
-        })
+            value: value.clone()})
         .collect::<Vec<_>>();
     let mut recorded = IncidentResponse {
         status: response.status,
@@ -3916,8 +3789,7 @@ fn incident_response(response: &HttpResponse) -> TestResult<IncidentResponse> {
         body_hex: hex_encode(&response.body),
         body_sha256: sha256_hex(&response.body),
         outcome: "complete".to_owned(),
-        fingerprint: String::new(),
-    };
+        fingerprint: String::new()};
     recorded.fingerprint = incident_response_fingerprint(&recorded)?;
     Ok(recorded)
 }
@@ -3930,9 +3802,7 @@ fn incident_phase(case: IncidentCase) -> &'static str {
         None => match case.contract {
             ContractKind::System => "management_admission",
             ContractKind::SafeUnauthorized => "ingress_rejection",
-            ContractKind::NotFound => "absence_of_local_identity_routes",
-        },
-    }
+            ContractKind::NotFound => "absence_of_local_identity_routes"}}
 }
 
 fn expanded_incident_cases() -> Vec<IncidentCase> {
@@ -4051,10 +3921,8 @@ fn validate_recorded_headers(
         "custom-identity-headers" => &[
             "cf-authorization",
             "cf-access-authenticated-user-email",
-            "x-zode-subject",
-        ],
-        _ => &["cf-access-jwt-assertion"],
-    };
+            "x-zode-subject"],
+        _ => &["cf-access-jwt-assertion"]};
     if headers.len() != expected_names.len()
         || headers
             .iter()
@@ -4125,8 +3993,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 fn sha256_hex(bytes: &[u8]) -> String {
     const INITIAL: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
+        0x5be0cd19];
     const ROUND: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -4137,8 +4004,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
         0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
         0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
+        0xc67178f2];
 
     let bit_length = (bytes.len() as u64).wrapping_mul(8);
     let mut padded = bytes.to_vec();
@@ -4157,8 +4023,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
                 chunk[offset],
                 chunk[offset + 1],
                 chunk[offset + 2],
-                chunk[offset + 3],
-            ]);
+                chunk[offset + 3]]);
         }
         for index in 16..64 {
             let s0 = words[index - 15].rotate_right(7)
@@ -4356,8 +4221,7 @@ fn scan_fixture_bytes(bytes: &[u8], dynamic_markers: &[String]) -> TestResult<()
         "forged-human",
         "rotated-human",
         "expired-human",
-        "future-nbf-human",
-    ];
+        "future-nbf-human"];
     if static_markers.iter().any(|marker| {
         bytes
             .windows(marker.len())
@@ -4489,12 +4353,10 @@ fn scan_static_secret_material(
     let markers = [
         SUBJECT_KEY.as_slice(),
         b"MIIEpAIBAAKCAQEA".as_slice(),
-        b"MIIEpQIBAAKCAQEA".as_slice(),
-    ];
+        b"MIIEpQIBAAKCAQEA".as_slice()];
     for (label, bytes) in [
         ("Server stdout", capture.stdout.as_slice()),
-        ("Server stderr", capture.stderr.as_slice()),
-    ] {
+        ("Server stderr", capture.stderr.as_slice())] {
         if markers
             .iter()
             .any(|marker| bytes.windows(marker.len()).any(|window| window == *marker))
@@ -4538,16 +4400,14 @@ struct JwksFixture {
     requests: Arc<AtomicUsize>,
     response_gate: Arc<(Mutex<bool>, Condvar)>,
     stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
-}
+    join: Option<JoinHandle<()>>}
 
 #[derive(Clone)]
 struct JwksHttpState {
     rotated: Arc<AtomicBool>,
     failure: Arc<AtomicBool>,
     requests: Arc<AtomicUsize>,
-    response_gate: Arc<(Mutex<bool>, Condvar)>,
-}
+    response_gate: Arc<(Mutex<bool>, Condvar)>}
 
 impl JwksFixture {
     fn start() -> TestResult<Self> {
@@ -4593,8 +4453,7 @@ impl JwksFixture {
                             rotated: thread_rotated,
                             failure: thread_failure,
                             requests: thread_requests,
-                            response_gate: thread_response_gate,
-                        });
+                            response_gate: thread_response_gate});
                 if ready_tx.send(Ok(())).is_err() {
                     return;
                 }
@@ -4628,8 +4487,7 @@ impl JwksFixture {
             requests,
             response_gate,
             stop,
-            join: Some(join),
-        })
+            join: Some(join)})
     }
 
     fn issuer(&self) -> String {
@@ -4762,13 +4620,11 @@ struct ServerProcess {
     base_url: String,
     stdout: Arc<Mutex<Vec<u8>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
-    readers: Vec<JoinHandle<()>>,
-}
+    readers: Vec<JoinHandle<()>>}
 
 struct ServerCapture {
     stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
+    stderr: Vec<u8>}
 
 impl ServerProcess {
     fn start(config_path: &Path) -> TestResult<Self> {
@@ -4827,8 +4683,7 @@ impl ServerProcess {
                             let _ = ready_tx.send(address.trim().to_owned());
                         }
                     }
-                    Err(_) => break,
-                }
+                    Err(_) => break}
             }
         });
         let stderr_store = Arc::clone(&stderr);
@@ -4858,8 +4713,7 @@ impl ServerProcess {
             base_url,
             stdout,
             stderr,
-            readers: vec![stdout_thread, stderr_thread],
-        })
+            readers: vec![stdout_thread, stderr_thread]})
     }
 
     fn stop(&mut self) -> TestResult<ServerCapture> {
@@ -4879,8 +4733,7 @@ impl ServerProcess {
                 .stderr
                 .lock()
                 .map_err(|_| "stderr lock poisoned")?
-                .clone(),
-        })
+                .clone()})
     }
 }
 

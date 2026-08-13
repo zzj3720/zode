@@ -6,8 +6,7 @@ import {
   type IncomingHttpHeaders,
   type IncomingMessage,
   type Server as HttpServer,
-  type ServerResponse,
-} from 'node:http';
+  type ServerResponse} from 'node:http';
 import { readFileSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -141,8 +140,7 @@ const OAUTH_PROVIDER_FIXTURE = resolve(
 );
 const OAUTH_SECRET_MARKERS = [
   'fixture-access-token-oauth-1',
-  'fixture-refresh-token-oauth-1',
-] as const;
+  'fixture-refresh-token-oauth-1'] as const;
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -329,10 +327,7 @@ class AccessFixture {
             ...this.publicKey.export({ format: 'jwk' }),
             kid: this.kid,
             use: 'sig',
-            alg: 'RS256',
-          },
-        ],
-      }),
+            alg: 'RS256'}]}),
     );
   });
   baseUrl = '';
@@ -352,8 +347,7 @@ class AccessFixture {
         type: 'app',
         iat: now,
         nbf: now - 1,
-        exp: now + 300,
-      }),
+        exp: now + 300}),
     );
     const signingInput = `${header}.${payload}`;
     const signature = sign('RSA-SHA256', Buffer.from(signingInput), this.privateKey);
@@ -404,8 +398,7 @@ class AccessEdge {
         port: target.port,
         path: `${target.pathname}${target.search}`,
         method: request.method,
-        headers,
-      },
+        headers},
       (upstreamResponse: IncomingMessage) => {
         response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
         upstreamResponse.pipe(response);
@@ -471,8 +464,7 @@ class LlmRecorder {
       path: request.url ?? '/',
       body: this.redact(body.toString('utf8')),
       headers,
-      receivedAtMs: Date.now(),
-    });
+      receivedAtMs: Date.now()});
     response.statusCode = 500;
     response.setHeader('content-type', 'application/json');
     response.end(JSON.stringify({ error: { code: 'fixture_provider_not_expected', retryable: false } }));
@@ -503,8 +495,7 @@ class LlmRecorder {
       owning_e2e: this.owner,
       boundary: 'provider_model',
       secret_slots: this.secretMarkers.map((_, index) => `SLOT_SECRET_${index + 1}`),
-      exchanges: this.exchanges.map((exchange, sequence) => ({ sequence, ...exchange, body_sha256: sha256(exchange.body) })),
-    });
+      exchanges: this.exchanges.map((exchange, sequence) => ({ sequence, ...exchange, body_sha256: sha256(exchange.body) }))});
     this.quarantineFlushed = true;
     return path;
   }
@@ -543,8 +534,7 @@ async function spawnReady(
 ): Promise<RunningProcess> {
   const child = spawn(binary, args, {
     env: { ...process.env, ...environment },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+    stdio: ['ignore', 'pipe', 'pipe']});
   let output = '';
   let readyUrl: string | null = null;
   let readyResolve: ((url: string) => void) | null = null;
@@ -585,11 +575,9 @@ async function spawnReady(
           exit,
           delay(CHILD_STOP_TIMEOUT_MS).then(() => {
             if (child.exitCode === null) child.kill('SIGKILL');
-          }),
-        ]);
+          })]);
         await exit;
-      },
-    };
+      }};
   } catch (error) {
     if (child.exitCode === null) child.kill('SIGKILL');
     await exit;
@@ -704,8 +692,7 @@ class EndpointProxy {
       const upstream = await fetch(`${this.targetUrl}${exchange.path}`, {
         method: exchange.method,
         headers: exchange.headers,
-        body: exchange.body.length === 0 ? undefined : new Uint8Array(exchange.body),
-      });
+        body: exchange.body.length === 0 ? undefined : new Uint8Array(exchange.body)});
       this.responses.push({ method: exchange.method, path: exchange.path, status: upstream.status });
       exchange.response.statusCode = upstream.status;
       upstream.headers.forEach((value, key) => exchange.response.setHeader(key, value));
@@ -787,8 +774,7 @@ function resolvedProbeContract(endpointId: string, status: number): RouteContrac
   return {
     method: seamMatrix.endpointCatalog.probe.method,
     path: seamMatrix.endpointCatalog.probe.path.replace('{endpoint_id}', endpointId),
-    status,
-  };
+    status};
 }
 
 async function expectEndpointCatalogBarrier(proxy: EndpointProxy, label: string): Promise<void> {
@@ -823,23 +809,17 @@ async function writeEndpointConfig(
     runtime_store: { kind: 'sqlite', path: database },
     credential_replica_store: { kind: 'files', directory: 'credentials' },
     blob_store: { kind: 'files', directory: 'blobs' },
-    controller_auth: [
-      { authority_id: authority, revision: 1, kind: 'bearer_secret_file', secret_file: 'controller.secret' },
-    ],
     runtime: {
       tool_foreground_ms: 100,
       model_step_max_attempts: 1,
       model_retry_base_ms: 1,
       model_retry_max_ms: 10,
-      snapshot_every_events: 1,
-    },
+      snapshot_every_events: 1},
     provider_execution: {
       adapter_kinds: ['openai_compatible'],
-      allowed_base_url_origins: [providerOrigin],
-    },
+      allowed_base_url_origins: [providerOrigin]},
     callback: { allowed_public_origins: [providerOrigin] },
-    tools: [],
-  });
+    tools: []});
   return configPath;
 }
 
@@ -873,8 +853,7 @@ async function writeServerConfig(
       audiences: [TEST_AUDIENCE],
       jwks_url: `${access.baseUrl}/jwks`,
       subject_key_file: subjectKey,
-      subject_key_version: 1,
-    },
+      subject_key_version: 1},
     provider_auth_adapters: [
       {
         provider: scenario.provider,
@@ -884,10 +863,7 @@ async function writeServerConfig(
         client_id: 'zode-provider-profiles-e2e',
         client_secret_file: null,
         scopes: ['models.execute'],
-        refresh_recovery: 'same_operation_id_idempotent',
-      },
-    ],
-  });
+        refresh_recovery: 'same_operation_id_idempotent'}]});
   return configPath;
 }
 
@@ -952,8 +928,7 @@ async function assertBootstrapRouteIsRepaired(
   expect(request.method).toBe(route.method);
   expect(request.path).toBe(route.path);
   const response = await page.goto(`${environment.accessEdges[0].baseUrl}${String(request.path)}`, {
-    waitUntil: 'domcontentloaded',
-  });
+    waitUntil: 'domcontentloaded'});
   expect(response?.request().method()).toBe(route.method);
   expect(response ? new URL(response.url()).pathname : '').toBe(route.path);
   const body = await response?.text();
@@ -976,14 +951,12 @@ async function replayFirstFailureCassette(
   const request = exchange.request as JsonObject;
   const expected = exchange.recorded_response as JsonObject;
   const response = await page.goto(`${environment.accessEdges[0].baseUrl}${String(request.path)}`, {
-    waitUntil: 'commit',
-  });
+    waitUntil: 'commit'});
   const body = response ? await response.text() : '';
   const reproduced = { status: response?.status() ?? 0, body: Buffer.from(body).toString('hex') };
   const expectedPublicExchange = {
     status: expected.status,
-    body: expected.body_hex,
-  };
+    body: expected.body_hex};
   if (JSON.stringify(reproduced) === JSON.stringify(expectedPublicExchange)) {
     throw new ShallowNonEvidence404('GET /v1/providers cassette replay');
   }
@@ -1042,8 +1015,7 @@ class ProviderDistributionEnvironment {
     );
     const childEnvironment = {
       ZODE_OAUTH_FIXTURE_ORIGIN: oauthProvider.origin,
-      ZODE_WEB_E2E_OAUTH_FIXTURE_ORIGIN: oauthProvider.origin,
-    };
+      ZODE_WEB_E2E_OAUTH_FIXTURE_ORIGIN: oauthProvider.origin};
     try {
       for (const [index, controlSecret] of endpointControlSecrets.entries()) {
         const endpointRoot = join(root, `endpoint-${index + 1}`);
@@ -1176,8 +1148,7 @@ class SecretSurfaceGuard {
       indexedDbNames:
         'databases' in indexedDB
           ? (await indexedDB.databases()).map((database) => database.name ?? '')
-          : [],
-    }));
+          : []}));
     const allCookies = JSON.stringify(await this.context.cookies());
     const browserUrl = page.url();
     const storageText = `${JSON.stringify(storage)}${allCookies}`;
@@ -1224,8 +1195,7 @@ function profileCard(page: Page, label: string): Locator {
 
 function resourceArticle(page: Page, heading: string): Locator {
   return page.getByRole('article').filter({
-    has: page.getByRole('heading', { name: heading, exact: true }),
-  });
+    has: page.getByRole('heading', { name: heading, exact: true })});
 }
 
 function distributionRow(card: Locator, endpointLabel: string): Locator {
@@ -1279,8 +1249,7 @@ async function assertSharedMultiProfileView(page: Page, profiles: ProfileResourc
   }
 
   const providerCards = page.getByRole('article', {
-    name: new RegExp(escapeRegex(scenario.provider)),
-  });
+    name: new RegExp(escapeRegex(scenario.provider))});
   await expect(providerCards).toHaveCount(1);
   await expect(providerCards).toContainText(scenario.model);
 
@@ -1386,8 +1355,7 @@ async function addRemoteEndpoint(
   await expectEndpointCatalogBarrier(proxy, label);
   await expect(dialog).toBeHidden();
   const endpoint = page.getByRole('article').filter({
-    has: page.getByRole('heading', { name: label, exact: true }),
-  });
+    has: page.getByRole('heading', { name: label, exact: true })});
   await expect(endpoint).toContainText(/online|ready/i);
   return String(responseBody.endpoint_id);
 }
@@ -1396,8 +1364,7 @@ async function configureProvider(page: Page, recorderBaseUrl: string): Promise<v
   await openProviders(page);
   await page.getByRole('button', { name: 'Configure provider' }).click();
   const editor = page.locator('form').filter({
-    has: page.getByRole('heading', { name: 'Configure provider', exact: true }),
-  });
+    has: page.getByRole('heading', { name: 'Configure provider', exact: true })});
   await editor.getByLabel(/^(?:Provider name|Provider ID)$/).fill(scenario.provider);
   const providerKind = editor.getByLabel('Provider kind');
   if (await providerKind.count()) await providerKind.selectOption('openai_compatible');
@@ -1449,10 +1416,8 @@ async function updateProviderDescriptorThroughPublicApi(
         headers: {
           accept: 'application/json',
           'content-type': 'application/json',
-          'idempotency-key': `put-provider-${crypto.randomUUID()}`,
-        },
-        body: JSON.stringify(body),
-      });
+          'idempotency-key': `put-provider-${crypto.randomUUID()}`},
+        body: JSON.stringify(body)});
       return { status: response.status, body: await response.json() as JsonObject };
     },
     {
@@ -1461,9 +1426,7 @@ async function updateProviderDescriptorThroughPublicApi(
         kind: 'openai_compatible',
         base_url: `${recorderBaseUrl}/v1`,
         models: [model],
-        options: {},
-      },
-    },
+        options: {}}},
   );
   expect(result.status, 'provider descriptor revision 2 status').toBe(200);
   expect(result.body.provider).toBe(scenario.provider);
@@ -1543,8 +1506,7 @@ async function installFirstSessionCreateResponseDrop(
       sessionId,
       profileId,
       minimumAuthRevision,
-      descriptor: cloneJsonObject(descriptor),
-    });
+      descriptor: cloneJsonObject(descriptor)});
     if (first) {
       first = false;
       await route.abort('connectionreset');
@@ -1909,8 +1871,7 @@ test.describe('provider profile distribution', () => {
   test('e2e_provider_profiles_two_profiles_same_provider_have_explicit_default_and_distinct_endpoint_sharing', async ({
     browser,
     context,
-    page,
-  }, testInfo) => {
+    page}, testInfo) => {
     const apiKeyA = `web-e2e-api-key-a-${randomUUID()}`;
     const controllerA = `web-e2e-controller-a-${randomUUID()}`;
     const controllerB = `web-e2e-controller-b-${randomUUID()}`;
@@ -1984,8 +1945,7 @@ test.describe('provider profile distribution', () => {
       await gotoProvidersWithBootstrap(actorB.page, environment.accessEdges[1].baseUrl, true);
       await assertSharedMultiProfileView(actorB.page, [
         profileOnPage(actorB.page, profileA, scenario.profiles[0].label),
-        profileOnPage(actorB.page, profileB, scenario.profiles[1].label),
-      ]);
+        profileOnPage(actorB.page, profileB, scenario.profiles[1].label)]);
       await openEndpoints(actorB.page);
       await expect(
         actorB.page.getByRole('article', { name: new RegExp(escapeRegex(scenario.profiles[0].endpointLabel)) }),
@@ -2006,8 +1966,7 @@ test.describe('provider profile distribution', () => {
 
   test('e2e_provider_profiles_distribution_reconciles_stale_unreachable_and_removed_with_safe_action_gates', async ({
     context,
-    page,
-  }, testInfo) => {
+    page}, testInfo) => {
     const apiKeyA = `web-e2e-api-key-a-${randomUUID()}`;
     const rotatedApiKeyA = `web-e2e-api-key-a-rotated-${randomUUID()}`;
     const controllerA = `web-e2e-controller-a-${randomUUID()}`;
@@ -2074,8 +2033,7 @@ test.describe('provider profile distribution', () => {
       );
       await writeFile(orphanSecretPath, 'test-owned-unreferenced-provider-secret', {
         flag: 'wx',
-        mode: 0o600,
-      });
+        mode: 0o600});
       environment.endpointProxies[0].holdReplicaWrites = true;
       await rotateApiKey(page, profileA, rotatedApiKeyA, environment.endpointProxies[0]);
       await expect
@@ -2158,8 +2116,7 @@ test.describe('provider profile distribution', () => {
   test('e2e_browser_first_run_freezes_profile_descriptor_and_waits_for_replica_ready', async ({
     browser,
     context,
-    page,
-  }, testInfo) => {
+    page}, testInfo) => {
     expect(testInfo.title).toBe(FIRST_FAILURE_OWNER);
     const cassette = loadFirstFailureCassette();
     const apiKeyA = `web-e2e-api-key-a-${randomUUID()}`;
@@ -2318,8 +2275,7 @@ test.describe('provider profile distribution', () => {
 
   test('e2e_browser_profile_create_remains_accepted_while_replica_distribution_is_pending', async ({
     context,
-    page,
-  }, testInfo) => {
+    page}, testInfo) => {
     const apiKey = `web-e2e-pending-profile-${randomUUID()}`;
     const controller = `web-e2e-pending-controller-${randomUUID()}`;
     const environment = await ProviderDistributionEnvironment.start(
@@ -2377,8 +2333,7 @@ test.describe('provider profile distribution', () => {
 
   test('e2e_provider_profiles_secret_markers_never_enter_dom_accessibility_storage_url_console_or_download', async ({
     context,
-    page,
-  }, testInfo) => {
+    page}, testInfo) => {
     const apiKey = `web-e2e-secret-${randomUUID()}`;
     const controllerSecret = `web-e2e-control-secret-${randomUUID()}`;
     const environment = await ProviderDistributionEnvironment.start(

@@ -4,7 +4,7 @@ Status: authoritative system boundary. `docs/design.md` defines the Endpoint
 runtime, `docs/http-api.md` defines the Endpoint protocol,
 `docs/server-api.md` defines the management Server and UI-facing protocol, and
 `docs/auth-replication.md` defines credential distribution. `docs/access.md`
-defines Cloudflare Access ingress and actor isolation. The Server's
+defines Cloudflare Access ingress. The Server's
 cross-version Endpoint admission matrix is frozen in
 [`docs/protocol-compatibility.md`](protocol-compatibility.md).
 
@@ -49,8 +49,10 @@ flowchart LR
 
 ### Endpoint is passive with respect to Server
 
-Endpoint exposes an authenticated, versioned HTTP command/query API and SSE
-event streams. Server initiates every connection to Endpoint.
+Endpoint exposes a versioned HTTP command/query API and SSE event streams.
+It does not authenticate callers. Trust is the listen scope: loopback, a unix
+socket, or an operator-added network layer in front of a private address.
+Server initiates every connection to Endpoint.
 
 Endpoint must not:
 
@@ -104,7 +106,7 @@ does not require a user to repeat non-secret provider configuration on every
 device. Server includes a versioned, credential-free execution descriptor in
 the session's concrete model selection; Endpoint validates it against local
 outbound policy and persists it as session selection state. Standalone
-controllers use the same descriptor.
+callers use the same descriptor.
 
 ### Session execution has one authority
 
@@ -119,13 +121,14 @@ as an opaque path value while proxying a request. The public identity is the
 pair `(endpoint_id, session_id)`: `endpoint_id` supplies the namespace, so no
 second global ID or global allocation service is needed.
 
-Session authorization is also Endpoint-enforced without importing management
-identity models. An authenticated controller supplies a stable opaque subject
-under its controller authority. Endpoint records that subject at create and requires the
-same authority/subject for list, read, command, and SSE access. Server derives
-the subject from the validated Cloudflare Access actor and forwards it
-ephemerally; it stores no session ACL or mapping. Zode has no local user,
-workspace, membership, role, grant, login, or login-session resource.
+Endpoint has one session namespace per process. It does not authenticate a
+controller, accept `Zode-Subject`, or enforce per-caller session ownership.
+Whoever can reach the listen address can list, read, command, and stream every
+session on that Endpoint. Server still stores no session ACL or mapping. Zode
+has no local user, workspace, membership, role, grant, login, or login-session
+resource. Access actors admitted to the same management origin therefore share
+that Endpoint's sessions. Isolation, if a deployment needs it, is an extra
+layer in front of Endpoint, not an Endpoint protocol concern.
 
 Automatic migration or silent failover is out of scope for v0. If an Endpoint
 is unavailable, Server reports the Endpoint unavailable and has no stale
@@ -142,12 +145,12 @@ service actor has the same management capabilities in v0; provider profiles and
 Endpoint records are shared inside that one trust domain. Server stores no user
 or authorization-policy rows.
 
-Actor identity is still required for isolation and idempotency. Human Access
-tokens contribute their stable `sub`; service-token assertions contribute their
-`common_name`. Server converts either into a keyed pseudonymous actor key and a
-separately domain-separated Endpoint subject. Raw identity claims are not
-persisted. Full validation, key rotation, SSE expiry, and E2E rules live in
-`docs/access.md`.
+Actor identity is still required for Server-owned mutation receipts and OAuth
+attempts. Human Access tokens contribute their stable `sub`; service-token
+assertions contribute their `common_name`. Server converts either into a keyed
+pseudonymous actor key. It does not derive or forward an Endpoint subject.
+Raw identity claims are not persisted. Full validation, key rotation, SSE
+expiry, and E2E rules live in `docs/access.md`.
 
 External tool callbacks use a separate public callback origin that exposes only
 the Endpoint-scoped bearer route. It is not placed behind interactive Access.
@@ -158,9 +161,9 @@ management origin.
 
 The same components support three deployments:
 
-1. **Endpoint-only**: an independent execution service controlled through its
-   public protocol. A controller can provision credentials and run sessions
-   without zode Server.
+1. **Endpoint-only**: an independent execution service reached through its
+   public protocol on a trusted listen address. A local caller can provision
+   credentials and run sessions without zode Server.
 2. **Server-only**: management Server and UI use only configured remote
    Endpoints.
 3. **All-in-one**: Server starts and manages one built-in local Endpoint in
@@ -230,47 +233,23 @@ object. The object has exactly these composition fields:
   Endpoint `--listen` override and derives the private Endpoint origin from it;
   there is no separately configurable origin that can drift. Port zero is
   invalid because crash adoption needs a stable address.
-- `bootstrap_controller_secret_file`: a private Endpoint-side bootstrap file
-  path. Unlike other Server-config paths, a relative value resolves from the
-  referenced Endpoint config directory, exactly like Endpoint
-  `controller_auth.secret_file`. Before starting a new child, Server preflights
-  the Endpoint JSON and requires exactly one revision-1 controller entry for
-  `server_authority_id` whose finally resolved path is this path. It is not a
-  provider credential and never appears in JSON, SQLite, logs, or HTTP.
 
-Server keeps its authoritative controller-secret copy inside its own
-`secret_directory` and stages a separate private copy at
-`bootstrap_controller_secret_file` before the first child start. The bootstrap
-file is the one-time seed consumed only by an unclaimed Endpoint; it is not the
-Server secret source. For a new bootstrap operation, Server generates the bearer,
-persists its authoritative private copy first, then creates the Endpoint seed
-copy. The control database stores only phase and keyed fingerprint, both files
-use create-new/private-file semantics, and restart reconciles the same operation.
-A missing authoritative Server copy, conflicting seed during an incomplete
-bootstrap, or preflight authority/revision/path mismatch fails before child start
-or public readiness.
-
-After an authenticated identity probe proves initialization and the Server
-commits the bootstrap operation, later startup never reads, compares, imports, or
-falls back to the seed. Endpoint restores its active controller secret from its
-own durable control manifests. Controller rotation uses the ordinary
-authenticated, idempotent Endpoint control route plus the Server operation
-journal and promotes the separately staged Server secret only after Endpoint
-reconciliation. A stale bootstrap seed can never reclaim authority.
+The local Endpoint is trusted because it binds that private loopback address,
+not because Server plants a controller secret. Server does not generate,
+stage, or rotate an Endpoint control bearer. Endpoint configuration has no
+`controller_auth` field and no `PUT /v1/controller-auth` route.
 
 Startup has one order:
 
 1. resolve and validate all Server and local Endpoint composition paths;
-   preflight the Endpoint controller entry using the Endpoint config directory;
 2. acquire the Server process lock and open/validate Server control, secret, and
    Access state;
-3. reconcile the controller bootstrap operation;
-4. probe the stable private address; adopt a healthy matching Endpoint, block on
+3. probe the stable private address; adopt a healthy matching Endpoint, block on
    an unresponsive/mismatched Endpoint, or launch one candidate after refusal;
-5. require the Endpoint's own lock, startup recovery, and `ZODE_READY`, then make
-   authenticated identity and capability probes using the normal Endpoint API;
-6. append or verify the same local Endpoint catalog record; and
-7. arm the Server's process shutdown signal handling, then bind the public
+4. require the Endpoint's own lock, startup recovery, and `ZODE_READY`, then make
+   identity and capability probes using the normal Endpoint API;
+5. append or verify the same local Endpoint catalog record; and
+6. arm the Server's process shutdown signal handling, then bind the public
    listener and emit `ZODE_SERVER_READY`.
 
 Stdout readiness is a process barrier, not identity evidence. Once it is
@@ -289,12 +268,10 @@ not access Endpoint reducers, SQLite, session IDs, or provider execution.
 These decisions are frozen by real-process E2Es before production composition:
 
 - `e2e_all_in_one_first_run_uses_normal_server_api_and_local_endpoint` covers
-  different Server/Endpoint config directories, final bootstrap-path preflight,
-  two-store controller bootstrap, authenticated probe/catalog, ordinary profile
-  distribution, Endpoint-created session ULID, proxied SSE, provider traffic
-  leaving Endpoint, normal controller rotation followed by restart, proof that
-  the old seed cannot authenticate or reclaim authority, process-handle
-  stop/wait/reap, and Server-store absence.
+  different Server/Endpoint config directories, unauthenticated probe/catalog
+  on the private loopback origin, ordinary profile distribution,
+  Endpoint-created session ULID, proxied SSE, provider traffic leaving
+  Endpoint, process-handle stop/wait/reap, and Server-store absence.
 - `e2e_all_in_one_parent_crash_adopts_local_endpoint_without_duplicate_effect`
   holds a provider/tool effect, kills only Server, and proves the new Server
   adopts the same Endpoint and observes one terminal effect.
@@ -381,23 +358,21 @@ preallocation, pending route, or orphan-session scan exists.
 
 Every mutating UI command has a stable idempotency key. For session commands,
 Server forwards that key unchanged and does not keep a second command receipt.
-Endpoint scopes the receipt by controller authority and opaque subject and
-atomically stores it with its event append. In particular, session creation
-generates the ULID and commits its idempotency receipt in the same Endpoint
-transaction. If Server or the connection fails after that commit, the client
-retries the same Endpoint-scoped URL and key; Endpoint returns the original
-ULID and outcome instead of creating a second session.
+Endpoint scopes the receipt by command kind and resource, not by caller
+identity, and atomically stores it with its event append. In particular,
+session creation generates the ULID and commits its idempotency receipt in the
+same Endpoint transaction. If Server or the connection fails after that commit,
+the client retries the same Endpoint-scoped URL and key; Endpoint returns the
+original ULID and outcome instead of creating a second session.
 
 ## 6. Endpoint discovery and connectivity
 
 Endpoint records are created through the Access-protected management API,
 provisioning automation admitted by Access, or all-in-one composition. A record
-contains a reachable base URL,
-an Endpoint control-auth reference, expected stable controller authority and
-Endpoint-owned ID, and policy metadata. Secret values are stored only in
-Server's secret store. Controller authority is logical identity, not a hash or
-derivation of the current bearer; credential rotation advances its own revision
-without changing session ownership.
+contains a reachable base URL, the Endpoint-owned ID, and policy metadata.
+Server does not store an Endpoint control bearer. Reaching a remote Endpoint
+is an operator network concern; Endpoint itself does not authenticate that
+hop.
 
 Server checks Endpoint identity and capabilities before forwarding a create.
 Health checks are bounded reads. An Endpoint is `online`, `degraded`,
@@ -416,7 +391,8 @@ rules are:
 
 - Server is the only writer for a Server-managed profile.
 - Every profile has a stable ID and monotonically increasing revision.
-- Server initiates an authenticated, idempotent install or tombstone command.
+- Server initiates an idempotent install or tombstone command to a reachable
+  Endpoint.
 - Endpoint stages the secret, atomically promotes it, commits non-secret
   replica metadata, and only then acknowledges the revision as ready.
 - Older or differently fingerprinted writes cannot replace a newer revision.
@@ -435,15 +411,14 @@ explicit secret-transfer operation; it is never automatic.
 ## 8. Session proxy and UI delivery
 
 Endpoint event IDs are durable global positions within one Endpoint database.
-One Endpoint-wide stream multiplexes every public event visible to the current
-controller authority and subject; its IDs may skip private facts or sessions
-owned by another subject. Server preserves those IDs while proxying. Each
-browser application graph keeps at most one live stream and one cursor per
+One Endpoint-wide stream multiplexes every public event on that Endpoint; its
+IDs may skip private storage facts. Server preserves those IDs while proxying.
+Each browser application graph keeps at most one live stream and one cursor per
 Endpoint, resumes it with the Endpoint `Last-Event-ID`, and dispatches frames to
 sessions by `session_id`. Session navigation and component lifecycle do not
-open, close, or reset that stream. Endpoint performs subject filtering,
-replay/live handoff, and deduplication under its public SSE contract. Server
-does not allocate a second event ID or retain a durable cursor.
+open, close, or reset that stream. Endpoint performs replay/live handoff and
+deduplication under its public SSE contract. Server does not allocate a second
+event ID or retain a durable cursor.
 
 Session list/read routes are also live Endpoint proxy reads. A cross-Endpoint
 screen may query multiple Endpoint-scoped list routes and combine the responses
@@ -631,7 +606,7 @@ Required cross-component scenarios include:
 | Offline | miss a revision while Endpoint is unreachable, reconnect, reconcile exactly once, and resume explicitly |
 | Identity | two Endpoints create sessions independently; every Server route requires `(endpoint_id, session_id)`, no ID-only lookup exists, and create retry returns one Endpoint-generated ULID |
 | Access ingress | real RS256 Access/JWKS edge fixture accepts valid human and service actors; invalid claims/signatures fail closed; rotated `kid` refreshes without restart |
-| Actor isolation | two Access actors share management resources but get isolated Endpoint-owned session lists/commands/SSE and receipt scopes without a Server session ACL |
+| Shared Endpoint sessions | two Access actors share management resources and the same Endpoint session namespace; list/read/command/SSE and Endpoint receipts are not isolated by Access actor |
 | No user system | browser reaches the UI through Access with no Zode login/logout, user, workspace, role, grant, or login-cookie resource |
 | Streaming | one proxied Endpoint-wide SSE carries at least two owned sessions across navigation; disconnect/reconnect uses one Endpoint cursor without missing or duplicating durable events and without Server event storage |
 | Callback split | OAuth callback remains Access-protected; external tool callback works only on the separate callback origin with its bearer and exposes no management route |

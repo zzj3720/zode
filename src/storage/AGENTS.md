@@ -10,7 +10,7 @@ rebuildable operational projections.
 - Append a command's complete semantic event batch atomically with optimistic
   stream-version checking and idempotency binding; append none on any failure.
 - Session creation atomically appends the version-1 `SessionCreated` event and
-  its authority/subject-scoped collection receipt projection. The projection
+  its Endpoint-global collection receipt projection. The projection
   stores only versioned command/request digests and event-derived identifiers;
   it is rebuilt from verified creation events and must not become a second
   receipt authority or retain raw idempotency keys/canonical request bytes.
@@ -45,13 +45,13 @@ rebuildable operational projections.
   now. Startup lists outstanding waits, runnable sessions
   (`SessionState::is_startup_runnable`), and active activations
   (`session_index.status = 'active'`) instead of scanning every owned session.
-- Owner/list and collection-create indexes are likewise rebuildable
-  projections. Rebuild fails closed if verified history maps one scoped create
-  digest to multiple streams. Owned read, append, SSE catch-up, and list paths
-  share one verified owner gate so missing and cross-owner resources have the
-  same public result; list order uses durable creation position, never ULID
-  lexical order. Each listed session's current model selection comes from the
-  verified event-replayed state, not the immutable creation projection; a
+- List and collection-create indexes are likewise rebuildable
+  projections. Rebuild fails closed if verified history maps one create
+  digest to multiple streams. Read, append, SSE catch-up, and list paths
+  are Endpoint-global; a missing session is not-found. List order uses durable
+  creation position, never ULID lexical order. Each listed session's current
+  model selection comes from the verified event-replayed state, not the
+  immutable creation projection; a
   `model_selection_changed` event must be visible consistently in session GET,
   SSE, and list responses.
 - Initialize the storage schema only when the SQLite catalog is genuinely
@@ -94,10 +94,6 @@ the verified `SessionCreated` event and replay the exact original response via
 HTTP/SSE without allocating another session or event.
 
 `e2e_conflicting_create_receipt_projection_fails_closed` anchors the corruption
-boundary: if verified version-one events map one authority/subject/command
-scope to multiple streams, restart must reject readiness transactionally and
-must not choose, rewrite, or publish either receipt.
-
-`e2e_ownerless_session_history_fails_closed` anchors the owner-integrity
-boundary: a verified event whose immutable creation owner cannot be decoded
-must reject readiness without guessing, adopting, or rewriting ownership.
+boundary: if verified version-one events map one create digest to multiple
+streams, restart must reject readiness transactionally and must not choose,
+rewrite, or publish either receipt.

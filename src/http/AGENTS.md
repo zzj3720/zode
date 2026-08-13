@@ -1,7 +1,7 @@
 # Endpoint HTTP and SSE adapter rules
 
-`src/http` is the passive device Endpoint adapter. It admits controller
-commands, renders Endpoint projections, and exposes the Endpoint-wide durable
+`src/http` is the passive device Endpoint adapter. It admits commands,
+renders Endpoint projections, and exposes the Endpoint-wide durable
 event stream. It
 is not the agent runtime, management Server, UI API, provider-auth authority, or
 a second domain service. `docs/http-api.md` is the authoritative Endpoint
@@ -9,22 +9,21 @@ contract.
 
 ## HTTP contract
 
-- Validate transport shape, authenticate/authorize when introduced, translate
-  into one runtime command or query, and return only after durable admission/
-  commit or a runtime-owned read. List, get, and SSE catch-up call Runtime;
-  this adapter does not hold EventStore.
-- Derive controller authority from control authentication and accept a bounded
-  opaque subject only in that trusted context. Bind session ownership and
-  command receipt scope to authority/subject; list/read/mutate/SSE must not leak
-  another subject's session existence.
+- Validate transport shape, translate into one runtime command or query, and
+  return only after durable admission/commit or a runtime-owned read. List,
+  get, and SSE catch-up call Runtime; this adapter does not hold EventStore.
+- Do not authenticate callers. Ignore `Authorization` and `Zode-Subject`.
+  Trust is the listen address. Session receipts, list, read, mutate, and SSE
+  are Endpoint-global. The only bearer this adapter checks is the external
+  callback invocation token.
 - Bind every idempotency key to the canonical semantic request. Reuse with an
   equivalent request replays the original status and body; reuse with different
   semantics returns conflict and creates no additional session or event.
 - Session create rejects a caller-supplied ID. Endpoint generates a ULID and
   commits it atomically with the collection-scoped command receipt and initial
   session event; replay returns the same ULID.
-- Authenticated replay-only mode on every session mutation checks the
-  authority/subject/command-scoped receipt before current state: hit returns the
+- Replay-only mode on every session mutation checks the
+  command-scoped receipt before current state: hit returns the
   original response, changed fingerprint conflicts, and miss is typed and
   mutation-free. It cannot allocate, append, wake, issue an effect, or bypass
   normal admission for a new key.
@@ -41,16 +40,12 @@ contract.
 - Do not expose raw event payloads or storage records. Maintain explicit,
   versioned public session and event mappings with secret-safe fields.
 - All blocking adapter work crosses `spawn_blocking` or a dedicated worker.
-- Expose bounded identity/health/capability reads and authenticated,
-  idempotent credential-replica install/tombstone commands. Replica routes
-  authenticate the controller, decode the body, and call one Runtime provision
-  method; they do not import or hold the replica file store. Never expose OAuth,
-  provider defaults, sharing policy, endpoint registration, or UI routes.
-- Require `Zode-Subject` only for session ownership and session-command receipt
-  scope. Identity, health, capabilities, controller-auth, and auth-replica
-  routes authenticate the controller bearer without requiring or consuming a
-  subject; management probes and credential distribution must not manufacture
-  a session owner.
+- Expose bounded identity/health/capability reads and idempotent
+  credential-replica install/tombstone commands. Replica routes decode the body
+  and call one Runtime provision method; they do not import or hold the replica
+  file store. Never expose OAuth, provider defaults, sharing policy, endpoint
+  registration, or UI routes.
+- Do not require or consume `Zode-Subject`. There is no controller-auth route.
 - Health is the fixed `zode.endpoint-health.v1` readiness projection capped at
   4 KiB. Capabilities use the exact `zode.endpoint-capabilities.v1` minimum
   shape in `docs/http-api.md`, are sorted and pre-serialized before READY, and
@@ -61,20 +56,15 @@ contract.
   accepted configuration fields. In particular, advertise `external_callback`
   only when its callback policy, tool, public route, and runtime lifecycle are
   all active; otherwise omit it even if dormant callback-shaped config exists.
-- Keep controller authority identity independent from bearer bytes. Its
-  authenticated, idempotent rotation advances a credential revision,
-  atomically fences the old secret, and preserves authority/subject-owned
-  sessions and receipts across restart.
 - Endpoint never opens a connection to management Server. API code contains no
   reverse registration, heartbeat, manager discovery, or reconnect loop.
 
 ## SSE contract
 
-- SSE IDs are durable Endpoint-global event positions. One authenticated
-  Endpoint stream multiplexes every public event belonging to sessions owned by
-  the trusted controller authority and subject. Replay and live publication
-  form one strictly increasing, lossless eligible sequence. Numeric IDs may
-  skip private facts or sessions owned by another subject.
+- SSE IDs are durable Endpoint-global event positions. One Endpoint stream
+  multiplexes every public event. Replay and live publication form one
+  strictly increasing, lossless eligible sequence. Numeric IDs may skip
+  private facts.
 - Commit order, not handler completion order, controls publication. Recover a
   lagged receiver from storage without leaking debug errors into the stream.
 - Subscribe before replay through Runtime so the durable head is read under the

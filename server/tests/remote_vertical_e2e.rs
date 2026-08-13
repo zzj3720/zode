@@ -6,8 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+    time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use axum::{
     body::{Body, Bytes},
@@ -15,8 +14,7 @@ use axum::{
     http::{header, HeaderMap, Method, StatusCode as AxumStatusCode, Uri},
     response::Response as AxumResponse,
     routing::{get, post},
-    Router,
-};
+    Router};
 use futures_util::StreamExt;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::{Client, RequestBuilder, StatusCode};
@@ -28,13 +26,11 @@ use tokio::{
     process::{Child, Command},
     sync::{oneshot, Notify},
     task::JoinHandle,
-    time::timeout,
-};
+    time::timeout};
 
 const TEST_SUBJECT: &str = "remote-vertical-human";
 const TEST_AUDIENCE: &str = "zode-server-remote-e2e";
 const SERVER_AUTHORITY: &str = "server-remote-vertical-e2e";
-const ENDPOINT_AUTHORITY: &str = SERVER_AUTHORITY;
 const ENDPOINT_CONTROL_SECRET: &str = "remote-endpoint-control-secret-e2e";
 const PROVIDER_KEY: &str = "remote-provider-api-key-e2e";
 const PROVIDER_NAME: &str = "fixture-provider";
@@ -92,20 +88,17 @@ const ACCESS_JWK: &str = r#"{
 struct ProviderState {
     authorization_headers: Arc<Mutex<Vec<String>>>,
     requests: Arc<Mutex<Vec<Value>>>,
-    request_seen: Arc<Notify>,
-}
+    request_seen: Arc<Notify>}
 
 #[derive(Clone)]
 struct JwksState {
     requests: Arc<Mutex<Vec<(String, String)>>>,
-    request_seen: Arc<Notify>,
-}
+    request_seen: Arc<Notify>}
 
 struct FixtureServer {
     base_url: String,
     shutdown: Option<oneshot::Sender<()>>,
-    task: Option<JoinHandle<()>>,
-}
+    task: Option<JoinHandle<()>>}
 
 impl FixtureServer {
     async fn start(router: Router) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -122,8 +115,7 @@ impl FixtureServer {
         Ok(Self {
             base_url: format!("http://{address}"),
             shutdown: Some(shutdown),
-            task: Some(task),
-        })
+            task: Some(task)})
     }
 
     fn url(&self, path: &str) -> String {
@@ -203,8 +195,7 @@ async fn start_provider(
     let state = ProviderState {
         authorization_headers: Arc::new(Mutex::new(Vec::new())),
         requests: Arc::new(Mutex::new(Vec::new())),
-        request_seen: Arc::new(Notify::new()),
-    };
+        request_seen: Arc::new(Notify::new())};
     let router = Router::new()
         .route("/v1/chat/completions", post(fake_provider_chat))
         .with_state(state.clone());
@@ -215,8 +206,7 @@ async fn start_jwks() -> Result<(FixtureServer, JwksState), Box<dyn std::error::
 {
     let state = JwksState {
         requests: Arc::new(Mutex::new(Vec::new())),
-        request_seen: Arc::new(Notify::new()),
-    };
+        request_seen: Arc::new(Notify::new())};
     let server = FixtureServer::start(
         Router::new()
             .route("/jwks", get(fake_jwks))
@@ -297,8 +287,7 @@ struct ReadyProcess {
     child: Option<Child>,
     base_url: String,
     logs: Arc<Mutex<Vec<u8>>>,
-    drainers: Vec<JoinHandle<()>>,
-}
+    drainers: Vec<JoinHandle<()>>}
 
 async fn join_output_drainers(drainers: &mut Vec<JoinHandle<()>>) {
     for drainer in drainers.drain(..) {
@@ -387,8 +376,7 @@ impl ReadyProcess {
             child: Some(child),
             base_url,
             logs,
-            drainers,
-        })
+            drainers})
     }
 
     async fn stop(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -452,12 +440,7 @@ fn write_endpoint_config(
         "runtime_store": {"kind": "sqlite", "path": database},
         "credential_replica_store": {"kind": "files", "directory": "credentials"},
         "blob_store": {"kind": "files", "directory": "blobs"},
-        "controller_auth": [{
-            "authority_id": ENDPOINT_AUTHORITY,
-            "revision": 1,
-            "kind": "bearer_secret_file",
-            "secret_file": "controller.secret"
-        }],
+
         "runtime": {
             "tool_foreground_ms": 100,
             "model_step_max_attempts": 1,
@@ -654,8 +637,7 @@ fn load_endpoint_create_cassette() -> Result<Value, Box<dyn std::error::Error + 
             "schema",
             "slots",
             "version",
-            "whole_digest",
-        ],
+            "whole_digest"],
         "remote vertical cassette",
     )?;
     if cassette["schema"] != "zode.http-incident-recording.v1"
@@ -800,8 +782,7 @@ fn capture_first_exchange(
         &mut safe_request,
         &[
             (ENDPOINT_CONTROL_SECRET, "SLOT_ENDPOINT_CONTROL_SECRET"),
-            (PROVIDER_KEY, "SLOT_PROVIDER_KEY"),
-        ],
+            (PROVIDER_KEY, "SLOT_PROVIDER_KEY")],
     );
     let raw = json!({
         "schema": "zode.http-incident-recording.v1",
@@ -862,8 +843,7 @@ struct ReplicaReadyExpectation<'a> {
     profile_id: &'a str,
     endpoint_id: &'a str,
     provider: &'a str,
-    revision: u64,
-}
+    revision: u64}
 
 async fn wait_for_replica_ready(
     client: &Client,
@@ -1105,8 +1085,7 @@ async fn read_assistant_event(
                 }
                 let value: Value = match serde_json::from_str(&data) {
                     Ok(value) => value,
-                    Err(_) => continue,
-                };
+                    Err(_) => continue};
                 if (value["kind"] == "assistant_message_committed"
                     || value["event_type"] == "assistant_message_committed")
                     && value["data"]["message"]["content"] == expected_content
@@ -1207,8 +1186,7 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
             "--database".to_owned(),
             endpoint_database.to_string_lossy().into_owned(),
             "--listen".to_owned(),
-            "127.0.0.1:0".to_owned(),
-        ],
+            "127.0.0.1:0".to_owned()],
         "ZODE_READY ",
     )
     .await
@@ -1221,8 +1199,7 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         &server_binary,
         &[
             "--config".to_owned(),
-            server_config.to_string_lossy().into_owned(),
-        ],
+            server_config.to_string_lossy().into_owned()],
         "ZODE_SERVER_READY ",
     )
     .await
@@ -1244,8 +1221,7 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         "remote-session-model-selection-replay".to_owned(),
         "remote-session-message".to_owned(),
         "remote-session-follow-up".to_owned(),
-        "remote-profile-delete".to_owned(),
-    ];
+        "remote-profile-delete".to_owned()];
     let cassette = load_endpoint_create_cassette()?;
     let request_path = cassette["request"]["path"]
         .as_str()
@@ -1409,8 +1385,7 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
             profile_id: &profile_id,
             endpoint_id: &endpoint_id,
             provider: PROVIDER_NAME,
-            revision: profile_revision,
-        },
+            revision: profile_revision},
         &marker_refs(&marker_values),
     )
     .await?;
@@ -1621,8 +1596,7 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
         &server_binary,
         &[
             "--config".to_owned(),
-            server_config.to_string_lossy().into_owned(),
-        ],
+            server_config.to_string_lossy().into_owned()],
         "ZODE_SERVER_READY ",
     )
     .await
@@ -1752,8 +1726,7 @@ async fn e2e_remote_server_configure_once_distributes_and_runs_session_without_s
     if provider_headers
         != vec![
             format!("Bearer {PROVIDER_KEY}"),
-            format!("Bearer {PROVIDER_KEY}"),
-        ]
+            format!("Bearer {PROVIDER_KEY}")]
     {
         return Err(
             Error::other("fake provider did not receive the credential on both requests").into(),
@@ -1881,8 +1854,7 @@ async fn e2e_auth_profile_sharing_removal_survives_offline_endpoint_and_server_r
             "--database".to_owned(),
             endpoint_a_database.to_string_lossy().into_owned(),
             "--listen".to_owned(),
-            "127.0.0.1:0".to_owned(),
-        ],
+            "127.0.0.1:0".to_owned()],
         "ZODE_READY ",
     )
     .await?;
@@ -1904,8 +1876,7 @@ async fn e2e_auth_profile_sharing_removal_survives_offline_endpoint_and_server_r
             "--database".to_owned(),
             endpoint_b_database.to_string_lossy().into_owned(),
             "--listen".to_owned(),
-            "127.0.0.1:0".to_owned(),
-        ],
+            "127.0.0.1:0".to_owned()],
         "ZODE_READY ",
     )
     .await?;
@@ -1917,8 +1888,7 @@ async fn e2e_auth_profile_sharing_removal_survives_offline_endpoint_and_server_r
         &server_binary,
         &[
             "--config".to_owned(),
-            server_config.to_string_lossy().into_owned(),
-        ],
+            server_config.to_string_lossy().into_owned()],
         "ZODE_SERVER_READY ",
     )
     .await?;
@@ -1943,8 +1913,7 @@ async fn e2e_auth_profile_sharing_removal_survives_offline_endpoint_and_server_r
         "sharing-session-b-model".to_owned(),
         "sharing-session-b-message".to_owned(),
         "sharing-session-a-create".to_owned(),
-        "sharing-session-a-model".to_owned(),
-    ];
+        "sharing-session-a-model".to_owned()];
     let markers = marker_refs(&marker_values);
 
     let endpoint_a_id = add_remote_endpoint(
@@ -2031,8 +2000,7 @@ async fn e2e_auth_profile_sharing_removal_survives_offline_endpoint_and_server_r
             profile_id: &profile_id,
             endpoint_id: &endpoint_a_id,
             provider: PROVIDER_NAME,
-            revision: 1,
-        },
+            revision: 1},
         &markers,
     )
     .await?;
@@ -2044,8 +2012,7 @@ async fn e2e_auth_profile_sharing_removal_survives_offline_endpoint_and_server_r
             profile_id: &profile_id,
             endpoint_id: &endpoint_b_id,
             provider: PROVIDER_NAME,
-            revision: 1,
-        },
+            revision: 1},
         &markers,
     )
     .await?;
@@ -2151,8 +2118,7 @@ async fn e2e_auth_profile_sharing_removal_survives_offline_endpoint_and_server_r
         &server_binary,
         &[
             "--config".to_owned(),
-            server_config.to_string_lossy().into_owned(),
-        ],
+            server_config.to_string_lossy().into_owned()],
         "ZODE_SERVER_READY ",
     )
     .await?;
@@ -2163,8 +2129,7 @@ async fn e2e_auth_profile_sharing_removal_survives_offline_endpoint_and_server_r
         &profile_id,
         &[
             (&endpoint_a_id, "unreachable", sharing_revision),
-            (&endpoint_b_id, "ready", sharing_revision),
-        ],
+            (&endpoint_b_id, "ready", sharing_revision)],
         &markers,
     )
     .await?;
@@ -2177,8 +2142,7 @@ async fn e2e_auth_profile_sharing_removal_survives_offline_endpoint_and_server_r
             "--database".to_owned(),
             endpoint_a_database.to_string_lossy().into_owned(),
             "--listen".to_owned(),
-            endpoint_a_listen,
-        ],
+            endpoint_a_listen],
         "ZODE_READY ",
     )
     .await?;
@@ -2189,8 +2153,7 @@ async fn e2e_auth_profile_sharing_removal_survives_offline_endpoint_and_server_r
         &profile_id,
         &[
             (&endpoint_a_id, "removed", sharing_revision),
-            (&endpoint_b_id, "ready", sharing_revision),
-        ],
+            (&endpoint_b_id, "ready", sharing_revision)],
         &markers,
     )
     .await?;

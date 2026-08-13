@@ -11,17 +11,14 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Condvar, Mutex,
-    },
+        mpsc, Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use process_capture::{
     ProcessCaptureSet, ProcessIncidentReplay, ProcessObservation, ProcessReplayProof,
-    ProcessStopObservation,
-};
+    ProcessStopObservation};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -31,15 +28,13 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UiMode {
     Assets,
-    ApiOnly,
-}
+    ApiOnly}
 
 impl UiMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Assets => "assets",
-            Self::ApiOnly => "api_only",
-        }
+            Self::ApiOnly => "api_only"}
     }
 }
 
@@ -60,7 +55,6 @@ const INCIDENT_CASSETTE_PATH: &str = "tests/fixtures/ui_delivery/ui-delivery-fir
 const INCIDENT_EVIDENCE_GAP_PATH: &str =
     "tests/fixtures/ui_delivery/ui-delivery-first-404-evidence-gap.v1.json";
 const CAPTURE_ENV: &str = "ZODE_CAPTURE_FIRST_OCCURRENCE";
-const CALLBACK_ENDPOINT_AUTHORITY: &str = SERVER_AUTHORITY;
 const CALLBACK_ENDPOINT_SECRET: &str = "ui-delivery-endpoint-control-secret";
 const CALLBACK_ENDPOINT_LABEL: &str = "ui-delivery-callback-endpoint";
 const CALLBACK_TOOL_NAME: &str = "callback_tool";
@@ -151,8 +145,7 @@ fn e2e_server_ui_delivery_serves_access_protected_management_assets_and_isolates
     let response_markers = vec![
         assertion.clone(),
         ACCESS_SUBJECT.to_owned(),
-        ACCESS_EMAIL.to_owned(),
-    ];
+        ACCESS_EMAIL.to_owned()];
     let root = management_request_with_first_post_bootstrap_recording(
         &edge,
         &jwks,
@@ -163,8 +156,7 @@ fn e2e_server_ui_delivery_serves_access_protected_management_assets_and_isolates
             accept: "text/html",
             assertion: Some(&assertion),
             extra_headers: &[],
-            body: &[],
-        },
+            body: &[]},
         &mut first_post_bootstrap,
     )?;
     let shallow_root_404 = root.status == 404;
@@ -422,8 +414,7 @@ fn e2e_server_ui_delivery_serves_access_protected_management_assets_and_isolates
             callback_asset_probe_path.as_str(),
         ),
         ("callback browser history route", HISTORY_PATH),
-        ("callback management API", "/v1/system"),
-    ] {
+        ("callback management API", "/v1/system")] {
         let response = callback_request(&edge, "GET", path, "text/html", &[])?;
         check_safe_callback_404_surface(label, &response, &response, &mut failures);
         scan_response(label, &response, &response_markers, &mut failures);
@@ -437,8 +428,7 @@ fn e2e_server_ui_delivery_serves_access_protected_management_assets_and_isolates
                 accept: "text/html",
                 assertion: Some(&assertion),
                 extra_headers: &[],
-                body: &[],
-            },
+                body: &[]},
         )?;
         check_safe_callback_404_surface(
             &format!("{label} with valid Access"),
@@ -472,10 +462,8 @@ fn e2e_server_ui_delivery_serves_access_protected_management_assets_and_isolates
             assertion: Some(&assertion),
             extra_headers: &[
                 ("Forwarded", "host=management.ui-delivery.test"),
-                ("X-Forwarded-Host", MANAGEMENT_AUTHORITY),
-            ],
-            body: &[],
-        },
+                ("X-Forwarded-Host", MANAGEMENT_AUTHORITY)],
+            body: &[]},
     )?;
     check_safe_callback_404_surface(
         "callback Forwarded/X-Forwarded-Host surface probe",
@@ -516,8 +504,7 @@ fn e2e_server_ui_delivery_hardening_rejects_invalid_ui_mode_combinations_before_
             "api_only with ui_assets_directory",
             UiMode::ApiOnly,
             Some("ui-dist"),
-        ),
-    ] {
+        )] {
         let temp = tempfile::tempdir()?;
         let config_path = write_server_config(temp.path(), &jwks, mode, directory)?;
         assert_server_rejected_before_ready(&config_path, label)?;
@@ -617,8 +604,7 @@ thread_local! {
 struct CallbackHttpRecord {
     boundary: String,
     file: String,
-    sha256: String,
-}
+    sha256: String}
 
 struct CallbackLaterCapture {
     root: PathBuf,
@@ -626,8 +612,7 @@ struct CallbackLaterCapture {
     http_directory: PathBuf,
     http_records: Vec<CallbackHttpRecord>,
     process_capture: ProcessCaptureSet,
-    process_capture_error: Option<String>,
-}
+    process_capture_error: Option<String>}
 
 impl CallbackLaterCapture {
     fn new() -> TestResult<Self> {
@@ -668,8 +653,7 @@ impl CallbackLaterCapture {
             http_directory,
             http_records: Vec::new(),
             process_capture,
-            process_capture_error: None,
-        })
+            process_capture_error: None})
     }
 
     fn record_http(&mut self, boundary: &str, exchange: &RawHttpExchange) -> TestResult<()> {
@@ -688,8 +672,7 @@ impl CallbackLaterCapture {
         self.http_records.push(CallbackHttpRecord {
             boundary: boundary.to_owned(),
             file,
-            sha256,
-        });
+            sha256});
         sync_directory(&self.http_directory)?;
         Ok(())
     }
@@ -702,8 +685,7 @@ impl CallbackLaterCapture {
             } else {
                 vec![RawResponseChunk {
                     offset_us: 0,
-                    bytes: response.clone(),
-                }]
+                    bytes: response.clone()}]
             };
             let raw = terminal_raw_exchange(
                 &exchange.request,
@@ -737,9 +719,7 @@ impl CallbackLaterCapture {
                 leaked_pids: Vec::new(),
                 timed_out: false,
                 flush_status: "ok".to_owned(),
-                proof: true,
-            }),
-        };
+                proof: true})};
         if let Err(error) = self.process_capture.capture_process(observation) {
             self.process_capture_error = Some(error.to_string());
         }
@@ -775,16 +755,13 @@ impl CallbackLaterCapture {
                 "records": self.http_records.iter().map(|record| json!({
                     "boundary": record.boundary,
                     "file": record.file,
-                    "sha256": record.sha256,
-                })).collect::<Vec<_>>()
+                    "sha256": record.sha256})).collect::<Vec<_>>()
             },
             "process_capture": {
                 "path": process_path.to_string_lossy(),
-                "sha256": process_sha256,
-            },
+                "sha256": process_sha256},
             "historical_gap": "callback-lifecycle-access-edge-wouldblock-first-gap.v1.json",
-            "do_not_relabel_later_capture": true,
-        });
+            "do_not_relabel_later_capture": true});
         let manifest_path = self.root.join("later-reproduction.v1.json");
         write_restricted_new_json(&manifest_path, &manifest)?;
         sync_directory(&self.root)?;
@@ -909,8 +886,7 @@ fn capture_ui_asset_path_escape_later_gap(cassette: &Path) -> TestResult {
         &ProcessReplayProof {
             matched: true,
             fingerprint,
-            source_digest: replay.source_digest().to_owned(),
-        },
+            source_digest: replay.source_digest().to_owned()},
     )?;
     Err(io::Error::other(format!(
         "UI asset path escape later reproduction retained before repair; relation={UI_ASSET_PATH_RELATION}; raw={}; cassette={}",
@@ -926,8 +902,7 @@ struct UiAssetPathObservation {
     stderr: Vec<u8>,
     status: ExitStatus,
     pid: u32,
-    killed_by_test: bool,
-}
+    killed_by_test: bool}
 
 impl UiAssetPathObservation {
     fn process_observation(&self) -> ProcessObservation {
@@ -949,9 +924,7 @@ impl UiAssetPathObservation {
                 leaked_pids: Vec::new(),
                 timed_out: false,
                 flush_status: "ok".to_owned(),
-                proof: true,
-            }),
-        }
+                proof: true})}
     }
 }
 
@@ -1012,8 +985,7 @@ fn observe_ui_asset_path_escape() -> TestResult<UiAssetPathObservation> {
         stderr,
         status,
         pid,
-        killed_by_test,
-    })
+        killed_by_test})
 }
 
 fn private_ui_asset_log(path: &Path) -> io::Result<File> {
@@ -1121,8 +1093,7 @@ fn e2e_callback_origin_accepts_only_real_bearer_callback_and_never_management() 
         (Err(error), Err(flush_error)) => Err(io::Error::other(format!(
             "callback lifecycle red: {error}; capture flush failed: {flush_error}"
         ))
-        .into()),
-    }
+        .into())}
 }
 
 fn callback_lifecycle_body() -> TestResult {
@@ -1160,8 +1131,7 @@ fn callback_lifecycle_body() -> TestResult {
     let forbidden = vec![
         assertion.clone(),
         CALLBACK_ENDPOINT_SECRET.to_owned(),
-        CALLBACK_PROVIDER_KEY.to_owned(),
-    ];
+        CALLBACK_PROVIDER_KEY.to_owned()];
 
     let system = management_request(
         &edge,
@@ -1195,10 +1165,8 @@ fn callback_lifecycle_body() -> TestResult {
             assertion: Some(&assertion),
             extra_headers: &[
                 ("Content-Type", "application/json"),
-                ("Idempotency-Key", "ui-delivery-callback-endpoint-create"),
-            ],
-            body: &serde_json::to_vec(&endpoint_create_body)?,
-        },
+                ("Idempotency-Key", "ui-delivery-callback-endpoint-create")],
+            body: &serde_json::to_vec(&endpoint_create_body)?},
     )?;
     if endpoint_create.status == 404 {
         return Err(io::Error::other(
@@ -1239,15 +1207,13 @@ fn callback_lifecycle_body() -> TestResult {
             assertion: Some(&assertion),
             extra_headers: &[
                 ("Content-Type", "application/json"),
-                ("Idempotency-Key", "ui-delivery-callback-provider"),
-            ],
+                ("Idempotency-Key", "ui-delivery-callback-provider")],
             body: &serde_json::to_vec(&json!({
                 "kind": "openai_compatible",
                 "base_url": boundary.provider_base_url(),
                 "models": [CALLBACK_MODEL_NAME],
                 "options": {}
-            }))?,
-        },
+            }))?},
     )?;
     if descriptor.status == 404 {
         return Err(io::Error::other(
@@ -1277,16 +1243,14 @@ fn callback_lifecycle_body() -> TestResult {
             assertion: Some(&assertion),
             extra_headers: &[
                 ("Content-Type", "application/json"),
-                ("Idempotency-Key", "ui-delivery-callback-profile"),
-            ],
+                ("Idempotency-Key", "ui-delivery-callback-profile")],
             body: &serde_json::to_vec(&json!({
                 "kind": "api_key",
                 "label": "ui-delivery callback profile",
                 "api_key": "ui-delivery-provider-key",
                 "make_default": true,
                 "sharing": {"mode": "selected", "endpoint_ids": [endpoint_id]}
-            }))?,
-        },
+            }))?},
     )?;
     if profile.status == 404 {
         return Err(io::Error::other(
@@ -1328,8 +1292,7 @@ fn callback_lifecycle_body() -> TestResult {
             assertion: Some(&assertion),
             extra_headers: &[
                 ("Content-Type", "application/json"),
-                ("Idempotency-Key", "ui-delivery-callback-session"),
-            ],
+                ("Idempotency-Key", "ui-delivery-callback-session")],
             body: &serde_json::to_vec(&json!({
                 "model": {
                     "provider": CALLBACK_PROVIDER_NAME,
@@ -1345,8 +1308,7 @@ fn callback_lifecycle_body() -> TestResult {
                     "minimum_auth_revision": profile_revision
                 },
                 "tools": [CALLBACK_TOOL_NAME]
-            }))?,
-        },
+            }))?},
     )?;
     if session_create.status == 404 {
         return Err(io::Error::other(
@@ -1385,8 +1347,7 @@ fn wait_for_callback_profile_ready(
                 accept: "application/json",
                 assertion: Some(assertion),
                 extra_headers: &[],
-                body: &[],
-            },
+                body: &[]},
         )?;
         if replicas.status == 200 {
             let value: Value = serde_json::from_slice(&replicas.body)?;
@@ -1435,10 +1396,8 @@ fn run_real_callback_exchange(
             assertion: Some(assertion),
             extra_headers: &[
                 ("Content-Type", "application/json"),
-                ("Idempotency-Key", "ui-delivery-callback-message"),
-            ],
-            body: br#"{"content":"start callback"}"#,
-        },
+                ("Idempotency-Key", "ui-delivery-callback-message")],
+            body: br#"{"content":"start callback"}"#},
     )
     .map_err(|error| io::Error::other(format!("callback message request: {error}")))?;
     if message.status != 202 {
@@ -1486,8 +1445,7 @@ fn run_real_callback_exchange(
     for path in [
         "/",
         "/v1/system",
-        &format!("/endpoints/{endpoint_id}/sessions/{session_id}"),
-    ] {
+        &format!("/endpoints/{endpoint_id}/sessions/{session_id}")] {
         let baseline = origin_request(
             &edge.callback_url(),
             "GET",
@@ -1513,8 +1471,7 @@ fn run_real_callback_exchange(
                 accept: "text/html",
                 assertion: Some(assertion),
                 extra_headers: &[],
-                body: &[],
-            },
+                body: &[]},
         )?;
         check_safe_callback_404_surface(
             &format!("callback valid-Access route {path}"),
@@ -1553,10 +1510,8 @@ fn run_real_callback_exchange(
             assertion: Some(assertion),
             extra_headers: &[
                 ("Forwarded", "host=management.ui-delivery.test"),
-                ("X-Forwarded-Host", MANAGEMENT_AUTHORITY),
-            ],
-            body: &[],
-        },
+                ("X-Forwarded-Host", MANAGEMENT_AUTHORITY)],
+            body: &[]},
     )?;
     check_safe_callback_404_surface(
         "callback Forwarded/X-Forwarded-Host lifecycle probe",
@@ -1579,10 +1534,8 @@ fn run_real_callback_exchange(
                 ("Authorization", format!("Bearer {bearer}").as_str()),
                 ("Forwarded", "host=callback.ui-delivery.test"),
                 ("X-Forwarded-Host", CALLBACK_AUTHORITY),
-                ("Content-Type", "application/json"),
-            ],
-            body: br#"{"status":"completed","result":{"content":"callback terminal"}}"#,
-        },
+                ("Content-Type", "application/json")],
+            body: br#"{"status":"completed","result":{"content":"callback terminal"}}"#},
     )?;
     if (200..300).contains(&management_callback.status) {
         return Err(
@@ -1600,10 +1553,8 @@ fn run_real_callback_exchange(
             assertion: None,
             extra_headers: &[
                 ("Authorization", format!("Bearer {bearer}").as_str()),
-                ("Content-Type", "application/json"),
-            ],
-            body: br#"{"status":"completed","result":{"content":"callback terminal"}}"#,
-        },
+                ("Content-Type", "application/json")],
+            body: br#"{"status":"completed","result":{"content":"callback terminal"}}"#},
     )?;
     if !(200..300).contains(&callback.status) {
         return Err(io::Error::other(format!(
@@ -1639,8 +1590,7 @@ fn find_value_string(value: &Value, key: &str) -> Option<String> {
         Value::Array(values) => values
             .iter()
             .find_map(|value| find_value_string(value, key)),
-        _ => None,
-    }
+        _ => None}
 }
 
 #[test]
@@ -1816,8 +1766,7 @@ fn validate_incident_evidence_gap(evidence_gap: &Value) -> TestResult {
         "cassette",
         "reason",
         "do_not_relabel_later_capture",
-        "whole_digest",
-    ];
+        "whole_digest"];
     if object.len() != required.len() || required.iter().any(|key| !object.contains_key(*key)) {
         return Err(io::Error::other("UI delivery evidence-gap fields were changed").into());
     }
@@ -1915,8 +1864,7 @@ fn validate_incident_cassette(cassette: &Value) -> TestResult {
         "request",
         "response",
         "canonical_fingerprint",
-        "whole_digest",
-    ];
+        "whole_digest"];
     if object.len() != required.len() || required.iter().any(|key| !object.contains_key(*key)) {
         return Err(io::Error::other("UI delivery incident cassette fields were changed").into());
     }
@@ -1949,8 +1897,7 @@ fn validate_incident_cassette(cassette: &Value) -> TestResult {
     }
     for field in [
         cassette["first_failure"]["body"].as_str(),
-        cassette["response"]["body"].as_str(),
-    ] {
+        cassette["response"]["body"].as_str()] {
         if field.is_none()
             || field != Some(cassette["response"]["body"].as_str().unwrap_or_default())
         {
@@ -2042,8 +1989,7 @@ fn assert_server_rejected_before_ready(config_path: &Path, label: &str) -> TestR
         Err(error) => Err(io::Error::other(format!(
             "{label} did not reach the expected pre-READY rejection barrier: {error}"
         ))
-        .into()),
-    }
+        .into())}
 }
 
 fn write_server_config(
@@ -2169,12 +2115,7 @@ fn write_callback_endpoint_config(
         "runtime_store": {"kind": "sqlite", "path": root.join("endpoint.sqlite")},
         "credential_replica_store": {"kind": "files", "directory": "credentials"},
         "blob_store": {"kind": "files", "directory": "blobs"},
-        "controller_auth": [{
-            "authority_id": CALLBACK_ENDPOINT_AUTHORITY,
-            "revision": 1,
-            "kind": "bearer_secret_file",
-            "secret_file": "controller.secret"
-        }],
+
         "runtime": {
             "tool_foreground_ms": 100,
             "model_step_max_attempts": 1,
@@ -2251,8 +2192,7 @@ struct HttpRequestSpec<'a> {
     accept: &'a str,
     assertion: Option<&'a str>,
     extra_headers: &'a [(&'a str, &'a str)],
-    body: &'a [u8],
-}
+    body: &'a [u8]}
 
 fn management_request_with_first_post_bootstrap_recording(
     edge: &AccessEdge,
@@ -2301,8 +2241,7 @@ fn origin_request(
             accept,
             assertion,
             extra_headers: &[],
-            body,
-        },
+            body},
     )
 }
 
@@ -2333,8 +2272,7 @@ fn raw_request(
             accept,
             assertion,
             extra_headers: &[],
-            body,
-        },
+            body},
     )
 }
 
@@ -2349,8 +2287,7 @@ fn raw_request_with_headers(
         accept,
         assertion,
         extra_headers,
-        body,
-    } = request_spec;
+        body} = request_spec;
     let exchange_started = Instant::now();
     let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}\r\nAccept: {accept}\r\nConnection: close\r\n"
@@ -2477,8 +2414,7 @@ fn raw_request_with_headers(
             Ok(read) => {
                 response_chunks.push(RawResponseChunk {
                     offset_us: response_timing_origin.elapsed().as_micros(),
-                    bytes: buffer[..read].to_vec(),
-                });
+                    bytes: buffer[..read].to_vec()});
                 response.extend_from_slice(&buffer[..read]);
             }
             Err(error)
@@ -2501,15 +2437,13 @@ fn raw_request_with_headers(
         request_write_elapsed_us,
         write_error_elapsed_us: None,
         total_elapsed_us: exchange_started.elapsed().as_micros(),
-        termination,
-    })
+        termination})
 }
 
 struct SseConnection {
     stream: TcpStream,
     buffered: Vec<u8>,
-    request: Vec<u8>,
-}
+    request: Vec<u8>}
 
 fn open_sse_connection(
     base_url: &str,
@@ -2570,8 +2504,7 @@ fn open_sse_connection(
     Ok(SseConnection {
         stream,
         buffered: buffered[header_end..].to_vec(),
-        request,
-    })
+        request})
 }
 
 impl SseConnection {
@@ -2588,8 +2521,7 @@ impl SseConnection {
                 } else {
                     vec![RawResponseChunk {
                         offset_us: 0,
-                        bytes: bytes.clone(),
-                    }]
+                        bytes: bytes.clone()}]
                 };
                 let exchange = terminal_raw_exchange(
                     &self.request,
@@ -2621,8 +2553,7 @@ impl SseConnection {
                 }
                 Ok(read) => bytes.extend_from_slice(&chunk[..read]),
                 Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
-                Err(error) => return Err(error.into()),
-            }
+                Err(error) => return Err(error.into())}
         }
     }
 }
@@ -2636,8 +2567,7 @@ const LOCAL_ZODE_LOGIN_MARKERS: &[&str] = &[
     "href=\"/logout\"",
     "type=\"password\"",
     "cf_authorization",
-    "create account",
-];
+    "create account"];
 
 fn check_html_response(label: &str, response: &HttpResponse, failures: &mut Vec<String>) {
     if response.status != 200 {
@@ -2742,8 +2672,7 @@ fn check_json_response(label: &str, response: &HttpResponse, failures: &mut Vec<
         Ok(_) => failures.push(format!(
             "{label} did not return the versioned system schema"
         )),
-        Err(error) => failures.push(format!("{label} returned invalid JSON: {error}")),
-    }
+        Err(error) => failures.push(format!("{label} returned invalid JSON: {error}"))}
 }
 
 fn check_system_response(label: &str, response: &HttpResponse, failures: &mut Vec<String>) {
@@ -3124,8 +3053,7 @@ fn parse_hex_hint(bytes: &[u8]) -> Option<usize> {
             b'0'..=b'9' => byte - b'0',
             b'a'..=b'f' => byte - b'a' + 10,
             b'A'..=b'F' => byte - b'A' + 10,
-            _ => return None,
-        };
+            _ => return None};
         value.checked_mul(16)?.checked_add(digit as usize)
     })
 }
@@ -3201,8 +3129,7 @@ fn parse_http_response(bytes: &[u8]) -> TestResult<HttpResponse> {
     Ok(HttpResponse {
         status,
         headers,
-        body,
-    })
+        body})
 }
 
 fn decode_chunked(mut bytes: &[u8]) -> TestResult<Vec<u8>> {
@@ -3383,8 +3310,7 @@ fn proxy_connection(
             Err(error) if error.kind() == io::ErrorKind::ConnectionReset && response_started => {
                 break;
             }
-            Err(error) => return Err(error),
-        }
+            Err(error) => return Err(error)}
     }
     Ok(())
 }
@@ -3394,8 +3320,7 @@ struct AccessEdge {
     callback_address: SocketAddr,
     stop: Arc<AtomicBool>,
     joins: Vec<JoinHandle<()>>,
-    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
-}
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>}
 
 impl AccessEdge {
     fn start(server_url: &str) -> TestResult<Self> {
@@ -3422,15 +3347,13 @@ impl AccessEdge {
                 false,
                 Arc::clone(&stop),
                 Arc::clone(&connections),
-            ),
-        ];
+            )];
         Ok(Self {
             management_address,
             callback_address,
             stop,
             joins,
-            connections,
-        })
+            connections})
     }
 
     fn management_url(&self) -> String {
@@ -3491,8 +3414,7 @@ fn spawn_edge_listener(
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
                 }
-                Err(_) => break,
-            }
+                Err(_) => break}
         }
     })
 }
@@ -3500,20 +3422,17 @@ fn spawn_edge_listener(
 #[derive(Clone, Debug)]
 struct CapturedToolInvocation {
     body: Value,
-    authorization: Option<String>,
-}
+    authorization: Option<String>}
 
 struct BoundaryFixtureState {
     invocation: Option<CapturedToolInvocation>,
-    released: bool,
-}
+    released: bool}
 
 struct CallbackBoundaryFixture {
     address: SocketAddr,
     state: Arc<(Mutex<BoundaryFixtureState>, Condvar)>,
     stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
-}
+    join: Option<JoinHandle<()>>}
 
 impl CallbackBoundaryFixture {
     fn start() -> TestResult<Self> {
@@ -3523,8 +3442,7 @@ impl CallbackBoundaryFixture {
         let state = Arc::new((
             Mutex::new(BoundaryFixtureState {
                 invocation: None,
-                released: false,
-            }),
+                released: false}),
             Condvar::new(),
         ));
         let stop = Arc::new(AtomicBool::new(false));
@@ -3542,16 +3460,14 @@ impl CallbackBoundaryFixture {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                     }
-                    Err(_) => break,
-                }
+                    Err(_) => break}
             }
         });
         Ok(Self {
             address,
             state,
             stop,
-            join: Some(join),
-        })
+            join: Some(join)})
     }
 
     fn base_url(&self) -> String {
@@ -3645,8 +3561,7 @@ fn serve_callback_boundary(
         let body = request_body(&request).unwrap_or_default();
         let invocation = CapturedToolInvocation {
             body: serde_json::from_slice(&body).unwrap_or(Value::Null),
-            authorization: request_header(&request, "authorization"),
-        };
+            authorization: request_header(&request, "authorization")};
         let (lock, wake) = &**state;
         let mut fixture = lock
             .lock()
@@ -3708,15 +3623,13 @@ struct JwksExchange {
     response_wire: Option<Vec<u8>>,
     terminal: &'static str,
     completion: &'static str,
-    response_write_succeeded: bool,
-}
+    response_write_succeeded: bool}
 
 struct JwksFixture {
     address: SocketAddr,
     exchanges: Arc<Mutex<Vec<JwksExchange>>>,
     stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
-}
+    join: Option<JoinHandle<()>>}
 
 impl JwksFixture {
     fn start() -> TestResult<Self> {
@@ -3739,16 +3652,14 @@ impl JwksFixture {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                     }
-                    Err(_) => break,
-                }
+                    Err(_) => break}
             }
         });
         Ok(Self {
             address,
             exchanges,
             stop,
-            join: Some(join),
-        })
+            join: Some(join)})
     }
 
     fn issuer(&self) -> String {
@@ -3811,8 +3722,7 @@ fn serve_jwks(mut stream: TcpStream, exchanges: &Mutex<Vec<JwksExchange>>) -> io
             jwks_write_terminal(error),
             "response_write_failed",
             false,
-        ),
-    };
+        )};
     let mut exchanges = exchanges
         .lock()
         .map_err(|_| io::Error::other("JWKS exchange ledger lock poisoned"))?;
@@ -3823,8 +3733,7 @@ fn serve_jwks(mut stream: TcpStream, exchanges: &Mutex<Vec<JwksExchange>>) -> io
         response_wire,
         terminal,
         completion,
-        response_write_succeeded,
-    });
+        response_write_succeeded});
     drop(exchanges);
     write_result
 }
@@ -3837,8 +3746,7 @@ fn jwks_write_terminal(error: &io::Error) -> &'static str {
         | io::ErrorKind::ConnectionReset
         | io::ErrorKind::NotConnected
         | io::ErrorKind::UnexpectedEof => "disconnect",
-        _ => "safe_error",
-    }
+        _ => "safe_error"}
 }
 
 fn parse_socket_addr(base_url: &str) -> TestResult<SocketAddr> {
@@ -3858,8 +3766,7 @@ enum TransportTermination {
     Complete,
     Disconnect,
     Timeout,
-    SafeError,
-}
+    SafeError}
 
 impl TransportTermination {
     fn as_str(self) -> &'static str {
@@ -3867,8 +3774,7 @@ impl TransportTermination {
             Self::Complete => "complete",
             Self::Disconnect => "disconnect",
             Self::Timeout => "timeout",
-            Self::SafeError => "safe_error",
-        }
+            Self::SafeError => "safe_error"}
     }
 }
 
@@ -3879,14 +3785,12 @@ struct RawHttpExchange {
     request_write_elapsed_us: u128,
     write_error_elapsed_us: Option<u128>,
     total_elapsed_us: u128,
-    termination: TransportTermination,
-}
+    termination: TransportTermination}
 
 #[derive(Clone)]
 struct RawResponseChunk {
     offset_us: u128,
-    bytes: Vec<u8>,
-}
+    bytes: Vec<u8>}
 
 fn terminal_raw_exchange(
     request: &[u8],
@@ -3904,8 +3808,7 @@ fn terminal_raw_exchange(
         request_write_elapsed_us,
         write_error_elapsed_us,
         total_elapsed_us: exchange_started.elapsed().as_micros(),
-        termination,
-    }
+        termination}
 }
 
 fn raw_exchange_envelope(
@@ -3959,8 +3862,7 @@ fn raw_exchange_envelope_with_boundary(
 struct FirstPostBootstrapRecorder {
     root: PathBuf,
     recording_id: String,
-    captured: bool,
-}
+    captured: bool}
 
 impl FirstPostBootstrapRecorder {
     fn new() -> TestResult<Self> {
@@ -3981,8 +3883,7 @@ impl FirstPostBootstrapRecorder {
         Ok(Self {
             root,
             recording_id,
-            captured: false,
-        })
+            captured: false})
     }
 
     fn record(&mut self, exchange: &RawHttpExchange, jwks: &JwksFixture) -> TestResult<()> {
@@ -4063,8 +3964,7 @@ impl FirstPostBootstrapRecorder {
                 "response_complete": jwks_exchange.response_write_succeeded
                     && jwks_exchange.response_wire.is_some(),
                 "terminal": jwks_exchange.terminal,
-                "completion": jwks_exchange.completion,
-            }));
+                "completion": jwks_exchange.completion}));
         }
         let captured_response_bytes = exchange
             .response_chunks
@@ -4263,8 +4163,7 @@ impl FirstPostBootstrapRecorder {
 struct WireMessage {
     start_line: String,
     status: Option<u16>,
-    body_length: usize,
-}
+    body_length: usize}
 
 fn parse_wire_message(bytes: &[u8], response: bool) -> TestResult<WireMessage> {
     let header_end = http_header_end(bytes)?;
@@ -4293,8 +4192,7 @@ fn parse_wire_message(bytes: &[u8], response: bool) -> TestResult<WireMessage> {
     Ok(WireMessage {
         start_line,
         status,
-        body_length: bytes[header_end + 4..].len(),
-    })
+        body_length: bytes[header_end + 4..].len()})
 }
 
 fn raw_response_chunks(chunks: &[RawResponseChunk]) -> Vec<Value> {
@@ -4355,8 +4253,7 @@ fn sync_directory(path: &Path) -> TestResult {
 struct HttpResponse {
     status: u16,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
+    body: Vec<u8>}
 
 struct ServerProcess {
     child: Option<Child>,
@@ -4365,15 +4262,13 @@ struct ServerProcess {
     base_url: String,
     stdout: Arc<Mutex<Vec<u8>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
-    readers: Vec<JoinHandle<()>>,
-}
+    readers: Vec<JoinHandle<()>>}
 
 struct ServerCapture {
     pid: u32,
     status: ExitStatus,
     stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
+    stderr: Vec<u8>}
 
 impl ServerProcess {
     fn start(config_path: &Path) -> TestResult<Self> {
@@ -4434,8 +4329,7 @@ impl ServerProcess {
                             let _ = ready_tx.send(address.trim().to_owned());
                         }
                     }
-                    Err(_) => break,
-                }
+                    Err(_) => break}
             }
         });
         let stderr_store = Arc::clone(&stderr);
@@ -4468,8 +4362,7 @@ impl ServerProcess {
             base_url,
             stdout,
             stderr,
-            readers: vec![stdout_thread, stderr_thread],
-        })
+            readers: vec![stdout_thread, stderr_thread]})
     }
 
     fn stop(&mut self) -> TestResult<ServerCapture> {
@@ -4494,8 +4387,7 @@ impl ServerProcess {
                 .stderr
                 .lock()
                 .map_err(|_| "stderr lock poisoned")?
-                .clone(),
-        };
+                .clone()};
         record_active_callback_process(&self.process_name, &capture);
         Ok(capture)
     }
@@ -4525,8 +4417,7 @@ impl Drop for ServerProcess {
                     .stderr
                     .lock()
                     .map(|bytes| bytes.clone())
-                    .unwrap_or_default(),
-            };
+                    .unwrap_or_default()};
             record_active_callback_process(&self.process_name, &capture);
         }
     }
