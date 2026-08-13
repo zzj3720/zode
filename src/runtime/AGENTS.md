@@ -2,7 +2,7 @@
 
 `src/runtime` is the application layer. It coordinates durable session
 activations and declares the ports needed from storage, models, tools, timers,
-blobs, and event publication in `src/runtime/ports`. It depends on the domain,
+clock, blobs, and event publication in `src/runtime/ports`. It depends on the domain,
 never on concrete SQLite, aimux provider, HTTP, filesystem, management Server,
 or process types. Adapters implement those ports; they do not declare them.
 

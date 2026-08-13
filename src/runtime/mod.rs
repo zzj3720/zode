@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ pub mod ports;
 pub use model::{ModelOutcome, ModelRequest, ModelTokenUsage};
 use model::{MAX_CONTEXT_HANDOFF_DOCUMENT_TOKENS, MAX_CONTEXT_HANDOFF_GENERATION_TOKENS};
 pub use ports::{
-    AppendResult, BlobPort, BlobStore, EventStore, ExternalCallbackLookup, ModelExecutor,
+    AppendResult, BlobPort, BlobStore, Clock, EventStore, ExternalCallbackLookup, ModelExecutor,
     ModelPort, OwnedSessionRef, RehydrateError, SessionAppendResult, SessionCreate,
     SessionCreateCommand, SessionCreateResult, SessionListCursor, SessionListItem, SessionListPage,
     SnapshotRecord, StoreError, StorePort, StorePortError, ToolExecutor, ToolPort,
@@ -290,6 +290,7 @@ pub struct Runtime {
     store: Arc<dyn EventStore>,
     model: Arc<dyn ModelExecutor>,
     tools: Arc<dyn ToolExecutor>,
+    clock: Arc<dyn Clock>,
     stream_publisher: Arc<RuntimeStreamPublisher>,
     stream_observer: Arc<dyn ModelStreamObserver>,
     options: RuntimeOptions,
@@ -302,12 +303,14 @@ impl Runtime {
         model: Arc<dyn ModelExecutor>,
         tools: Arc<dyn ToolExecutor>,
         snapshot_every: Option<u64>,
+        clock: Arc<dyn Clock>,
     ) -> Arc<Self> {
         Self::new_with_options(
             store,
             model,
             tools,
             RuntimeOptions::defaults(snapshot_every),
+            clock,
         )
     }
 
@@ -316,6 +319,7 @@ impl Runtime {
         model: Arc<dyn ModelExecutor>,
         tools: Arc<dyn ToolExecutor>,
         options: RuntimeOptions,
+        clock: Arc<dyn Clock>,
     ) -> Arc<Self> {
         let stream_publisher = RuntimeStreamPublisher::new(1_024);
         let stream_observer = Arc::new(BroadcastModelStreamObserver {
@@ -325,6 +329,7 @@ impl Runtime {
             store,
             model,
             tools,
+            clock,
             stream_publisher,
             stream_observer,
             options: options.bounded(),
@@ -334,6 +339,10 @@ impl Runtime {
 
     pub fn stream_publisher(&self) -> Arc<RuntimeStreamPublisher> {
         self.stream_publisher.clone()
+    }
+
+    pub fn now_ms(&self) -> i64 {
+        self.clock.now_ms()
     }
 
     /// Validate a session's configured adapter-tool selection against the
@@ -358,9 +367,10 @@ impl Runtime {
         payload: Value,
     ) -> Result<CallbackCompletion, RuntimeCommandError> {
         let store = self.store.clone();
+        let clock = self.clock.clone();
         let callback_lookup_id = callback_id.clone();
         let completion = tokio::task::spawn_blocking(move || {
-            complete_external_callback_blocking(&*store, &callback_id, &bearer, payload)
+            complete_external_callback_blocking(&*store, &*clock, &callback_id, &bearer, payload)
         })
         .await
         .map_err(|_| RuntimeCommandError::Backend)??;
@@ -410,9 +420,11 @@ impl Runtime {
         command_id: String,
     ) -> Result<AsyncToolCallRecord, RuntimeCommandError> {
         let store = self.store.clone();
+        let clock = self.clock.clone();
         tokio::task::spawn_blocking(move || {
             cancel_tool_call_blocking(
                 &*store,
+                &*clock,
                 &owner,
                 &session_id,
                 &tool_call_id,
@@ -546,10 +558,11 @@ impl Runtime {
         timer: crate::domain::WaitTimerIntent,
     ) {
         let runtime = Arc::downgrade(self);
+        let clock = self.clock.clone();
         tokio::spawn(async move {
-            let delay_ms = timer.deadline_ms.saturating_sub(current_time_ms());
+            let delay_ms = timer.deadline_ms.saturating_sub(clock.now_ms());
             if let Ok(delay_ms) = u64::try_from(delay_ms) {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                clock.sleep(Duration::from_millis(delay_ms)).await;
             }
             let Some(runtime) = runtime.upgrade() else {
                 return;
@@ -558,7 +571,7 @@ impl Runtime {
                 runtime.store.clone(),
                 owner.clone(),
                 session_id.clone(),
-                current_time_ms(),
+                clock.now_ms(),
             )
             .await
             {
@@ -777,6 +790,7 @@ impl Runtime {
             }
             let (append, next_state) = start_activation(
                 self.store.clone(),
+                self.clock.clone(),
                 owner.clone(),
                 session_id.clone(),
                 &state,
@@ -803,6 +817,7 @@ impl Runtime {
                 if let Some(activation) = state.active_activation.as_ref() {
                     if let Some((append, next_state)) = finish_activation(
                         self.store.clone(),
+                        self.clock.clone(),
                         owner.clone(),
                         session_id.clone(),
                         &state,
@@ -912,6 +927,7 @@ impl Runtime {
                 if let Some(activation) = state.active_activation.as_ref() {
                     if let Some((append, next_state)) = finish_activation(
                         self.store.clone(),
+                        self.clock.clone(),
                         owner.clone(),
                         session_id.clone(),
                         &state,
@@ -1008,6 +1024,7 @@ impl Runtime {
         };
         let Some((append, next_state)) = finish_activation(
             self.store.clone(),
+            self.clock.clone(),
             owner.clone(),
             session_id.to_owned(),
             &state,
@@ -1188,11 +1205,13 @@ impl Runtime {
         result: Result<ToolExecutionResult, ToolError>,
     ) -> Result<(), &'static str> {
         let store = self.store.clone();
+        let clock = self.clock.clone();
         let append_owner = owner.clone();
         let append_session_id = session_id.clone();
         let append = tokio::task::spawn_blocking(move || {
             append_background_tool_result_blocking(
                 &*store,
+                &*clock,
                 &append_owner,
                 &append_session_id,
                 &batch_identity,
@@ -1426,12 +1445,4 @@ fn stable_digest(kind: &str, value: &str) -> String {
     digest.update((value.len() as u64).to_be_bytes());
     digest.update(value.as_bytes());
     format!("sha256:v1:{:x}", digest.finalize())
-}
-
-fn current_time_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .unwrap_or(i64::MAX)
 }

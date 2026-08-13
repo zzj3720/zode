@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     convert::Infallible,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -807,7 +806,7 @@ async fn create_session(
             .create_session(&SessionCreate {
                 owner,
                 command,
-                created_at_ms: current_time_ms(),
+                created_at_ms: runtime.now_ms(),
                 selection,
             })
             .map_err(ServiceError::store)
@@ -943,7 +942,7 @@ async fn append_message(
         semantic_digest("session.message.delivery-event", &command_id, &message_id)
     );
     let delivery_dedupe_key = format!("delivery:{command_id}");
-    let created_at_ms = current_time_ms();
+    let created_at_ms = state.runtime.now_ms();
     let store = state.store.clone();
     let id = session_id.clone();
     let key = idempotency_key.clone();
@@ -1853,14 +1852,6 @@ where
 
 fn default_auth_revision() -> u64 {
     1
-}
-
-fn current_time_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .unwrap_or(i64::MAX)
 }
 
 fn existing_owned_session(

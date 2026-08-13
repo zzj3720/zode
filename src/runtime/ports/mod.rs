@@ -1,9 +1,11 @@
 mod blob;
+mod clock;
 mod model;
 mod store;
 mod tool;
 
 pub use blob::{BlobPort, BlobStore};
+pub use clock::Clock;
 pub use model::{ModelExecutor, ModelPort};
 pub use store::{
     AppendResult, EventStore, ExternalCallbackLookup, OwnedSessionRef, RehydrateError,

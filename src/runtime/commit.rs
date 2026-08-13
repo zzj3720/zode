@@ -239,15 +239,26 @@ pub(super) fn model_request_draft(
     ))
 }
 
+pub(super) struct ContextHandoffPlanInput<'a> {
+    pub(super) state: &'a VerifiedSessionState,
+    pub(super) plan: ContextHandoffPlan,
+    pub(super) request: &'a ModelRequest,
+    pub(super) maximum_attempts: u32,
+}
+
 pub(super) async fn append_context_handoff_plan(
     store: Arc<dyn EventStore>,
+    clock: Arc<dyn Clock>,
     owner: SessionOwner,
     session_id: String,
-    state: &VerifiedSessionState,
-    plan: ContextHandoffPlan,
-    request: &ModelRequest,
-    maximum_attempts: u32,
+    input: ContextHandoffPlanInput<'_>,
 ) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
+    let ContextHandoffPlanInput {
+        state,
+        plan,
+        request,
+        maximum_attempts,
+    } = input;
     if state.active_model_round.as_ref().is_some_and(|round| {
         round
             .attempt
@@ -267,7 +278,7 @@ pub(super) async fn append_context_handoff_plan(
         request,
         maximum_attempts,
     )?;
-    let started_at_ms = current_time_ms();
+    let started_at_ms = clock.now_ms();
     let command_id = format!("context-handoff-prepare:{plan_id}");
     let drafts = vec![
         EventDraft::new(
@@ -316,6 +327,12 @@ pub(super) async fn append_context_handoff_plan(
     })
     .await
     .map_err(|_| "context_handoff_prepare_join")?
+}
+
+pub(super) struct ToolResultsInput {
+    pub(super) batch_identity: String,
+    pub(super) tool_calls: Vec<ToolCall>,
+    pub(super) results: Vec<Result<ToolExecutionResult, ToolError>>,
 }
 
 pub(super) struct ToolBatchInput {
@@ -446,6 +463,7 @@ pub(super) async fn append_expired_timer(
 
 pub(super) async fn start_activation(
     store: Arc<dyn EventStore>,
+    clock: Arc<dyn Clock>,
     owner: SessionOwner,
     session_id: String,
     state: &VerifiedSessionState,
@@ -479,7 +497,7 @@ pub(super) async fn start_activation(
             selection: state.selection.clone(),
             selection_version: state.selection_version,
             minimum_auth_revision,
-            started_at_ms: current_time_ms(),
+            started_at_ms: clock.now_ms(),
         },
     )
     .await
@@ -487,6 +505,7 @@ pub(super) async fn start_activation(
 
 pub(super) async fn finish_activation(
     store: Arc<dyn EventStore>,
+    clock: Arc<dyn Clock>,
     owner: SessionOwner,
     session_id: String,
     state: &VerifiedSessionState,
@@ -507,7 +526,7 @@ pub(super) async fn finish_activation(
             SessionEvent::ActivationFinished {
                 activation_id,
                 outcome,
-                finished_at_ms: current_time_ms(),
+                finished_at_ms: clock.now_ms(),
             },
         )
         .await?,
@@ -516,6 +535,7 @@ pub(super) async fn finish_activation(
 
 pub(super) async fn prepare_model_round(
     store: Arc<dyn EventStore>,
+    clock: Arc<dyn Clock>,
     owner: SessionOwner,
     session_id: String,
     input: ModelRoundInput<'_>,
@@ -581,7 +601,7 @@ pub(super) async fn prepare_model_round(
                         round_id: round_id.clone(),
                         purpose: purpose.clone(),
                         delivery_through_queue_id,
-                        started_at_ms: current_time_ms(),
+                        started_at_ms: clock.now_ms(),
                     },
                 ),
                 request_draft,
@@ -662,7 +682,7 @@ pub(super) async fn prepare_model_round(
                 attempt_id: attempt_id.clone(),
                 attempt_number,
                 auth_revision: selection.auth_revision,
-                started_at_ms: current_time_ms(),
+                started_at_ms: clock.now_ms(),
             },
         )
         .await?;
@@ -751,6 +771,7 @@ pub(super) async fn append_context_handoff_document(
 
 pub(super) async fn append_context_handoff_failure(
     store: Arc<dyn EventStore>,
+    clock: Arc<dyn Clock>,
     owner: SessionOwner,
     session_id: String,
     state: &VerifiedSessionState,
@@ -770,7 +791,7 @@ pub(super) async fn append_context_handoff_failure(
         class: ModelAttemptErrorClass::ContextHandoffFailed,
         message: message.to_owned(),
     };
-    let finished_at_ms = current_time_ms();
+    let finished_at_ms = clock.now_ms();
     tokio::task::spawn_blocking(move || {
         let command_id = format!("context-handoff-failure:{plan_id}");
         for _ in 0..16 {
@@ -877,6 +898,7 @@ pub(super) async fn append_model_lifecycle_failure(
 
 pub(super) async fn append_model_attempts_exhausted(
     store: Arc<dyn EventStore>,
+    clock: Arc<dyn Clock>,
     owner: SessionOwner,
     session_id: String,
     identity: &PreparedRequestIdentity,
@@ -918,7 +940,7 @@ pub(super) async fn append_model_attempts_exhausted(
                 attempt_id: attempt_id.clone(),
                 attempt_number,
                 maximum_attempts,
-                finished_at_ms: current_time_ms(),
+                finished_at_ms: clock.now_ms(),
             };
             match store.append_verified_owned(
                 &owner,

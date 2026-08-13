@@ -7,8 +7,9 @@ use zode::{
     api,
     control::ControlState,
     provider::{AimuxProvider, ProviderExecutionPolicy, ReplicaStore},
-    runtime::Runtime,
+    runtime::{Clock, Runtime},
     storage::SqliteEventStore,
+    timer::SystemClock,
     tools::HttpToolExecutor,
 };
 
@@ -179,8 +180,14 @@ async fn run(
         )),
         None => Arc::new(HttpToolExecutor::new(composition.tool_specs)),
     };
-    let runtime =
-        Runtime::new_with_options(store.clone(), provider, tools, composition.runtime_options);
+    let clock = Arc::new(SystemClock) as Arc<dyn Clock>;
+    let runtime = Runtime::new_with_options(
+        store.clone(),
+        provider,
+        tools,
+        composition.runtime_options,
+        clock.clone(),
+    );
     runtime.queue_startup_recovery().await?;
     let state = api::AppState::new(
         store,

@@ -4,6 +4,7 @@ pub mod domain;
 pub mod provider;
 pub mod runtime;
 pub mod storage;
+pub mod timer;
 pub mod tools;
 
 pub use zode_protocol as protocol;
