@@ -37,6 +37,14 @@ rebuildable operational projections.
   total history. Repair only a missing/inconsistent projection, preserving
   historical command idempotency bytes rather than reserializing old events
   with current code.
+- `due_timers` is a rebuildable projection of every outstanding wait timer,
+  including future deadlines. Maintain it in the same append transaction as
+  `WaitSet` / `WaitTimerScheduled` / `WaitExpired` / `WaitCleared`. Do not bump
+  `PROJECTION_SCHEMA_VERSION` to add it: a missing or non-canonical table marks
+  projections dirty and rebuilds. The adapter must not filter listed timers by
+  now. Startup lists outstanding waits, runnable sessions
+  (`SessionState::is_startup_runnable`), and active activations
+  (`session_index.status = 'active'`) instead of scanning every owned session.
 - Owner/list and collection-create indexes are likewise rebuildable
   projections. Rebuild fails closed if verified history maps one scoped create
   digest to multiple streams. Owned read, append, SSE catch-up, and list paths

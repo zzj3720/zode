@@ -17,8 +17,8 @@ pub use replica::{
     MAX_REPLICA_REQUEST_BYTES,
 };
 pub use store::{
-    AppendResult, EventStore, ExternalCallbackLookup, OwnedSessionRef, RehydrateError,
-    SessionAppendResult, SessionCreate, SessionCreateCommand, SessionCreateResult,
+    AppendResult, EventStore, ExternalCallbackLookup, OutstandingWaitTimer, OwnedSessionRef,
+    RehydrateError, SessionAppendResult, SessionCreate, SessionCreateCommand, SessionCreateResult,
     SessionListCursor, SessionListItem, SessionListPage, SnapshotRecord, StoreError, StorePort,
     StorePortError, VerifiedSessionState, MAX_OWNED_SESSION_SCAN_LIMIT, MAX_SESSION_LIST_LIMIT,
     SNAPSHOT_ENCODING_JSON,

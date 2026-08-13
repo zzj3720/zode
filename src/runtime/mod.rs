@@ -573,8 +573,9 @@ impl Runtime {
     }
 
     pub async fn queue_startup_recovery(self: &Arc<Self>) -> Result<(), &'static str> {
-        self.scan_startup_refs(false).await?;
-        self.scan_startup_refs(true).await?;
+        self.arm_outstanding_wait_timers().await?;
+        self.recover_active_activations().await?;
+        self.wake_runnable_sessions().await?;
         Ok(())
     }
 
@@ -629,52 +630,65 @@ impl Runtime {
         }
     }
 
-    async fn scan_startup_refs(self: &Arc<Self>, wake: bool) -> Result<(), &'static str> {
-        let mut after_creation_position = 0;
-        loop {
-            let store = self.store.clone();
-            let page = tokio::task::spawn_blocking(move || {
-                store
-                    .scan_owned_session_refs(after_creation_position, MAX_OWNED_SESSION_SCAN_LIMIT)
-                    .map_err(|_| "startup_scan")
-            })
-            .await
-            .map_err(|_| "startup_scan_join")??;
-            let page_len = page.len();
-            let Some(last) = page.last() else {
-                return Ok(());
-            };
-            after_creation_position = last.creation_global_position;
-            if wake {
-                for session in page {
-                    let owner = session.owner.clone();
-                    let session_id = session.session_id.clone();
-                    match self
-                        .recover_startup_session(owner.clone(), session_id.clone())
-                        .await
-                    {
-                        Ok(state) => {
-                            if let Some(timer) = state.active_timer.clone() {
-                                self.schedule_timer(owner.clone(), session_id.clone(), timer);
-                            }
-                            if startup_session_is_runnable(&state) {
-                                self.wake(owner, session_id);
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                error,
-                                session_id,
-                                "startup recovery deferred for an invalid session stream"
-                            );
-                        }
-                    }
-                }
-            }
-            if page_len < MAX_OWNED_SESSION_SCAN_LIMIT {
-                return Ok(());
+    async fn arm_outstanding_wait_timers(self: &Arc<Self>) -> Result<(), &'static str> {
+        let store = self.store.clone();
+        let timers = tokio::task::spawn_blocking(move || {
+            store
+                .list_outstanding_wait_timers()
+                .map_err(|_| "startup_wait_list")
+        })
+        .await
+        .map_err(|_| "startup_wait_list_join")??;
+        for timer in timers {
+            self.schedule_timer(
+                timer.owner,
+                timer.session_id,
+                crate::domain::WaitTimerIntent {
+                    wait_id: timer.wait_id,
+                    deadline_ms: timer.deadline_ms,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    async fn recover_active_activations(self: &Arc<Self>) -> Result<(), &'static str> {
+        let store = self.store.clone();
+        let sessions = tokio::task::spawn_blocking(move || {
+            store
+                .list_active_activations()
+                .map_err(|_| "startup_active_list")
+        })
+        .await
+        .map_err(|_| "startup_active_list_join")??;
+        for session in sessions {
+            if let Err(error) = self
+                .recover_startup_session(session.owner, session.session_id.clone())
+                .await
+            {
+                tracing::warn!(
+                    error,
+                    session_id = session.session_id,
+                    "startup recovery deferred for an invalid session stream"
+                );
             }
         }
+        Ok(())
+    }
+
+    async fn wake_runnable_sessions(self: &Arc<Self>) -> Result<(), &'static str> {
+        let store = self.store.clone();
+        let sessions = tokio::task::spawn_blocking(move || {
+            store
+                .list_runnable_sessions()
+                .map_err(|_| "startup_runnable_list")
+        })
+        .await
+        .map_err(|_| "startup_runnable_list_join")??;
+        for session in sessions {
+            self.wake(session.owner, session.session_id);
+        }
+        Ok(())
     }
 
     /// Reconcile only durable work that was left in an in-flight state before
@@ -837,7 +851,7 @@ impl Runtime {
             // when a prior activation reaches a terminal handoff failure.
             // Re-check durable runnable state after acquiring that lock so a
             // stale wake cannot start the same failed handoff again.
-            if !startup_session_is_runnable(&state) {
+            if !state.is_startup_runnable() {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(());
                 }
@@ -897,8 +911,9 @@ impl Runtime {
             }
             state = next_state;
 
-            if let Some(trigger_identity) =
-                unresolved_user(&state).map(|trigger| trigger.message_id.clone())
+            if let Some(trigger_identity) = state
+                .unresolved_user()
+                .map(|trigger| trigger.message_id.clone())
             {
                 let (next_state, prepared) = self
                     .ensure_model_context(
@@ -940,7 +955,7 @@ impl Runtime {
                 continue;
             }
 
-            if let Some(round_identity) = model_followup_identity(&state) {
+            if let Some(round_identity) = state.model_followup_identity() {
                 let (next_state, prepared) = self
                     .ensure_model_context(
                         &owner,
@@ -1313,34 +1328,6 @@ impl Runtime {
     }
 }
 
-fn unresolved_user(state: &SessionState) -> Option<&TranscriptMessage> {
-    let trigger = state.transcript.last()?;
-    if trigger.role == TranscriptRole::User
-        && state.terminal_model_failure_for_last_user().is_none()
-    {
-        Some(trigger)
-    } else {
-        None
-    }
-}
-
-/// Startup recovery only schedules an activation when durable work can make
-/// progress.  In particular, a completed assistant-only turn has no pending
-/// delivery or unresolved model boundary; waking it would create an empty
-/// activation and advance the stream merely because the process restarted.
-fn startup_session_is_runnable(state: &SessionState) -> bool {
-    if !state.delivery_queue.is_empty() {
-        return true;
-    }
-    if state.last_context_handoff_failure.is_some() {
-        return false;
-    }
-    if state.active_wait.is_some() {
-        return false;
-    }
-    unresolved_user(state).is_some() || model_followup_identity(state).is_some()
-}
-
 /// Build the provider-facing context from the durable transcript.  Runtime
 /// notifications are public coordination facts, not provider chat turns.
 /// While an async call is still running its foreground `async_running` Tool
@@ -1414,41 +1401,6 @@ fn terminal_tool_content(record: &AsyncToolCallRecord) -> Option<String> {
             None
         }
     }
-}
-
-fn model_followup_identity(state: &SessionState) -> Option<String> {
-    if state.active_wait.is_some() {
-        return None;
-    }
-    let latest = state.transcript.last()?;
-    if !matches!(latest.role, TranscriptRole::Tool | TranscriptRole::Runtime) {
-        return None;
-    }
-    let assistant = state
-        .transcript
-        .iter()
-        .rev()
-        .skip_while(|message| {
-            matches!(message.role, TranscriptRole::Tool | TranscriptRole::Runtime)
-        })
-        .find(|message| {
-            message.role == TranscriptRole::Assistant && !message.tool_calls.is_empty()
-        })?;
-
-    // A timer expiry ends the current activation, but it does not turn a
-    // still-running tool into a model input.  Wait until every ordinary call
-    // from this assistant batch has a durable terminal fact; the completion
-    // delivery will wake a fresh activation and re-enter this boundary.  The
-    // internal `wait_for` call has no async record and is intentionally
-    // ignored here so its timer can still resume a later round.
-    let all_tools_terminal = assistant.tool_calls.iter().all(|call| {
-        call.tool_name == WAIT_FOR_TOOL_NAME
-            || state
-                .async_tool_calls
-                .get(&call.tool_call_id)
-                .is_some_and(|record| record.status.is_terminal())
-    });
-    all_tools_terminal.then(|| assistant.message_id.clone())
 }
 
 fn inline_tool_input(call: &ToolCall) -> Result<Value, &'static str> {

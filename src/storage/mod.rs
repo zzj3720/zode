@@ -19,11 +19,11 @@ use crate::domain::{
 };
 use crate::runtime::ports::{
     canonical_json_bytes, checksum_from_digest, hash_field, hex_encode, require_text, AppendResult,
-    ExternalCallbackLookup, IntegrityDigest, OwnedSessionRef, RehydrateError, SessionAppendResult,
-    SessionCreate, SessionCreateCommand, SessionCreateResult, SessionListCursor, SessionListItem,
-    SessionListPage, SnapshotRecord, StateDigestComponents, StoreError, StorePort,
-    VerifiedSessionState, INTEGRITY_DIGEST_BYTES, MAX_OWNED_SESSION_SCAN_LIMIT,
-    MAX_SESSION_LIST_LIMIT, SNAPSHOT_ENCODING_JSON,
+    ExternalCallbackLookup, IntegrityDigest, OutstandingWaitTimer, OwnedSessionRef, RehydrateError,
+    SessionAppendResult, SessionCreate, SessionCreateCommand, SessionCreateResult,
+    SessionListCursor, SessionListItem, SessionListPage, SnapshotRecord, StateDigestComponents,
+    StoreError, StorePort, VerifiedSessionState, INTEGRITY_DIGEST_BYTES,
+    MAX_OWNED_SESSION_SCAN_LIMIT, MAX_SESSION_LIST_LIMIT, SNAPSHOT_ENCODING_JSON,
 };
 
 const STORAGE_SCHEMA_VERSION: i64 = 1;
@@ -203,7 +203,7 @@ impl SchemaDefinition {
     }
 }
 
-const STORAGE_SCHEMA: [SchemaDefinition; 12] = [
+const STORAGE_SCHEMA: [SchemaDefinition; 13] = [
     SchemaDefinition::table(
         "events",
         SchemaRole::Authority,
@@ -306,7 +306,17 @@ const STORAGE_SCHEMA: [SchemaDefinition; 12] = [
             creation_global_position INTEGER NOT NULL CHECK (creation_global_position > 0),
             created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
             status TEXT NOT NULL CHECK (status IN ('idle', 'active')),
+            runnable INTEGER NOT NULL CHECK (runnable IN (0, 1)),
             UNIQUE (creation_global_position)
+        );",
+    ),
+    SchemaDefinition::table(
+        "due_timers",
+        SchemaRole::Projection,
+        "CREATE TABLE due_timers (
+            stream_id TEXT PRIMARY KEY NOT NULL,
+            wait_id TEXT NOT NULL,
+            deadline_ms INTEGER NOT NULL CHECK (deadline_ms >= 0)
         );",
     ),
     SchemaDefinition::table(
@@ -394,7 +404,7 @@ impl TriggerDefinition {
     }
 }
 
-const STORAGE_TRIGGERS: [TriggerDefinition; 15] = [
+const STORAGE_TRIGGERS: [TriggerDefinition; 18] = [
     TriggerDefinition::new(
         "events_insert_dirty",
         "events",
@@ -470,6 +480,24 @@ const STORAGE_TRIGGERS: [TriggerDefinition; 15] = [
     TriggerDefinition::new(
         "session_index_delete_dirty",
         "session_index",
+        "AFTER DELETE",
+        MARK_PROJECTIONS_DIRTY,
+    ),
+    TriggerDefinition::new(
+        "due_timers_insert_dirty",
+        "due_timers",
+        "AFTER INSERT",
+        MARK_PROJECTIONS_DIRTY,
+    ),
+    TriggerDefinition::new(
+        "due_timers_update_dirty",
+        "due_timers",
+        "AFTER UPDATE",
+        MARK_PROJECTIONS_DIRTY,
+    ),
+    TriggerDefinition::new(
+        "due_timers_delete_dirty",
+        "due_timers",
         "AFTER DELETE",
         MARK_PROJECTIONS_DIRTY,
     ),
@@ -1234,15 +1262,16 @@ fn append_in_transaction(
             transaction,
             "INSERT INTO session_index
                 (stream_id, authority_id, subject, creation_global_position,
-                 created_at_ms, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 created_at_ms, status, runnable)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 stream_id,
                 &owner.authority_id,
                 &owner.subject,
                 to_sqlite_integer("creation_global_position", created.global_position)?,
                 created_at_ms,
-                session_status_sql(&rehydrated.state.status),
+                session_status_sql(&session_index_status(&rehydrated.state)),
+                session_index_runnable(&rehydrated.state),
             ],
         )?;
     } else {
@@ -1262,13 +1291,18 @@ fn append_in_transaction(
         }
         let changed = execute_cached(
             transaction,
-            "UPDATE session_index SET status = ?2 WHERE stream_id = ?1",
-            params![stream_id, session_status_sql(&rehydrated.state.status)],
+            "UPDATE session_index SET status = ?2, runnable = ?3 WHERE stream_id = ?1",
+            params![
+                stream_id,
+                session_status_sql(&session_index_status(&rehydrated.state)),
+                session_index_runnable(&rehydrated.state),
+            ],
         )?;
         if changed != 1 {
             return Err(StoreError::InvalidSessionCreateReceipt);
         }
     }
+    sync_due_timer(transaction, stream_id, &rehydrated.state)?;
     let resulting_state_digest = state_digest_v2(&rehydrated.state, &rehydrated.digest_components)?;
     execute_cached(
         transaction,
@@ -1405,7 +1439,7 @@ fn verified_owned_stream(
     if restored.state.stream_version != verified.head.version
         || restored.state.owner.as_ref() != Some(owner)
         || restored.state.created_at_ms != Some(verified.creation.created_at_ms)
-        || restored.state.status != verified.projected_status
+        || session_index_status(&restored.state) != verified.projected_status
     {
         return Err(StoreError::InvalidSessionCreateReceipt);
     }
@@ -1426,7 +1460,7 @@ fn verified_current_state(
     if current.session_id != stream_id
         || current.owner.as_ref() != Some(owner)
         || current.created_at_ms != Some(verified.creation.created_at_ms)
-        || current.status != verified.projected_status
+        || session_index_status(current) != verified.projected_status
     {
         return Err(StoreError::InvalidSessionCreateReceipt);
     }
@@ -1460,7 +1494,7 @@ fn verified_carried_state(
     if current.session_id != stream_id
         || current.owner.as_ref() != Some(owner)
         || current.created_at_ms != Some(verified.creation.created_at_ms)
-        || current.status != verified.projected_status
+        || session_index_status(&current) != verified.projected_status
         || current.stream_version != verified.head.version
         || !digest_matches(&current.prefix_digest, &verified.head.anchor.prefix_digest)
         || current.state_digest_version != verified.head.anchor.state_digest_version
@@ -1601,11 +1635,113 @@ fn lookup_session_create_in_view(
     }))
 }
 
+fn session_index_status(state: &SessionState) -> SessionStatus {
+    if state.active_activation.is_some() {
+        SessionStatus::Active
+    } else {
+        state.status.clone()
+    }
+}
+
+fn session_index_runnable(state: &SessionState) -> i64 {
+    i64::from(state.is_startup_runnable())
+}
+
+fn owned_session_ref_from_projection(
+    connection: &Connection,
+    stream_id: String,
+    authority_id: String,
+    subject: String,
+    creation_position: i64,
+) -> Result<OwnedSessionRef, StoreError> {
+    let creation_position = from_sqlite_integer("creation_global_position", creation_position)?;
+    let owner = SessionOwner::new(authority_id, subject);
+    let creation = verified_creation_event(connection, &stream_id)?;
+    if creation.record.stream_id != stream_id
+        || creation.owner != owner
+        || creation.record.global_position != creation_position
+    {
+        return Err(StoreError::InvalidSessionCreateReceipt);
+    }
+    Ok(OwnedSessionRef {
+        owner,
+        session_id: stream_id,
+        creation_global_position: creation_position,
+    })
+}
+
+fn list_session_index_refs(
+    store: &SqliteEventStore,
+    sql: &'static str,
+) -> Result<Vec<OwnedSessionRef>, StoreError> {
+    let mut connection = store.lock()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    require_clean_storage_metadata(&transaction)?;
+    let projections = {
+        let mut statement = transaction.prepare(sql)?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut sessions = Vec::with_capacity(projections.len());
+    for (stream_id, authority_id, subject, creation_position) in projections {
+        sessions.push(owned_session_ref_from_projection(
+            &transaction,
+            stream_id,
+            authority_id,
+            subject,
+            creation_position,
+        )?);
+    }
+    transaction.commit()?;
+    Ok(sessions)
+}
+
 fn session_status_sql(status: &SessionStatus) -> &'static str {
     match status {
         SessionStatus::Idle => "idle",
         SessionStatus::Active => "active",
     }
+}
+
+fn sync_due_timer(
+    transaction: &Transaction<'_>,
+    stream_id: &str,
+    state: &SessionState,
+) -> Result<(), StoreError> {
+    match &state.active_timer {
+        Some(timer) => {
+            require_text("wait_id", &timer.wait_id)?;
+            if timer.deadline_ms < 0 {
+                return Err(StoreError::IntegerRange {
+                    field: "deadline_ms",
+                });
+            }
+            execute_cached(
+                transaction,
+                "INSERT INTO due_timers (stream_id, wait_id, deadline_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(stream_id) DO UPDATE SET
+                    wait_id = excluded.wait_id,
+                    deadline_ms = excluded.deadline_ms",
+                params![stream_id, &timer.wait_id, timer.deadline_ms],
+            )?;
+        }
+        None => {
+            execute_cached(
+                transaction,
+                "DELETE FROM due_timers WHERE stream_id = ?1",
+                params![stream_id],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn session_status_from_sql(status: &str) -> Result<SessionStatus, StoreError> {
@@ -1989,24 +2125,94 @@ impl StorePort for SqliteEventStore {
         };
         let mut sessions = Vec::with_capacity(projections.len());
         for (stream_id, authority_id, subject, creation_position) in projections {
-            let creation_position =
-                from_sqlite_integer("creation_global_position", creation_position)?;
-            let owner = SessionOwner::new(authority_id, subject);
-            let creation = verified_creation_event(&transaction, &stream_id)?;
-            if creation.record.stream_id != stream_id
-                || creation.owner != owner
-                || creation.record.global_position != creation_position
-            {
-                return Err(StoreError::InvalidSessionCreateReceipt);
-            }
-            sessions.push(OwnedSessionRef {
-                owner,
-                session_id: stream_id,
-                creation_global_position: creation_position,
-            });
+            sessions.push(owned_session_ref_from_projection(
+                &transaction,
+                stream_id,
+                authority_id,
+                subject,
+                creation_position,
+            )?);
         }
         transaction.commit()?;
         Ok(sessions)
+    }
+
+    fn list_outstanding_wait_timers(&self) -> Result<Vec<OutstandingWaitTimer>, StoreError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        require_clean_storage_metadata(&transaction)?;
+        let projections = {
+            let mut statement = transaction.prepare(
+                "SELECT timers.stream_id, sessions.authority_id, sessions.subject,
+                        timers.wait_id, timers.deadline_ms, sessions.creation_global_position
+                 FROM due_timers AS timers
+                 LEFT JOIN session_index AS sessions ON sessions.stream_id = timers.stream_id
+                 ORDER BY timers.deadline_ms ASC, timers.stream_id ASC",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut timers = Vec::with_capacity(projections.len());
+        for (stream_id, authority_id, subject, wait_id, deadline_ms, creation_position) in
+            projections
+        {
+            let (Some(authority_id), Some(subject), Some(creation_position)) =
+                (authority_id, subject, creation_position)
+            else {
+                return Err(StoreError::InvalidSessionCreateReceipt);
+            };
+            require_text("wait_id", &wait_id)?;
+            if deadline_ms < 0 {
+                return Err(StoreError::CorruptInteger {
+                    field: "deadline_ms",
+                    value: deadline_ms,
+                });
+            }
+            let session = owned_session_ref_from_projection(
+                &transaction,
+                stream_id,
+                authority_id,
+                subject,
+                creation_position,
+            )?;
+            timers.push(OutstandingWaitTimer {
+                owner: session.owner,
+                session_id: session.session_id,
+                wait_id,
+                deadline_ms,
+            });
+        }
+        transaction.commit()?;
+        Ok(timers)
+    }
+
+    fn list_runnable_sessions(&self) -> Result<Vec<OwnedSessionRef>, StoreError> {
+        list_session_index_refs(
+            self,
+            "SELECT stream_id, authority_id, subject, creation_global_position
+             FROM session_index
+             WHERE runnable = 1
+             ORDER BY creation_global_position ASC, stream_id ASC",
+        )
+    }
+
+    fn list_active_activations(&self) -> Result<Vec<OwnedSessionRef>, StoreError> {
+        list_session_index_refs(
+            self,
+            "SELECT stream_id, authority_id, subject, creation_global_position
+             FROM session_index
+             WHERE status = 'active'
+             ORDER BY creation_global_position ASC, stream_id ASC",
+        )
     }
 
     fn list_sessions(
@@ -2093,14 +2299,14 @@ impl StorePort for SqliteEventStore {
             if version != verified.head.version
                 || creation_position != verified.creation.record.global_position
                 || created_at_ms != verified.creation.created_at_ms
-                || status != verified.rehydrated.state.status
+                || status != session_index_status(&verified.rehydrated.state)
             {
                 return Err(StoreError::InvalidSessionCreateReceipt);
             }
             items.push(SessionListItem {
                 session_id: stream_id,
                 version,
-                status,
+                status: verified.rehydrated.state.status,
                 created_at_ms,
                 creation_global_position: creation_position,
                 selection: verified.rehydrated.state.selection,
@@ -2337,6 +2543,7 @@ fn rebuild_projections_in_transaction(transaction: &Transaction<'_>) -> Result<(
     transaction.execute("DELETE FROM commands", [])?;
     transaction.execute("DELETE FROM session_create_receipts", [])?;
     transaction.execute("DELETE FROM session_index", [])?;
+    transaction.execute("DELETE FROM due_timers", [])?;
     transaction.execute("DELETE FROM event_streams", [])?;
     for (stream_id, head) in &stream_heads {
         let state = stream_states
@@ -2361,17 +2568,19 @@ fn rebuild_projections_in_transaction(transaction: &Transaction<'_>) -> Result<(
         transaction.execute(
             "INSERT INTO session_index
                 (stream_id, authority_id, subject, creation_global_position,
-                 created_at_ms, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 created_at_ms, status, runnable)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 stream_id,
                 &owner.authority_id,
                 &owner.subject,
                 to_sqlite_integer("creation_global_position", creation_position)?,
                 created_at_ms,
-                session_status_sql(&state.status),
+                session_status_sql(&session_index_status(state)),
+                session_index_runnable(state),
             ],
         )?;
+        sync_due_timer(transaction, stream_id, state)?;
     }
     for ((stream_id, command_id), projection) in commands {
         transaction.execute(

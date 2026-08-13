@@ -13,6 +13,7 @@ pub const REDUCER_SCHEMA_VERSION: u32 = 1;
 pub const SESSION_CREATED_SCHEMA_VERSION: u32 = 2;
 pub const WAIT_MIN_SECONDS: u32 = 1;
 pub const WAIT_MAX_SECONDS: u32 = 600;
+pub const WAIT_FOR_TOOL_NAME: &str = "wait_for";
 pub const MAX_INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_ERROR_MESSAGE_BYTES: usize = 8 * 1024;
 pub const MAX_RECENT_DEDUPE_FACTS: usize = 256;

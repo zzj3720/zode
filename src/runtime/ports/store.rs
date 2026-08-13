@@ -228,6 +228,14 @@ pub struct OwnedSessionRef {
     pub creation_global_position: GlobalPosition,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutstandingWaitTimer {
+    pub owner: SessionOwner,
+    pub session_id: String,
+    pub wait_id: String,
+    pub deadline_ms: i64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SnapshotRecord {
     pub snapshot_id: Option<i64>,
@@ -333,6 +341,18 @@ pub trait StorePort: Send + Sync {
         after_creation_position: GlobalPosition,
         limit: usize,
     ) -> Result<Vec<OwnedSessionRef>, StoreError>;
+
+    /// Every outstanding wait timer, including future deadlines.
+    ///
+    /// The adapter must not filter by the current clock. Startup arms the
+    /// complete set; a due fire is decided later by the timer adapter.
+    fn list_outstanding_wait_timers(&self) -> Result<Vec<OutstandingWaitTimer>, StoreError>;
+
+    /// Sessions matching `SessionState::is_startup_runnable`.
+    fn list_runnable_sessions(&self) -> Result<Vec<OwnedSessionRef>, StoreError>;
+
+    /// Sessions whose `session_index.status` is `active`.
+    fn list_active_activations(&self) -> Result<Vec<OwnedSessionRef>, StoreError>;
 
     fn list_sessions(
         &self,

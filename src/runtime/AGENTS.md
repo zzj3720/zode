@@ -167,6 +167,11 @@ enter events.
   name or transport.
 - Recovery derives runnable work, waits, and async status from durable facts;
   an orphaned in-memory handle is never evidence that work is still running.
+- Startup recovery arms every outstanding wait, reconciles every active
+  activation before READY, then wakes runnable sessions. It uses the store's
+  outstanding-wait, active-activation, and runnable lists; it does not scan
+  every owned session. READY-before-GET must already observe restart
+  classifications such as `unknown_outcome` and failed-attempt reconciliation.
 - A persisted `ModelAttemptFailedFact` is itself an unfinished recovery
   boundary: after restart, finish its exhaustion/terminal/activation batch (or
   schedule its recorded retry) before claiming the session is reconciled. Do

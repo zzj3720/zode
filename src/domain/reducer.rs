@@ -194,6 +194,69 @@ impl SessionState {
             .then_some(failure)
     }
 
+    pub fn unresolved_user(&self) -> Option<&TranscriptMessage> {
+        let trigger = self.transcript.last()?;
+        if trigger.role == TranscriptRole::User
+            && self.terminal_model_failure_for_last_user().is_none()
+        {
+            Some(trigger)
+        } else {
+            None
+        }
+    }
+
+    /// Startup and wake only schedule an activation when durable work can make
+    /// progress. A completed assistant-only turn has no pending delivery or
+    /// unresolved model boundary; waking it would create an empty activation
+    /// merely because the process restarted.
+    pub fn is_startup_runnable(&self) -> bool {
+        if !self.delivery_queue.is_empty() {
+            return true;
+        }
+        if self.last_context_handoff_failure.is_some() {
+            return false;
+        }
+        if self.active_wait.is_some() {
+            return false;
+        }
+        self.unresolved_user().is_some() || self.model_followup_identity().is_some()
+    }
+
+    pub fn model_followup_identity(&self) -> Option<String> {
+        if self.active_wait.is_some() {
+            return None;
+        }
+        let latest = self.transcript.last()?;
+        if !matches!(latest.role, TranscriptRole::Tool | TranscriptRole::Runtime) {
+            return None;
+        }
+        let assistant = self
+            .transcript
+            .iter()
+            .rev()
+            .skip_while(|message| {
+                matches!(message.role, TranscriptRole::Tool | TranscriptRole::Runtime)
+            })
+            .find(|message| {
+                message.role == TranscriptRole::Assistant && !message.tool_calls.is_empty()
+            })?;
+
+        // A timer expiry ends the current activation, but it does not turn a
+        // still-running tool into a model input. Wait until every ordinary call
+        // from this assistant batch has a durable terminal fact; the completion
+        // delivery will wake a fresh activation and re-enter this boundary. The
+        // internal `wait_for` call has no async record and is intentionally
+        // ignored here so its timer can still resume a later round.
+        let all_tools_terminal = assistant.tool_calls.iter().all(|call| {
+            call.tool_name == WAIT_FOR_TOOL_NAME
+                || self
+                    .async_tool_calls
+                    .get(&call.tool_call_id)
+                    .is_some_and(|record| record.status.is_terminal())
+        });
+        all_tools_terminal.then(|| assistant.message_id.clone())
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         require_text("session_id", &self.session_id)?;
         validate_text("session_id", &self.session_id)?;
