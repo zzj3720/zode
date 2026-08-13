@@ -37,10 +37,10 @@ use crate::{
         MAX_IDENTIFIER_BYTES,
     },
     runtime::{
-        session_command_id, CallbackCompletion, EventStore, RehydrateError, ReplicaInstallRequest,
-        ReplicaMetadata, ReplicaPortError, ReplicaTombstoneRequest, Runtime, RuntimeCommandError,
-        RuntimeStreamEvent, RuntimeStreamSubscription, SessionListCursor, StoreError,
-        TransientModelEvent, MAX_REPLICA_REQUEST_BYTES, MAX_SESSION_LIST_LIMIT,
+        session_command_id, CallbackCompletion, ReplicaInstallRequest, ReplicaMetadata,
+        ReplicaPortError, ReplicaTombstoneRequest, Runtime, RuntimeCommandError,
+        RuntimeStreamEvent, SessionListCursor, SessionListPage, TransientModelEvent,
+        MAX_REPLICA_REQUEST_BYTES, MAX_SESSION_LIST_LIMIT,
     },
 };
 
@@ -51,7 +51,6 @@ const MAX_IDEMPOTENCY_KEY_BYTES: usize = 1_024;
 
 #[derive(Clone)]
 pub struct AppState {
-    store: Arc<dyn EventStore>,
     control: Arc<ControlState>,
     runtime: Arc<Runtime>,
     health_body: Arc<Vec<u8>>,
@@ -60,14 +59,12 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(
-        store: Arc<dyn EventStore>,
         control: Arc<ControlState>,
         runtime: Arc<Runtime>,
         health_body: Vec<u8>,
         capabilities_body: Vec<u8>,
     ) -> Self {
         Self {
-            store,
             control,
             runtime,
             health_body: Arc::new(health_body),
@@ -267,48 +264,11 @@ struct CommandResponse {
 enum ServiceError {
     NotFound,
     IdempotencyReceiptNotFound,
-    Conflict(String),
     AuthReplicaUnavailable,
     Malformed,
     Invalid(String),
     PayloadTooLarge,
     Backend,
-}
-
-impl ServiceError {
-    fn store(error: StoreError) -> Self {
-        match error {
-            StoreError::OptimisticConcurrency { .. }
-            | StoreError::CommandIdempotencyConflict { .. }
-            | StoreError::EventIdempotencyConflict { .. }
-            | StoreError::DuplicateEventIdInBatch { .. } => {
-                Self::Conflict("request conflicts with an existing command".into())
-            }
-            StoreError::SessionNotFound => Self::NotFound,
-            StoreError::InvalidSessionListLimit => {
-                Self::Invalid("invalid session list limit".into())
-            }
-            StoreError::InvalidSessionListCursor => Self::Malformed,
-            StoreError::EmptyField { .. } | StoreError::Domain(_) => {
-                Self::Invalid("invalid request".into())
-            }
-            _ => Self::Backend,
-        }
-    }
-
-    fn rehydrate(error: RehydrateError) -> Self {
-        match error {
-            RehydrateError::Store(StoreError::SessionNotFound) => Self::NotFound,
-            _ => Self::Backend,
-        }
-    }
-
-    fn read_store(error: StoreError) -> Self {
-        match error {
-            StoreError::SessionNotFound => Self::NotFound,
-            _ => Self::Backend,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -404,12 +364,6 @@ impl ApiError {
                 status: StatusCode::NOT_FOUND,
                 code: "idempotency_receipt_not_found",
                 message: "idempotency receipt was not found".into(),
-                retryable: false,
-            },
-            ServiceError::Conflict(message) => Self {
-                status: StatusCode::CONFLICT,
-                code: "conflict",
-                message,
                 retryable: false,
             },
             ServiceError::AuthReplicaUnavailable => Self {
@@ -763,16 +717,14 @@ async fn list_sessions(
     {
         return Err(ApiError::malformed());
     }
-    let store = state.store.clone();
-    let page =
-        run_blocking(move || list_owned_sessions(&*store, &owner, cursor.as_ref(), limit as usize))
-            .await
-            .map_err(ApiError::from_service)?;
-    Ok(Json(json!({
-        "schema": "zode.session-list.v1",
-        "items": page.items,
-        "next_cursor": page.next_cursor,
-    })))
+    let page = state
+        .runtime
+        .list_sessions(owner, cursor, limit as usize)
+        .await
+        .map_err(api_error_from_runtime_session)?;
+    Ok(Json(
+        public_session_list(page).map_err(ApiError::from_service)?,
+    ))
 }
 
 async fn get_session(
@@ -784,12 +736,12 @@ async fn get_session(
         .control
         .authenticate(&headers)
         .map_err(ApiError::from_control)?;
-    let store = state.store.clone();
-    let id = session_id.clone();
     let owner = SessionOwner::new(context.authority_id(), context.subject());
-    let session = run_blocking(move || existing_owned_session(&*store, &id, &owner))
+    let session = state
+        .runtime
+        .get_session(owner, session_id)
         .await
-        .map_err(ApiError::from_service)?;
+        .map_err(api_error_from_runtime_session)?;
     Ok(Json(session_view(session)))
 }
 
@@ -1110,13 +1062,11 @@ async fn stream_endpoint_events(
         .map_err(ApiError::from_control)?;
     let after = parse_last_event_id(&headers).map_err(ApiError::from_service)?;
     let owner = SessionOwner::new(context.authority_id(), context.subject());
-    let subscription = subscribe_runtime_stream(&state)
+    let (subscription, initial_records) = state
+        .runtime
+        .subscribe_owned(owner.clone(), after.unwrap_or(0), READ_GLOBAL_BATCH_SIZE)
         .await
-        .map_err(ApiError::from_service)?;
-    let initial_records =
-        read_owned_event_batch(state.store.clone(), owner.clone(), after.unwrap_or(0))
-            .await
-            .map_err(ApiError::from_service)?;
+        .map_err(api_error_from_runtime_session)?;
     let initial_batch_was_full = initial_records.len() == READ_GLOBAL_BATCH_SIZE;
     let initial_catch_up_pending = !initial_records.is_empty();
 
@@ -1173,12 +1123,10 @@ async fn stream_endpoint_events(
                     Ok(message) => match message.event {
                         RuntimeStreamEvent::Transient(event) => {
                             if !owned_sessions.contains(&event.session_id) {
-                                match session_is_owned(
-                                    state.store.clone(),
-                                    owner.clone(),
-                                    event.session_id.clone(),
-                                )
-                                .await
+                                match state
+                                    .runtime
+                                    .session_is_owned(owner.clone(), event.session_id.clone())
+                                    .await
                                 {
                                     Ok(true) => {
                                         owned_sessions.insert(event.session_id.clone());
@@ -1217,19 +1165,35 @@ async fn stream_endpoint_events(
                         }
                     },
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        match subscribe_runtime_stream(&state).await {
-                            Ok(next) => {
+                        match state
+                            .runtime
+                            .subscribe_owned(
+                                owner.clone(),
+                                last_position,
+                                READ_GLOBAL_BATCH_SIZE,
+                            )
+                            .await
+                        {
+                            Ok((next, records)) => {
                                 receiver = next.receiver;
                                 skip_through_sequence = next.fence.sequence;
                                 catch_up_through =
                                     catch_up_through.max(next.fence.durable_position);
-                                catch_up_pending = true;
                                 retry_barriers = next.fence.retry_barriers;
                                 retry_barriers.retain(|_, position| *position > last_position);
                                 blocked_transient = None;
-                                catch_up_batch.clear();
-                                catch_up_batch_was_full = false;
-                                prefer_live = false;
+                                if records.is_empty() {
+                                    catch_up_batch.clear();
+                                    catch_up_batch_was_full = false;
+                                    catch_up_pending = false;
+                                    prefer_live = true;
+                                } else {
+                                    catch_up_batch_was_full =
+                                        records.len() == READ_GLOBAL_BATCH_SIZE;
+                                    catch_up_batch = records.into();
+                                    catch_up_pending = true;
+                                    prefer_live = false;
+                                }
                             }
                             Err(_) => {
                                 yield Ok::<SseEvent, Infallible>(SseEvent::default()
@@ -1248,12 +1212,10 @@ async fn stream_endpoint_events(
             }
 
             if catch_up_batch.is_empty() {
-                match read_owned_event_batch(
-                    state.store.clone(),
-                    owner.clone(),
-                    last_position,
-                )
-                .await
+                match state
+                    .runtime
+                    .read_owned_events(owner.clone(), last_position, READ_GLOBAL_BATCH_SIZE)
+                    .await
                 {
                     Ok(records) if records.is_empty() => {
                         catch_up_pending = false;
@@ -1357,104 +1319,30 @@ fn default_auth_revision() -> u64 {
     1
 }
 
-fn existing_owned_session(
-    store: &dyn EventStore,
-    session_id: &str,
-    owner: &SessionOwner,
-) -> Result<SessionState, ServiceError> {
-    store
-        .rehydrate_owned(owner, session_id)
-        .map_err(ServiceError::rehydrate)
-}
-
-struct PublicSessionListPage {
-    items: Vec<Value>,
-    next_cursor: Option<String>,
-}
-
-fn list_owned_sessions(
-    store: &dyn EventStore,
-    owner: &SessionOwner,
-    cursor: Option<&SessionListCursor>,
-    limit: usize,
-) -> Result<PublicSessionListPage, ServiceError> {
-    store
-        .list_sessions_page(owner, cursor, limit)
-        .map(|page| {
-            let next_cursor = page
-                .next_cursor
-                .map(|cursor| cursor.encode())
-                .transpose()
-                .map_err(ServiceError::store)?;
-            let items = page
-                .items
-                .into_iter()
-                .map(|item| {
-                    json!({
-                        "session_id": item.session_id,
-                        "version": item.version,
-                        "status": item.status,
-                        "created_at_ms": item.created_at_ms,
-                        "model": item.selection.model.map(public_model),
-                    })
-                })
-                .collect();
-            Ok(PublicSessionListPage { items, next_cursor })
+fn public_session_list(page: SessionListPage) -> Result<Value, ServiceError> {
+    let next_cursor = page
+        .next_cursor
+        .map(|cursor| cursor.encode())
+        .transpose()
+        .map_err(|_| ServiceError::Backend)?;
+    let items = page
+        .items
+        .into_iter()
+        .map(|item| {
+            json!({
+                "session_id": item.session_id,
+                "version": item.version,
+                "status": item.status,
+                "created_at_ms": item.created_at_ms,
+                "model": item.selection.model.map(public_model),
+            })
         })
-        .map_err(ServiceError::store)?
-}
-
-async fn subscribe_runtime_stream(
-    state: &AppState,
-) -> Result<RuntimeStreamSubscription, ServiceError> {
-    let publisher = state.runtime.stream_publisher();
-    let store = state.store.clone();
-    run_blocking(move || {
-        publisher.subscribe_with_fence(|| {
-            store
-                .latest_global_position()
-                .map_err(ServiceError::read_store)
-        })
-    })
-    .await
-}
-
-async fn read_owned_event_batch(
-    store: Arc<dyn EventStore>,
-    owner: SessionOwner,
-    after: u64,
-) -> Result<Vec<EventRecord>, ServiceError> {
-    run_blocking(move || {
-        store
-            .read_owned_events(&owner, after, READ_GLOBAL_BATCH_SIZE)
-            .map_err(ServiceError::read_store)
-    })
-    .await
-}
-
-async fn session_is_owned(
-    store: Arc<dyn EventStore>,
-    owner: SessionOwner,
-    session_id: String,
-) -> Result<bool, ServiceError> {
-    run_blocking(
-        move || match store.read_session_events(&owner, &session_id, 0, 0) {
-            Ok(_) => Ok(true),
-            Err(StoreError::SessionNotFound) => Ok(false),
-            Err(error) => Err(ServiceError::read_store(error)),
-        },
-    )
-    .await
-}
-
-async fn run_blocking<T, F>(operation: F) -> Result<T, ServiceError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, ServiceError> + Send + 'static,
-{
-    tokio::task::spawn_blocking(operation)
-        .await
-        .map_err(|_| ServiceError::Backend)?
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "schema": "zode.session-list.v1",
+        "items": items,
+        "next_cursor": next_cursor,
+    }))
 }
 
 fn parse_last_event_id(headers: &HeaderMap) -> Result<Option<u64>, ServiceError> {

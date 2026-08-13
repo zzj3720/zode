@@ -10,7 +10,9 @@ contract.
 ## HTTP contract
 
 - Validate transport shape, authenticate/authorize when introduced, translate
-  into one runtime command, and return only after durable admission/commit.
+  into one runtime command or query, and return only after durable admission/
+  commit or a runtime-owned read. List, get, and SSE catch-up call Runtime;
+  this adapter does not hold EventStore.
 - Derive controller authority from control authentication and accept a bounded
   opaque subject only in that trusted context. Bind session ownership and
   command receipt scope to authority/subject; list/read/mutate/SSE must not leak
@@ -75,7 +77,8 @@ contract.
   skip private facts or sessions owned by another subject.
 - Commit order, not handler completion order, controls publication. Recover a
   lagged receiver from storage without leaking debug errors into the stream.
-- Subscribe before replay, establish one Endpoint-wide handoff fence, stream
+- Subscribe before replay through Runtime so the durable head is read under the
+  publisher fence lock. Establish one Endpoint-wide handoff fence, stream
   catch-up in bounded batches through that fence, and merge later durable frames
   into the same ordered catch-up. No-ID transient progress may overtake an older
   durable replay tail, but a durable retry boundary must be delivered before

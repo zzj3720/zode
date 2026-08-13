@@ -5,15 +5,17 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::domain::{
-    DeliveryKind, DurablePayload, EventDraft, QueuedDelivery, SessionEvent, SessionModelSelection,
-    SessionOwner, SessionSelection, SessionState, ToolCall, TranscriptMessage, TranscriptRole,
+    DeliveryKind, DurablePayload, EventDraft, EventRecord, QueuedDelivery, SessionEvent,
+    SessionModelSelection, SessionOwner, SessionSelection, SessionState, ToolCall,
+    TranscriptMessage, TranscriptRole,
 };
 
 use super::{
     AppendResult, EventStore, ExecutionPolicyPort, RehydrateError, ReplicaInstallRequest,
     ReplicaMetadata, ReplicaPort, ReplicaPortError, ReplicaProvisionOutcome,
-    ReplicaTombstoneRequest, Runtime, RuntimeCommandError, SessionCreate, SessionCreateCommand,
-    SessionCreateResult, StoreError, ToolExecutor, VerifiedSessionState,
+    ReplicaTombstoneRequest, Runtime, RuntimeCommandError, RuntimeStreamSubscription,
+    SessionCreate, SessionCreateCommand, SessionCreateResult, SessionListCursor, SessionListPage,
+    StoreError, ToolExecutor, VerifiedSessionState,
 };
 
 #[derive(Debug, Serialize)]
@@ -703,5 +705,105 @@ impl Runtime {
         tokio::task::spawn_blocking(move || replicas.read(&authority_id, &profile_id))
             .await
             .map_err(|_| ReplicaPortError::Backend)?
+    }
+
+    pub async fn list_sessions(
+        &self,
+        owner: SessionOwner,
+        cursor: Option<SessionListCursor>,
+        limit: usize,
+    ) -> Result<SessionListPage, RuntimeCommandError> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            store
+                .list_sessions_page(&owner, cursor.as_ref(), limit)
+                .map_err(list_store_error)
+        })
+        .await
+        .map_err(|_| RuntimeCommandError::Backend)?
+    }
+
+    pub async fn get_session(
+        &self,
+        owner: SessionOwner,
+        session_id: String,
+    ) -> Result<SessionState, RuntimeCommandError> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            store
+                .rehydrate_verified_owned(&owner, &session_id)
+                .map(|state| state.into_state())
+                .map_err(rehydrate_error)
+        })
+        .await
+        .map_err(|_| RuntimeCommandError::Backend)?
+    }
+
+    /// Subscribe first, then sample owned catch-up. The durable head is read
+    /// inside the publisher fence lock so live commits cannot slip past replay.
+    pub async fn subscribe_owned(
+        &self,
+        owner: SessionOwner,
+        last_event_id: u64,
+        limit: usize,
+    ) -> Result<(RuntimeStreamSubscription, Vec<EventRecord>), RuntimeCommandError> {
+        let publisher = self.stream_publisher.clone();
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let subscription = publisher.subscribe_with_fence(|| {
+                store.latest_global_position().map_err(read_store_error)
+            })?;
+            let records = store
+                .read_owned_events(&owner, last_event_id, limit)
+                .map_err(read_store_error)?;
+            Ok((subscription, records))
+        })
+        .await
+        .map_err(|_| RuntimeCommandError::Backend)?
+    }
+
+    pub async fn read_owned_events(
+        &self,
+        owner: SessionOwner,
+        after_position: u64,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>, RuntimeCommandError> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            store
+                .read_owned_events(&owner, after_position, limit)
+                .map_err(read_store_error)
+        })
+        .await
+        .map_err(|_| RuntimeCommandError::Backend)?
+    }
+
+    pub async fn session_is_owned(
+        &self,
+        owner: SessionOwner,
+        session_id: String,
+    ) -> Result<bool, RuntimeCommandError> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            match store.read_session_events(&owner, &session_id, 0, 0) {
+                Ok(_) => Ok(true),
+                Err(StoreError::SessionNotFound) => Ok(false),
+                Err(error) => Err(read_store_error(error)),
+            }
+        })
+        .await
+        .map_err(|_| RuntimeCommandError::Backend)?
+    }
+}
+
+fn list_store_error(error: StoreError) -> RuntimeCommandError {
+    match error {
+        StoreError::InvalidSessionListLimit => {
+            RuntimeCommandError::Invalid("invalid session list limit")
+        }
+        StoreError::InvalidSessionListCursor => {
+            RuntimeCommandError::Invalid("invalid session list cursor")
+        }
+        other => store_error(other),
     }
 }

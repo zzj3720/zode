@@ -193,7 +193,7 @@ async fn run(
     let (due_tx, mut due_rx) = tokio::sync::mpsc::unbounded_channel::<TimerArm>();
     let timer = Arc::new(SleepTimer::new(clock.clone(), due_tx));
     let runtime = Runtime::new_with_options(
-        store.clone(),
+        store,
         provider,
         tools,
         composition.runtime_options,
@@ -210,7 +210,6 @@ async fn run(
     });
     runtime.queue_startup_recovery().await?;
     let state = api::AppState::new(
-        store,
         composition.control,
         runtime.clone(),
         composition.health_body,

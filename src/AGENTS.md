@@ -16,10 +16,11 @@ Management Server code belongs under `server/`; browser code belongs under
   Runtime arms it only after the WaitSet/timer-intent transaction commits.
 - Session create, append-message, and model-select go through Runtime.
   Credential-replica install, tombstone, list, and get go through Runtime.
+  Session list, get, and owned SSE subscribe/catch-up go through Runtime.
   `ProviderExecutionPolicy` implements `ExecutionPolicyPort`; `FileReplicaStore`
   implements `ReplicaPort` and is injected into Runtime only. HTTP does not
-  hold the replica store or construct session event drafts. Aimux receives a
-  short-lived `SecretLease` at call time, not a store.
+  hold EventStore or the replica store, or construct session event drafts.
+  Aimux receives a short-lived `SecretLease` at call time, not a store.
 - Do not add management Server discovery, registration, reverse connection,
   heartbeat, users, OAuth/profile authority, cross-Endpoint routing, mirror, or
   UI concerns anywhere under `src/`.

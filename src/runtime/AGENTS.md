@@ -11,14 +11,19 @@ not declare them.
 
 Session create, append-message, and model-select are admitted only through
 Runtime. Credential-replica install, tombstone, list, and get are admitted
-only through Runtime provision methods. HTTP authenticates and decodes, then
-calls one Runtime method. Receipt lookup precedes current tool-catalog,
-execution-policy, replica-probe, clock, ULID, and event effects. Replay-only
-misses are typed and mutation-free. Create does not wake; message and
-model-select wake after a non-replayed commit. Runtime resolves a
-`SecretLease` after `ModelRequestDeclared`/`ModelRequestPrepared` and
-immediately before each aimux call; only the revision enters
-`ModelAttemptStarted`. Secrets never enter events.
+only through Runtime provision methods. Session list, get, and owned SSE
+subscribe/catch-up are served only through Runtime query methods. HTTP
+authenticates and decodes, then calls one Runtime method. Receipt lookup
+precedes current tool-catalog, execution-policy, replica-probe, clock, ULID,
+and event effects. Replay-only misses are typed and mutation-free. Create
+does not wake; message and model-select wake after a non-replayed commit.
+`subscribe_owned` uses `RuntimeStreamPublisher::subscribe_with_fence` and
+reads `latest_global_position` under that lock; it must not pre-read the
+head and then subscribe. Missing or cross-owner sessions are the same safe
+not-found as a missing session. Runtime resolves a `SecretLease` after
+`ModelRequestDeclared`/`ModelRequestPrepared` and immediately before each
+aimux call; only the revision enters `ModelAttemptStarted`. Secrets never
+enter events.
 
 ## Authority and activation
 
