@@ -61,13 +61,6 @@ struct PreparedModelRequestInput<'a> {
     purpose: ModelRequestPurpose,
 }
 
-pub trait ModelExecutor: Send + Sync {
-    fn complete<'a>(
-        &'a self,
-        request: &'a ModelRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<ModelOutcome, ModelError>> + Send + 'a>>;
-}
-
 impl Runtime {
     pub(super) async fn recover_model_round(
         self: &Arc<Self>,

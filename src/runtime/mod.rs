@@ -1,7 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    future::Future,
-    pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -14,9 +12,18 @@ mod callback;
 mod commit;
 mod context;
 mod model;
+pub mod ports;
 
-pub use model::{ModelExecutor, ModelOutcome, ModelRequest, ModelTokenUsage};
+pub use model::{ModelOutcome, ModelRequest, ModelTokenUsage};
 use model::{MAX_CONTEXT_HANDOFF_DOCUMENT_TOKENS, MAX_CONTEXT_HANDOFF_GENERATION_TOKENS};
+pub use ports::{
+    AppendResult, BlobPort, BlobStore, EventStore, ExternalCallbackLookup, ModelExecutor,
+    ModelPort, OwnedSessionRef, RehydrateError, SessionAppendResult, SessionCreate,
+    SessionCreateCommand, SessionCreateResult, SessionListCursor, SessionListItem, SessionListPage,
+    SnapshotRecord, StoreError, StorePort, StorePortError, ToolExecutor, ToolPort,
+    VerifiedSessionState, MAX_OWNED_SESSION_SCAN_LIMIT, MAX_SESSION_LIST_LIMIT,
+    SNAPSHOT_ENCODING_JSON,
+};
 mod stream;
 mod transition;
 
@@ -38,19 +45,13 @@ use context::{
     runtime_tool_definitions, token_estimate_scale_millionths, ProviderContextCache,
 };
 
-use crate::{
-    domain::{
-        ActivationOutcome, ActiveWait, AsyncToolCallRecord, AsyncToolStatus, CompletionMode,
-        ContextHandoffDocument, ContextHandoffPlan, DeliveryKind, DurablePayload, EventDraft,
-        EventRecord, ModelAttemptError, ModelAttemptErrorClass, ModelAttemptFailure,
-        ModelRequestPurpose, ModelRetrySchedule, ModelUsageAnchor, SessionEvent,
-        SessionModelSelection, SessionOwner, SessionSelection, SessionState, ToolCall,
-        ToolError as DomainToolError, TranscriptMessage, TranscriptRole, WaitSource,
-        WAIT_MAX_SECONDS, WAIT_MIN_SECONDS,
-    },
-    storage::{
-        AppendResult, EventStore, StoreError, VerifiedSessionState, MAX_OWNED_SESSION_SCAN_LIMIT,
-    },
+use crate::domain::{
+    ActivationOutcome, ActiveWait, AsyncToolCallRecord, AsyncToolStatus, CompletionMode,
+    ContextHandoffDocument, ContextHandoffPlan, DeliveryKind, DurablePayload, EventDraft,
+    EventRecord, ModelAttemptError, ModelAttemptErrorClass, ModelAttemptFailure,
+    ModelRequestPurpose, ModelRetrySchedule, ModelUsageAnchor, SessionEvent, SessionModelSelection,
+    SessionOwner, SessionSelection, SessionState, ToolCall, ToolError as DomainToolError,
+    TranscriptMessage, TranscriptRole, WaitSource, WAIT_MAX_SECONDS, WAIT_MIN_SECONDS,
 };
 
 #[derive(Debug)]
@@ -206,26 +207,6 @@ pub enum ToolError {
 
 #[derive(Debug)]
 pub struct BlobStoreError;
-
-/// Immutable output storage owned by the composition root.  Runtime/tools
-/// write a blob before returning its reference; the event stream only ever
-/// receives the resulting content-addressed `BlobRef`.
-pub trait BlobStore: Send + Sync {
-    fn put(
-        &self,
-        bytes: &[u8],
-        media_type: Option<&str>,
-    ) -> Result<crate::domain::BlobRef, BlobStoreError>;
-}
-
-pub trait ToolExecutor: Send + Sync {
-    fn definitions(&self, selected: &[String]) -> Result<Vec<ToolDefinition>, ToolError>;
-
-    fn execute<'a>(
-        &'a self,
-        invocation: ToolInvocation,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionResult, ToolError>> + Send + 'a>>;
-}
 
 /// Runtime budgets and bounded effect windows.  Composition roots should use
 /// [`Runtime::new_with_options`] so configuration is applied once at the

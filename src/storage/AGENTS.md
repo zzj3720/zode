@@ -1,8 +1,9 @@
 # Storage module rules
 
-`src/storage` owns the transactional event-store port and the default SQLite
-adapter. The event stream is authoritative; all other records are optimizations
-or rebuildable operational projections.
+`src/storage` implements the runtime-declared `StorePort` as the default SQLite
+adapter. The port lives in `src/runtime/ports`; this module does not declare it.
+The event stream is authoritative; all other records are optimizations or
+rebuildable operational projections.
 
 ## Transaction and replay invariants
 

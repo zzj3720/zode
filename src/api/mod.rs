@@ -44,12 +44,9 @@ use crate::{
         MAX_REPLICA_REQUEST_BYTES,
     },
     runtime::{
-        CallbackCompletion, Runtime, RuntimeCommandError, RuntimeStreamEvent,
-        RuntimeStreamSubscription, TransientModelEvent,
-    },
-    storage::{
-        EventStore, RehydrateError, SessionCreate, SessionCreateCommand, SessionListCursor,
-        StoreError, MAX_SESSION_LIST_LIMIT,
+        CallbackCompletion, EventStore, RehydrateError, Runtime, RuntimeCommandError,
+        RuntimeStreamEvent, RuntimeStreamSubscription, SessionCreate, SessionCreateCommand,
+        SessionListCursor, StoreError, TransientModelEvent, MAX_SESSION_LIST_LIMIT,
     },
 };
 
@@ -1358,7 +1355,7 @@ fn enqueue_model_delivery(
     session_id: &str,
     mut current: SessionState,
     spec: ModelDeliverySpec,
-) -> Result<(crate::storage::AppendResult, SessionState), ServiceError> {
+) -> Result<(crate::runtime::AppendResult, SessionState), ServiceError> {
     let payload = DurablePayload::inline(json!({
         "message_id": &spec.message_id,
         "content": &spec.content,
@@ -1422,7 +1419,7 @@ fn replay_queued_delivery(
     session_id: &str,
     command_id: &str,
     requested: &QueuedDelivery,
-) -> Result<Option<(crate::storage::AppendResult, SessionState)>, ServiceError> {
+) -> Result<Option<(crate::runtime::AppendResult, SessionState)>, ServiceError> {
     let records = store
         .read_stream_owned(owner, session_id, 0)
         .map_err(ServiceError::read_store)?;
@@ -1456,7 +1453,7 @@ fn replay_queued_delivery(
         .map(|record| record.stream_version)
         .unwrap_or(state.stream_version);
     Ok(Some((
-        crate::storage::AppendResult {
+        crate::runtime::AppendResult {
             stream_id: session_id.to_owned(),
             command_id: command_id.to_owned(),
             events,
@@ -1486,7 +1483,7 @@ fn replay_message_command(
     command_id: &str,
     expected_message: &TranscriptMessage,
     requested_delivery: Option<&QueuedDelivery>,
-) -> Result<Option<(crate::storage::AppendResult, SessionState)>, ServiceError> {
+) -> Result<Option<(crate::runtime::AppendResult, SessionState)>, ServiceError> {
     let records = match store.read_stream_owned(owner, session_id, 0) {
         Ok(records) => records,
         Err(StoreError::SessionNotFound) => return Ok(None),
@@ -1524,7 +1521,7 @@ fn replay_message_command(
         .map(|record| record.stream_version)
         .unwrap_or(state.stream_version);
     Ok(Some((
-        crate::storage::AppendResult {
+        crate::runtime::AppendResult {
             stream_id: session_id.to_owned(),
             command_id: command_id.to_owned(),
             events,
@@ -1815,7 +1812,7 @@ fn lookup_session_command<F>(
     session_id: &str,
     command_id: &str,
     matches_request: F,
-) -> Result<Option<(crate::storage::AppendResult, SessionState)>, ServiceError>
+) -> Result<Option<(crate::runtime::AppendResult, SessionState)>, ServiceError>
 where
     F: Fn(&SessionEvent) -> bool,
 {
@@ -1840,7 +1837,7 @@ where
         .rehydrate_owned(owner, session_id)
         .map_err(ServiceError::rehydrate)?;
     Ok(Some((
-        crate::storage::AppendResult {
+        crate::runtime::AppendResult {
             stream_id: session_id.to_owned(),
             command_id: command_id.to_owned(),
             stream_version: events
