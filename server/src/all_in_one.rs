@@ -196,9 +196,8 @@ async fn probe_and_commit(
     Ok(endpoint_id)
 }
 
-fn validate_probe(config: &ServerConfig, probe: &EndpointProbe) -> Result<(), LocalEndpointError> {
-    if probe.identity.authority_id != config.server_authority_id()
-        || probe.identity.endpoint_id != probe.capabilities.endpoint_id
+fn validate_probe(_config: &ServerConfig, probe: &EndpointProbe) -> Result<(), LocalEndpointError> {
+    if probe.identity.endpoint_id != probe.capabilities.endpoint_id
         || probe.identity.protocol_version != probe.capabilities.protocol_version
     {
         return Err(LocalEndpointError::Identity);

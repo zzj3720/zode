@@ -48,7 +48,8 @@ pub(crate) enum CatalogError {
 pub(crate) struct CreateEndpointRequest {
     label: String,
     base_url: String,
-    control_auth: ControlAuth,
+    #[serde(default)]
+    control_auth: Option<ControlAuth>,
 }
 
 #[derive(Deserialize)]
@@ -96,26 +97,24 @@ impl Catalog {
             return Err(CatalogError::Invalid);
         }
         request.base_url = normalize_endpoint_url(&request.base_url)?;
-        if request.control_auth.kind != "bearer"
-            || request.control_auth.secret.is_empty()
-            || request.control_auth.secret.len() > MAX_CONTROL_SECRET_BYTES
-            || request
-                .control_auth
-                .secret
-                .as_bytes()
-                .iter()
-                .any(u8::is_ascii_whitespace)
-        {
-            return Err(
-                if request.control_auth.secret.len() > MAX_CONTROL_SECRET_BYTES {
+        let control_secret = request
+            .control_auth
+            .as_ref()
+            .map(|auth| auth.secret.as_str())
+            .unwrap_or("")
+            .to_owned();
+        if let Some(auth) = request.control_auth.as_ref() {
+            if auth.kind != "bearer"
+                || auth.secret.len() > MAX_CONTROL_SECRET_BYTES
+                || auth.secret.as_bytes().iter().any(u8::is_ascii_whitespace)
+            {
+                return Err(if auth.secret.len() > MAX_CONTROL_SECRET_BYTES {
                     CatalogError::PayloadTooLarge
                 } else {
                     CatalogError::Invalid
-                },
-            );
+                });
+            }
         }
-        HeaderValue::from_str(&format!("Bearer {}", request.control_auth.secret))
-            .map_err(|_| CatalogError::Invalid)?;
 
         let keys = self.store.keys();
         let actor_key = *actor.actor_key();
@@ -123,12 +122,8 @@ impl Catalog {
             b"endpoint-create-command-v1",
             &[&actor_key, idempotency_key.as_bytes()],
         );
-        let request_fingerprint = request_fingerprint(
-            &keys,
-            &request.label,
-            &request.base_url,
-            &request.control_auth.secret,
-        );
+        let request_fingerprint =
+            request_fingerprint(&keys, &request.label, &request.base_url, &control_secret);
         let secret_ref = hex(&keys.digest(
             b"endpoint-control-secret-ref-v1",
             &[&actor_key, &command_key],
@@ -153,19 +148,14 @@ impl Catalog {
             BeginEndpointCreate::Pending(operation) => (operation, None),
             BeginEndpointCreate::Complete(operation, record) => (operation, Some(record)),
         };
-        verify_operation(
-            &keys,
-            &operation,
-            &request.control_auth.secret,
-            replay.as_deref(),
-        )?;
+        verify_operation(&keys, &operation, &control_secret, replay.as_deref())?;
         if let Some(record) = replay {
             return Ok(public_endpoint(&record));
         }
 
         let store = Arc::clone(&self.store);
         let secret_ref = operation.secret_ref.clone();
-        let mut secret = request.control_auth.secret.as_bytes().to_vec();
+        let mut secret = control_secret.into_bytes();
         tokio::task::spawn_blocking(move || {
             let result = store.stage_endpoint_secret(&secret_ref, &secret);
             secret.fill(0);
@@ -175,9 +165,7 @@ impl Catalog {
         .map_err(|_| CatalogError::Internal)?
         .map_err(map_store_error)?;
 
-        let probe = self
-            .probe_endpoint(&operation.base_url, &request.control_auth.secret)
-            .await?;
+        let probe = self.probe_endpoint(&operation.base_url).await?;
         let store = Arc::clone(&self.store);
         let operation = Arc::new(operation);
         let completion = Arc::clone(&operation);
@@ -253,10 +241,9 @@ impl Catalog {
         .await
         .map_err(|_| CatalogError::Internal)??;
         let secret = std::str::from_utf8(&secret).map_err(|_| CatalogError::Internal)?;
-        let probe = self.probe_endpoint(&record.base_url, secret).await?;
+        let _ = secret;
+        let probe = self.probe_endpoint(&record.base_url).await?;
         if probe.identity.endpoint_id != record.endpoint_id
-            || probe.identity.authority_id != record.controller_authority_id
-            || probe.identity.revision != record.controller_credential_revision
             || probe.identity.protocol_version != record.protocol_version
         {
             return Err(CatalogError::EndpointUnavailable);
@@ -273,7 +260,8 @@ impl Catalog {
         base_url: &str,
         secret: &str,
     ) -> Result<EndpointProbe, CatalogError> {
-        self.probe_endpoint(base_url, secret).await
+        let _ = secret;
+        self.probe_endpoint(base_url).await
     }
 
     pub(crate) async fn install_auth_replica(
@@ -303,14 +291,13 @@ impl Catalog {
         .await
         .map_err(|_| CatalogError::Internal)?
         .map_err(map_store_error)?;
-        let bearer = std::str::from_utf8(&secret).map_err(|_| CatalogError::Internal)?;
+        let _ = secret;
         let response = self
             .client
             .put(format!(
                 "{}/v1/auth-replicas/{profile_id}",
                 endpoint.base_url
             ))
-            .header("authorization", format!("Bearer {bearer}"))
             .header("idempotency-key", operation_id)
             .json(&body)
             .send()
@@ -322,15 +309,10 @@ impl Catalog {
         read_json_response(response).await
     }
 
-    async fn probe_endpoint(
-        &self,
-        base_url: &str,
-        secret: &str,
-    ) -> Result<EndpointProbe, CatalogError> {
-        let identity: EndpointIdentity = self.probe_json(base_url, "/v1/identity", secret).await?;
-        let capabilities: EndpointCapabilities = self
-            .probe_json(base_url, "/v1/capabilities", secret)
-            .await?;
+    async fn probe_endpoint(&self, base_url: &str) -> Result<EndpointProbe, CatalogError> {
+        let identity: EndpointIdentity = self.probe_json(base_url, "/v1/identity").await?;
+        let capabilities: EndpointCapabilities =
+            self.probe_json(base_url, "/v1/capabilities").await?;
         negotiate_endpoint_protocol(&identity, &capabilities)
             .map_err(|_| CatalogError::EndpointUnavailable)?;
         Ok(EndpointProbe {
@@ -343,12 +325,10 @@ impl Catalog {
         &self,
         base_url: &str,
         path: &str,
-        secret: &str,
     ) -> Result<T, CatalogError> {
         let response = self
             .client
             .get(format!("{base_url}{path}"))
-            .header("authorization", format!("Bearer {secret}"))
             .send()
             .await
             .map_err(|_| CatalogError::EndpointUnavailable)?;

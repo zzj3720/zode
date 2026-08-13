@@ -26,10 +26,7 @@ use zode_protocol::{
 };
 
 use crate::{
-    control::{
-        ControlAuthError, ControlRotationError, ControlState, ControllerAuthRotationRequest,
-        MAX_ROTATION_REQUEST_BYTES,
-    },
+    control::{ControlAuthError, ControlRotationError, ControlState},
     domain::{
         ActiveWait, AsyncToolCallRecord, CompletionMode, DurablePayload, EventRecord, ModelLimits,
         ProviderExecutionSelection, SessionEvent, SessionModelSelection, SessionOwner,
@@ -48,6 +45,12 @@ const PUBLIC_SCHEMA: &str = "zode.event.v1";
 const READ_GLOBAL_BATCH_SIZE: usize = 256;
 const MAX_SESSION_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 1_024;
+const SHARED_SESSION_AUTHORITY: &str = "local";
+const SHARED_SESSION_SUBJECT: &str = "shared";
+
+fn shared_session_owner() -> SessionOwner {
+    SessionOwner::new(SHARED_SESSION_AUTHORITY, SHARED_SESSION_SUBJECT)
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -435,7 +438,6 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/identity", get(identity))
         .route("/v1/health", get(health))
         .route("/v1/capabilities", get(capabilities))
-        .route("/v1/controller-auth", put(rotate_controller_auth))
         .route("/v1/auth-replicas", get(list_auth_replicas))
         .route(
             "/v1/auth-replicas/{profile}",
@@ -465,22 +467,11 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    state
-        .control
-        .authenticate_controller(&headers)
-        .map_err(ApiError::from_control)?;
+async fn health(State(state): State<AppState>) -> Result<Response, ApiError> {
     Ok(pre_serialized_json(state.health_body.as_ref()))
 }
 
-async fn capabilities(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    state
-        .control
-        .authenticate_controller(&headers)
-        .map_err(ApiError::from_control)?;
+async fn capabilities(State(state): State<AppState>) -> Result<Response, ApiError> {
     Ok(pre_serialized_json(state.capabilities_body.as_ref()))
 }
 
@@ -497,18 +488,10 @@ fn pre_serialized_json(body: &[u8]) -> Response {
     response
 }
 
-async fn list_auth_replicas(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    let context = state
-        .control
-        .authenticate_controller(&headers)
-        .map_err(ApiError::from_control)?;
-    let authority_id = context.authority_id().to_owned();
+async fn list_auth_replicas(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let metadata = state
         .runtime
-        .list_replicas(authority_id)
+        .list_replicas(String::new())
         .await
         .map_err(ApiError::from_replica)?;
     Ok(Json(json!({
@@ -532,18 +515,16 @@ fn public_replica_metadata(metadata: ReplicaMetadata) -> Value {
 async fn read_auth_replica(
     State(state): State<AppState>,
     Path(profile_id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let context = state
-        .control
-        .authenticate_controller(&headers)
-        .map_err(ApiError::from_control)?;
-    let authority_id = context.authority_id().to_owned();
     let metadata = state
         .runtime
-        .get_replica(authority_id, profile_id)
+        .list_replicas(String::new())
         .await
         .map_err(ApiError::from_replica)?;
+    let metadata = metadata
+        .into_iter()
+        .find(|item| item.profile_id == profile_id)
+        .ok_or_else(|| ApiError::from_replica(ReplicaPortError::NotFound))?;
     Ok(Json(public_replica_metadata(metadata)))
 }
 
@@ -553,10 +534,6 @@ async fn install_auth_replica(
     headers: HeaderMap,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let context = state
-        .control
-        .authenticate_controller(&headers)
-        .map_err(ApiError::from_control)?;
     let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
     require_json_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_REPLICA_REQUEST_BYTES)
@@ -567,16 +544,11 @@ async fn install_auth_replica(
         .get("schema")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::invalid("credential replica schema is required"))?;
-    let authority_id = context.authority_id().to_owned();
     let outcome = match schema {
         "zode.auth-replica.install.v1" => {
             let request = serde_json::from_value::<ReplicaInstallRequest>(value)
                 .map_err(|_| ApiError::invalid("invalid credential replica request"))?;
-            if request.authority_id != authority_id {
-                return Err(ApiError::invalid(
-                    "credential replica authority does not match",
-                ));
-            }
+            let authority_id = request.authority_id.clone();
             state
                 .runtime
                 .install_replica(profile_id, authority_id, idempotency_key, request)
@@ -585,11 +557,7 @@ async fn install_auth_replica(
         "zode.auth-replica.tombstone.v1" => {
             let request = serde_json::from_value::<ReplicaTombstoneRequest>(value)
                 .map_err(|_| ApiError::invalid("invalid credential replica request"))?;
-            if request.authority_id != authority_id {
-                return Err(ApiError::invalid(
-                    "credential replica authority does not match",
-                ));
-            }
+            let authority_id = request.authority_id.clone();
             state
                 .runtime
                 .tombstone_replica(profile_id, authority_id, idempotency_key, request)
@@ -608,50 +576,12 @@ async fn install_auth_replica(
 
 async fn identity(
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Json<zode_protocol::EndpointIdentity>, ApiError> {
-    let context = state
-        .control
-        .authenticate_controller(&headers)
-        .map_err(ApiError::from_control)?;
     Ok(Json(zode_protocol::EndpointIdentity::v1(
         state.control.endpoint_id(),
-        context.authority_id(),
-        context.revision(),
+        SHARED_SESSION_AUTHORITY,
+        1,
     )))
-}
-
-async fn rotate_controller_auth(
-    State(state): State<AppState>,
-    request: Request,
-) -> Result<Response, ApiError> {
-    let controller = state
-        .control
-        .authenticate_controller(request.headers())
-        .map_err(ApiError::from_control)?;
-    let idempotency_key = rotation_idempotency_key(request.headers())?;
-    require_json_content_type(request.headers())?;
-    let body = to_bytes(request.into_body(), MAX_ROTATION_REQUEST_BYTES)
-        .await
-        .map_err(|_| ApiError::payload_too_large())?;
-    let rotation: ControllerAuthRotationRequest =
-        serde_json::from_slice(&body).map_err(|_| ApiError::malformed())?;
-    let control = state.control.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        control.rotate(&controller, &idempotency_key, &rotation)
-    })
-    .await
-    .map_err(|_| ApiError::internal())?
-    .map_err(ApiError::from_rotation)?;
-
-    let mut response = Response::new(Body::from(outcome.body));
-    *response.status_mut() =
-        StatusCode::from_u16(outcome.status).map_err(|_| ApiError::internal())?;
-    response.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/json"),
-    );
-    Ok(response)
 }
 
 async fn create_session(
@@ -659,10 +589,6 @@ async fn create_session(
     headers: HeaderMap,
     request: Request,
 ) -> Result<(StatusCode, Json<CommandResponse>), ApiError> {
-    let context = state
-        .control
-        .authenticate(&headers)
-        .map_err(ApiError::from_control)?;
     require_json_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_SESSION_REQUEST_BYTES)
         .await
@@ -671,7 +597,7 @@ async fn create_session(
     let selection = validate_create_body(body)?;
     let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
     let replay_only = replay_only_mode(&headers).map_err(ApiError::from_service)?;
-    let owner = SessionOwner::new(context.authority_id(), context.subject());
+    let owner = shared_session_owner();
     let operation = state
         .runtime
         .create_session(owner, idempotency_key, selection, replay_only)
@@ -690,13 +616,8 @@ async fn create_session(
 
 async fn list_sessions(
     State(state): State<AppState>,
-    headers: HeaderMap,
     query: Result<Query<SessionListQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
-    let context = state
-        .control
-        .authenticate(&headers)
-        .map_err(ApiError::from_control)?;
     let Query(query) = query.map_err(|_| ApiError::malformed())?;
     let limit = query.limit.unwrap_or(50);
     if !(1..=MAX_SESSION_LIST_LIMIT as u64).contains(&limit) {
@@ -704,7 +625,7 @@ async fn list_sessions(
             "limit must be between 1 and {MAX_SESSION_LIST_LIMIT}"
         )));
     }
-    let owner = SessionOwner::new(context.authority_id(), context.subject());
+    let owner = shared_session_owner();
     let cursor = query
         .cursor
         .as_deref()
@@ -730,13 +651,8 @@ async fn list_sessions(
 async fn get_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let context = state
-        .control
-        .authenticate(&headers)
-        .map_err(ApiError::from_control)?;
-    let owner = SessionOwner::new(context.authority_id(), context.subject());
+    let owner = shared_session_owner();
     let session = state
         .runtime
         .get_session(owner, session_id)
@@ -751,10 +667,7 @@ async fn append_message(
     headers: HeaderMap,
     request: Request,
 ) -> Result<(StatusCode, Json<CommandResponse>), ApiError> {
-    let context = state
-        .control
-        .authenticate(&headers)
-        .map_err(ApiError::from_control)?;
+
     let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
     let replay_only = replay_only_mode(&headers).map_err(ApiError::from_service)?;
     require_json_content_type(&headers)?;
@@ -766,7 +679,7 @@ async fn append_message(
             serde_json::error::Category::Data => ApiError::invalid("invalid message request"),
             _ => ApiError::malformed(),
         })?;
-    let owner = SessionOwner::new(context.authority_id(), context.subject());
+    let owner = shared_session_owner();
     let (append, _) = state
         .runtime
         .append_message(
@@ -796,10 +709,7 @@ async fn select_model(
     headers: HeaderMap,
     request: Request,
 ) -> Result<(StatusCode, Json<CommandResponse>), ApiError> {
-    let context = state
-        .control
-        .authenticate(&headers)
-        .map_err(ApiError::from_control)?;
+
     let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
     let replay_only = replay_only_mode(&headers).map_err(ApiError::from_service)?;
     require_json_content_type(&headers)?;
@@ -808,7 +718,7 @@ async fn select_model(
         .map_err(|_| ApiError::payload_too_large())?;
     let body: Value = serde_json::from_slice(&body).map_err(|_| ApiError::malformed())?;
     let model = parse_model_selection(body)?;
-    let owner = SessionOwner::new(context.authority_id(), context.subject());
+    let owner = shared_session_owner();
     let (append, _) = state
         .runtime
         .select_model(
@@ -834,16 +744,12 @@ async fn select_model(
 async fn read_tool_call(
     State(state): State<AppState>,
     Path((session_id, tool_call_id)): Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let context = state
-        .control
-        .authenticate(&headers)
-        .map_err(ApiError::from_control)?;
+
     if session_id.is_empty() || tool_call_id.is_empty() {
         return Err(ApiError::tool_not_found());
     }
-    let owner = SessionOwner::new(context.authority_id(), context.subject());
+    let owner = shared_session_owner();
     let record = state
         .runtime
         .read_tool_call(owner, session_id.clone(), tool_call_id)
@@ -859,10 +765,7 @@ async fn cancel_tool_call(
     headers: HeaderMap,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    let context = state
-        .control
-        .authenticate(&headers)
-        .map_err(ApiError::from_control)?;
+
     let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
     require_json_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_SESSION_REQUEST_BYTES)
@@ -880,7 +783,7 @@ async fn cancel_tool_call(
     if request.reason.len() > MAX_ERROR_MESSAGE_BYTES {
         return Err(ApiError::payload_too_large());
     }
-    let owner = SessionOwner::new(context.authority_id(), context.subject());
+    let owner = shared_session_owner();
     let command_id = session_command_id("tool-cancel", &owner, &session_id, &idempotency_key);
     let record = state
         .runtime
@@ -902,10 +805,7 @@ async fn reconcile_tool_call(
     headers: HeaderMap,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    let context = state
-        .control
-        .authenticate(&headers)
-        .map_err(ApiError::from_control)?;
+
     let idempotency_key = required_idempotency_key(&headers).map_err(ApiError::from_service)?;
     require_json_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_SESSION_REQUEST_BYTES)
@@ -921,7 +821,7 @@ async fn reconcile_tool_call(
     if request.action != "retry_dispatch" {
         return Err(ApiError::invalid("unsupported reconciliation action"));
     }
-    let owner = SessionOwner::new(context.authority_id(), context.subject());
+    let owner = shared_session_owner();
     let command_id = session_command_id("tool-reconcile", &owner, &session_id, &idempotency_key);
     let record = state
         .runtime
@@ -1056,12 +956,9 @@ async fn stream_endpoint_events(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    let context = state
-        .control
-        .authenticate(&headers)
-        .map_err(ApiError::from_control)?;
+
     let after = parse_last_event_id(&headers).map_err(ApiError::from_service)?;
-    let owner = SessionOwner::new(context.authority_id(), context.subject());
+    let owner = shared_session_owner();
     let (subscription, initial_records) = state
         .runtime
         .subscribe_owned(owner.clone(), after.unwrap_or(0), READ_GLOBAL_BATCH_SIZE)

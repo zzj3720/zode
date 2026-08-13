@@ -978,14 +978,14 @@ async fn e2e_endpoint_health_is_controller_authenticated_and_independent_of_acti
             ("health.missing_controller", None),
             ("health.invalid_controller", Some(WRONG_CONTROLLER_SECRET)),
         ] {
-            let rejected = metadata_probe(&client, &current.url(""), phase, path, bearer).await;
-            let validation = validate_auth_rejection(&rejected.response)
-                .and_then(|()| assert_observation_omits(&rejected.response, &forbidden));
+            let open = metadata_probe(&client, &current.url(""), phase, path, bearer).await;
+            let validation = validate_health(&open.response, &endpoint_id)
+                .and_then(|()| assert_observation_omits(&open.response, &forbidden));
             if let Err(reason) = validation {
                 deferred_mismatch = Some((
-                    "retain the first health authentication mismatch while a provider stream is held",
+                    "retain the first unauthenticated health mismatch while a provider stream is held",
                     reason,
-                    vec![rejected],
+                    vec![open],
                 ));
                 return Ok(());
             }
@@ -1185,15 +1185,15 @@ async fn e2e_endpoint_capabilities_are_restart_stable_bounded_and_non_secret() -
                 Some(WRONG_CONTROLLER_SECRET),
             ),
         ] {
-            let rejected = metadata_probe(&client, &current.url(""), phase, path, bearer).await;
-            let validation = validate_auth_rejection(&rejected.response)
-                .and_then(|()| assert_observation_omits(&rejected.response, &forbidden));
+            let open = metadata_probe(&client, &current.url(""), phase, path, bearer).await;
+            let validation = validate_capabilities(&open.response, &endpoint_id)
+                .and_then(|()| assert_observation_omits(&open.response, &forbidden));
             if let Err(reason) = validation {
                 return contract_failure(
                     CAPABILITIES_E2E,
-                    "retain the first capability authentication mismatch",
+                    "retain the first unauthenticated capability mismatch",
                     reason,
-                    std::slice::from_ref(&rejected),
+                    std::slice::from_ref(&open),
                     None,
                 );
             }

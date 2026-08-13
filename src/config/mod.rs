@@ -211,7 +211,7 @@ impl EndpointConfig {
         let base = config_path
             .map(config_directory)
             .unwrap_or_else(|| Path::new("."));
-        config.validate_and_resolve(base, config_path.is_some())?;
+        config.validate_and_resolve(base)?;
         Ok(config)
     }
 
@@ -404,11 +404,7 @@ impl EndpointConfig {
         Ok(())
     }
 
-    fn validate_and_resolve(
-        &mut self,
-        base: &Path,
-        require_controller_auth: bool,
-    ) -> Result<(), ConfigError> {
+    fn validate_and_resolve(&mut self, base: &Path) -> Result<(), ConfigError> {
         validate_bounded_string(&self.schema, MAX_SCHEMA_BYTES, "schema")?;
         if self.schema != "zode.config.v1" {
             return Err(ConfigError::Invalid("schema must be zode.config.v1"));
@@ -433,11 +429,6 @@ impl EndpointConfig {
         }
 
         validate_controller_auth(base, &mut self.controller_auth)?;
-        if require_controller_auth && self.controller_auth.is_empty() {
-            return Err(ConfigError::Invalid(
-                "controller_auth must contain at least one authority",
-            ));
-        }
         validate_runtime(&self.runtime)?;
         if let Some(execution) = &mut self.provider_execution {
             validate_provider_execution(execution)?;

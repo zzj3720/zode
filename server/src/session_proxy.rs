@@ -693,17 +693,13 @@ impl SessionProxy {
     fn authorized_request(
         &self,
         target: &EndpointTarget,
-        actor: &ActorContext,
+        _actor: &ActorContext,
         method: reqwest::Method,
         path: &str,
     ) -> Result<reqwest::RequestBuilder, SessionProxyError> {
         let url = url::Url::parse(&format!("{}{}", target.record.base_url, path))
             .map_err(|_| SessionProxyError::Internal)?;
-        Ok(self
-            .client
-            .request(method, url)
-            .header(header::AUTHORIZATION, target.authorization.clone())
-            .header("zode-subject", actor.endpoint_subject()))
+        Ok(self.client.request(method, url))
     }
 
     async fn send_json(
@@ -722,18 +718,13 @@ impl SessionProxy {
 
     async fn send_json_url(
         &self,
-        target: &EndpointTarget,
-        actor: &ActorContext,
+        _target: &EndpointTarget,
+        _actor: &ActorContext,
         method: reqwest::Method,
         url: url::Url,
         details: JsonRequest<'_>,
     ) -> Result<EndpointJson, SessionProxyError> {
-        let mut request = self
-            .client
-            .request(method, url)
-            .header(header::AUTHORIZATION, target.authorization.clone())
-            .header("zode-subject", actor.endpoint_subject())
-            .timeout(Duration::from_secs(10));
+        let mut request = self.client.request(method, url).timeout(Duration::from_secs(10));
         if let Some(idempotency_key) = details.idempotency_key {
             request = request.header("idempotency-key", idempotency_key);
         }

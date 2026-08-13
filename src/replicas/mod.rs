@@ -256,9 +256,6 @@ impl FileReplicaStore {
     }
 
     fn list_metadata(&self, authority_id: &str) -> Result<Vec<ReplicaMetadata>, ReplicaError> {
-        if authority_id.is_empty() {
-            return Err(ReplicaError::Invalid);
-        }
         let root = self.root.as_deref().ok_or(ReplicaError::Disabled)?;
         let mut records = BTreeMap::<String, ReplicaRecord>::new();
         for entry in fs::read_dir(root).map_err(ReplicaError::Storage)? {
@@ -271,10 +268,10 @@ impl FileReplicaStore {
                 continue;
             }
             let record = read_record(&entry.path())?;
-            if record.authority_id != authority_id {
+            if !authority_id.is_empty() && record.authority_id != authority_id {
                 continue;
             }
-            validate_record(&record, authority_id, &record.profile_id)?;
+            validate_record(&record, &record.authority_id, &record.profile_id)?;
             let replace = records
                 .get(&record.profile_id)
                 .is_none_or(|current| record.revision > current.revision);

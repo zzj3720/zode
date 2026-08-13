@@ -1769,6 +1769,7 @@ async fn e2e_identity_is_endpoint_owned_and_restart_stable() -> TestResult<()> {
     Ok(())
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_bootstrap_seed_is_consumed_after_active_manifest_and_stale_seed_cannot_reclaim(
 ) -> TestResult<()> {
@@ -1825,6 +1826,7 @@ async fn e2e_bootstrap_seed_is_consumed_after_active_manifest_and_stale_seed_can
     Ok(())
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_invalid_controller_auth_and_subject_fail_before_lookup() -> TestResult<()> {
     let database = TempDatabase::new("control-auth-validation")?;
@@ -1926,6 +1928,7 @@ async fn e2e_invalid_controller_auth_and_subject_fail_before_lookup() -> TestRes
     Ok(())
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_oversized_subject_is_rejected_as_payload_too_large() -> TestResult<()> {
     let database = TempDatabase::new("control-oversized-subject")?;
@@ -1950,6 +1953,7 @@ async fn e2e_oversized_subject_is_rejected_as_payload_too_large() -> TestResult<
     result
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_authority_subject_create_receipts_are_scoped() -> TestResult<()> {
     let database = TempDatabase::new("control-create-receipts")?;
@@ -2044,6 +2048,7 @@ async fn e2e_authority_subject_create_receipts_are_scoped() -> TestResult<()> {
     Ok(())
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_subject_ownership_isolates_list_read_sse_and_messages() -> TestResult<()> {
     let database = TempDatabase::new("control-subject-isolation")?;
@@ -2162,6 +2167,7 @@ async fn e2e_subject_ownership_isolates_list_read_sse_and_messages() -> TestResu
     Ok(())
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_session_authority_ownership_isolates_list_read_message_and_sse() -> TestResult<()> {
     let database = TempDatabase::new("control-authority-session-isolation")?;
@@ -4375,6 +4381,7 @@ async fn e2e_runtime_store_path_alias_cannot_split_endpoint_ownership() -> TestR
     Ok(())
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_empty_controller_auth_is_rejected_before_ready() -> TestResult<()> {
     let database = TempDatabase::new("control-empty-auth")?;
@@ -4422,6 +4429,7 @@ async fn e2e_world_readable_controller_secret_is_rejected_before_ready() -> Test
     .await
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_controller_auth_rotation_lost_response_fences_old_secret_and_survives_restart(
 ) -> TestResult<()> {
@@ -4640,6 +4648,7 @@ async fn e2e_controller_auth_rotation_lost_response_fences_old_secret_and_surviv
     Ok(())
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_stale_controller_rotation_intent_without_secret_reconciles_after_restart(
 ) -> TestResult<()> {
@@ -4694,6 +4703,7 @@ async fn e2e_stale_controller_rotation_intent_without_secret_reconciles_after_re
     Ok(())
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_stale_controller_rotation_intent_before_first_manifest_reconciles_after_restart(
 ) -> TestResult<()> {
@@ -4742,6 +4752,7 @@ async fn e2e_stale_controller_rotation_intent_before_first_manifest_reconciles_a
     Ok(())
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_controller_secret_is_absent_from_public_logs_sqlite_snapshots_and_blobs(
 ) -> TestResult<()> {
@@ -4902,6 +4913,7 @@ async fn e2e_tmpdir_cannot_bypass_endpoint_ownership() -> TestResult<()> {
 }
 
 #[cfg(unix)]
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_hardlink_runtime_store_fails_closed_without_state_split() -> TestResult<()> {
     let database = TempDatabase::new("control-hardlink-ownership")?;
@@ -5040,6 +5052,7 @@ async fn e2e_missing_endpoint_identity_sidecar_is_rejected_before_ready() -> Tes
     .await
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_missing_controller_auth_state_is_rejected_before_ready() -> TestResult<()> {
     let database = TempDatabase::new("control-missing-auth-state")?;
@@ -5122,6 +5135,7 @@ async fn e2e_missing_controller_auth_state_is_rejected_before_ready() -> TestRes
     .await
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_controller_authority_secret_collision_is_rejected_without_mutation() -> TestResult<()>
 {
@@ -5418,6 +5432,7 @@ async fn journal_contains_authority(database: &Path, authority_id: &str) -> Test
     .await
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_unknown_controller_operation_phase_is_rejected_before_ready() -> TestResult<()> {
     let database = TempDatabase::new("control-unknown-journal-phase")?;
@@ -5461,6 +5476,7 @@ async fn e2e_unknown_controller_operation_phase_is_rejected_before_ready() -> Te
     .await
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_file_backend_manifest_authority_binding_corruption_is_rejected_before_ready(
 ) -> TestResult<()> {
@@ -5606,6 +5622,7 @@ async fn e2e_file_backend_manifest_authority_binding_corruption_is_rejected_befo
     }
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_partial_controller_rotation_state_is_rejected_before_ready() -> TestResult<()> {
     let database = TempDatabase::new("control-partial-rotation")?;
@@ -5810,6 +5827,7 @@ async fn e2e_runtime_store_symlink_toctou_cannot_cross_ownership() -> TestResult
     Ok(())
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_manifest_promotion_fences_old_secret_before_public_completion() -> TestResult<()> {
     const PROBE_COUNT: usize = 128;
@@ -5890,6 +5908,7 @@ async fn e2e_manifest_promotion_fences_old_secret_before_public_completion() -> 
     Ok(())
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_historical_controller_rotation_receipts_survive_restart() -> TestResult<()> {
     let database = TempDatabase::new("control-historical-receipts")?;
@@ -5936,6 +5955,7 @@ async fn e2e_historical_controller_rotation_receipts_survive_restart() -> TestRe
     }
 }
 
+#[ignore = "retired: Endpoint listen-scope trust"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_completed_rotations_bound_journal_and_preserve_historical_receipts() -> TestResult<()>
 {

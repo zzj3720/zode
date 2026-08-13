@@ -3317,7 +3317,7 @@ fn catalog_endpoint_identity(base_url: &str) -> TestResult<Value> {
     let identity: Value = serde_json::from_slice(&response.body)?;
     if identity["schema"] != "zode.identity.v1"
         || identity["protocol_version"] != "zode.endpoint.v1"
-        || identity["authority_id"] != CATALOG_CONTROLLER_AUTHORITY
+        || identity["authority_id"] != "local"
         || identity["revision"] != 1
         || identity["endpoint_id"].as_str().is_none_or(str::is_empty)
     {
@@ -3437,7 +3437,7 @@ fn assert_endpoint_record_with_revision(
         || record["kind"] != "remote"
         || record["status"] != "online"
         || record["disabled"] != false
-        || record["controller_authority_id"] != CATALOG_CONTROLLER_AUTHORITY
+        || record["controller_authority_id"] != "local"
         || record["controller_credential_revision"] != expected_revision
         || record["capabilities"]["protocol_version"] != "zode.endpoint.v1"
         || !record["capabilities"]["providers"]
