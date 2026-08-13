@@ -20,41 +20,14 @@ pub(super) fn materialize_boundary_blocking(
     mut state: VerifiedSessionState,
 ) -> Result<(Option<AppendResult>, VerifiedSessionState), &'static str> {
     for _ in 0..16 {
-        let Some(last_delivery) = state.delivery_queue.last() else {
+        let Some(through_queue_id) = state
+            .delivery_queue
+            .last()
+            .map(|delivery| delivery.queue_id)
+        else {
             return Ok((None, state));
         };
-        let through_queue_id = last_delivery.queue_id;
-        let mut drafts = Vec::new();
-        for delivery in &state.delivery_queue {
-            if delivery.materialized_message_id.is_some() {
-                continue;
-            }
-            let candidate = materialize_message(delivery)?;
-            // Callback completion atomically appends its terminal Tool
-            // transcript message together with the wakeable delivery.  The
-            // delivery acknowledges that existing message; it must not try
-            // to materialize a second Runtime row with the same ID.
-            let message = state
-                .transcript
-                .iter()
-                .find(|existing| {
-                    existing.message_id == candidate.message_id
-                        && existing.source_queue_id == Some(delivery.queue_id)
-                })
-                .cloned()
-                .unwrap_or(candidate);
-            drafts.push(EventDraft::new(
-                materialization_event_id(delivery),
-                SessionEvent::DeliveryMaterialized {
-                    queue_id: delivery.queue_id,
-                    message,
-                },
-            ));
-        }
-        drafts.push(EventDraft::new(
-            acknowledgement_event_id(through_queue_id),
-            SessionEvent::DeliveryAcknowledged { through_queue_id },
-        ));
+        let drafts = delivery_materialize_drafts(&state)?;
         let command_id = format!("delivery-boundary:v1:{through_queue_id}");
         match store.append_verified_owned(owner, session_id, state, &command_id, &drafts) {
             Ok(appended) => return Ok((Some(appended.append), appended.state)),
@@ -70,6 +43,50 @@ pub(super) fn materialize_boundary_blocking(
         }
     }
     Err("materialize_concurrency")
+}
+
+pub(super) fn delivery_materialize_drafts(
+    state: &SessionState,
+) -> Result<Vec<EventDraft>, &'static str> {
+    let Some(through_queue_id) = state
+        .delivery_queue
+        .last()
+        .map(|delivery| delivery.queue_id)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut drafts = Vec::new();
+    for delivery in &state.delivery_queue {
+        if delivery.materialized_message_id.is_some() {
+            continue;
+        }
+        let candidate = materialize_message(delivery)?;
+        // Callback completion atomically appends its terminal Tool
+        // transcript message together with the wakeable delivery.  The
+        // delivery acknowledges that existing message; it must not try
+        // to materialize a second Runtime row with the same ID.
+        let message = state
+            .transcript
+            .iter()
+            .find(|existing| {
+                existing.message_id == candidate.message_id
+                    && existing.source_queue_id == Some(delivery.queue_id)
+            })
+            .cloned()
+            .unwrap_or(candidate);
+        drafts.push(EventDraft::new(
+            materialization_event_id(delivery),
+            SessionEvent::DeliveryMaterialized {
+                queue_id: delivery.queue_id,
+                message,
+            },
+        ));
+    }
+    drafts.push(EventDraft::new(
+        acknowledgement_event_id(through_queue_id),
+        SessionEvent::DeliveryAcknowledged { through_queue_id },
+    ));
+    Ok(drafts)
 }
 
 pub(super) fn materialize_message(
@@ -116,13 +133,14 @@ pub(super) fn materialize_message(
 
 pub(super) async fn append_tool_batch(
     store: Arc<dyn EventStore>,
+    clock: Arc<dyn Clock>,
     owner: SessionOwner,
     session_id: String,
     state: VerifiedSessionState,
     input: ToolBatchInput,
 ) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     tokio::task::spawn_blocking(move || {
-        append_tool_batch_blocking(&*store, &owner, &session_id, state, &input)
+        append_tool_batch_blocking(&*store, &*clock, &owner, &session_id, state, &input)
     })
     .await
     .map_err(|_| "tool_batch_join")?
@@ -130,6 +148,7 @@ pub(super) async fn append_tool_batch(
 
 pub(super) fn append_tool_batch_blocking(
     store: &dyn EventStore,
+    clock: &dyn Clock,
     owner: &SessionOwner,
     session_id: &str,
     mut state: VerifiedSessionState,
@@ -183,7 +202,7 @@ pub(super) fn append_tool_batch_blocking(
             }
             return Ok((replayed_append(session_id, &command_id, &state), state));
         }
-        let started_at_ms = current_time_ms();
+        let started_at_ms = clock.now_ms();
         let mut drafts = vec![EventDraft::new(
             format!("model-tool-batch-assistant-event:v1:{identity}"),
             SessionEvent::MessageAppended {
@@ -260,23 +279,14 @@ pub(super) fn append_tool_batch_blocking(
 
 pub(super) async fn append_tool_results(
     store: Arc<dyn EventStore>,
+    clock: Arc<dyn Clock>,
     owner: SessionOwner,
     session_id: String,
     state: VerifiedSessionState,
-    batch_identity: String,
-    tool_calls: Vec<ToolCall>,
-    results: Vec<Result<ToolExecutionResult, ToolError>>,
+    input: ToolResultsInput,
 ) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
     tokio::task::spawn_blocking(move || {
-        append_tool_results_blocking(
-            &*store,
-            &owner,
-            &session_id,
-            state,
-            &batch_identity,
-            &tool_calls,
-            &results,
-        )
+        append_tool_results_blocking(&*store, &*clock, &owner, &session_id, state, &input)
     })
     .await
     .map_err(|_| "tool_results_join")?
@@ -284,13 +294,15 @@ pub(super) async fn append_tool_results(
 
 pub(super) fn append_tool_results_blocking(
     store: &dyn EventStore,
+    clock: &dyn Clock,
     owner: &SessionOwner,
     session_id: &str,
     mut state: VerifiedSessionState,
-    batch_identity: &str,
-    tool_calls: &[ToolCall],
-    results: &[Result<ToolExecutionResult, ToolError>],
+    input: &ToolResultsInput,
 ) -> Result<(AppendResult, VerifiedSessionState), &'static str> {
+    let batch_identity = input.batch_identity.as_str();
+    let tool_calls = input.tool_calls.as_slice();
+    let results = input.results.as_slice();
     let result_message_ids = tool_calls
         .iter()
         .map(|call| tool_result_message_id(batch_identity, &call.tool_call_id))
@@ -376,7 +388,7 @@ pub(super) fn append_tool_results_blocking(
             }
             let content = if call.tool_name == WAIT_FOR_TOOL_NAME {
                 saw_wait = true;
-                final_wait = parse_wait(call).ok();
+                final_wait = parse_wait(call, clock).ok();
                 match final_wait {
                     Some(_) => "wait_for accepted".to_owned(),
                     None => "invalid_request: wait_for input is invalid".to_owned(),
@@ -419,7 +431,7 @@ pub(super) fn append_tool_results_blocking(
                             SessionEvent::AsyncToolCallCompleted {
                                 tool_call_id: call.tool_call_id.clone(),
                                 result: payload,
-                                completed_at_ms: current_time_ms(),
+                                completed_at_ms: clock.now_ms(),
                             },
                         ));
                     }
@@ -431,7 +443,7 @@ pub(super) fn append_tool_results_blocking(
                                 class: "tool_execution_failed".to_owned(),
                                 message: "tool execution failed".to_owned(),
                             },
-                            completed_at_ms: current_time_ms(),
+                            completed_at_ms: clock.now_ms(),
                         },
                     )),
                 }
@@ -460,7 +472,8 @@ pub(super) fn append_tool_results_blocking(
                     wait_id: stable_digest("auto-wait", batch_identity),
                     reason: "waiting for asynchronous tool completion".to_owned(),
                     timeout_seconds,
-                    deadline_ms: current_time_ms()
+                    deadline_ms: clock
+                        .now_ms()
                         .checked_add(i64::from(timeout_seconds) * 1_000)
                         .ok_or("auto wait deadline")?,
                     source: WaitSource::AutoToolBatch,
@@ -507,6 +520,7 @@ pub(super) fn append_tool_results_blocking(
 
 pub(super) fn append_background_tool_result_blocking(
     store: &dyn EventStore,
+    clock: &dyn Clock,
     owner: &SessionOwner,
     session_id: &str,
     batch_identity: &str,
@@ -566,7 +580,7 @@ pub(super) fn append_background_tool_result_blocking(
             .delivery_ack
             .checked_add(state.delivery_queue.len() as u64 + 1)
             .ok_or("background_tool_queue_id")?;
-        let completed_at_ms = current_time_ms();
+        let completed_at_ms = clock.now_ms();
         let mut drafts = Vec::with_capacity(2);
         if is_failure {
             drafts.push(EventDraft::new(
@@ -636,7 +650,7 @@ pub(super) fn append_background_tool_result_blocking(
     Err("background_tool_concurrency")
 }
 
-pub(super) fn parse_wait(call: &ToolCall) -> Result<ActiveWait, &'static str> {
+pub(super) fn parse_wait(call: &ToolCall, clock: &dyn Clock) -> Result<ActiveWait, &'static str> {
     let DurablePayload::Inline(payload) = &call.input else {
         return Err("wait input");
     };
@@ -661,7 +675,8 @@ pub(super) fn parse_wait(call: &ToolCall) -> Result<ActiveWait, &'static str> {
     if !(WAIT_MIN_SECONDS..=WAIT_MAX_SECONDS).contains(&timeout_seconds) {
         return Err("wait timeout");
     }
-    let deadline_ms = current_time_ms()
+    let deadline_ms = clock
+        .now_ms()
         .checked_add(i64::from(timeout_seconds) * 1_000)
         .ok_or("wait deadline")?;
     Ok(ActiveWait {
@@ -708,6 +723,7 @@ pub(super) fn acknowledgement_event_id(queue_id: u64) -> String {
 
 pub(super) async fn append_assistant(
     store: Arc<dyn EventStore>,
+    clock: Arc<dyn Clock>,
     owner: SessionOwner,
     session_id: String,
     state: VerifiedSessionState,
@@ -717,6 +733,7 @@ pub(super) async fn append_assistant(
     tokio::task::spawn_blocking(move || {
         append_assistant_blocking(
             &*store,
+            &*clock,
             &owner,
             &session_id,
             state,
@@ -730,6 +747,7 @@ pub(super) async fn append_assistant(
 
 pub(super) fn append_assistant_blocking(
     store: &dyn EventStore,
+    clock: &dyn Clock,
     owner: &SessionOwner,
     session_id: &str,
     mut state: VerifiedSessionState,
@@ -784,7 +802,7 @@ pub(super) fn append_assistant_blocking(
                     SessionEvent::ActivationFinished {
                         activation_id: activation.activation_id.clone(),
                         outcome: ActivationOutcome::Finished,
-                        finished_at_ms: current_time_ms(),
+                        finished_at_ms: clock.now_ms(),
                     },
                 ));
             }

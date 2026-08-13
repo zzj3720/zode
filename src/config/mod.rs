@@ -343,10 +343,10 @@ impl EndpointConfig {
             .collect()
     }
 
-    pub(crate) fn capability_tools(&self) -> Vec<zode::api::CapabilityTool> {
+    pub(crate) fn capability_tools(&self) -> Vec<zode::http::CapabilityTool> {
         self.tools
             .iter()
-            .map(|tool| zode::api::CapabilityTool {
+            .map(|tool| zode::http::CapabilityTool {
                 name: tool.name.clone(),
                 completion_mode: match tool.completion_mode {
                     CompletionMode::Response => "response".to_owned(),

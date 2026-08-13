@@ -61,13 +61,6 @@ struct PreparedModelRequestInput<'a> {
     purpose: ModelRequestPurpose,
 }
 
-pub trait ModelExecutor: Send + Sync {
-    fn complete<'a>(
-        &'a self,
-        request: &'a ModelRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<ModelOutcome, ModelError>> + Send + 'a>>;
-}
-
 impl Runtime {
     pub(super) async fn recover_model_round(
         self: &Arc<Self>,
@@ -89,7 +82,7 @@ impl Runtime {
         if attempt.outcome != crate::domain::ModelAttemptOutcome::Running {
             return Ok(state);
         }
-        let abandoned_at_ms = current_time_ms();
+        let abandoned_at_ms = self.clock.now_ms();
         let recovered = append_runtime_events(
             self.store.clone(),
             owner,
@@ -168,6 +161,7 @@ impl Runtime {
                 };
                 let exhausted = append_model_attempts_exhausted(
                     self.store.clone(),
+                    self.clock.clone(),
                     owner.clone(),
                     session_id.clone(),
                     &identity,
@@ -203,7 +197,7 @@ impl Runtime {
                 request_id: attempt.request_id,
                 attempt_id: attempt.attempt_id,
                 reason: "runtime_restarted_after_retryable_failure".to_owned(),
-                abandoned_at_ms: current_time_ms(),
+                abandoned_at_ms: self.clock.now_ms(),
             },
         )
         .await?;
@@ -249,6 +243,29 @@ impl Runtime {
         Ok(state)
     }
 
+    async fn resolve_secret_lease(
+        &self,
+        selection: &SessionModelSelection,
+    ) -> Result<SecretLease, ModelError> {
+        let replicas = self.replicas.clone();
+        let authority = selection.auth_authority_id.clone();
+        let profile = selection.auth_profile_id.clone();
+        let provider = selection.provider.clone();
+        let minimum_revision = selection.auth_revision;
+        tokio::task::spawn_blocking(move || {
+            replicas.resolve(&authority, &profile, &provider, minimum_revision)
+        })
+        .await
+        .map_err(|_| ModelError::Unavailable)?
+        .map_err(|error| match error {
+            ReplicaPortError::Disabled | ReplicaPortError::SecretUnavailable => {
+                ModelError::AuthReplicaUnavailable
+            }
+            ReplicaPortError::Invalid => ModelError::InvalidSelection,
+            _ => ModelError::Unavailable,
+        })
+    }
+
     async fn execute_prepared_model_request(
         self: &Arc<Self>,
         input: PreparedModelRequestInput<'_>,
@@ -266,7 +283,11 @@ impl Runtime {
         let mut attempt_number = request_identity.attempt_number;
         let mut attempt_id = request_identity.attempt_id.clone();
         loop {
-            let completion = self.model.complete(&request).await.and_then(|value| {
+            let completion = match self.resolve_secret_lease(&request.selection).await {
+                Ok(lease) => self.model.complete(&request, lease).await,
+                Err(error) => Err(error),
+            }
+            .and_then(|value| {
                 if validate_tool_calls(&value.tool_calls, &request.tools).is_ok() {
                     Ok(value)
                 } else {
@@ -302,6 +323,7 @@ impl Runtime {
                     if attempt_number >= request_identity.maximum_attempts {
                         let exhausted = append_model_attempts_exhausted(
                             self.store.clone(),
+                            self.clock.clone(),
                             owner.clone(),
                             session_id.to_owned(),
                             request_identity,
@@ -347,6 +369,7 @@ impl Runtime {
                     if attempt_number >= request_identity.maximum_attempts {
                         let exhausted = append_model_attempts_exhausted(
                             self.store.clone(),
+                            self.clock.clone(),
                             owner.clone(),
                             session_id.to_owned(),
                             request_identity,
@@ -388,7 +411,7 @@ impl Runtime {
                         failed_attempt_number: attempt_number,
                         next_attempt_number: next_number,
                         delay_ms: delay,
-                        not_before_ms: current_time_ms(),
+                        not_before_ms: self.clock.now_ms(),
                         maximum_attempts: request_identity.maximum_attempts,
                         error_class: error_class.to_owned(),
                     };
@@ -405,7 +428,7 @@ impl Runtime {
                     self.observe_commit(&scheduled.0, &scheduled.1).await;
                     state = scheduled.1;
                     if delay > 0 {
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        self.clock.sleep(Duration::from_millis(delay)).await;
                     }
                     let started = append_runtime_event_from_state(
                         self.store.clone(),
@@ -421,7 +444,7 @@ impl Runtime {
                             attempt_id: next_id.clone(),
                             attempt_number: next_number,
                             auth_revision,
-                            started_at_ms: current_time_ms(),
+                            started_at_ms: self.clock.now_ms(),
                         },
                     )
                     .await?;
@@ -470,6 +493,7 @@ impl Runtime {
             ModelRequestPurpose::ContextHandoff => {
                 let failed = append_context_handoff_failure(
                     self.store.clone(),
+                    self.clock.clone(),
                     owner.clone(),
                     session_id.to_owned(),
                     &state,
@@ -644,12 +668,15 @@ impl Runtime {
             };
             let planned = append_context_handoff_plan(
                 self.store.clone(),
+                self.clock.clone(),
                 owner.clone(),
                 session_id.to_owned(),
-                &state,
-                plan,
-                &request,
-                self.options.model_step_max_attempts,
+                ContextHandoffPlanInput {
+                    state: &state,
+                    plan,
+                    request: &request,
+                    maximum_attempts: self.options.model_step_max_attempts,
+                },
             )
             .await?;
             self.observe_commit(&planned.0, &planned.1).await;
@@ -704,6 +731,7 @@ impl Runtime {
         };
         let (prep_commits, prepared_state, request_identity) = prepare_model_round(
             self.store.clone(),
+            self.clock.clone(),
             owner.clone(),
             session_id.to_owned(),
             ModelRoundInput {
@@ -839,6 +867,7 @@ impl Runtime {
     ) -> Result<VerifiedSessionState, &'static str> {
         let failed = append_context_handoff_failure(
             self.store.clone(),
+            self.clock.clone(),
             owner.clone(),
             session_id.to_owned(),
             &state,
@@ -927,6 +956,7 @@ impl Runtime {
         };
         let (prep_commits, _prepared_state, request_identity) = prepare_model_round(
             self.store.clone(),
+            self.clock.clone(),
             owner.clone(),
             session_id.to_owned(),
             ModelRoundInput {
@@ -1023,6 +1053,7 @@ impl Runtime {
         if outcome.tool_calls.is_empty() {
             let commit = append_assistant(
                 self.store.clone(),
+                self.clock.clone(),
                 owner.clone(),
                 session_id.to_owned(),
                 completed.1,
@@ -1040,6 +1071,7 @@ impl Runtime {
             .map_err(|_| "callback_plan")?;
         let initial_commit = append_tool_batch(
             self.store.clone(),
+            self.clock.clone(),
             owner.clone(),
             session_id.to_owned(),
             completed.1,
@@ -1089,12 +1121,15 @@ impl Runtime {
             .await;
         let result_commit = append_tool_results(
             self.store.clone(),
+            self.clock.clone(),
             owner.clone(),
             session_id.to_owned(),
             initial_commit.1,
-            batch_identity,
-            outcome.tool_calls,
-            results,
+            ToolResultsInput {
+                batch_identity,
+                tool_calls: outcome.tool_calls,
+                results,
+            },
         )
         .await?;
         self.observe_commit(&result_commit.0, &result_commit.1)

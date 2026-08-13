@@ -1,9 +1,10 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    future::Future,
-    pin::Pin,
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -11,12 +12,26 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
 
 mod callback;
+mod commands;
 mod commit;
 mod context;
 mod model;
+pub mod ports;
 
-pub use model::{ModelExecutor, ModelOutcome, ModelRequest, ModelTokenUsage};
+pub use commands::session_command_id;
+pub use model::{ModelOutcome, ModelRequest, ModelTokenUsage};
 use model::{MAX_CONTEXT_HANDOFF_DOCUMENT_TOKENS, MAX_CONTEXT_HANDOFF_GENERATION_TOKENS};
+pub use ports::{
+    AppendResult, BlobPort, BlobStore, Clock, EventStore, ExecutionPolicyError,
+    ExecutionPolicyPort, ExternalCallbackLookup, ModelExecutor, ModelPort, OwnedSessionRef,
+    RehydrateError, ReplicaInstallRequest, ReplicaMetadata, ReplicaPort, ReplicaPortError,
+    ReplicaProbe, ReplicaProvisionOutcome, ReplicaTombstoneRequest, SecretLease,
+    SessionAppendResult, SessionCreate, SessionCreateCommand, SessionCreateResult,
+    SessionListCursor, SessionListItem, SessionListPage, SnapshotRecord, StoreError, StorePort,
+    StorePortError, TimerArm, TimerKey, TimerPort, TimerPortError, ToolExecutor, ToolPort,
+    VerifiedSessionState, MAX_OWNED_SESSION_SCAN_LIMIT, MAX_REPLICA_REQUEST_BYTES,
+    MAX_SESSION_LIST_LIMIT, SNAPSHOT_ENCODING_JSON,
+};
 mod stream;
 mod transition;
 
@@ -38,19 +53,13 @@ use context::{
     runtime_tool_definitions, token_estimate_scale_millionths, ProviderContextCache,
 };
 
-use crate::{
-    domain::{
-        ActivationOutcome, ActiveWait, AsyncToolCallRecord, AsyncToolStatus, CompletionMode,
-        ContextHandoffDocument, ContextHandoffPlan, DeliveryKind, DurablePayload, EventDraft,
-        EventRecord, ModelAttemptError, ModelAttemptErrorClass, ModelAttemptFailure,
-        ModelRequestPurpose, ModelRetrySchedule, ModelUsageAnchor, SessionEvent,
-        SessionModelSelection, SessionOwner, SessionSelection, SessionState, ToolCall,
-        ToolError as DomainToolError, TranscriptMessage, TranscriptRole, WaitSource,
-        WAIT_MAX_SECONDS, WAIT_MIN_SECONDS,
-    },
-    storage::{
-        AppendResult, EventStore, StoreError, VerifiedSessionState, MAX_OWNED_SESSION_SCAN_LIMIT,
-    },
+use crate::domain::{
+    ActivationOutcome, ActiveWait, AsyncToolCallRecord, AsyncToolStatus, CompletionMode,
+    ContextHandoffDocument, ContextHandoffPlan, DeliveryKind, DurablePayload, EventDraft,
+    EventRecord, ModelAttemptError, ModelAttemptErrorClass, ModelAttemptFailure,
+    ModelRequestPurpose, ModelRetrySchedule, ModelUsageAnchor, SessionEvent, SessionModelSelection,
+    SessionOwner, SessionState, ToolCall, ToolError as DomainToolError, TranscriptMessage,
+    TranscriptRole, WaitSource, WAIT_MAX_SECONDS, WAIT_MIN_SECONDS,
 };
 
 #[derive(Debug)]
@@ -207,26 +216,6 @@ pub enum ToolError {
 #[derive(Debug)]
 pub struct BlobStoreError;
 
-/// Immutable output storage owned by the composition root.  Runtime/tools
-/// write a blob before returning its reference; the event stream only ever
-/// receives the resulting content-addressed `BlobRef`.
-pub trait BlobStore: Send + Sync {
-    fn put(
-        &self,
-        bytes: &[u8],
-        media_type: Option<&str>,
-    ) -> Result<crate::domain::BlobRef, BlobStoreError>;
-}
-
-pub trait ToolExecutor: Send + Sync {
-    fn definitions(&self, selected: &[String]) -> Result<Vec<ToolDefinition>, ToolError>;
-
-    fn execute<'a>(
-        &'a self,
-        invocation: ToolInvocation,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionResult, ToolError>> + Send + 'a>>;
-}
-
 /// Runtime budgets and bounded effect windows.  Composition roots should use
 /// [`Runtime::new_with_options`] so configuration is applied once at the
 /// durable runtime boundary; [`Runtime::new`] remains a compatibility
@@ -253,6 +242,8 @@ pub enum RuntimeCommandError {
     Conflict,
     Invalid(&'static str),
     Backend,
+    IdempotencyReceiptNotFound,
+    AuthReplicaUnavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -309,32 +300,51 @@ pub struct Runtime {
     store: Arc<dyn EventStore>,
     model: Arc<dyn ModelExecutor>,
     tools: Arc<dyn ToolExecutor>,
+    clock: Arc<dyn Clock>,
+    timer: Arc<dyn TimerPort>,
+    execution_policy: Arc<dyn ExecutionPolicyPort>,
+    replicas: Arc<dyn ReplicaPort>,
     stream_publisher: Arc<RuntimeStreamPublisher>,
     stream_observer: Arc<dyn ModelStreamObserver>,
     options: RuntimeOptions,
     session_locks: Mutex<HashMap<SessionKey, Arc<AsyncMutex<()>>>>,
+    shutting_down: AtomicBool,
 }
 
 impl Runtime {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<dyn EventStore>,
         model: Arc<dyn ModelExecutor>,
         tools: Arc<dyn ToolExecutor>,
         snapshot_every: Option<u64>,
+        clock: Arc<dyn Clock>,
+        timer: Arc<dyn TimerPort>,
+        execution_policy: Arc<dyn ExecutionPolicyPort>,
+        replicas: Arc<dyn ReplicaPort>,
     ) -> Arc<Self> {
         Self::new_with_options(
             store,
             model,
             tools,
             RuntimeOptions::defaults(snapshot_every),
+            clock,
+            timer,
+            execution_policy,
+            replicas,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_options(
         store: Arc<dyn EventStore>,
         model: Arc<dyn ModelExecutor>,
         tools: Arc<dyn ToolExecutor>,
         options: RuntimeOptions,
+        clock: Arc<dyn Clock>,
+        timer: Arc<dyn TimerPort>,
+        execution_policy: Arc<dyn ExecutionPolicyPort>,
+        replicas: Arc<dyn ReplicaPort>,
     ) -> Arc<Self> {
         let stream_publisher = RuntimeStreamPublisher::new(1_024);
         let stream_observer = Arc::new(BroadcastModelStreamObserver {
@@ -344,26 +354,33 @@ impl Runtime {
             store,
             model,
             tools,
+            clock,
+            timer,
+            execution_policy,
+            replicas,
             stream_publisher,
             stream_observer,
             options: options.bounded(),
             session_locks: Mutex::new(HashMap::new()),
+            shutting_down: AtomicBool::new(false),
         })
+    }
+
+    /// Stops new activations; in-flight work may finish or be left for startup recovery.
+    pub async fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
     }
 
     pub fn stream_publisher(&self) -> Arc<RuntimeStreamPublisher> {
         self.stream_publisher.clone()
     }
 
-    /// Validate a session's configured adapter-tool selection against the
-    /// current runtime catalog.  The HTTP adapter calls this only after a
-    /// create receipt miss; receipt replay therefore never consults the
-    /// current catalog.
-    pub fn validate_tool_selection(&self, selected: &[String]) -> Result<(), RuntimeCommandError> {
-        self.tools
-            .definitions(selected)
-            .map(|_| ())
-            .map_err(|_| RuntimeCommandError::Invalid("tool_selection"))
+    pub fn now_ms(&self) -> i64 {
+        self.clock.now_ms()
     }
 
     /// Complete an external callback through the durable stream.  The
@@ -377,9 +394,10 @@ impl Runtime {
         payload: Value,
     ) -> Result<CallbackCompletion, RuntimeCommandError> {
         let store = self.store.clone();
+        let clock = self.clock.clone();
         let callback_lookup_id = callback_id.clone();
         let completion = tokio::task::spawn_blocking(move || {
-            complete_external_callback_blocking(&*store, &callback_id, &bearer, payload)
+            complete_external_callback_blocking(&*store, &*clock, &callback_id, &bearer, payload)
         })
         .await
         .map_err(|_| RuntimeCommandError::Backend)??;
@@ -429,9 +447,11 @@ impl Runtime {
         command_id: String,
     ) -> Result<AsyncToolCallRecord, RuntimeCommandError> {
         let store = self.store.clone();
+        let clock = self.clock.clone();
         tokio::task::spawn_blocking(move || {
             cancel_tool_call_blocking(
                 &*store,
+                &*clock,
                 &owner,
                 &session_id,
                 &tool_call_id,
@@ -553,92 +573,122 @@ impl Runtime {
     }
 
     pub async fn queue_startup_recovery(self: &Arc<Self>) -> Result<(), &'static str> {
-        self.scan_startup_refs(false).await?;
-        self.scan_startup_refs(true).await?;
+        self.arm_outstanding_wait_timers().await?;
+        self.recover_active_activations().await?;
+        self.wake_runnable_sessions().await?;
         Ok(())
     }
 
+    /// Admit a due wait as `WaitExpired` when the durable wait is still
+    /// current. Stale or replaced fires are ignored.
+    pub async fn expire_wait(self: &Arc<Self>, arm: TimerArm) {
+        // Shutdown is process death: do not invent WaitExpired; the next start re-arms.
+        if self.is_shutting_down() {
+            return;
+        }
+        match append_expired_timer(
+            self.store.clone(),
+            arm.owner.clone(),
+            arm.session_id.clone(),
+            arm.wait_id,
+            self.clock.now_ms(),
+        )
+        .await
+        {
+            Ok(Some((append, state))) => {
+                self.observe_commit(&append, &state).await;
+                if !append.replayed {
+                    self.wake(arm.owner, arm.session_id);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                error,
+                session_id = arm.session_id,
+                "wait timer expiry failed"
+            ),
+        }
+    }
+
     fn schedule_timer(
-        self: &Arc<Self>,
+        &self,
         owner: SessionOwner,
         session_id: String,
         timer: crate::domain::WaitTimerIntent,
     ) {
-        let runtime = Arc::downgrade(self);
-        tokio::spawn(async move {
-            let delay_ms = timer.deadline_ms.saturating_sub(current_time_ms());
-            if let Ok(delay_ms) = u64::try_from(delay_ms) {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            }
-            let Some(runtime) = runtime.upgrade() else {
-                return;
-            };
-            match append_expired_timer(
-                runtime.store.clone(),
-                owner.clone(),
-                session_id.clone(),
-                current_time_ms(),
-            )
-            .await
-            {
-                Ok(Some((append, state))) => {
-                    runtime.observe_commit(&append, &state).await;
-                    if !append.replayed {
-                        runtime.wake(owner, session_id);
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => tracing::warn!(error, session_id, "wait timer expiry failed"),
-            }
-        });
+        // Shutdown drops sleeps without expiry; startup recovery re-arms durable waits.
+        if self.is_shutting_down() {
+            return;
+        }
+        if let Err(error) = self.timer.arm(TimerArm {
+            owner,
+            session_id: session_id.clone(),
+            wait_id: timer.wait_id,
+            deadline_ms: timer.deadline_ms,
+        }) {
+            tracing::warn!(error = ?error, session_id, "wait timer arm failed");
+        }
     }
 
-    async fn scan_startup_refs(self: &Arc<Self>, wake: bool) -> Result<(), &'static str> {
-        let mut after_creation_position = 0;
-        loop {
-            let store = self.store.clone();
-            let page = tokio::task::spawn_blocking(move || {
-                store
-                    .scan_owned_session_refs(after_creation_position, MAX_OWNED_SESSION_SCAN_LIMIT)
-                    .map_err(|_| "startup_scan")
-            })
-            .await
-            .map_err(|_| "startup_scan_join")??;
-            let page_len = page.len();
-            let Some(last) = page.last() else {
-                return Ok(());
-            };
-            after_creation_position = last.creation_global_position;
-            if wake {
-                for session in page {
-                    let owner = session.owner.clone();
-                    let session_id = session.session_id.clone();
-                    match self
-                        .recover_startup_session(owner.clone(), session_id.clone())
-                        .await
-                    {
-                        Ok(state) => {
-                            if let Some(timer) = state.active_timer.clone() {
-                                self.schedule_timer(owner.clone(), session_id.clone(), timer);
-                            }
-                            if startup_session_is_runnable(&state) {
-                                self.wake(owner, session_id);
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                error,
-                                session_id,
-                                "startup recovery deferred for an invalid session stream"
-                            );
-                        }
-                    }
-                }
-            }
-            if page_len < MAX_OWNED_SESSION_SCAN_LIMIT {
-                return Ok(());
+    async fn arm_outstanding_wait_timers(self: &Arc<Self>) -> Result<(), &'static str> {
+        let store = self.store.clone();
+        let timers = tokio::task::spawn_blocking(move || {
+            store
+                .list_outstanding_wait_timers()
+                .map_err(|_| "startup_wait_list")
+        })
+        .await
+        .map_err(|_| "startup_wait_list_join")??;
+        for timer in timers {
+            self.schedule_timer(
+                timer.owner,
+                timer.session_id,
+                crate::domain::WaitTimerIntent {
+                    wait_id: timer.wait_id,
+                    deadline_ms: timer.deadline_ms,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    async fn recover_active_activations(self: &Arc<Self>) -> Result<(), &'static str> {
+        let store = self.store.clone();
+        let sessions = tokio::task::spawn_blocking(move || {
+            store
+                .list_active_activations()
+                .map_err(|_| "startup_active_list")
+        })
+        .await
+        .map_err(|_| "startup_active_list_join")??;
+        for session in sessions {
+            if let Err(error) = self
+                .recover_startup_session(session.owner, session.session_id.clone())
+                .await
+            {
+                tracing::warn!(
+                    error,
+                    session_id = session.session_id,
+                    "startup recovery deferred for an invalid session stream"
+                );
             }
         }
+        Ok(())
+    }
+
+    async fn wake_runnable_sessions(self: &Arc<Self>) -> Result<(), &'static str> {
+        let store = self.store.clone();
+        let sessions = tokio::task::spawn_blocking(move || {
+            store
+                .list_runnable_sessions()
+                .map_err(|_| "startup_runnable_list")
+        })
+        .await
+        .map_err(|_| "startup_runnable_list_join")??;
+        for session in sessions {
+            self.wake(session.owner, session.session_id);
+        }
+        Ok(())
     }
 
     /// Reconcile only durable work that was left in an in-flight state before
@@ -731,6 +781,13 @@ impl Runtime {
         session_id: String,
         mut ready: Option<oneshot::Sender<()>>,
     ) {
+        // New claims after shutdown belong to the next process's recovery.
+        if self.is_shutting_down() {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(());
+            }
+            return;
+        }
         let key = SessionKey {
             authority_id: owner.authority_id.clone(),
             subject: owner.subject.clone(),
@@ -751,6 +808,12 @@ impl Runtime {
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
             let _guard = lock.lock().await;
+            if runtime.is_shutting_down() {
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(());
+                }
+                return;
+            }
             let result = runtime
                 .activate(owner, session_id.clone(), &mut ready)
                 .await;
@@ -788,7 +851,7 @@ impl Runtime {
             // when a prior activation reaches a terminal handoff failure.
             // Re-check durable runnable state after acquiring that lock so a
             // stale wake cannot start the same failed handoff again.
-            if !startup_session_is_runnable(&state) {
+            if !state.is_startup_runnable() {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(());
                 }
@@ -796,10 +859,10 @@ impl Runtime {
             }
             let (append, next_state) = start_activation(
                 self.store.clone(),
+                self.clock.clone(),
                 owner.clone(),
                 session_id.clone(),
                 &state,
-                &state.selection,
             )
             .await?;
             self.observe_commit(&append, &next_state).await;
@@ -822,6 +885,7 @@ impl Runtime {
                 if let Some(activation) = state.active_activation.as_ref() {
                     if let Some((append, next_state)) = finish_activation(
                         self.store.clone(),
+                        self.clock.clone(),
                         owner.clone(),
                         session_id.clone(),
                         &state,
@@ -846,8 +910,9 @@ impl Runtime {
             }
             state = next_state;
 
-            if let Some(trigger_identity) =
-                unresolved_user(&state).map(|trigger| trigger.message_id.clone())
+            if let Some(trigger_identity) = state
+                .unresolved_user()
+                .map(|trigger| trigger.message_id.clone())
             {
                 let (next_state, prepared) = self
                     .ensure_model_context(
@@ -889,7 +954,7 @@ impl Runtime {
                 continue;
             }
 
-            if let Some(round_identity) = model_followup_identity(&state) {
+            if let Some(round_identity) = state.model_followup_identity() {
                 let (next_state, prepared) = self
                     .ensure_model_context(
                         &owner,
@@ -931,6 +996,7 @@ impl Runtime {
                 if let Some(activation) = state.active_activation.as_ref() {
                     if let Some((append, next_state)) = finish_activation(
                         self.store.clone(),
+                        self.clock.clone(),
                         owner.clone(),
                         session_id.clone(),
                         &state,
@@ -1027,6 +1093,7 @@ impl Runtime {
         };
         let Some((append, next_state)) = finish_activation(
             self.store.clone(),
+            self.clock.clone(),
             owner.clone(),
             session_id.to_owned(),
             &state,
@@ -1207,11 +1274,13 @@ impl Runtime {
         result: Result<ToolExecutionResult, ToolError>,
     ) -> Result<(), &'static str> {
         let store = self.store.clone();
+        let clock = self.clock.clone();
         let append_owner = owner.clone();
         let append_session_id = session_id.clone();
         let append = tokio::task::spawn_blocking(move || {
             append_background_tool_result_blocking(
                 &*store,
+                &*clock,
                 &append_owner,
                 &append_session_id,
                 &batch_identity,
@@ -1256,34 +1325,6 @@ impl Runtime {
         }
         Ok(())
     }
-}
-
-fn unresolved_user(state: &SessionState) -> Option<&TranscriptMessage> {
-    let trigger = state.transcript.last()?;
-    if trigger.role == TranscriptRole::User
-        && state.terminal_model_failure_for_last_user().is_none()
-    {
-        Some(trigger)
-    } else {
-        None
-    }
-}
-
-/// Startup recovery only schedules an activation when durable work can make
-/// progress.  In particular, a completed assistant-only turn has no pending
-/// delivery or unresolved model boundary; waking it would create an empty
-/// activation and advance the stream merely because the process restarted.
-fn startup_session_is_runnable(state: &SessionState) -> bool {
-    if !state.delivery_queue.is_empty() {
-        return true;
-    }
-    if state.last_context_handoff_failure.is_some() {
-        return false;
-    }
-    if state.active_wait.is_some() {
-        return false;
-    }
-    unresolved_user(state).is_some() || model_followup_identity(state).is_some()
 }
 
 /// Build the provider-facing context from the durable transcript.  Runtime
@@ -1361,41 +1402,6 @@ fn terminal_tool_content(record: &AsyncToolCallRecord) -> Option<String> {
     }
 }
 
-fn model_followup_identity(state: &SessionState) -> Option<String> {
-    if state.active_wait.is_some() {
-        return None;
-    }
-    let latest = state.transcript.last()?;
-    if !matches!(latest.role, TranscriptRole::Tool | TranscriptRole::Runtime) {
-        return None;
-    }
-    let assistant = state
-        .transcript
-        .iter()
-        .rev()
-        .skip_while(|message| {
-            matches!(message.role, TranscriptRole::Tool | TranscriptRole::Runtime)
-        })
-        .find(|message| {
-            message.role == TranscriptRole::Assistant && !message.tool_calls.is_empty()
-        })?;
-
-    // A timer expiry ends the current activation, but it does not turn a
-    // still-running tool into a model input.  Wait until every ordinary call
-    // from this assistant batch has a durable terminal fact; the completion
-    // delivery will wake a fresh activation and re-enter this boundary.  The
-    // internal `wait_for` call has no async record and is intentionally
-    // ignored here so its timer can still resume a later round.
-    let all_tools_terminal = assistant.tool_calls.iter().all(|call| {
-        call.tool_name == WAIT_FOR_TOOL_NAME
-            || state
-                .async_tool_calls
-                .get(&call.tool_call_id)
-                .is_some_and(|record| record.status.is_terminal())
-    });
-    all_tools_terminal.then(|| assistant.message_id.clone())
-}
-
 fn inline_tool_input(call: &ToolCall) -> Result<Value, &'static str> {
     let DurablePayload::Inline(payload) = &call.input else {
         return Err("tool input must be inline");
@@ -1445,12 +1451,4 @@ fn stable_digest(kind: &str, value: &str) -> String {
     digest.update((value.len() as u64).to_be_bytes());
     digest.update(value.as_bytes());
     format!("sha256:v1:{:x}", digest.finalize())
-}
-
-fn current_time_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .unwrap_or(i64::MAX)
 }

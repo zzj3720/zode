@@ -51,6 +51,7 @@ pub(super) fn write_canonical_callback_json(
 
 pub(super) fn complete_external_callback_blocking(
     store: &dyn EventStore,
+    clock: &dyn Clock,
     callback_id: &str,
     bearer: &str,
     payload: Value,
@@ -109,7 +110,7 @@ pub(super) fn complete_external_callback_blocking(
                     error: error
                         .clone()
                         .ok_or(RuntimeCommandError::Invalid("callback_error"))?,
-                    completed_at_ms: current_time_ms(),
+                    completed_at_ms: clock.now_ms(),
                 },
             ));
         } else {
@@ -120,7 +121,7 @@ pub(super) fn complete_external_callback_blocking(
                     tool_call_id: lookup.binding.tool_call_id.clone(),
                     payload_fingerprint: payload_fingerprint.clone(),
                     result: result_payload.clone(),
-                    completed_at_ms: current_time_ms(),
+                    completed_at_ms: clock.now_ms(),
                 },
             ));
         }
@@ -192,7 +193,7 @@ pub(super) fn complete_external_callback_blocking(
                     payload: delivery_payload,
                     dedupe_key: delivery_dedupe_key,
                     wake: true,
-                    created_at_ms: Some(current_time_ms()),
+                    created_at_ms: Some(clock.now_ms()),
                     source_tool_call_id: Some(lookup.binding.tool_call_id.clone()),
                     materialized_message_id: None,
                 },
@@ -227,6 +228,7 @@ pub(super) fn complete_external_callback_blocking(
 
 pub(super) fn cancel_tool_call_blocking(
     store: &dyn EventStore,
+    clock: &dyn Clock,
     owner: &SessionOwner,
     session_id: &str,
     tool_call_id: &str,
@@ -260,7 +262,7 @@ pub(super) fn cancel_tool_call_blocking(
                 SessionEvent::AsyncToolCallCancelled {
                     tool_call_id: tool_call_id.to_owned(),
                     reason: reason.to_owned(),
-                    completed_at_ms: current_time_ms(),
+                    completed_at_ms: clock.now_ms(),
                 },
             )],
         ) {

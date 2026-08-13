@@ -2,8 +2,28 @@
 
 `src/runtime` is the application layer. It coordinates durable session
 activations and declares the ports needed from storage, models, tools, timers,
-blobs, and event publication. It depends on the domain, never on concrete
-SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
+clock, blobs, execution policy, credential-replica probes, and event
+publication in `src/runtime/ports`. Replica provision and resolve are
+runtime-declared ports; the file store is an adapter. It depends on the
+domain, never on concrete SQLite, aimux provider, HTTP, filesystem,
+management Server, or process types. Adapters implement those ports; they do
+not declare them.
+
+Session create, append-message, and model-select are admitted only through
+Runtime. Credential-replica install, tombstone, list, and get are admitted
+only through Runtime provision methods. Session list, get, and owned SSE
+subscribe/catch-up are served only through Runtime query methods. HTTP
+authenticates and decodes, then calls one Runtime method. Receipt lookup
+precedes current tool-catalog, execution-policy, replica-probe, clock, ULID,
+and event effects. Replay-only misses are typed and mutation-free. Create
+does not wake; message and model-select wake after a non-replayed commit.
+`subscribe_owned` uses `RuntimeStreamPublisher::subscribe_with_fence` and
+reads `latest_global_position` under that lock; it must not pre-read the
+head and then subscribe. Missing or cross-owner sessions are the same safe
+not-found as a missing session. Runtime resolves a `SecretLease` after
+`ModelRequestDeclared`/`ModelRequestPrepared` and immediately before each
+aimux call; only the revision enters `ModelAttemptStarted`. Secrets never
+enter events.
 
 ## Authority and activation
 
@@ -27,6 +47,9 @@ SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
   that activation; credential revision changes may affect only a provider
   request not yet sent.
 - HTTP/SSE connection lifetime never owns or cancels an activation.
+- Process shutdown stops new wake/activation claims and must not append
+  `WaitExpired`. Outstanding waits stay durable for startup re-arm. In-flight
+  model requests may finish or be abandoned for the existing restart path.
 
 ## Atomic lifecycle boundaries
 
@@ -144,6 +167,11 @@ SQLite, aimux provider, HTTP, filesystem, management Server, or process types.
   name or transport.
 - Recovery derives runnable work, waits, and async status from durable facts;
   an orphaned in-memory handle is never evidence that work is still running.
+- Startup recovery arms every outstanding wait, reconciles every active
+  activation before READY, then wakes runnable sessions. It uses the store's
+  outstanding-wait, active-activation, and runnable lists; it does not scan
+  every owned session. READY-before-GET must already observe restart
+  classifications such as `unknown_outcome` and failed-attempt reconciliation.
 - A persisted `ModelAttemptFailedFact` is itself an unfinished recovery
   boundary: after restart, finish its exhaustion/terminal/activation batch (or
   schedule its recorded retry) before claiming the session is reconciled. Do
@@ -221,6 +249,7 @@ Stable executable anchors are:
   `e2e_mixed_tool_batch_is_concurrent_ordered_and_waits_once`,
   `e2e_explicit_wait_last_wins_without_skipping_ordinary_tool`,
   `e2e_explicit_wait_defaults_to_sixty_seconds_and_survives_restart`,
+  `e2e_outstanding_wait_expires_after_restart`,
   `e2e_external_completion_first_wins_and_wakes_one_next_activation`,
   `e2e_auto_wait_timeout_does_not_cancel_running_tool`, and
   `e2e_two_session_waits_do_not_cross`;

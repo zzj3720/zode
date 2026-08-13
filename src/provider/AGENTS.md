@@ -2,9 +2,9 @@
 
 `src/provider` owns device-side provider execution: provider/model capability
 reporting, aimux model construction, complete stream conversion, and secure
-consumption/storage of controller-provisioned credential replicas. It does not
-own management Server, OAuth login, profile defaults, sharing policy, or user
-accounts.
+consumption of a short-lived `SecretLease` at each aimux call. It does not own
+the replica file store, management Server, OAuth login, profile defaults,
+sharing policy, or user accounts. Replica persistence lives in `src/replicas`.
 
 The system boundary is `docs/architecture.md`, the Endpoint API is
 `docs/http-api.md`, and replica atomicity is `docs/auth-replication.md`.
@@ -73,9 +73,10 @@ The system boundary is `docs/architecture.md`, the Endpoint API is
 - Before Endpoint readiness, reconcile every staged install/tombstone, active
   secret, orphaned file, and metadata record. Preserve the highest accepted
   revision even when cleanup failed.
-- Expose separate provisioning and resolution ports. Resolution returns a
-  non-serializable, non-session-owned secret lease for one provider attempt;
-  only its identity and revision may cross into durable runtime facts.
+- Do not hold `ReplicaStore`/`FileReplicaStore`. Runtime resolves a
+  non-serializable, non-session-owned secret lease immediately before this
+  adapter is called; only identity and revision may cross into durable
+  runtime facts.
 
 ## Selection and refresh
 

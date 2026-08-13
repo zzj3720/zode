@@ -1,16 +1,27 @@
 mod config;
 
-use std::{env, io::Write, path::PathBuf, sync::Arc};
+use std::{
+    env,
+    future::{Future, IntoFuture},
+    io::Write,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use config::EndpointConfig;
 use zode::{
-    api,
     control::ControlState,
-    provider::{AimuxProvider, ProviderExecutionPolicy, ReplicaStore},
-    runtime::Runtime,
+    http,
+    provider::{AimuxProvider, ProviderExecutionPolicy},
+    replicas::FileReplicaStore,
+    runtime::{Runtime, TimerArm, TimerPort},
     storage::SqliteEventStore,
+    timer::{SleepTimer, SystemClock},
     tools::HttpToolExecutor,
 };
+
+const ENDPOINT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct Cli {
@@ -23,7 +34,7 @@ struct Cli {
 struct Composition {
     runtime_options: zode::runtime::RuntimeOptions,
     control: Arc<ControlState>,
-    replicas: Arc<ReplicaStore>,
+    replicas: Arc<FileReplicaStore>,
     provider_policy: ProviderExecutionPolicy,
     tool_specs: Vec<zode::tools::HttpToolSpec>,
     blob_store: Option<Arc<dyn zode::runtime::BlobStore>>,
@@ -123,15 +134,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen_addr = config.listen_addr()?;
     let runtime_options = config.runtime_options();
     let credential_replica_directory = control.credential_replica_directory().map(PathBuf::from);
-    let replicas = Arc::new(ReplicaStore::open(credential_replica_directory.as_deref())?);
+    let replicas = Arc::new(FileReplicaStore::open(
+        credential_replica_directory.as_deref(),
+    )?);
     let (adapter_kinds, allowed_origins, transport_retry) = config.provider_execution_policy();
-    let capabilities_body = api::build_capabilities_body_with_callback(
+    let capabilities_body = http::build_capabilities_body_with_callback(
         control.endpoint_id(),
         adapter_kinds.clone(),
         config.capability_tools(),
         true,
     )?;
-    let health_body = api::build_health_body(control.endpoint_id())?;
+    let health_body = http::build_health_body(control.endpoint_id())?;
     let provider_policy =
         ProviderExecutionPolicy::new(adapter_kinds, allowed_origins, transport_retry);
     let tool_specs = config.tool_specs();
@@ -168,10 +181,7 @@ async fn run(
     let store = Arc::new(
         tokio::task::spawn_blocking(move || SqliteEventStore::open(database_path)).await??,
     );
-    let provider = Arc::new(AimuxProvider::new(
-        composition.replicas.clone(),
-        composition.provider_policy.clone(),
-    ));
+    let provider = Arc::new(AimuxProvider::new(composition.provider_policy.clone()));
     let tools = match composition.blob_store {
         Some(blob_store) => Arc::new(HttpToolExecutor::new_with_blob_store(
             composition.tool_specs,
@@ -179,15 +189,29 @@ async fn run(
         )),
         None => Arc::new(HttpToolExecutor::new(composition.tool_specs)),
     };
-    let runtime =
-        Runtime::new_with_options(store.clone(), provider, tools, composition.runtime_options);
-    runtime.queue_startup_recovery().await?;
-    let state = api::AppState::new(
+    let clock = Arc::new(SystemClock);
+    let (due_tx, mut due_rx) = tokio::sync::mpsc::unbounded_channel::<TimerArm>();
+    let timer = Arc::new(SleepTimer::new(clock.clone(), due_tx));
+    let runtime = Runtime::new_with_options(
         store,
+        provider,
+        tools,
+        composition.runtime_options,
+        clock,
+        timer.clone(),
+        Arc::new(composition.provider_policy.clone()),
+        composition.replicas.clone(),
+    );
+    let expire = runtime.clone();
+    tokio::spawn(async move {
+        while let Some(arm) = due_rx.recv().await {
+            expire.expire_wait(arm).await;
+        }
+    });
+    runtime.queue_startup_recovery().await?;
+    let state = http::AppState::new(
         composition.control,
-        composition.replicas,
-        runtime,
-        composition.provider_policy,
+        runtime.clone(),
         composition.health_body,
         composition.capabilities_body,
     );
@@ -197,6 +221,49 @@ async fn run(
     println!("ZODE_READY http://{address}");
     std::io::stdout().flush()?;
 
-    axum::serve(listener, api::router(state)).await?;
+    let shutdown_signal = arm_shutdown_signal()?;
+    tokio::pin!(shutdown_signal);
+    let (shutdown, shutdown_requested) = tokio::sync::oneshot::channel::<()>();
+    let serving = axum::serve(listener, http::router(state))
+        .with_graceful_shutdown(async {
+            let _ = shutdown_requested.await;
+        })
+        .into_future();
+    tokio::pin!(serving);
+
+    let result = tokio::select! {
+        result = &mut serving => result,
+        () = &mut shutdown_signal => {
+            // Stop HTTP admission first; then refuse new wakes before sleeps are dropped.
+            let _ = shutdown.send(());
+            runtime.shutdown().await;
+            match tokio::time::timeout(ENDPOINT_DRAIN_TIMEOUT, &mut serving).await {
+                Ok(result) => result,
+                Err(_) => Ok(()),
+            }
+        }
+    };
+    runtime.shutdown().await;
+    timer.shutdown();
+    result?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn arm_shutdown_signal() -> Result<impl Future<Output = ()>, std::io::Error> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn arm_shutdown_signal() -> Result<impl Future<Output = ()>, std::io::Error> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
 }

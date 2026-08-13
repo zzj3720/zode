@@ -77,26 +77,29 @@ flowchart LR
     Runtime --> ModelPort["model port"]
     Runtime --> ToolPort["tool port"]
     Runtime --> BlobPort["blob port"]
+    Runtime --> TimerPort["timer port"]
+    Runtime --> ReplicaPort["replica port"]
     StorePort --> SQLite["SQLite adapter"]
+    TimerPort --> Timer["timer adapter"]
     ModelPort --> Provider["aimux provider adapter"]
-    Provider --> Replicas["credential replica store"]
-    API --> Replicas
+    ReplicaPort --> Replicas["credential replica store"]
     ToolPort --> Tools["tool adapters"]
-    API --> RuntimeEvents["durable global event reader"]
-    RuntimeEvents --> SQLite
 ```
 
 The domain imports nothing from the other layers. The runtime depends on the
 domain and declares effect ports. SQLite, aimux/provider, tools, credential
-replicas, blobs, timers, and HTTP/SSE are adapters. `main.rs` only constructs
-Endpoint adapters, runs recovery, starts schedulers, and serves HTTP.
+replicas, blobs, timers, and HTTP/SSE are adapters; adapters do not import one
+another. `main.rs` only constructs Endpoint adapters, runs recovery, starts
+schedulers, and serves HTTP.
 
 Critical session mutations use one runtime-store port. Do not split event
 append, delivery admission, wait/timer intent, async terminal result, runnable
 projection, and publication facts across independently committing stores.
-Credential-replica provisioning state is separate because it is not session
-history and has different secrecy requirements. OAuth/profile authority is not
-an Endpoint component.
+The HTTP/SSE adapter talks only to runtime: it does not read SQLite or hold
+replica types. Credential-replica provisioning state is a separate store
+reached through a runtime replica port because it is not session history and
+has different secrecy requirements. OAuth/profile authority is not an
+Endpoint component.
 
 ## 4. Durable session model
 

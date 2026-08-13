@@ -1,6 +1,6 @@
 # Endpoint HTTP and SSE adapter rules
 
-`src/api` is the passive device Endpoint adapter. It admits controller
+`src/http` is the passive device Endpoint adapter. It admits controller
 commands, renders Endpoint projections, and exposes the Endpoint-wide durable
 event stream. It
 is not the agent runtime, management Server, UI API, provider-auth authority, or
@@ -10,7 +10,9 @@ contract.
 ## HTTP contract
 
 - Validate transport shape, authenticate/authorize when introduced, translate
-  into one runtime command, and return only after durable admission/commit.
+  into one runtime command or query, and return only after durable admission/
+  commit or a runtime-owned read. List, get, and SSE catch-up call Runtime;
+  this adapter does not hold EventStore.
 - Derive controller authority from control authentication and accept a bounded
   opaque subject only in that trusted context. Bind session ownership and
   command receipt scope to authority/subject; list/read/mutate/SSE must not leak
@@ -40,7 +42,9 @@ contract.
   versioned public session and event mappings with secret-safe fields.
 - All blocking adapter work crosses `spawn_blocking` or a dedicated worker.
 - Expose bounded identity/health/capability reads and authenticated,
-  idempotent credential-replica install/tombstone commands. Never expose OAuth,
+  idempotent credential-replica install/tombstone commands. Replica routes
+  authenticate the controller, decode the body, and call one Runtime provision
+  method; they do not import or hold the replica file store. Never expose OAuth,
   provider defaults, sharing policy, endpoint registration, or UI routes.
 - Require `Zode-Subject` only for session ownership and session-command receipt
   scope. Identity, health, capabilities, controller-auth, and auth-replica
@@ -73,7 +77,8 @@ contract.
   skip private facts or sessions owned by another subject.
 - Commit order, not handler completion order, controls publication. Recover a
   lagged receiver from storage without leaking debug errors into the stream.
-- Subscribe before replay, establish one Endpoint-wide handoff fence, stream
+- Subscribe before replay through Runtime so the durable head is read under the
+  publisher fence lock. Establish one Endpoint-wide handoff fence, stream
   catch-up in bounded batches through that fence, and merge later durable frames
   into the same ordered catch-up. No-ID transient progress may overtake an older
   durable replay tail, but a durable retry boundary must be delivered before
