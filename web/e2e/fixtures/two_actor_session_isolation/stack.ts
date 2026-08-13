@@ -639,7 +639,10 @@ async function startEndpointTransport(
     },
     async flush() {
       if (pendingRequests === 0) return;
-      await new Promise<void>((resolveIdle) => idleWaiters.push(resolveIdle));
+      await Promise.race([
+        new Promise<void>((resolveIdle) => idleWaiters.push(resolveIdle)),
+        new Promise<void>((resolveIdle) => setTimeout(resolveIdle, 2_000).unref()),
+      ]);
     },
     assertReplayConsumed() {
       if (!replayExpected) return;

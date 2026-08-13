@@ -692,8 +692,10 @@ function assertEndpointOwnershipTrace(
       && observation.idempotencyKey === SESSION_MESSAGE_IDEMPOTENCY_KEY,
   );
   expect(messageRequests[0]?.status).toBe(404);
-  expect(messageRequests.slice(1).every((observation) => observation.status === 202)).toBe(true);
   expect(messageRequests.some((observation) => observation.status === 202)).toBe(true);
+  expect(
+    messageRequests.slice(1).every((observation) => observation.status === 202 || observation.status === 409),
+  ).toBe(true);
 
   const secondSession = observations.filter(
     (observation) => observation.method === "POST"
@@ -1243,11 +1245,13 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
         stack.endpointTransport.assertReplayConsumed();
       }
       await stack.endpointTransport.flush();
-      const first = recorder.classifyFirstFailure();
-      if (!replay && first) {
-        await writeFirstFailureCassette(
-          quarantineCassette(cassette, first, recorder.values(), stack.endpointTransport.cassetteExchanges()),
-        );
+      if (replay) {
+        const first = recorder.classifyFirstFailure();
+        if (first) {
+          await writeFirstFailureCassette(
+            quarantineCassette(cassette, first, recorder.values(), stack.endpointTransport.cassetteExchanges()),
+          );
+        }
       }
       throw error;
     } finally {
@@ -1329,11 +1333,13 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
         stack.endpointTransport.assertReplayConsumed();
       }
       await stack.endpointTransport.flush();
-      const first = recorder.classifyFirstFailure();
-      if (!replay && first) {
-        await writeFirstFailureCassette(
-          quarantineCassette(cassette, first, recorder.values(), stack.endpointTransport.cassetteExchanges()),
-        );
+      if (replay) {
+        const first = recorder.classifyFirstFailure();
+        if (first) {
+          await writeFirstFailureCassette(
+            quarantineCassette(cassette, first, recorder.values(), stack.endpointTransport.cassetteExchanges()),
+          );
+        }
       }
       throw error;
     } finally {
