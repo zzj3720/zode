@@ -606,7 +606,7 @@ Required cross-component scenarios include:
 | Offline | miss a revision while Endpoint is unreachable, reconnect, reconcile exactly once, and resume explicitly |
 | Identity | two Endpoints create sessions independently; every Server route requires `(endpoint_id, session_id)`, no ID-only lookup exists, and create retry returns one Endpoint-generated ULID |
 | Access ingress | real RS256 Access/JWKS edge fixture accepts valid human and service actors; invalid claims/signatures fail closed; rotated `kid` refreshes without restart |
-| Actor isolation | two Access actors share management resources but get isolated Endpoint-owned session lists/commands/SSE and receipt scopes without a Server session ACL |
+| Shared Endpoint sessions | two Access actors share management resources and the same Endpoint session namespace; list/read/command/SSE and Endpoint receipts are not isolated by Access actor |
 | No user system | browser reaches the UI through Access with no Zode login/logout, user, workspace, role, grant, or login-cookie resource |
 | Streaming | one proxied Endpoint-wide SSE carries at least two owned sessions across navigation; disconnect/reconnect uses one Endpoint cursor without missing or duplicating durable events and without Server event storage |
 | Callback split | OAuth callback remains Access-protected; external tool callback works only on the separate callback origin with its bearer and exposes no management route |

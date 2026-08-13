@@ -281,7 +281,7 @@
     },
     {
       "file": "specs/two_actor_session_isolation.spec.ts",
-      "title": "two Access actors and Endpoint-owned session subjects › e2e_browser_two_actor_session_isolation"
+      "title": "two Access actors and Endpoint-owned session subjects › e2e_browser_two_actor_sessions_are_shared"
     },
     {
       "file": "specs/two_actor_session_isolation.spec.ts",

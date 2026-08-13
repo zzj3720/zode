@@ -55,15 +55,8 @@ type SessionAdmission = {
 
 type RecorderMode = "live" | "replay";
 
-function isExpectedActorIsolationNotFound(actor: AccessActor, method: string, path: string): boolean {
-  if (actor !== "actor-b") return false;
-  if (method === "POST" && /^\/v1\/endpoints\/[^/]+\/sessions\/[^/]+\/messages(?:\?.*)?$/.test(path)) return true;
-  if (method !== "GET") return false;
-  return (
-    /^\/v1\/endpoints\/[^/]+\/sessions\/[^/]+(?:\?.*)?$/.test(path)
-    || /^\/v1\/sessions\/[^/]+(?:\?.*)?$/.test(path)
-    || /^\/endpoints\/[^/]+\/sessions\/[^/]+(?:\?.*)?$/.test(path)
-  );
+function isExpectedActorIsolationNotFound(_actor: AccessActor, method: string, path: string): boolean {
+  return method === "GET" && /^\/v1\/sessions\/[^/]+(?:\?.*)?$/.test(path);
 }
 
 function browserSemanticHeaders(
@@ -663,8 +656,14 @@ function assertEndpointOwnershipTrace(
   const observations: EndpointObservation[] = stack.endpointTransport.observations()
     .filter((observation) => isEndpointSessionPath(observation.path));
   expect(observations.length, "Server must reach the real Endpoint session API").toBeGreaterThan(0);
-  expect(observations.every((observation) => observation.subject !== null)).toBe(true);
-  expect(observations.every((observation) => observation.controllerAuthMatched)).toBe(true);
+  expect(
+    observations.every((observation) => observation.subject === null),
+    "Server must not forward Zode-Subject to Endpoint",
+  ).toBe(true);
+  expect(
+    observations.every((observation) => observation.controllerAuthMatched === false),
+    "Server must not send an Endpoint controller bearer",
+  ).toBe(true);
 
   const createRequests = observations.filter(
     (observation) => observation.method === "POST"
@@ -672,72 +671,37 @@ function assertEndpointOwnershipTrace(
       && observation.idempotencyKey === admission.idempotencyKey,
   );
   expect(createRequests.length).toBeGreaterThanOrEqual(3);
-  const actorASubject = createRequests[0]?.subject;
-  expect(actorASubject).not.toBeNull();
-  const actorACreates = createRequests.filter(
-    (observation) => observation.subject === actorASubject,
-  );
-  expect(actorACreates.map((observation) => observation.status)).toEqual([404, 201, 201]);
-  expect(actorACreates[1]?.requestBodyDigest).toBe(actorACreates[0]?.requestBodyDigest);
-  expect(actorACreates[2]?.requestBodyDigest).toBe(actorACreates[1]?.requestBodyDigest);
-  expect(actorACreates[2]?.responseBodyDigest).toBe(actorACreates[1]?.responseBodyDigest);
-  const actorBCreate = createRequests.find((observation) => observation.subject !== actorASubject);
-  expect(actorBCreate).toBeDefined();
-  const actorBCreates = createRequests.filter(
-    (observation) => observation.subject === actorBCreate?.subject,
-  );
-  expect(actorBCreates.map((observation) => observation.status)).toEqual([404, 201]);
-  expect(actorBCreates[1]?.requestBodyDigest).toBe(actorACreates[1]?.requestBodyDigest);
-  expect(actorBCreate?.subject).not.toBe(actorASubject);
-  const subjects = new Set(observations.map((observation) => observation.subject));
-  expect(subjects.size).toBe(2);
-  expect(observations.every((observation) => observation.subject === actorASubject || observation.subject === actorBCreate?.subject)).toBe(true);
+  expect(createRequests[0]?.status).toBe(404);
+  expect(createRequests.slice(1).every((observation) => observation.status === 201)).toBe(true);
+  expect(createRequests.slice(1).every((observation) =>
+    observation.requestBodyDigest === createRequests[0]?.requestBodyDigest
+  )).toBe(true);
+  expect(createRequests.filter((observation) => observation.status === 201)
+    .every((observation) => observation.responseBodyDigest === createRequests[1]?.responseBodyDigest)).toBe(true);
 
   const actorASessionPath = `/v1/sessions/${admission.sessionId}`;
   const actorBSessionPath = `/v1/sessions/${actorBSessionId}`;
-  const actorAOwnedReads = observations.filter(
-    (observation) =>
-      observation.subject === actorASubject &&
-      observation.method === "GET" &&
-      observation.path === actorASessionPath,
+  const sessionReads = observations.filter(
+    (observation) => observation.method === "GET" && observation.path === actorASessionPath,
   );
-  expect(actorAOwnedReads.length).toBeGreaterThan(0);
-  expect(actorAOwnedReads.every((observation) => observation.status === 200)).toBe(true);
+  expect(sessionReads.length).toBeGreaterThan(0);
+  expect(sessionReads.every((observation) => observation.status === 200)).toBe(true);
 
-  const actorAMessageRequests = observations.filter(
-    (observation) => observation.subject === actorASubject
-      && observation.path === `${actorASessionPath}/messages`
+  const messageRequests = observations.filter(
+    (observation) => observation.path === `${actorASessionPath}/messages`
       && observation.idempotencyKey === SESSION_MESSAGE_IDEMPOTENCY_KEY,
   );
-  expect(actorAMessageRequests.map((observation) => observation.status)).toEqual([404, 202, 202]);
-  expect(actorAMessageRequests[1]?.requestBodyDigest).toBe(actorAMessageRequests[0]?.requestBodyDigest);
-  expect(actorAMessageRequests[2]?.requestBodyDigest).toBe(actorAMessageRequests[1]?.requestBodyDigest);
-  expect(actorAMessageRequests[2]?.responseBodyDigest).toBe(
-    actorAMessageRequests[1]?.responseBodyDigest,
-  );
+  expect(messageRequests[0]?.status).toBe(404);
+  expect(messageRequests.slice(1).every((observation) => observation.status === 202)).toBe(true);
+  expect(messageRequests.some((observation) => observation.status === 202)).toBe(true);
 
-  const actorBSubject = actorBCreate?.subject;
-  expect(actorBSubject).not.toBeNull();
-  const actorBAgainstA = observations.filter(
-    (observation) => observation.subject === actorBSubject && observation.path.includes(actorASessionPath),
+  const secondSession = observations.filter(
+    (observation) => observation.method === "POST"
+      && observation.path === "/v1/sessions"
+      && observation.idempotencyKey === "two-actor-session-create-b",
   );
-  expect(actorBAgainstA.length).toBeGreaterThanOrEqual(3);
-  expect(actorBAgainstA.every((observation) => observation.status === 404)).toBe(true);
-  const actorBMessageRequests = observations.filter(
-    (observation) => observation.subject === actorBSubject
-      && observation.path === `${actorASessionPath}/messages`
-      && observation.idempotencyKey === SESSION_MESSAGE_IDEMPOTENCY_KEY,
-  );
-  expect(actorBMessageRequests.length).toBeGreaterThanOrEqual(2);
-  expect(actorBMessageRequests[0]?.requestBodyDigest).toBe(actorAMessageRequests[0]?.requestBodyDigest);
-  expect(actorBMessageRequests.every((observation) => observation.status === 404)).toBe(true);
-
-  const actorBOwned = observations.filter(
-    (observation) => observation.subject === actorBSubject && observation.path.includes(actorBSessionPath),
-  );
-  expect(actorBOwned.length).toBeGreaterThan(0);
-  expect(actorBOwned.every((observation) => observation.status !== 404)).toBe(true);
-  expect(actorASubject).not.toBe(actorBSubject);
+  expect(secondSession.some((observation) => observation.status === 201)).toBe(true);
+  expect(actorBSessionPath).not.toBe(actorASessionPath);
 }
 
 function resourceCard(page: Page, heading: string) {
@@ -996,12 +960,25 @@ async function assertCreateIdempotencyScope(
     recordPublic,
   );
   expect(actorBSameKey.status).toBe(201);
-  expect(actorBSameKey.text).not.toBe(admission.response.text);
-  const actorBSessionId = String(asJson(actorBSameKey).session_id ?? "");
+  expect(actorBSameKey.text).toBe(admission.response.text);
+  expect(asJson(actorBSameKey).session_id).toBe(admission.sessionId);
+  await expectNoSecrets(actorBSameKey, [stack.providerSecret, stack.endpointControlSecret]);
+
+  const actorBNew = await publicRequest(
+    pageB,
+    "actor-b",
+    "POST",
+    path,
+    admission.body,
+    "two-actor-session-create-b",
+    recorder,
+    recordPublic,
+  );
+  expect(actorBNew.status).toBe(201);
+  const actorBSessionId = String(asJson(actorBNew).session_id ?? "");
   expect(actorBSessionId).not.toBe("");
   expect(actorBSessionId).not.toBe(admission.sessionId);
-  expect(asJson(actorBSameKey)).not.toEqual(asJson(admission.response));
-  await expectNoSecrets(actorBSameKey, [stack.providerSecret, stack.endpointControlSecret]);
+  await expectNoSecrets(actorBNew, [stack.providerSecret, stack.endpointControlSecret]);
   return actorBSessionId;
 }
 
@@ -1172,7 +1149,9 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
       "e2e_browser_two_actor_session_isolation",
       ISOLATION_RECORDING_ID,
     );
-    const stack = await createTwoActorStack({ replayEndpointExchanges: cassette?.endpointExchanges });
+    const stack = await createTwoActorStack({
+      replayEndpointExchanges: replay ? cassette.endpointExchanges : undefined,
+    });
     const contextA = await browser.newContext();
     const contextB = await browser.newContext();
     const pageA = await contextA.newPage();
@@ -1286,7 +1265,9 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
       "e2e_browser_provider_profiles_are_shared_deployment_resources",
       PROFILE_RECORDING_ID,
     );
-    const stack = await createTwoActorStack({ replayEndpointExchanges: cassette?.endpointExchanges });
+    const stack = await createTwoActorStack({
+      replayEndpointExchanges: replay ? cassette.endpointExchanges : undefined,
+    });
     const contextA = await browser.newContext();
     const contextB = await browser.newContext();
     const pageA = await contextA.newPage();
@@ -1321,10 +1302,10 @@ test.describe("two Access actors and Endpoint-owned session subjects", () => {
       );
       sessionId = admission.sessionId;
       armed = true;
-      actorBSessionId = await test.step("session creation idempotency remains actor scoped", () =>
+      actorBSessionId = await test.step("session creation receipts are shared on one Endpoint", () =>
         assertCreateIdempotencyScope(pageA, pageB, stack, resource, admission, recorder),
       );
-      await test.step("session content remains isolated between actors", () =>
+      await test.step("both Access actors share the Endpoint session namespace", () =>
         assertSessionIsolation(pageA, pageB, stack, resource, sessionId, recorder, true, actorBSessionId),
       );
       assertEndpointOwnershipTrace(stack, admission, actorBSessionId);
