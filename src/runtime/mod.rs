@@ -20,9 +20,9 @@ pub use ports::{
     AppendResult, BlobPort, BlobStore, Clock, EventStore, ExternalCallbackLookup, ModelExecutor,
     ModelPort, OwnedSessionRef, RehydrateError, SessionAppendResult, SessionCreate,
     SessionCreateCommand, SessionCreateResult, SessionListCursor, SessionListItem, SessionListPage,
-    SnapshotRecord, StoreError, StorePort, StorePortError, ToolExecutor, ToolPort,
-    VerifiedSessionState, MAX_OWNED_SESSION_SCAN_LIMIT, MAX_SESSION_LIST_LIMIT,
-    SNAPSHOT_ENCODING_JSON,
+    SnapshotRecord, StoreError, StorePort, StorePortError, TimerArm, TimerKey, TimerPort,
+    TimerPortError, ToolExecutor, ToolPort, VerifiedSessionState, MAX_OWNED_SESSION_SCAN_LIMIT,
+    MAX_SESSION_LIST_LIMIT, SNAPSHOT_ENCODING_JSON,
 };
 mod stream;
 mod transition;
@@ -291,6 +291,7 @@ pub struct Runtime {
     model: Arc<dyn ModelExecutor>,
     tools: Arc<dyn ToolExecutor>,
     clock: Arc<dyn Clock>,
+    timer: Arc<dyn TimerPort>,
     stream_publisher: Arc<RuntimeStreamPublisher>,
     stream_observer: Arc<dyn ModelStreamObserver>,
     options: RuntimeOptions,
@@ -304,6 +305,7 @@ impl Runtime {
         tools: Arc<dyn ToolExecutor>,
         snapshot_every: Option<u64>,
         clock: Arc<dyn Clock>,
+        timer: Arc<dyn TimerPort>,
     ) -> Arc<Self> {
         Self::new_with_options(
             store,
@@ -311,6 +313,7 @@ impl Runtime {
             tools,
             RuntimeOptions::defaults(snapshot_every),
             clock,
+            timer,
         )
     }
 
@@ -320,6 +323,7 @@ impl Runtime {
         tools: Arc<dyn ToolExecutor>,
         options: RuntimeOptions,
         clock: Arc<dyn Clock>,
+        timer: Arc<dyn TimerPort>,
     ) -> Arc<Self> {
         let stream_publisher = RuntimeStreamPublisher::new(1_024);
         let stream_observer = Arc::new(BroadcastModelStreamObserver {
@@ -330,6 +334,7 @@ impl Runtime {
             model,
             tools,
             clock,
+            timer,
             stream_publisher,
             stream_observer,
             options: options.bounded(),
@@ -551,40 +556,47 @@ impl Runtime {
         Ok(())
     }
 
+    /// Admit a due wait as `WaitExpired` when the durable wait is still
+    /// current. Stale or replaced fires are ignored.
+    pub async fn expire_wait(self: &Arc<Self>, arm: TimerArm) {
+        match append_expired_timer(
+            self.store.clone(),
+            arm.owner.clone(),
+            arm.session_id.clone(),
+            arm.wait_id,
+            self.clock.now_ms(),
+        )
+        .await
+        {
+            Ok(Some((append, state))) => {
+                self.observe_commit(&append, &state).await;
+                if !append.replayed {
+                    self.wake(arm.owner, arm.session_id);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                error,
+                session_id = arm.session_id,
+                "wait timer expiry failed"
+            ),
+        }
+    }
+
     fn schedule_timer(
-        self: &Arc<Self>,
+        &self,
         owner: SessionOwner,
         session_id: String,
         timer: crate::domain::WaitTimerIntent,
     ) {
-        let runtime = Arc::downgrade(self);
-        let clock = self.clock.clone();
-        tokio::spawn(async move {
-            let delay_ms = timer.deadline_ms.saturating_sub(clock.now_ms());
-            if let Ok(delay_ms) = u64::try_from(delay_ms) {
-                clock.sleep(Duration::from_millis(delay_ms)).await;
-            }
-            let Some(runtime) = runtime.upgrade() else {
-                return;
-            };
-            match append_expired_timer(
-                runtime.store.clone(),
-                owner.clone(),
-                session_id.clone(),
-                clock.now_ms(),
-            )
-            .await
-            {
-                Ok(Some((append, state))) => {
-                    runtime.observe_commit(&append, &state).await;
-                    if !append.replayed {
-                        runtime.wake(owner, session_id);
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => tracing::warn!(error, session_id, "wait timer expiry failed"),
-            }
-        });
+        if let Err(error) = self.timer.arm(TimerArm {
+            owner,
+            session_id: session_id.clone(),
+            wait_id: timer.wait_id,
+            deadline_ms: timer.deadline_ms,
+        }) {
+            tracing::warn!(error = ?error, session_id, "wait timer arm failed");
+        }
     }
 
     async fn scan_startup_refs(self: &Arc<Self>, wake: bool) -> Result<(), &'static str> {

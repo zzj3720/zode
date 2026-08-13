@@ -7,9 +7,9 @@ use zode::{
     api,
     control::ControlState,
     provider::{AimuxProvider, ProviderExecutionPolicy, ReplicaStore},
-    runtime::{Clock, Runtime},
+    runtime::{Runtime, TimerArm},
     storage::SqliteEventStore,
-    timer::SystemClock,
+    timer::{SleepTimer, SystemClock},
     tools::HttpToolExecutor,
 };
 
@@ -180,14 +180,23 @@ async fn run(
         )),
         None => Arc::new(HttpToolExecutor::new(composition.tool_specs)),
     };
-    let clock = Arc::new(SystemClock) as Arc<dyn Clock>;
+    let clock = Arc::new(SystemClock);
+    let (due_tx, mut due_rx) = tokio::sync::mpsc::unbounded_channel::<TimerArm>();
+    let timer = Arc::new(SleepTimer::new(clock.clone(), due_tx));
     let runtime = Runtime::new_with_options(
         store.clone(),
         provider,
         tools,
         composition.runtime_options,
-        clock.clone(),
+        clock,
+        timer.clone(),
     );
+    let expire = runtime.clone();
+    tokio::spawn(async move {
+        while let Some(arm) = due_rx.recv().await {
+            expire.expire_wait(arm).await;
+        }
+    });
     runtime.queue_startup_recovery().await?;
     let state = api::AppState::new(
         store,

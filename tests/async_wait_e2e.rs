@@ -3034,6 +3034,95 @@ async fn e2e_explicit_wait_defaults_to_sixty_seconds_and_survives_restart() -> T
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_outstanding_wait_expires_after_restart() -> TestResult<()> {
+    let database = TempDatabase::new("async-wait-expire-restart")?;
+    let mut model = ModelFixture::start(vec![ModelScript::tool_call(
+        "wait-expire",
+        "wait_for",
+        r#"{"reason":"expire after restart","timeout_seconds":1}"#,
+    )])
+    .await?;
+    let config = config_file(&database, &model.provider_url(), Vec::new(), 1)?;
+    let mut server = ConfiguredServer::start(&database, &config).await?;
+    let client = support::http_client()?;
+    let session_id = create_session(
+        &client,
+        &server,
+        &model.provider_url(),
+        "create-wait-expire-restart",
+        &[],
+    )
+    .await?;
+    post_message(
+        &client,
+        &server,
+        &session_id,
+        "wait-expire-message",
+        "start short wait",
+    )
+    .await?;
+    model.wait_for_requests(1).await?;
+    let first_request = model
+        .request(0)
+        .ok_or_else(|| Error::other("outstanding wait provider request missing"))?;
+    assert_provider_tool_contract(&first_request, &[])?;
+    let before_restart =
+        wait_for_wait_state(&client, &server, &session_id, "expire after restart", 1).await?;
+    assert_eq!(before_restart["wait"]["reason"], "expire after restart");
+    assert_eq!(before_restart["wait"]["timeout_seconds"], 1);
+    assert_eq!(before_restart["wait"]["source"], "wait_for");
+    let wait_id = before_restart["wait"]["wait_id"]
+        .as_str()
+        .ok_or_else(|| Error::other("outstanding wait omitted wait_id"))?
+        .to_owned();
+
+    server.stop().await?;
+    let mut restarted = ConfiguredServer::start(&database, &config).await?;
+    let after_restart = timeout(Duration::from_secs(10), async {
+        loop {
+            let state = read_session(&client, &restarted, &session_id).await?;
+            if state["wait"].is_null() {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(state);
+            }
+            if state["wait"]["wait_id"].as_str() != Some(wait_id.as_str()) {
+                return Err(Error::other(format!(
+                    "outstanding wait was replaced after restart: {}",
+                    state["wait"]
+                ))
+                .into());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Error::new(
+            ErrorKind::TimedOut,
+            "outstanding wait did not expire after restart",
+        )
+    })??;
+    let events = replay_events_through_version(
+        &client,
+        &restarted,
+        &session_id,
+        after_restart["version"]
+            .as_u64()
+            .ok_or_else(|| Error::other("expired wait GET omitted version"))?,
+    )
+    .await?;
+    assert!(events.iter().any(|frame| {
+        frame.event == "wait_expired" && frame.data["data"]["wait_id"] == wait_id
+    }));
+    assert!(!events
+        .iter()
+        .any(|frame| frame.event == "async_tool_call_cancelled"));
+    assert_eq!(model.request_count(), 1);
+    restarted.stop().await?;
+    model.stop().await?;
+    Ok(())
+}
+
 async fn invalid_wait_case(seconds: u64, label: &str) -> TestResult<()> {
     let database = TempDatabase::new(label)?;
     let mut model = ModelFixture::start(vec![ModelScript::tool_call(

@@ -419,6 +419,7 @@ pub(super) async fn append_expired_timer(
     store: Arc<dyn EventStore>,
     owner: SessionOwner,
     session_id: String,
+    wait_id: String,
     now_ms: i64,
 ) -> Result<Option<(AppendResult, VerifiedSessionState)>, &'static str> {
     tokio::task::spawn_blocking(move || {
@@ -429,7 +430,8 @@ pub(super) async fn append_expired_timer(
             let Some(timer) = state.active_timer.clone() else {
                 return Ok(None);
             };
-            if timer.deadline_ms > now_ms
+            if timer.wait_id != wait_id
+                || timer.deadline_ms > now_ms
                 || state
                     .active_wait
                     .as_ref()

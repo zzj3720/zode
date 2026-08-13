@@ -222,6 +222,7 @@ Stable executable anchors are:
   `e2e_mixed_tool_batch_is_concurrent_ordered_and_waits_once`,
   `e2e_explicit_wait_last_wins_without_skipping_ordinary_tool`,
   `e2e_explicit_wait_defaults_to_sixty_seconds_and_survives_restart`,
+  `e2e_outstanding_wait_expires_after_restart`,
   `e2e_external_completion_first_wins_and_wakes_one_next_activation`,
   `e2e_auto_wait_timeout_does_not_cancel_running_tool`, and
   `e2e_two_session_waits_do_not_cross`;

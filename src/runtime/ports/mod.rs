@@ -2,6 +2,7 @@ mod blob;
 mod clock;
 mod model;
 mod store;
+mod timer;
 mod tool;
 
 pub use blob::{BlobPort, BlobStore};
@@ -14,6 +15,7 @@ pub use store::{
     StorePortError, VerifiedSessionState, MAX_OWNED_SESSION_SCAN_LIMIT, MAX_SESSION_LIST_LIMIT,
     SNAPSHOT_ENCODING_JSON,
 };
+pub use timer::{TimerArm, TimerKey, TimerPort, TimerPortError};
 pub use tool::{ToolExecutor, ToolPort};
 
 pub(crate) use store::{
