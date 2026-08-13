@@ -226,21 +226,14 @@ impl Catalog {
         }
         let store = Arc::clone(&self.store);
         let endpoint_id_owned = endpoint_id.to_owned();
-        let (record, secret) = tokio::task::spawn_blocking(move || {
-            let record = store
+        let record = tokio::task::spawn_blocking(move || {
+            store
                 .get_endpoint(&endpoint_id_owned)
                 .map_err(map_store_error)?
-                .ok_or(CatalogError::NotFound)?;
-            let secret = store
-                .load_endpoint_secret(&record.secret_ref)
-                .map_err(map_store_error)?
-                .ok_or(CatalogError::Internal)?;
-            Ok::<_, CatalogError>((record, secret))
+                .ok_or(CatalogError::NotFound)
         })
         .await
         .map_err(|_| CatalogError::Internal)??;
-        let secret = std::str::from_utf8(&secret).map_err(|_| CatalogError::Internal)?;
-        let _ = secret;
         let probe = self.probe_endpoint(&record.base_url).await?;
         if probe.identity.endpoint_id != record.endpoint_id
             || probe.identity.protocol_version != record.protocol_version
@@ -278,19 +271,14 @@ impl Catalog {
         }
         let store = Arc::clone(&self.store);
         let endpoint_id = endpoint_id.to_owned();
-        let (endpoint, secret) = tokio::task::spawn_blocking(move || {
-            let endpoint = store
+        let endpoint = tokio::task::spawn_blocking(move || {
+            store
                 .get_endpoint(&endpoint_id)?
-                .ok_or(StoreError::Integrity)?;
-            let secret = store
-                .load_endpoint_secret(&endpoint.secret_ref)?
-                .ok_or(StoreError::Integrity)?;
-            Ok::<_, StoreError>((endpoint, secret))
+                .ok_or(StoreError::Integrity)
         })
         .await
         .map_err(|_| CatalogError::Internal)?
         .map_err(map_store_error)?;
-        let _ = secret;
         let response = self
             .client
             .put(format!(

@@ -49,7 +49,7 @@ const TRACKED_LLM_REPLAY_INDEX_SHA256: &str =
 const TRACKED_EVENT_REPLAY: &str =
     "tests/fixtures/deepswe/anko_default_function_arguments_deepseek_v4_flash.v2.events.json";
 const TRACKED_EVENT_REPLAY_SHA256: &str =
-    "2927398928170ac9a3a6993baf6d99b0c69357629109d92c0e9da303e0f40fec";
+    "d85e9bdc93a2d57ff4fa3b48add2439cb6046426016309e4a6fd23d94b8fe659";
 
 struct EventToolFixtureState {
     exchanges: Vec<DeepSweToolExchange>,

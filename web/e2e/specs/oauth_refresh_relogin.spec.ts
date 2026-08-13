@@ -661,7 +661,7 @@ async function buildTestOwnedUiDist(directory: string): Promise<void> {
       const parsed = new URL(candidate, "http://zode.invalid");
       if (
         parsed.origin === "http://zode.invalid" &&
-        /^\/assets\/[^/]+-[A-Za-z0-9_-]{8}\.(?:js|mjs|css)$/i.test(parsed.pathname)
+        /^\/assets\/[^/]+-[A-Za-z0-9_-]{8,}\.(?:js|mjs|css)$/i.test(parsed.pathname)
       ) {
         assetPathname = parsed.pathname;
         break;
