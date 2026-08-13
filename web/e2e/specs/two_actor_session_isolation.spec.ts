@@ -762,7 +762,7 @@ async function openManagementPage(page: Page, name: "Endpoints" | "Providers"): 
     await link.click();
     return;
   }
-  await page.getByRole("button", { name: "Zode", exact: true }).click();
+  await page.getByRole("button", { name: "Manage Zode", exact: true }).click();
   await page.getByRole("menuitem", { name, exact: true }).click();
 }
 

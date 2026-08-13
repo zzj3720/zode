@@ -3606,7 +3606,7 @@ test(E2E, async ({ playwright }) => {
       expect(harness.provider.requests).toHaveLength(0);
     }
 
-    await page.getByRole("button", { name: "Zode", exact: true }).click();
+    await page.getByRole("button", { name: "Manage Zode", exact: true }).click();
     await clickVisible(
       page,
       [

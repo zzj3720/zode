@@ -49,17 +49,17 @@ At the 1920 by 1080 desktop reference viewport, the required shell is:
 
 - a fixed 275 px left navigation pane separated from the main surface by a
   single-pixel boundary;
-- navigation background `#000000`, selected-row background
-  `rgba(255, 255, 255, 0.12)`, main background `#181818`, and both secondary
-  and composer surfaces `#212121`;
-- primary text `#ffffff`, secondary text `rgba(255, 255, 255, 0.7)`, subdued
-  text with at least AA contrast, and orange `#ff8549` only for the same narrow status or
+- navigation background `#27363b`, selected-row background `#38464b`, main
+  background `#181818`, secondary surface `#242424`, and composer surface
+  `#2a2a2a`;
+- primary text near `#f5f6f6`, secondary text near `#dfe1e1`, subdued text with
+  at least AA contrast, and amber `#f39c12` only for the same narrow status or
   attention role visible in the reference;
 - a 46 px main header and a 736 px maximum-width thread column centered in the
   space to the right of the navigation pane;
 - a 736 px composer aligned to that column, 16 px from the viewport bottom,
-  with a 24 px outer radius and content-driven height;
-- compact 32 px navigation rows, 8 px row radii, 16 px monochrome icons, quiet
+  with a 20 px outer radius and content-driven height;
+- compact 30 px navigation rows, 10 px row radii, 16 px monochrome icons, quiet
   one-pixel separators, and no decorative gradients, glass, large shadows, or
   marketing surfaces;
 - native system sans typography (`-apple-system`, `BlinkMacSystemFont`, then
@@ -72,15 +72,21 @@ At the 1920 by 1080 desktop reference viewport, the required shell is:
 The visual mapping is semantic rather than branded: Codex project groups map
 to Endpoint groups, threads map to Endpoint-owned sessions, the main chat maps
 to the selected session, and the bottom status area maps to safe Server and
-Endpoint state. Primary destinations remain Sessions, Endpoints, Providers,
-and Settings. Do not render copied controls for worktrees, plugins,
-automations, accounts, or other features that zode does not implement.
+Endpoint state. The persistent work navigation contains New session followed
+directly by Endpoint environment groups; each group owns the session rows
+beneath it. There is no separate Recent or Sessions directory. Endpoint,
+Provider, and Settings live behind the bottom Manage action and are not
+parallel daily-work destinations. Do not render copied controls for worktrees,
+plugins, automations, accounts, or other features that zode does not implement.
 
 At narrower widths, preserve the reference's density and component styling but
 use zode's responsive navigation and activity-state rules. Mobile is an
 intentional responsive adaptation, not a claim that a desktop source has a
-mobile reference. A future visual redesign is a deliberate design change; the
-first usable release does not mix another visual language into this baseline.
+mobile reference. At 760 px and below the sidebar starts collapsed and opens as
+an overlay drawer; collapsed sidebar controls are neither exposed nor focusable,
+and navigation closes the drawer without hiding the current workspace. A future
+visual redesign is a deliberate design change; the first usable release does
+not mix another visual language into this baseline.
 
 The visual contract is executable through these named browser E2Es:
 
@@ -117,18 +123,39 @@ against that zode golden and must work without access to the private source.
 
 ## 3. Navigation
 
-The v0 information architecture has four destinations. Sessions remain in the
-always-visible navigation; the compact Manage entry exposes the three
-management destinations without adding another visual hierarchy:
+The v0 sidebar has one persistent work action, Endpoint environment groups
+with their session rows, and three management destinations:
 
-1. **Sessions**: Endpoint-grouped live session lists, create action,
-   active/offline/waiting status, Endpoint and model summary.
-2. **Endpoints**: built-in local device and remote devices, reachability,
+1. **New session**: the persistent work action. It opens the start composer;
+   Endpoint-owned sessions remain directly reachable beneath their Endpoint
+   environment group, with active/offline/waiting status and accessible
+   Endpoint/model context. Selecting an Endpoint group opens that same start
+   composer with the group as its environment context. There is no separate
+   Recent or Sessions directory or duplicate Sessions navigation item.
+2. **Endpoints**: a Zode management destination for the built-in local device
+   and remote devices, reachability,
    capabilities, assigned sessions, and installed auth-replica health.
-3. **Providers**: provider types, multiple auth profiles, default selection,
+3. **Providers**: a Zode management destination for provider types, multiple
+   auth profiles, default selection,
    provider OAuth/API-key actions, sharing targets, refresh/expiry, and
    revocation.
-4. **Settings**: Server deployment information and safe operational settings.
+4. **Settings**: a Zode management destination for Server deployment
+   information and safe operational settings.
+
+The Zode name in the sidebar is static product identity, not a copied
+ChatGPT/Codex mode switch. Endpoints, Providers, and Settings are reachable
+from the bottom Manage action. While one is open, the sidebar may show only
+that current destination as context; it does not persist all three beside the
+work navigation.
+
+In the daily work surface an Endpoint is presented as the session execution
+environment, matching the environment role in the reference product rather
+than becoming a primary directory. The new-session composer shows that
+environment above the message surface and one concise model trigger. The
+execution chooser is model first: a model with one available provider/profile
+is selected directly; duplicate model entries open a second level containing
+the exact provider and auth-profile choices. An open session does not repeat
+those details in a metadata strip above the transcript.
 
 Provider auth is not hidden under each Endpoint. The primary workflow starts
 from Providers, then selects the Endpoints allowed to receive that profile.
@@ -153,8 +180,10 @@ it never tries to collect or refresh credentials itself.
 The session page contains:
 
 - transcript and composer;
-- Endpoint/model/profile identity in a compact header;
-- live connection state and Endpoint reachability;
+- Endpoint environment in the composer and one execution trigger whose chooser
+  exposes the provider/model/profile identity;
+- Endpoint connection state is announced accessibly; reconnecting,
+  disconnected, and unreachable states receive a visible attention row;
 - current activation state and safe model retry information;
 - active wait reason/deadline;
 - tool calls in provider order with `planned`, `running`,

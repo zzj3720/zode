@@ -5,16 +5,18 @@ export const globalStyles = css`
     --zode-toolbar-height: 46px;
     --zode-sidebar-toolbar-height: 46px;
     --zode-sidebar-width: 275px;
-    --zode-sidebar: #000;
-    --zode-selected-row: rgba(255, 255, 255, 0.12);
+    --zode-row-height: 30px;
+    --zode-row-radius: 10px;
+    --zode-sidebar: #27363b;
+    --zode-selected-row: #38464b;
     --zode-button-secondary: rgba(255, 255, 255, 0.05);
     --zode-main: #181818;
-    --zode-secondary-surface: #212121;
-    --zode-composer: #212121;
-    --zode-primary-text: #fff;
-    --zode-secondary-text: rgba(255, 255, 255, 0.7);
-    --zode-muted-text: rgba(255, 255, 255, 0.7);
-    --zode-subtle-text: rgba(255, 255, 255, 0.5);
+    --zode-secondary-surface: #242424;
+    --zode-composer: #2a2a2a;
+    --zode-primary-text: #f5f6f6;
+    --zode-secondary-text: #dfe1e1;
+    --zode-muted-text: rgba(223, 225, 225, 0.72);
+    --zode-subtle-text: rgba(223, 225, 225, 0.52);
     --zode-border: rgba(255, 255, 255, 0.08);
     --zode-border-heavy: rgba(255, 255, 255, 0.12);
     --zode-hover: rgba(255, 255, 255, 0.08);
@@ -23,7 +25,7 @@ export const globalStyles = css`
       0 0 0 0.5px var(--zode-border-heavy), 0 3px 7.5px rgba(0, 0, 0, 0.04),
       0 0 20px rgba(0, 0, 0, 0.05);
     --zode-success: #40c977;
-    --zode-attention: #ff8549;
+    --zode-attention: #f39c12;
     --zode-error: #ff6764;
     color: var(--zode-primary-text);
     background: var(--zode-main);
@@ -96,12 +98,22 @@ export const globalStyles = css`
     width: var(--zode-sidebar-width);
     flex-direction: column;
     padding: 0;
-    border-right: 1px solid var(--zode-border);
     background: var(--zode-sidebar);
     color: var(--zode-secondary-text);
     transition:
       width 140ms ease,
       transform 140ms ease;
+  }
+
+  .sidebar::after {
+    position: absolute;
+    right: 0;
+    bottom: 48px;
+    left: 0;
+    height: 1px;
+    background: var(--zode-border-heavy);
+    content: "";
+    pointer-events: none;
   }
 
   .sidebar-content {
@@ -151,8 +163,9 @@ export const globalStyles = css`
 
   .brand {
     display: flex;
-    height: 48px;
+    height: 36px;
     align-items: center;
+    gap: 4px;
     padding: 0 16px;
   }
 
@@ -166,6 +179,11 @@ export const globalStyles = css`
     line-height: 24px;
   }
 
+  .brand-chevron {
+    color: var(--zode-muted-text);
+    font-size: 11px;
+  }
+
   .primary-nav {
     display: grid;
     gap: 1px;
@@ -175,12 +193,12 @@ export const globalStyles = css`
 
   .new-session-button {
     width: 100%;
-    min-height: 32px;
-    height: 32px;
+    min-height: var(--zode-row-height);
+    height: var(--zode-row-height);
     justify-content: flex-start;
     padding: 5px 8px;
     border: 0;
-    border-radius: 8px;
+    border-radius: var(--zode-row-radius);
     color: var(--zode-secondary-text);
     background: transparent;
     font-size: 14px;
@@ -191,12 +209,12 @@ export const globalStyles = css`
   .nav-item {
     display: flex;
     width: 100%;
-    height: 32px;
+    height: var(--zode-row-height);
     align-items: center;
     gap: 8px;
     padding: 5px 8px;
     border: 0;
-    border-radius: 8px;
+    border-radius: var(--zode-row-radius);
     color: var(--zode-secondary-text);
     background: transparent;
     text-decoration: none;
@@ -229,52 +247,50 @@ export const globalStyles = css`
     flex: 1 1 auto;
     min-height: 0;
     margin-top: 12px;
-    padding: 0 8px;
+    padding: 0 8px 40px;
     overflow: auto;
     scrollbar-width: thin;
   }
 
   .sidebar-management-footer {
     display: flex;
-    position: relative;
-    height: 64px;
-    flex: 0 0 64px;
-    align-items: center;
+    position: fixed;
+    left: 8px;
+    bottom: 8px;
+    z-index: 3;
+    height: 40px;
+    width: calc(var(--zode-sidebar-width) - 16px);
+    align-items: flex-end;
     margin: 0;
-    padding: 8px 0;
-  }
-
-  .sidebar-management-footer::before {
-    position: absolute;
-    inset: 0 0 auto;
-    z-index: 1;
-    height: 0.5px;
+    padding: 0;
     pointer-events: none;
-    content: "";
-    background: rgba(255, 255, 255, 0.1);
   }
 
   .sidebar-management-trigger {
     display: flex;
     width: 100%;
-    height: 48px;
-    flex: 1 1 auto;
+    height: var(--zode-row-height);
+    min-height: var(--zode-row-height);
     align-items: center;
     gap: 8px;
     margin: 0;
-    padding: 0 16px;
+    padding: 4px 8px;
     border: 0;
-    border-radius: 8px;
-    color: var(--zode-primary-text);
+    border-radius: var(--zode-row-radius);
+    color: var(--zode-muted-text);
     background: transparent;
     font-size: 15px;
     line-height: 24px;
     text-align: left;
+    pointer-events: auto;
   }
 
   .sidebar-management-trigger:hover,
   .sidebar-management-trigger:focus-visible {
     color: var(--zode-primary-text);
+  }
+
+  .sidebar-management-trigger:hover {
     background: var(--zode-hover);
   }
 
@@ -300,7 +316,7 @@ export const globalStyles = css`
     align-items: center;
     gap: 8px;
     padding: 0 8px;
-    border-radius: 8px;
+    border-radius: var(--zode-row-radius);
     color: var(--zode-muted-text);
     text-decoration: none;
     font-size: 14px;
@@ -311,7 +327,6 @@ export const globalStyles = css`
   .sidebar-environment-heading:hover,
   .sidebar-environment-heading:focus-visible {
     color: var(--zode-primary-text);
-    background: var(--zode-hover);
   }
 
   .sidebar-environment-heading > i {
@@ -337,10 +352,10 @@ export const globalStyles = css`
     min-width: 0;
     align-items: center;
     gap: 8px;
-    min-height: 32px;
-    height: 32px;
+    min-height: var(--zode-row-height);
+    height: var(--zode-row-height);
     padding: 0 8px;
-    border-radius: 8px;
+    border-radius: var(--zode-row-radius);
     color: var(--zode-secondary-text);
     text-decoration: none;
     font-size: 14px;
@@ -490,9 +505,9 @@ export const globalStyles = css`
 
   .model-menu-content {
     z-index: 20;
-    width: 224px;
-    min-width: 224px;
-    max-width: min(224px, calc(100vw - 16px));
+    width: 260px;
+    min-width: 260px;
+    max-width: min(260px, calc(100vw - 16px));
     padding: 5px;
     border: 1px solid var(--zode-border-heavy);
     border-radius: 10px;
@@ -502,8 +517,14 @@ export const globalStyles = css`
   }
 
   .model-menu-subcontent {
-    width: 224px;
-    min-width: 224px;
+    width: 260px;
+    min-width: 260px;
+  }
+
+  .model-menu-model-subcontent {
+    width: 280px;
+    min-width: 280px;
+    max-width: min(280px, calc(100vw - 16px));
   }
 
   .power-slider-container {
@@ -547,8 +568,7 @@ export const globalStyles = css`
 
   .power-slider-ticks {
     position: absolute;
-    inset-block-start: 0;
-    inset-inline: 0;
+    inset: 0 14px;
     pointer-events: none;
   }
 
@@ -595,9 +615,14 @@ export const globalStyles = css`
     align-items: flex-start;
     justify-content: space-between;
     gap: 8px;
-    min-height: 36px;
+    min-height: 40px;
     padding: 0 8px;
     position: relative;
+  }
+
+  .power-view-controls[data-expanded="false"],
+  .power-view-controls[data-expanded="true"] {
+    min-height: 36px;
   }
 
   .power-view-controls[data-expanded="false"] .power-advanced-toggle {
@@ -621,6 +646,12 @@ export const globalStyles = css`
     inset: 0;
     pointer-events: none;
     white-space: nowrap;
+    opacity: 0;
+    transition: opacity 120ms ease-out;
+  }
+
+  .power-slider-endpoints[data-visible="true"] {
+    opacity: 1;
   }
 
   .power-view-controls .power-advanced-toggle {
@@ -635,6 +666,13 @@ export const globalStyles = css`
     color: var(--zode-muted-text);
     font-size: 14px;
     line-height: 20px;
+    opacity: 1;
+    transition: opacity 120ms ease-out;
+  }
+
+  .power-view-controls .power-advanced-toggle[data-visible="false"] {
+    pointer-events: none;
+    opacity: 0;
   }
 
   .power-advanced-toggle-content {
@@ -662,7 +700,7 @@ export const globalStyles = css`
   }
 
   .power-advanced-toggle.is-expanded .advanced-toggle-icon {
-    transform: rotate(90deg);
+    transform: rotate(-90deg);
   }
 
   .power-advanced-controls {
@@ -679,8 +717,9 @@ export const globalStyles = css`
   }
 
   .reasoning-menu-subcontent {
-    width: 224px;
-    min-width: 224px;
+    width: 180px;
+    min-width: 180px;
+    max-width: min(180px, calc(100vw - 16px));
   }
 
   .model-menu-item {
@@ -890,7 +929,6 @@ export const globalStyles = css`
     height: 100vh;
     overflow-y: auto;
     background: var(--zode-main);
-    box-shadow: var(--zode-elevation-prominent);
   }
 
   .main-surface:has(> .session-workspace) {
@@ -1090,9 +1128,9 @@ export const globalStyles = css`
   }
 
   .notice-alert {
-    border-color: rgba(255, 133, 73, 0.28);
-    border-inline-start-color: rgba(255, 133, 73, 0.72);
-    background: rgba(255, 133, 73, 0.08);
+    border-color: rgba(243, 156, 18, 0.28);
+    border-inline-start-color: rgba(243, 156, 18, 0.72);
+    background: rgba(243, 156, 18, 0.08);
   }
 
   .notice-alert > i {
@@ -1423,9 +1461,9 @@ export const globalStyles = css`
   }
 
   .status-badge[data-zode-severity="pending"] {
-    border-color: rgba(255, 133, 73, 0.42);
+    border-color: rgba(243, 156, 18, 0.42);
     color: var(--zode-attention);
-    background: rgba(255, 133, 73, 0.1);
+    background: rgba(243, 156, 18, 0.1);
   }
 
   .status-badge[data-zode-severity="error"] {
@@ -1439,18 +1477,18 @@ export const globalStyles = css`
   .status-waiting,
   .status-degraded,
   .status-warning {
-    border-color: rgba(255, 133, 73, 0.42);
+    border-color: rgba(243, 156, 18, 0.42);
     color: var(--zode-attention);
-    background: rgba(255, 133, 73, 0.1);
+    background: rgba(243, 156, 18, 0.1);
   }
 
   .profile-list[data-zode-stale="true"],
   .sidebar-session-row[data-zode-session-stale="true"] {
-    border-color: rgba(255, 133, 73, 0.34);
+    border-color: rgba(243, 156, 18, 0.34);
   }
 
   .sidebar-session-row[data-zode-session-stale="true"] {
-    background: rgba(255, 133, 73, 0.06);
+    background: rgba(243, 156, 18, 0.06);
   }
 
   .nested-editor {
@@ -1630,7 +1668,7 @@ export const globalStyles = css`
   }
 
   .empty-state-error {
-    border-color: rgba(255, 133, 73, 0.38);
+    border-color: rgba(243, 156, 18, 0.38);
     border-radius: 6px;
   }
 
@@ -1765,7 +1803,7 @@ export const globalStyles = css`
     align-items: center;
     justify-content: flex-end;
     padding-top: 24px;
-    padding-bottom: 96px;
+    padding-bottom: 48px;
     text-align: center;
   }
 
@@ -1816,6 +1854,46 @@ export const globalStyles = css`
     display: flex;
     width: min(736px, calc(100vw - var(--zode-sidebar-width) - 32px));
     flex-direction: column;
+    overflow: visible;
+  }
+
+  .home-composer-context-bar {
+    position: relative;
+    z-index: 1;
+    top: 0;
+    display: flex;
+    min-height: 36px;
+    align-items: center;
+    gap: 8px;
+    margin: 0 12px;
+    padding: 6px;
+    border-radius: 16px 16px 0 0;
+    color: var(--zode-muted-text);
+    background: color-mix(in oklab, var(--zode-primary-text) 2.5%, transparent);
+  }
+
+  .home-composer-context-bar .composer-context-field {
+    width: 100%;
+  }
+
+  .home-composer-context-bar .composer-select {
+    width: auto;
+    max-width: 224px;
+    height: 24px;
+    min-height: 24px;
+    padding-inline: 6px;
+    font-size: 14px;
+    line-height: 20px;
+  }
+
+  .home-composer-context-bar .composer-select > i {
+    flex: 0 0 auto;
+    color: var(--zode-muted-text);
+    font-size: 16px;
+  }
+
+  .home-composer-context-bar .composer-select > span:last-child {
+    display: none;
   }
 
   .composer-context-field {
@@ -1840,7 +1918,7 @@ export const globalStyles = css`
     border-radius: 9999px;
     color: var(--zode-muted-text);
     background: transparent;
-    font-size: 13px;
+    font-size: 14px;
     line-height: 18px;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1861,7 +1939,7 @@ export const globalStyles = css`
     display: inline-flex;
     min-width: 0;
     max-width: 192px;
-    height: 22px;
+    height: 28px;
     align-items: center;
     gap: 4px;
     overflow: hidden;
@@ -1870,17 +1948,35 @@ export const globalStyles = css`
     border-radius: 9999px;
     color: var(--zode-muted-text);
     background: transparent;
-    font-size: 13px;
-    line-height: 20px;
+    font-size: 14px;
+    line-height: 18px;
     text-align: left;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .composer-execution-trigger > span {
+  .composer-execution-trigger-content {
+    display: block;
     min-width: 0;
+    flex: 1 1 auto;
     overflow: hidden;
-    text-overflow: ellipsis;
+    text-align: center;
+    transition: inline-size 320ms cubic-bezier(0.23, 1, 0.32, 1);
+  }
+
+  .composer-execution-trigger-wrapper {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+  }
+
+  .composer-execution-trigger-label {
+    display: inline-flex;
+    position: relative;
+    min-width: 0;
+    max-width: 100%;
+    align-items: center;
+    gap: 4px;
   }
 
   .composer-execution-model {
@@ -1920,7 +2016,7 @@ export const globalStyles = css`
   .composer-execution-trigger[data-zode-execution-state="needs-recovery"]:focus-visible,
   .composer-execution-trigger[data-zode-execution-state="needs-recovery"][data-state="open"] {
     color: var(--zode-primary-text);
-    background: rgba(255, 133, 73, 0.14);
+    background: rgba(243, 156, 18, 0.14);
   }
 
   .composer-execution-trigger:disabled {
@@ -1928,9 +2024,17 @@ export const globalStyles = css`
     opacity: 0.55;
   }
 
+  .composer-context-readonly:focus-visible,
+  .composer-execution-trigger:focus-visible,
+  .composer-select:focus-visible,
+  .composer-submit:focus-visible {
+    outline: 2px solid var(--zode-focus);
+    outline-offset: 1px;
+  }
+
   .composer-context-field > i {
     flex: 0 0 auto;
-    font-size: 15px;
+    font-size: 16px;
   }
 
   .composer-select {
@@ -2009,14 +2113,16 @@ export const globalStyles = css`
   }
 
   .home-composer-body {
+    position: relative;
+    z-index: 1;
     display: flex;
     width: 100%;
     height: auto;
     flex-direction: column;
     min-height: 99px;
-    padding: 14px 16px 8px;
+    padding: 14px 0 8px;
     border: 0;
-    border-radius: 24px;
+    border-radius: 20px;
     background: var(--zode-composer);
     box-shadow: var(--zode-elevation-prominent);
   }
@@ -2028,7 +2134,7 @@ export const globalStyles = css`
     max-height: 180px;
     overflow-y: hidden;
     resize: none;
-    padding: 0;
+    padding: 0 16px;
     border: 0;
     color: var(--zode-primary-text);
     background: transparent;
@@ -2064,9 +2170,10 @@ export const globalStyles = css`
     min-height: 28px;
     container: composer-footer / inline-size;
     align-items: center;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto auto;
     column-gap: 5px;
-    margin: 0 -4px;
+    margin: 0;
+    padding-inline: 12px;
   }
 
   .composer-options {
@@ -2079,9 +2186,10 @@ export const globalStyles = css`
   }
 
   .home-composer-footer > .composer-utility-bar {
-    grid-column: 1;
+    grid-column: 2;
     min-width: 0;
     align-items: center;
+    justify-self: end;
     overflow-x: auto;
     scrollbar-width: none;
   }
@@ -2091,7 +2199,7 @@ export const globalStyles = css`
   }
 
   .home-composer-footer > .composer-submit {
-    grid-column: 2;
+    grid-column: 3;
     justify-self: end;
   }
 
@@ -2154,7 +2262,7 @@ export const globalStyles = css`
     gap: 5px;
     margin-left: 4px;
     padding: 0 8px;
-    border: 1px solid rgba(255, 133, 73, 0.38);
+    border: 1px solid rgba(243, 156, 18, 0.38);
     border-radius: 7px;
     color: var(--zode-primary-text);
     background: transparent;
@@ -2163,7 +2271,7 @@ export const globalStyles = css`
   }
 
   .session-reconnect-button:hover {
-    background: rgba(255, 133, 73, 0.12);
+    background: rgba(243, 156, 18, 0.12);
   }
 
   .session-reconnect-button:disabled {
@@ -2553,26 +2661,49 @@ export const globalStyles = css`
   }
 
   .turn-error-line[data-zode-alert="true"] > i {
-    color: var(--zode-error);
+    color: var(--zode-attention);
   }
 
-  .turn-error-line {
-    align-items: flex-start;
-    gap: 6px;
-    min-height: 20px;
-    padding: 0;
-    color: var(--zode-error);
+  .status-line.turn-error-line {
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 12px;
+    min-height: 0;
+    margin-bottom: 16px;
+    padding: 8px 8px 8px 12px;
+    overflow: hidden;
+    border: 1px solid var(--zode-border);
+    border-radius: 16px;
+    color: var(--zode-primary-text);
+    background: var(--zode-secondary-surface);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
     font-size: 14px;
     line-height: 20px;
   }
 
-  .turn-error-line > i {
-    margin-top: 4px;
-    font-size: 12px;
+  .status-line.turn-error-line > i {
+    margin-top: 0;
+    font-size: 16px;
   }
 
-  .turn-error-message {
-    color: var(--zode-error) !important;
+  .status-line.turn-error-line > .turn-error-copy {
+    display: flex;
+    min-width: 0;
+    flex: 1 1 auto;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+
+  .status-line.turn-error-line .turn-error-copy > strong {
+    color: var(--zode-primary-text);
+    font-size: 15px;
+    font-weight: 500;
+    line-height: 20px;
+  }
+
+  .status-line.turn-error-line .turn-error-message {
+    color: var(--zode-muted-text) !important;
     font-size: 14px !important;
     line-height: 20px !important;
   }
@@ -2607,7 +2738,7 @@ export const globalStyles = css`
     flex-direction: column;
     padding: 7px 14px 10px;
     border: 0;
-    border-radius: 24px;
+    border-radius: 20px;
     background: var(--zode-composer);
     box-shadow: var(--zode-elevation-prominent);
   }
@@ -2623,6 +2754,13 @@ export const globalStyles = css`
     outline: 0;
     background: transparent;
     line-height: 28px;
+    position: relative;
+    z-index: 1;
+  }
+
+  .composer-input:focus-visible,
+  .home-composer-input:focus-visible {
+    outline: 0;
   }
 
   .composer-footer {
@@ -2630,6 +2768,10 @@ export const globalStyles = css`
     align-items: center;
     grid-template-columns: minmax(0, auto) auto minmax(0, 1fr);
     column-gap: 5px;
+    margin-bottom: 8px;
+    padding-inline: 8px;
+    position: relative;
+    z-index: 1;
   }
 
   .composer-footer > .composer-utility-bar {
@@ -2729,7 +2871,6 @@ export const globalStyles = css`
       height: 100vh;
       max-height: none;
       padding: 0;
-      border-right: 1px solid var(--zode-border);
       border-bottom: 0;
       overflow: hidden;
       box-shadow: 8px 0 24px rgb(0 0 0 / 24%);
@@ -2817,28 +2958,19 @@ export const globalStyles = css`
     .home-composer-footer {
       position: relative;
       display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
       gap: 4px;
+      column-gap: 5px;
       overflow: visible;
     }
 
     .home-composer-footer > .composer-utility-bar {
+      grid-column: 2;
+      grid-row: 1;
       gap: 4px;
       min-width: 0;
+      justify-self: end;
       overflow: visible;
-    }
-
-    .home-composer-footer .composer-context-field {
-      min-width: 0;
-      flex: 0 1 auto;
-      gap: 4px;
-      overflow: hidden;
-    }
-
-    .home-composer-footer .composer-select {
-      width: auto;
-      max-width: min(42vw, 192px);
-      min-width: 0;
-      padding-right: 6px;
     }
 
     .home-composer-footer::after {
@@ -2848,16 +2980,17 @@ export const globalStyles = css`
     .home-composer-footer > .composer-submit {
       position: static;
       z-index: 1;
-      grid-column: 2;
+      grid-column: 3;
+      grid-row: 1;
     }
 
     @media (max-width: 340px) {
       .home-intro {
-        padding-bottom: 148px;
+        padding-bottom: 48px;
       }
 
       .home-page:has(.home-composer-empty) .home-intro {
-        padding-bottom: 164px;
+        padding-bottom: 64px;
       }
     }
 
@@ -2937,7 +3070,7 @@ export const globalStyles = css`
 
     .composer-footer
       .composer-execution-trigger[data-zode-execution-state="needs-recovery"]
-      > span {
+      .composer-execution-trigger-content {
       overflow: visible;
       text-overflow: clip;
     }
@@ -2956,11 +3089,11 @@ export const globalStyles = css`
     }
 
     .home-intro {
-      padding-bottom: 170px;
+      padding-bottom: 48px;
     }
 
     .home-page:has(.home-composer-empty) .home-intro {
-      padding-bottom: 186px;
+      padding-bottom: 64px;
     }
   }
 
@@ -2983,6 +3116,10 @@ export const globalStyles = css`
     padding: 0;
     transform: translateX(-100%);
     overflow: hidden;
+  }
+
+  .app-shell.sidebar-collapsed .sidebar-management-footer {
+    display: none;
   }
 
   @media (max-width: 760px) {

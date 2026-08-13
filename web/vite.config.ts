@@ -1,4 +1,14 @@
-import { defineConfig } from "vite-plus";
+import { existsSync, realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { defineConfig, searchForWorkspaceRoot } from "vite-plus";
+
+const webRoot = dirname(fileURLToPath(import.meta.url));
+const nodeModulesPath = resolve(webRoot, "node_modules");
+const allowedFsRoots = [searchForWorkspaceRoot(webRoot)];
+if (existsSync(nodeModulesPath)) {
+  allowedFsRoots.push(realpathSync(nodeModulesPath));
+}
 
 const devApiTarget =
   (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
@@ -7,6 +17,9 @@ const devApiTarget =
 export default defineConfig({
   server: {
     host: true,
+    fs: {
+      allow: allowedFsRoots,
+    },
     proxy: {
       "/v1": {
         target: devApiTarget,
@@ -31,7 +44,7 @@ export default defineConfig({
     ignorePatterns: ["dist/**", "node_modules/**", "e2e/**", "AGENTS.md"],
   },
   lint: {
-    ignorePatterns: ["dist/**", "node_modules/**", "e2e/**", "AGENTS.md"],
+    ignorePatterns: ["dist/**", "node_modules/**", "e2e/**", "AGENTS.md", "vite.config.ts"],
     options: {
       typeAware: true,
       typeCheck: true,

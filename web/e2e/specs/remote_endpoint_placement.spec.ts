@@ -818,7 +818,7 @@ async function openManagementPage(page: Page, name: "Endpoints" | "Providers"): 
     await directLink.click();
     return;
   }
-  await page.getByRole("button", { name: "Zode", exact: true }).click();
+  await page.getByRole("button", { name: "Manage Zode", exact: true }).click();
   await page.getByRole("menuitem", { name, exact: true }).click();
 }
 
@@ -880,7 +880,7 @@ async function addRemoteEndpoint(
     elements.map((element) => (element as HTMLInputElement).value),
   );
   expect(secretValues.every((value) => value === "")).toBe(true);
-  await expect(page.getByText(REMOTE_LABEL, { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: REMOTE_LABEL, exact: true })).toBeVisible();
   return endpoint;
 }
 

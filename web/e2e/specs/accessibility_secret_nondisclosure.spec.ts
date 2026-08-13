@@ -136,16 +136,15 @@ async function activeElementDescriptor(page: Page): Promise<{
       (element as HTMLInputElement).labels ?? [],
       (item) => item.textContent ?? "",
     ).join(" ");
-    const name = [
-      element.getAttribute("aria-label"),
-      labelledBy,
-      label,
-      element.getAttribute("title"),
-      element.getAttribute("placeholder"),
-      element.textContent,
-    ]
-      .filter(Boolean)
-      .join(" ")
+    const name = (
+      element.getAttribute("aria-label") ||
+      labelledBy ||
+      label ||
+      element.getAttribute("title") ||
+      element.getAttribute("placeholder") ||
+      element.textContent ||
+      ""
+    )
       .replace(/\s+/g, " ")
       .trim();
 
@@ -267,13 +266,13 @@ async function navigateToManagementPage(
   if (key) {
     await tabTo(
       page,
-      { role: "button", name: /^zode\b/i },
+      { role: "button", name: /Manage Zode/i },
       "management menu trigger",
       80,
       key,
     );
   } else {
-    await page.getByRole("button", { name: /^zode\b/i }).focus();
+    await page.getByRole("button", { name: /Manage Zode/i }).focus();
     await assertVisibleFocus(page, "management menu trigger");
   }
   await page.keyboard.press("Enter");

@@ -117,7 +117,7 @@ async function openManagement(page, name) {
   }
   let link = page.getByRole("menuitem", { name, exact: true });
   if (!(await link.isVisible())) {
-    await page.getByRole("button", { name: "Zode", exact: true }).click();
+    await page.getByRole("button", { name: "Manage Zode", exact: true }).click();
     link = page.getByRole("menuitem", { name, exact: true });
   }
   await link.click();

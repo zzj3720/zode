@@ -436,7 +436,9 @@ test(E2E_NAME, async ({ browser, page }) => {
     await submit.click();
     expect((await retryResponsePromise).status()).toBe(201);
     await expect(page).toHaveURL(/\/endpoints\/[^/]+\/sessions\/[^/]+$/u);
-    await expect(page.locator('[data-zode-session-identity="true"]')).toContainText(UPDATED_MODEL);
+    await expect(page.getByRole("button", { name: "Choose model", exact: true })).toContainText(
+      UPDATED_MODEL,
+    );
   } catch (error) {
     primaryError = error;
   } finally {
