@@ -13,7 +13,8 @@ use config::EndpointConfig;
 use zode::{
     api,
     control::ControlState,
-    provider::{AimuxProvider, ProviderExecutionPolicy, ReplicaStore},
+    provider::{AimuxProvider, ProviderExecutionPolicy},
+    replicas::FileReplicaStore,
     runtime::{Runtime, TimerArm, TimerPort},
     storage::SqliteEventStore,
     timer::{SleepTimer, SystemClock},
@@ -33,7 +34,7 @@ struct Cli {
 struct Composition {
     runtime_options: zode::runtime::RuntimeOptions,
     control: Arc<ControlState>,
-    replicas: Arc<ReplicaStore>,
+    replicas: Arc<FileReplicaStore>,
     provider_policy: ProviderExecutionPolicy,
     tool_specs: Vec<zode::tools::HttpToolSpec>,
     blob_store: Option<Arc<dyn zode::runtime::BlobStore>>,
@@ -133,7 +134,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen_addr = config.listen_addr()?;
     let runtime_options = config.runtime_options();
     let credential_replica_directory = control.credential_replica_directory().map(PathBuf::from);
-    let replicas = Arc::new(ReplicaStore::open(credential_replica_directory.as_deref())?);
+    let replicas = Arc::new(FileReplicaStore::open(
+        credential_replica_directory.as_deref(),
+    )?);
     let (adapter_kinds, allowed_origins, transport_retry) = config.provider_execution_policy();
     let capabilities_body = api::build_capabilities_body_with_callback(
         control.endpoint_id(),
@@ -178,10 +181,7 @@ async fn run(
     let store = Arc::new(
         tokio::task::spawn_blocking(move || SqliteEventStore::open(database_path)).await??,
     );
-    let provider = Arc::new(AimuxProvider::new(
-        composition.replicas.clone(),
-        composition.provider_policy.clone(),
-    ));
+    let provider = Arc::new(AimuxProvider::new(composition.provider_policy.clone()));
     let tools = match composition.blob_store {
         Some(blob_store) => Arc::new(HttpToolExecutor::new_with_blob_store(
             composition.tool_specs,
@@ -212,7 +212,6 @@ async fn run(
     let state = api::AppState::new(
         store,
         composition.control,
-        composition.replicas,
         runtime.clone(),
         composition.health_body,
         composition.capabilities_body,

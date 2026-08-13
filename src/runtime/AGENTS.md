@@ -3,15 +3,22 @@
 `src/runtime` is the application layer. It coordinates durable session
 activations and declares the ports needed from storage, models, tools, timers,
 clock, blobs, execution policy, credential-replica probes, and event
-publication in `src/runtime/ports`. It depends on the domain,
-never on concrete SQLite, aimux provider, HTTP, filesystem, management Server,
-or process types. Adapters implement those ports; they do not declare them.
+publication in `src/runtime/ports`. Replica provision and resolve are
+runtime-declared ports; the file store is an adapter. It depends on the
+domain, never on concrete SQLite, aimux provider, HTTP, filesystem,
+management Server, or process types. Adapters implement those ports; they do
+not declare them.
 
 Session create, append-message, and model-select are admitted only through
-Runtime. HTTP authenticates and decodes, then calls one Runtime method.
-Receipt lookup precedes current tool-catalog, execution-policy, replica-probe,
-clock, ULID, and event effects. Replay-only misses are typed and mutation-free.
-Create does not wake; message and model-select wake after a non-replayed commit.
+Runtime. Credential-replica install, tombstone, list, and get are admitted
+only through Runtime provision methods. HTTP authenticates and decodes, then
+calls one Runtime method. Receipt lookup precedes current tool-catalog,
+execution-policy, replica-probe, clock, ULID, and event effects. Replay-only
+misses are typed and mutation-free. Create does not wake; message and
+model-select wake after a non-replayed commit. Runtime resolves a
+`SecretLease` after `ModelRequestDeclared`/`ModelRequestPrepared` and
+immediately before each aimux call; only the revision enters
+`ModelAttemptStarted`. Secrets never enter events.
 
 ## Authority and activation
 

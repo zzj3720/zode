@@ -36,14 +36,11 @@ use crate::{
         SessionSelection, SessionState, TranscriptMessage, MAX_ERROR_MESSAGE_BYTES,
         MAX_IDENTIFIER_BYTES,
     },
-    provider::{
-        ReplicaError, ReplicaInstallRequest, ReplicaMutation, ReplicaStore,
-        ReplicaTombstoneRequest, MAX_REPLICA_REQUEST_BYTES,
-    },
     runtime::{
-        session_command_id, CallbackCompletion, EventStore, RehydrateError, Runtime,
-        RuntimeCommandError, RuntimeStreamEvent, RuntimeStreamSubscription, SessionListCursor,
-        StoreError, TransientModelEvent, MAX_SESSION_LIST_LIMIT,
+        session_command_id, CallbackCompletion, EventStore, RehydrateError, ReplicaInstallRequest,
+        ReplicaMetadata, ReplicaPortError, ReplicaTombstoneRequest, Runtime, RuntimeCommandError,
+        RuntimeStreamEvent, RuntimeStreamSubscription, SessionListCursor, StoreError,
+        TransientModelEvent, MAX_REPLICA_REQUEST_BYTES, MAX_SESSION_LIST_LIMIT,
     },
 };
 
@@ -56,7 +53,6 @@ const MAX_IDEMPOTENCY_KEY_BYTES: usize = 1_024;
 pub struct AppState {
     store: Arc<dyn EventStore>,
     control: Arc<ControlState>,
-    replicas: Arc<ReplicaStore>,
     runtime: Arc<Runtime>,
     health_body: Arc<Vec<u8>>,
     capabilities_body: Arc<Vec<u8>>,
@@ -66,7 +62,6 @@ impl AppState {
     pub fn new(
         store: Arc<dyn EventStore>,
         control: Arc<ControlState>,
-        replicas: Arc<ReplicaStore>,
         runtime: Arc<Runtime>,
         health_body: Vec<u8>,
         capabilities_body: Vec<u8>,
@@ -74,7 +69,6 @@ impl AppState {
         Self {
             store,
             control,
-            replicas,
             runtime,
             health_body: Arc::new(health_body),
             capabilities_body: Arc::new(capabilities_body),
@@ -453,16 +447,15 @@ impl ApiError {
         }
     }
 
-    fn from_replica(error: ReplicaError) -> Self {
+    fn from_replica(error: ReplicaPortError) -> Self {
         match error {
-            ReplicaError::Invalid => Self::invalid("invalid credential replica request"),
-            ReplicaError::Conflict => Self::conflict("credential replica operation conflicts"),
-            ReplicaError::NotFound => Self::replica_not_found(),
-            ReplicaError::Storage(_)
-            | ReplicaError::Record(_)
-            | ReplicaError::Unavailable
-            | ReplicaError::Disabled
-            | ReplicaError::SecretUnavailable => Self::internal(),
+            ReplicaPortError::Invalid => Self::invalid("invalid credential replica request"),
+            ReplicaPortError::Conflict => Self::conflict("credential replica operation conflicts"),
+            ReplicaPortError::NotFound => Self::replica_not_found(),
+            ReplicaPortError::Unavailable
+            | ReplicaPortError::Disabled
+            | ReplicaPortError::SecretUnavailable
+            | ReplicaPortError::Backend => Self::internal(),
         }
     }
 }
@@ -558,11 +551,11 @@ async fn list_auth_replicas(
         .control
         .authenticate_controller(&headers)
         .map_err(ApiError::from_control)?;
-    let replicas = state.replicas.clone();
     let authority_id = context.authority_id().to_owned();
-    let metadata = tokio::task::spawn_blocking(move || replicas.list_metadata(&authority_id))
+    let metadata = state
+        .runtime
+        .list_replicas(authority_id)
         .await
-        .map_err(|_| ApiError::internal())?
         .map_err(ApiError::from_replica)?;
     Ok(Json(json!({
         "schema": "zode.auth-replica-list.v1",
@@ -570,7 +563,7 @@ async fn list_auth_replicas(
     })))
 }
 
-fn public_replica_metadata(metadata: crate::provider::ReplicaMetadata) -> Value {
+fn public_replica_metadata(metadata: ReplicaMetadata) -> Value {
     json!({
         "schema": "zode.auth-replica.v1",
         "authority_id": metadata.authority_id,
@@ -591,13 +584,12 @@ async fn read_auth_replica(
         .control
         .authenticate_controller(&headers)
         .map_err(ApiError::from_control)?;
-    let replicas = state.replicas.clone();
     let authority_id = context.authority_id().to_owned();
-    let metadata =
-        tokio::task::spawn_blocking(move || replicas.read_metadata(&authority_id, &profile_id))
-            .await
-            .map_err(|_| ApiError::internal())?
-            .map_err(ApiError::from_replica)?;
+    let metadata = state
+        .runtime
+        .get_replica(authority_id, profile_id)
+        .await
+        .map_err(ApiError::from_replica)?;
     Ok(Json(public_replica_metadata(metadata)))
 }
 
@@ -621,39 +613,36 @@ async fn install_auth_replica(
         .get("schema")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::invalid("credential replica schema is required"))?;
-    let mutation = match schema {
-        "zode.auth-replica.install.v1" => ReplicaMutation::Install(
-            serde_json::from_value::<ReplicaInstallRequest>(value)
-                .map_err(|_| ApiError::invalid("invalid credential replica request"))?,
-        ),
-        "zode.auth-replica.tombstone.v1" => ReplicaMutation::Tombstone(
-            serde_json::from_value::<ReplicaTombstoneRequest>(value)
-                .map_err(|_| ApiError::invalid("invalid credential replica request"))?,
-        ),
-        _ => return Err(ApiError::invalid("unsupported credential replica schema")),
-    };
-    let mutation_authority = match &mutation {
-        ReplicaMutation::Install(replica) => &replica.authority_id,
-        ReplicaMutation::Tombstone(replica) => &replica.authority_id,
-    };
-    if mutation_authority != context.authority_id() {
-        return Err(ApiError::invalid(
-            "credential replica authority does not match",
-        ));
-    }
-    let replicas = state.replicas.clone();
     let authority_id = context.authority_id().to_owned();
-    let profile_for_store = profile_id.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        replicas.apply(
-            &profile_for_store,
-            &authority_id,
-            &idempotency_key,
-            mutation,
-        )
-    })
-    .await
-    .map_err(|_| ApiError::internal())?
+    let outcome = match schema {
+        "zode.auth-replica.install.v1" => {
+            let request = serde_json::from_value::<ReplicaInstallRequest>(value)
+                .map_err(|_| ApiError::invalid("invalid credential replica request"))?;
+            if request.authority_id != authority_id {
+                return Err(ApiError::invalid(
+                    "credential replica authority does not match",
+                ));
+            }
+            state
+                .runtime
+                .install_replica(profile_id, authority_id, idempotency_key, request)
+                .await
+        }
+        "zode.auth-replica.tombstone.v1" => {
+            let request = serde_json::from_value::<ReplicaTombstoneRequest>(value)
+                .map_err(|_| ApiError::invalid("invalid credential replica request"))?;
+            if request.authority_id != authority_id {
+                return Err(ApiError::invalid(
+                    "credential replica authority does not match",
+                ));
+            }
+            state
+                .runtime
+                .tombstone_replica(profile_id, authority_id, idempotency_key, request)
+                .await
+        }
+        _ => return Err(ApiError::invalid("unsupported credential replica schema")),
+    }
     .map_err(ApiError::from_replica)?;
     let metadata = outcome.metadata;
     let body = public_replica_metadata(metadata);

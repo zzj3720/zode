@@ -2,6 +2,7 @@ pub mod api;
 pub mod control;
 pub mod domain;
 pub mod provider;
+pub mod replicas;
 pub mod runtime;
 pub mod storage;
 pub mod timer;

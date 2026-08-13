@@ -24,11 +24,13 @@ use model::{MAX_CONTEXT_HANDOFF_DOCUMENT_TOKENS, MAX_CONTEXT_HANDOFF_GENERATION_
 pub use ports::{
     AppendResult, BlobPort, BlobStore, Clock, EventStore, ExecutionPolicyError,
     ExecutionPolicyPort, ExternalCallbackLookup, ModelExecutor, ModelPort, OwnedSessionRef,
-    RehydrateError, ReplicaPort, ReplicaPortError, ReplicaProbe, SessionAppendResult,
-    SessionCreate, SessionCreateCommand, SessionCreateResult, SessionListCursor, SessionListItem,
-    SessionListPage, SnapshotRecord, StoreError, StorePort, StorePortError, TimerArm, TimerKey,
-    TimerPort, TimerPortError, ToolExecutor, ToolPort, VerifiedSessionState,
-    MAX_OWNED_SESSION_SCAN_LIMIT, MAX_SESSION_LIST_LIMIT, SNAPSHOT_ENCODING_JSON,
+    RehydrateError, ReplicaInstallRequest, ReplicaMetadata, ReplicaPort, ReplicaPortError,
+    ReplicaProbe, ReplicaProvisionOutcome, ReplicaTombstoneRequest, SecretLease,
+    SessionAppendResult, SessionCreate, SessionCreateCommand, SessionCreateResult,
+    SessionListCursor, SessionListItem, SessionListPage, SnapshotRecord, StoreError, StorePort,
+    StorePortError, TimerArm, TimerKey, TimerPort, TimerPortError, ToolExecutor, ToolPort,
+    VerifiedSessionState, MAX_OWNED_SESSION_SCAN_LIMIT, MAX_REPLICA_REQUEST_BYTES,
+    MAX_SESSION_LIST_LIMIT, SNAPSHOT_ENCODING_JSON,
 };
 mod stream;
 mod transition;

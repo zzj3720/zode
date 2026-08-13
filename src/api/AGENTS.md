@@ -40,7 +40,9 @@ contract.
   versioned public session and event mappings with secret-safe fields.
 - All blocking adapter work crosses `spawn_blocking` or a dedicated worker.
 - Expose bounded identity/health/capability reads and authenticated,
-  idempotent credential-replica install/tombstone commands. Never expose OAuth,
+  idempotent credential-replica install/tombstone commands. Replica routes
+  authenticate the controller, decode the body, and call one Runtime provision
+  method; they do not import or hold the replica file store. Never expose OAuth,
   provider defaults, sharing policy, endpoint registration, or UI routes.
 - Require `Zode-Subject` only for session ownership and session-command receipt
   scope. Identity, health, capabilities, controller-auth, and auth-replica

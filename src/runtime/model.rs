@@ -243,6 +243,29 @@ impl Runtime {
         Ok(state)
     }
 
+    async fn resolve_secret_lease(
+        &self,
+        selection: &SessionModelSelection,
+    ) -> Result<SecretLease, ModelError> {
+        let replicas = self.replicas.clone();
+        let authority = selection.auth_authority_id.clone();
+        let profile = selection.auth_profile_id.clone();
+        let provider = selection.provider.clone();
+        let minimum_revision = selection.auth_revision;
+        tokio::task::spawn_blocking(move || {
+            replicas.resolve(&authority, &profile, &provider, minimum_revision)
+        })
+        .await
+        .map_err(|_| ModelError::Unavailable)?
+        .map_err(|error| match error {
+            ReplicaPortError::Disabled | ReplicaPortError::SecretUnavailable => {
+                ModelError::AuthReplicaUnavailable
+            }
+            ReplicaPortError::Invalid => ModelError::InvalidSelection,
+            _ => ModelError::Unavailable,
+        })
+    }
+
     async fn execute_prepared_model_request(
         self: &Arc<Self>,
         input: PreparedModelRequestInput<'_>,
@@ -260,7 +283,11 @@ impl Runtime {
         let mut attempt_number = request_identity.attempt_number;
         let mut attempt_id = request_identity.attempt_id.clone();
         loop {
-            let completion = self.model.complete(&request).await.and_then(|value| {
+            let completion = match self.resolve_secret_lease(&request.selection).await {
+                Ok(lease) => self.model.complete(&request, lease).await,
+                Err(error) => Err(error),
+            }
+            .and_then(|value| {
                 if validate_tool_calls(&value.tool_calls, &request.tools).is_ok() {
                     Ok(value)
                 } else {

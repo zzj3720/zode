@@ -10,9 +10,10 @@ use crate::domain::{
 };
 
 use super::{
-    AppendResult, EventStore, ExecutionPolicyPort, RehydrateError, ReplicaPort, ReplicaPortError,
-    Runtime, RuntimeCommandError, SessionCreate, SessionCreateCommand, SessionCreateResult,
-    StoreError, ToolExecutor, VerifiedSessionState,
+    AppendResult, EventStore, ExecutionPolicyPort, RehydrateError, ReplicaInstallRequest,
+    ReplicaMetadata, ReplicaPort, ReplicaPortError, ReplicaProvisionOutcome,
+    ReplicaTombstoneRequest, Runtime, RuntimeCommandError, SessionCreate, SessionCreateCommand,
+    SessionCreateResult, StoreError, ToolExecutor, VerifiedSessionState,
 };
 
 #[derive(Debug, Serialize)]
@@ -137,7 +138,7 @@ fn admit_model_selection(
         .validate_descriptor(&model.provider_execution)
         .map_err(|_| RuntimeCommandError::Invalid("invalid provider execution"))?;
     let probe = replicas
-        .probe(
+        .probe_ready(
             &model.auth_authority_id,
             &model.auth_profile_id,
             &model.provider,
@@ -651,5 +652,56 @@ impl Runtime {
             self.wake(wake_owner, wake_session_id);
         }
         Ok(operation)
+    }
+
+    pub async fn install_replica(
+        self: &Arc<Self>,
+        profile_id: String,
+        authority_id: String,
+        idempotency_key: String,
+        request: ReplicaInstallRequest,
+    ) -> Result<ReplicaProvisionOutcome, ReplicaPortError> {
+        let replicas = self.replicas.clone();
+        tokio::task::spawn_blocking(move || {
+            replicas.install(&profile_id, &authority_id, &idempotency_key, request)
+        })
+        .await
+        .map_err(|_| ReplicaPortError::Backend)?
+    }
+
+    pub async fn tombstone_replica(
+        self: &Arc<Self>,
+        profile_id: String,
+        authority_id: String,
+        idempotency_key: String,
+        request: ReplicaTombstoneRequest,
+    ) -> Result<ReplicaProvisionOutcome, ReplicaPortError> {
+        let replicas = self.replicas.clone();
+        tokio::task::spawn_blocking(move || {
+            replicas.tombstone(&profile_id, &authority_id, &idempotency_key, request)
+        })
+        .await
+        .map_err(|_| ReplicaPortError::Backend)?
+    }
+
+    pub async fn list_replicas(
+        self: &Arc<Self>,
+        authority_id: String,
+    ) -> Result<Vec<ReplicaMetadata>, ReplicaPortError> {
+        let replicas = self.replicas.clone();
+        tokio::task::spawn_blocking(move || replicas.list(&authority_id))
+            .await
+            .map_err(|_| ReplicaPortError::Backend)?
+    }
+
+    pub async fn get_replica(
+        self: &Arc<Self>,
+        authority_id: String,
+        profile_id: String,
+    ) -> Result<ReplicaMetadata, ReplicaPortError> {
+        let replicas = self.replicas.clone();
+        tokio::task::spawn_blocking(move || replicas.read(&authority_id, &profile_id))
+            .await
+            .map_err(|_| ReplicaPortError::Backend)?
     }
 }
