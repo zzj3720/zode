@@ -11,6 +11,9 @@ Management Server code belongs under `server/`; browser code belongs under
   application/runtime layer declares effect ports and depends on the domain;
   SQLite, aimux/provider execution, credential-replica, tool, timer, and
   transport code are adapters; `main.rs` only composes them.
+- The timer adapter implements a runtime-declared TimerPort. It must not
+  append events, rehydrate sessions, cancel tools, or persist wait state.
+  Runtime arms it only after the WaitSet/timer-intent transaction commits.
 - Do not add management Server discovery, registration, reverse connection,
   heartbeat, users, OAuth/profile authority, cross-Endpoint routing, mirror, or
   UI concerns anywhere under `src/`.
