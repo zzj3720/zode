@@ -11,14 +11,20 @@ use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
 
 use crate::runtime::ports::{Clock, TimerArm, TimerKey, TimerPort, TimerPortError};
 
+struct ArmedWait {
+    handle: JoinHandle<()>,
+    generation: u64,
+}
+
 struct SleepTimerInner {
     due_tx: Option<UnboundedSender<TimerArm>>,
-    arms: HashMap<String, JoinHandle<()>>,
+    arms: HashMap<String, ArmedWait>,
+    next_generation: u64,
 }
 
 pub struct SleepTimer {
     clock: Arc<dyn Clock>,
-    inner: Mutex<SleepTimerInner>,
+    inner: Arc<Mutex<SleepTimerInner>>,
     shutdown: AtomicBool,
 }
 
@@ -26,10 +32,11 @@ impl SleepTimer {
     pub fn new(clock: Arc<dyn Clock>, due_tx: UnboundedSender<TimerArm>) -> Self {
         Self {
             clock,
-            inner: Mutex::new(SleepTimerInner {
+            inner: Arc::new(Mutex::new(SleepTimerInner {
                 due_tx: Some(due_tx),
                 arms: HashMap::new(),
-            }),
+                next_generation: 0,
+            })),
             shutdown: AtomicBool::new(false),
         }
     }
@@ -51,20 +58,36 @@ impl TimerPort for SleepTimer {
             return Err(TimerPortError::Shutdown);
         }
         let session_id = arm.session_id.clone();
+        let generation = inner.next_generation;
+        inner.next_generation = inner.next_generation.wrapping_add(1);
+        let cleanup = self.inner.clone();
+        let cleanup_session = session_id.clone();
         let handle = tokio::spawn(async move {
             clock.sleep(delay).await;
             let _ = tx.send(arm);
+            if let Ok(mut guard) = cleanup.lock() {
+                if guard
+                    .arms
+                    .get(&cleanup_session)
+                    .is_some_and(|armed| armed.generation == generation)
+                {
+                    guard.arms.remove(&cleanup_session);
+                }
+            }
         });
-        if let Some(previous) = inner.arms.insert(session_id, handle) {
-            previous.abort();
+        if let Some(previous) = inner
+            .arms
+            .insert(session_id, ArmedWait { handle, generation })
+        {
+            previous.handle.abort();
         }
         Ok(())
     }
 
     fn cancel(&self, key: &TimerKey) -> Result<(), TimerPortError> {
         let mut inner = self.inner.lock().map_err(|_| TimerPortError::Backend)?;
-        if let Some(handle) = inner.arms.remove(&key.session_id) {
-            handle.abort();
+        if let Some(previous) = inner.arms.remove(&key.session_id) {
+            previous.handle.abort();
         }
         Ok(())
     }
@@ -73,8 +96,8 @@ impl TimerPort for SleepTimer {
         self.shutdown.store(true, Ordering::SeqCst);
         if let Ok(mut inner) = self.inner.lock() {
             inner.due_tx.take();
-            for (_, handle) in inner.arms.drain() {
-                handle.abort();
+            for (_, armed) in inner.arms.drain() {
+                armed.handle.abort();
             }
         }
     }

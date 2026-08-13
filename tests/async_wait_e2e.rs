@@ -3079,7 +3079,14 @@ async fn e2e_outstanding_wait_expires_after_restart() -> TestResult<()> {
 
     server.stop().await?;
     let mut restarted = ConfiguredServer::start(&database, &config).await?;
-    let after_restart = timeout(Duration::from_secs(10), async {
+    let after_ready = read_session(&client, &restarted, &session_id).await?;
+    assert_eq!(after_ready["wait"]["wait_id"], wait_id);
+    assert_eq!(after_ready["wait"]["reason"], "expire after restart");
+    assert_eq!(after_ready["wait"]["timeout_seconds"], 1);
+    assert_eq!(after_ready["wait"]["source"], "wait_for");
+    assert_eq!(model.request_count(), 1);
+
+    let after_expire = timeout(Duration::from_secs(10), async {
         loop {
             let state = read_session(&client, &restarted, &session_id).await?;
             if state["wait"].is_null() {
@@ -3106,7 +3113,7 @@ async fn e2e_outstanding_wait_expires_after_restart() -> TestResult<()> {
         &client,
         &restarted,
         &session_id,
-        after_restart["version"]
+        after_expire["version"]
             .as_u64()
             .ok_or_else(|| Error::other("expired wait GET omitted version"))?,
     )
@@ -3117,7 +3124,6 @@ async fn e2e_outstanding_wait_expires_after_restart() -> TestResult<()> {
     assert!(!events
         .iter()
         .any(|frame| frame.event == "async_tool_call_cancelled"));
-    assert_eq!(model.request_count(), 1);
     restarted.stop().await?;
     model.stop().await?;
     Ok(())
